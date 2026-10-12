@@ -1,0 +1,16 @@
+/target
+/.tmp
+/docs
+
+# Local secrets and test accounts
+.env
+.env.*
+!.env.example
+# Local mail cache
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+# Android build output
+*.aab
+*.apk
