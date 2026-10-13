@@ -7,10 +7,13 @@ use std::sync::{Arc, Mutex};
 
 use beavermail_core::{Account, MailError, MailSource, MessageId, Role, Server, Tls};
 use beavermail_imap::ImapSource;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
 const HEADER: &str = "From: Ada <ada@example.com>\r\nSubject: Hello\r\nDate: Mon, 1 Jan 2024 10:00:00 +0000\r\n\r\n";
+
+/// The one message the server holds, complete.
+const MESSAGE: &str = "From: Ada <ada@example.com>\r\nTo: Me <me@example.com>, grace@example.com\r\nCc: Linus <linus@example.com>\r\nReply-To: lists@example.com\r\nSubject: Hello\r\nMessage-ID: <m2@example.com>\r\nReferences: <m0@example.com> <m1@example.com>\r\nDate: Mon, 1 Jan 2024 10:00:00 +0000\r\n\r\nHi there.\r\n";
 
 struct Mock {
     source: ImapSource,
@@ -42,30 +45,53 @@ async fn start(move_works: bool) -> Mock {
         }
     });
     let server = Server { host: "127.0.0.1".into(), port, tls: Tls::None };
-    let account = Account { name: "mock".into(), user: "u".into(), email: String::new(), imap: server.clone(), smtp: server };
+    let account = Account { name: "mock".into(), user: "u".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true };
     Mock { source: ImapSource::new(&account, "p".into()), log }
 }
 
 async fn serve(socket: TcpStream, log: Arc<Mutex<Vec<String>>>, move_works: bool) {
     let (read, mut write) = socket.into_split();
-    let mut lines = BufReader::new(read).lines();
+    let mut read = BufReader::new(read);
     let _ = write.write_all(b"* OK ready\r\n").await;
-    while let Ok(Some(line)) = lines.next_line().await {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if !matches!(read.read_line(&mut line).await, Ok(n) if n > 0) {
+            return;
+        }
+        let line = line.trim_end().to_owned();
         let Some((tag, command)) = line.split_once(' ') else { continue };
         log.lock().unwrap().push(command.to_owned());
         let verb = command.to_ascii_uppercase();
         let reply = if verb.starts_with("LIST") {
             format!(
-                "* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n* LIST (\\Archive) \"/\" \"Archive\"\r\n* LIST (\\Trash) \"/\" \"Trash\"\r\n{tag} OK done\r\n"
+                "* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n* LIST (\\Archive) \"/\" \"Archive\"\r\n* LIST (\\Sent) \"/\" \"Sent\"\r\n* LIST (\\Trash) \"/\" \"Trash\"\r\n{tag} OK done\r\n"
             )
         } else if verb.starts_with("STATUS") {
             let name = command.split(' ').nth(1).unwrap_or("\"INBOX\"");
             format!("* STATUS {name} (UNSEEN 1)\r\n{tag} OK done\r\n")
         } else if verb.starts_with("SELECT") || verb.starts_with("EXAMINE") {
             format!("* 1 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 1] ok\r\n{tag} OK [READ-WRITE] done\r\n")
+        } else if verb.contains("BODY.PEEK[]") {
+            let n = MESSAGE.len();
+            format!("* 1 FETCH (UID 5 BODY[] {{{n}}}\r\n{MESSAGE})\r\n{tag} OK done\r\n")
         } else if verb.contains("FETCH") {
             let n = HEADER.len();
             format!("* 1 FETCH (UID 5 FLAGS () BODY[HEADER] {{{n}}}\r\n{HEADER})\r\n{tag} OK done\r\n")
+        } else if verb.starts_with("APPEND") {
+            // "APPEND "Sent" (\Seen) {123}": ask for the literal, read it, and record what arrived.
+            let size: usize = command.rsplit('{').next().and_then(|n| n.trim_end_matches('}').parse().ok()).unwrap_or(0);
+            if write.write_all(b"+ go ahead\r\n").await.is_err() {
+                return;
+            }
+            let mut data = vec![0; size];
+            if read.read_exact(&mut data).await.is_err() {
+                return;
+            }
+            let mut rest = String::new();
+            let _ = read.read_line(&mut rest).await; // the CRLF that ends the command
+            log.lock().unwrap().push(format!("APPEND-DATA {}", String::from_utf8_lossy(&data)));
+            format!("{tag} OK [APPENDUID 1 1] done\r\n")
         } else if verb.starts_with("UID MOVE") && !move_works {
             format!("{tag} NO [CANNOT] MOVE is not supported\r\n")
         } else if verb.starts_with("UID EXPUNGE") {
@@ -147,4 +173,29 @@ async fn moving_within_the_target_folder_is_refused() {
     let id = message_in(&mock, "Trash").await;
     assert!(mock.source.trash(id).await.is_err());
     assert!(mock.writes().is_empty());
+}
+
+#[tokio::test]
+async fn opening_a_message_reads_recipients_and_threading_headers() {
+    let mock = start(true).await;
+    let id = message_in(&mock, "INBOX").await;
+    let summary = &mock.source.messages("INBOX").await.unwrap()[0];
+    assert_eq!(summary.address, "ada@example.com");
+    let body = mock.source.body(id).await.unwrap();
+    assert_eq!(body.text.trim(), "Hi there.");
+    assert_eq!(body.to, ["Me <me@example.com>", "grace@example.com"]);
+    assert_eq!(body.cc, ["Linus <linus@example.com>"]);
+    assert_eq!(body.reply_to, ["lists@example.com"]);
+    assert_eq!(body.message_id, "m2@example.com");
+    assert_eq!(body.references, ["m0@example.com", "m1@example.com"]);
+}
+
+#[tokio::test]
+async fn a_sent_copy_is_appended_to_sent_as_read() {
+    let mock = start(true).await;
+    let raw = b"Subject: Sent one\r\n\r\nBody\r\n".to_vec();
+    mock.source.save_sent(raw).await.unwrap();
+    let commands = mock.commands();
+    assert!(commands.iter().any(|c| c.starts_with("APPEND \"Sent\" (\\Seen)")), "{commands:?}");
+    assert!(commands.iter().any(|c| c.starts_with("APPEND-DATA Subject: Sent one")), "{commands:?}");
 }

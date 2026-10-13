@@ -8,7 +8,7 @@
 pub mod model;
 pub mod sample;
 
-pub use model::{Account, Mailbox, MessageId, MessageSummary, Outgoing, Role, Server, Tls};
+pub use model::{Account, Mailbox, MessageBody, MessageId, MessageSummary, Outgoing, Role, Server, Tls};
 
 use std::fmt;
 use std::future::Future;
@@ -47,8 +47,11 @@ pub trait MailSource {
     /// Summaries of the messages in `mailbox`, newest first.
     fn messages(&self, mailbox: &str) -> impl Future<Output = Result<Vec<MessageSummary>, MailError>> + Send;
 
-    /// Plain-text body of a message; [`MailError::NotFound`] if it does not exist.
-    fn body(&self, id: MessageId) -> impl Future<Output = Result<String, MailError>> + Send;
+    /// Text, recipients and threading headers of a message; [`MailError::NotFound`] if it does not exist.
+    fn body(&self, id: MessageId) -> impl Future<Output = Result<MessageBody, MailError>> + Send;
+
+    /// Stores a copy of a sent message (RFC 5322 bytes) in the Sent folder, marked as read.
+    fn save_sent(&self, raw: Vec<u8>) -> impl Future<Output = Result<(), MailError>> + Send;
 
     /// Marks a message unread (`true`) or read (`false`).
     fn set_unread(&self, id: MessageId, unread: bool) -> impl Future<Output = Result<(), MailError>> + Send;
@@ -65,7 +68,8 @@ pub trait MailSource {
 
 /// Sends mail for one account. Kept apart from [`MailSource`]: sending and reading use different servers.
 pub trait MailSender {
-    /// Delivers `message` to the account's outgoing server. Addresses that do not parse are
+    /// Delivers `message` to the account's outgoing server and returns the message as sent
+    /// (RFC 5322 bytes), for a copy in the Sent folder. Addresses that do not parse are
     /// reported as [`MailError::Backend`] before anything is sent.
-    fn send(&self, message: Outgoing) -> impl Future<Output = Result<(), MailError>> + Send;
+    fn send(&self, message: Outgoing) -> impl Future<Output = Result<Vec<u8>, MailError>> + Send;
 }

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use async_imap::types::{Fetch, Flag, NameAttribute};
 use async_imap::{Client, Session};
-use beavermail_core::{Account, MailError, MailSource, Mailbox, MessageId, MessageSummary, Role, Server, Tls};
+use beavermail_core::{Account, MailError, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Role, Server, Tls};
 use futures::TryStreamExt;
 use mail_parser::MessageParser;
 use rustls::pki_types::ServerName;
@@ -32,6 +32,7 @@ struct State {
     /// Special-use folders from the last LIST (RFC 6154), by name.
     archive: Option<String>,
     trash: Option<String>,
+    sent: Option<String>,
 }
 
 /// What a write does to one message.
@@ -139,6 +140,7 @@ impl State {
                 let find = |role| names.iter().find(|(_, r)| *r == role).map(|(n, _)| n.clone());
                 self.archive = find(Role::Archive);
                 self.trash = find(Role::Trash);
+                self.sent = find(Role::Sent);
                 self.mailboxes = names.into_iter().map(|(n, _)| n).collect();
                 Ok(mailboxes)
             }
@@ -211,17 +213,16 @@ fn decode(id: MessageId) -> (usize, u32) {
 fn summary(mailbox: usize, fetch: &Fetch) -> Option<MessageSummary> {
     let uid = fetch.uid?;
     let message = MessageParser::default().parse_headers(fetch.header()?)?;
-    let from = message
-        .from()
-        .and_then(|a| a.first())
-        .map(|a| a.name().or(a.address()).unwrap_or_default().to_owned())
-        .unwrap_or_default();
+    let sender = message.from().and_then(|a| a.first());
+    let from = sender.map(|a| a.name().or(a.address()).unwrap_or_default().to_owned()).unwrap_or_default();
+    let address = sender.and_then(|a| a.address()).unwrap_or_default().to_owned();
     let received = message.date().map_or_else(String::new, |d| {
         format!("{:04}-{:02}-{:02} {:02}:{:02}", d.year, d.month, d.day, d.hour, d.minute)
     });
     Some(MessageSummary {
         id: encode(mailbox, uid),
         from,
+        address,
         subject: message.subject().unwrap_or_default().to_owned(),
         preview: String::new(), // shortcut: needs the body; filled once bodies are cached
         received,
@@ -277,6 +278,19 @@ impl ImapSource {
     }
 }
 
+/// "Name <address>" or a bare address for each entry of an address header.
+fn addresses(header: Option<&mail_parser::Address<'_>>) -> Vec<String> {
+    header
+        .into_iter()
+        .flat_map(|h| h.iter())
+        .filter_map(|a| match (a.name(), a.address()) {
+            (Some(name), Some(address)) => Some(format!("{name} <{address}>")),
+            (None, Some(address)) => Some(address.to_owned()),
+            _ => None,
+        })
+        .collect()
+}
+
 impl MailSource for ImapSource {
     async fn mailboxes(&self) -> Result<Vec<Mailbox>, MailError> {
         self.state.lock().await.list(&self.config).await
@@ -309,7 +323,7 @@ impl MailSource for ImapSource {
         Ok(messages)
     }
 
-    async fn body(&self, id: MessageId) -> Result<String, MailError> {
+    async fn body(&self, id: MessageId) -> Result<MessageBody, MailError> {
         let (index, uid) = decode(id);
         let mut state = self.state.lock().await;
         let mailbox = state.mailbox_name(&self.config, index).await?;
@@ -323,7 +337,28 @@ impl MailSource for ImapSource {
         let fetches = result.map_err(|e| state.failed(e))?;
         let raw = fetches.iter().find_map(|f| f.body()).ok_or(MailError::NotFound)?;
         let message = MessageParser::default().parse(raw).ok_or(MailError::NotFound)?;
-        Ok(message.body_text(0).map(|t| t.into_owned()).unwrap_or_default())
+        Ok(MessageBody {
+            text: message.body_text(0).map(|t| t.into_owned()).unwrap_or_default(),
+            to: addresses(message.to()),
+            cc: addresses(message.cc()),
+            reply_to: addresses(message.reply_to()),
+            message_id: message.message_id().unwrap_or_default().to_owned(),
+            references: message.references().as_text_list().map_or_else(
+                || message.references().as_text().map(|r| vec![r.to_owned()]).unwrap_or_default(),
+                |list| list.iter().map(|r| r.to_string()).collect(),
+            ),
+        })
+    }
+
+    async fn save_sent(&self, raw: Vec<u8>) -> Result<(), MailError> {
+        let mut state = self.state.lock().await;
+        if state.mailboxes.is_empty() {
+            state.list(&self.config).await?;
+        }
+        let sent = state.sent.clone().ok_or_else(|| backend("this account has no Sent folder"))?;
+        let session = state.session(&self.config).await?;
+        let result = session.append(&sent, Some("(\\Seen)"), None, &raw).await;
+        result.map_err(|e| state.failed(e))
     }
 
     async fn set_unread(&self, id: MessageId, unread: bool) -> Result<(), MailError> {

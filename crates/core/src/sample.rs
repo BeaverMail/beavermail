@@ -2,7 +2,7 @@
 
 //! An in-memory [`MailSource`] with generated data, for development and tests.
 
-use crate::{MailError, MailSource, Mailbox, MessageId, MessageSummary, Role};
+use crate::{MailError, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Role};
 
 const FOLDERS: [&str; 6] = ["Inbox", "Starred", "Drafts", "Sent", "Archive", "Trash"];
 const SENDERS: [&str; 8] = [
@@ -34,6 +34,7 @@ impl SampleSource {
                 let summary = MessageSummary {
                     id: MessageId(i as u64),
                     from: SENDERS[next() % SENDERS.len()].to_owned(),
+                    address: String::new(),
                     subject,
                     preview: body.chars().take(90).collect(),
                     received: format!("{:02}:{:02}", next() % 24, next() % 60),
@@ -86,12 +87,16 @@ impl MailSource for SampleSource {
             .collect())
     }
 
-    async fn body(&self, id: MessageId) -> Result<String, MailError> {
+    async fn body(&self, id: MessageId) -> Result<MessageBody, MailError> {
         self.messages
             .iter()
             .find(|(_, m, _)| m.id == id)
-            .map(|(_, _, body)| body.clone())
+            .map(|(_, _, text)| MessageBody { text: text.clone(), ..MessageBody::default() })
             .ok_or(MailError::NotFound)
+    }
+
+    async fn save_sent(&self, _: Vec<u8>) -> Result<(), MailError> {
+        Err(read_only())
     }
 
     async fn set_unread(&self, _: MessageId, _: bool) -> Result<(), MailError> {

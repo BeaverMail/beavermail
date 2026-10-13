@@ -13,7 +13,7 @@ mod theme;
 mod views;
 
 use beavermail_accounts as store;
-use beavermail_core::{Account, MailError, MailSender, MailSource, Mailbox, MessageId, MessageSummary, Role, Server, Tls};
+use beavermail_core::{Account, MailError, MailSender, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Role, Server, Tls};
 use beavermail_imap::ImapSource;
 use beavermail_smtp::SmtpSender;
 use eframe::egui::{self, Align, Layout, RichText, pos2, vec2};
@@ -26,11 +26,12 @@ use tokio::runtime::Runtime;
 enum Event {
     Mailboxes(u64, Result<Vec<Mailbox>, MailError>),
     Messages(u64, usize, Result<Vec<MessageSummary>, MailError>),
-    Body(u64, MessageId, Result<String, MailError>),
+    Body(u64, MessageId, Result<MessageBody, MailError>),
     /// A write (read flag, archive, trash) finished; the UI already showed its result.
     Done(u64, usize, Result<(), MailError>),
     /// The message in the compose window was sent, or the server refused it.
-    Sent(Result<(), MailError>),
+    /// Second field: why the copy in Sent could not be saved, when the message itself went out.
+    Sent(Result<(), MailError>, Option<String>),
 }
 
 #[derive(Clone, Copy)]
@@ -39,12 +40,15 @@ enum Action {
     Archive,
     Trash,
     Erase,
+    Reply,
+    ReplyAll,
+    Forward,
 }
 
 impl Action {
     /// Whether the message leaves the folder being shown.
     fn removes(self) -> bool {
-        !matches!(self, Self::Unread(_))
+        matches!(self, Self::Archive | Self::Trash | Self::Erase)
     }
 }
 
@@ -84,6 +88,7 @@ struct NewAccount {
     smtp_host: String,
     smtp_port: String,
     smtp_tls: Tls,
+    save_sent: bool,
     error: Option<String>,
     /// Focus the first field on the first frame only.
     focus_first: bool,
@@ -103,6 +108,7 @@ impl Default for NewAccount {
             smtp_host: String::new(),
             smtp_port: "587".into(),
             smtp_tls: Tls::StartTls,
+            save_sent: true,
             error: None,
             focus_first: true,
         }
@@ -124,6 +130,7 @@ impl NewAccount {
             smtp_host: if account.smtp.host == account.imap.host { String::new() } else { account.smtp.host.clone() },
             smtp_port: port(&account.smtp),
             smtp_tls: account.smtp.tls,
+            save_sent: account.save_sent,
             focus_first: true,
             ..Self::default()
         }
@@ -154,6 +161,7 @@ impl NewAccount {
             email: email.to_owned(),
             imap: Server { host: imap_host.to_owned(), port: port(&self.imap_port, "IMAP")?, tls: self.imap_tls },
             smtp: Server { host: smtp_host.to_owned(), port: port(&self.smtp_port, "SMTP")?, tls: self.smtp_tls },
+            save_sent: self.save_sent,
         })
     }
 }
@@ -203,7 +211,7 @@ struct BeaverApp {
     selected: Option<(u64, usize)>,
     messages: Vec<MessageSummary>,
     message: Option<MessageId>,
-    body: Option<String>,
+    body: Option<MessageBody>,
     error: Option<String>,
     form: Option<NewAccount>,
     /// A message waiting for the user to confirm erasing it for good.
@@ -325,6 +333,7 @@ impl BeaverApp {
                 self.messages.remove(pos);
                 -i32::from(was_unread)
             }
+            Action::Reply | Action::ReplyAll | Action::Forward => return,
         };
         if let Some(mailbox) = self.accounts.iter_mut().find(|v| v.serial == serial).and_then(|v| v.mailboxes.get_mut(index)) {
             mailbox.unread = mailbox.unread.saturating_add_signed(unread_change);
@@ -335,6 +344,7 @@ impl BeaverApp {
                 Action::Archive => source.archive(id).await,
                 Action::Trash => source.trash(id).await,
                 Action::Erase => source.erase(id).await,
+                Action::Reply | Action::ReplyAll | Action::Forward => Ok(()),
             };
             Event::Done(serial, index, result)
         });
@@ -390,12 +400,19 @@ impl BeaverApp {
             compose::Outcome::Discard => self.confirm_discard = true,
             compose::Outcome::Send => {
                 if let Some(view) = self.view(compose.from) {
-                    let (account, sender) = (view.account.clone(), view.sender.clone());
+                    let (account, sender, source) = (view.account.clone(), view.sender.clone(), view.source.clone());
                     if let Some(sender) = sender {
                         let message = compose.outgoing(account.address());
                         compose.sending = true;
                         compose.error = None;
-                        self.spawn(async move { Event::Sent(sender.send(message).await) });
+                        self.spawn(async move {
+                            let result = sender.send(message).await;
+                            let copy_error = match (&result, source) {
+                                (Ok(raw), Some(source)) if account.save_sent => source.save_sent(raw.clone()).await.err().map(|e| e.to_string()),
+                                _ => None,
+                            };
+                            Event::Sent(result.map(|_| ()), copy_error)
+                        });
                     }
                 }
             }
@@ -432,10 +449,27 @@ impl BeaverApp {
 
     /// Runs a user action; trashing from the trash asks first, because that erases for good.
     fn request(&mut self, id: MessageId, action: Action) {
-        if matches!(action, Action::Trash) && self.role() == Role::Trash {
+        if matches!(action, Action::Reply | Action::ReplyAll | Action::Forward) {
+            self.answer(id, action);
+        } else if matches!(action, Action::Trash) && self.role() == Role::Trash {
             self.confirm_erase = Some(id);
         } else {
             self.act(id, action);
+        }
+    }
+
+    /// Opens a reply or a forward of the open message.
+    fn answer(&mut self, id: MessageId, action: Action) {
+        let Some((serial, _)) = self.selected else { return };
+        let (Some(summary), Some(body)) = (self.messages.iter().find(|m| m.id == id), &self.body) else { return };
+        let Some(view) = self.view(serial).filter(|v| v.sender.is_some()) else { return };
+        let own = view.account.address();
+        let compose = match action {
+            Action::Forward => compose::Compose::forward(serial, summary, body),
+            _ => compose::Compose::reply(serial, own, summary, body, matches!(action, Action::ReplyAll)),
+        };
+        if self.compose.is_none() {
+            self.compose = Some(compose);
         }
     }
 
@@ -463,7 +497,13 @@ impl BeaverApp {
             }
         }
         let (Some(id), Some(_)) = (self.message, pos) else { return };
-        if key(egui::Key::E) {
+        if key(egui::Key::R) {
+            self.request(id, Action::Reply);
+        } else if key(egui::Key::A) {
+            self.request(id, Action::ReplyAll);
+        } else if key(egui::Key::F) {
+            self.request(id, Action::Forward);
+        } else if key(egui::Key::E) {
             self.request(id, Action::Archive);
         } else if key(egui::Key::Delete) {
             self.request(id, Action::Trash);
@@ -574,10 +614,13 @@ impl BeaverApp {
                 }
             }
             Event::Done(..) => {}
-            Event::Sent(result) => match result {
+            Event::Sent(result, copy_error) => match result {
                 Ok(()) => {
                     self.compose = None;
                     self.notice = Some(("Message sent".into(), std::time::Instant::now()));
+                    if let Some(e) = copy_error {
+                        self.error = Some(format!("The message was sent, but its copy could not be saved to Sent: {e}"));
+                    }
                 }
                 Err(e) => {
                     if let Some(compose) = &mut self.compose {
@@ -667,6 +710,8 @@ impl BeaverApp {
                 });
                 ui.end_row();
             });
+            ui.checkbox(&mut form.save_sent, "Keep a copy of sent messages in Sent")
+                .on_hover_text("Turn off for providers that already do it, such as Gmail and Microsoft 365");
             if let Some(error) = &form.error {
                 ui.add_space(8.0);
                 ui.colored_label(t.danger, error);
@@ -837,6 +882,18 @@ impl BeaverApp {
             ui.horizontal(|ui| {
                 ui.add_space(12.0);
                 let archived = role == Role::Archive;
+                let loaded = self.body.is_some();
+                let answers = [
+                    (Icon::Reply, "Reply (R)", Action::Reply),
+                    (Icon::ReplyAll, "Reply all (A)", Action::ReplyAll),
+                    (Icon::Forward, "Forward (F)", Action::Forward),
+                ];
+                for (icon, tip, what) in answers {
+                    if icons::button(ui, t, icon, tip, loaded, false).clicked() {
+                        action = Some((message.id, what));
+                    }
+                }
+                ui.add_space(8.0);
                 let tools = [
                     (Icon::Archive, "Archive (E)", Action::Archive, !archived),
                     (
@@ -872,13 +929,18 @@ impl BeaverApp {
                             let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), views::AVATAR), egui::Sense::hover());
                             views::avatar(ui, t, &message.from, rect.left_center() + vec2(views::AVATAR / 2.0, 0.0), views::AVATAR);
                             let name = ui.painter().layout_no_wrap(message.from.clone(), egui::FontId::proportional(15.5), t.text);
-                            let date = ui.painter().layout_no_wrap(message.received.clone(), egui::FontId::proportional(13.0), t.text_dim);
+                            let detail = if message.address.is_empty() || message.address == message.from { message.received.clone() } else { format!("{}  ·  {}", message.address, message.received) };
+                            let date = ui.painter().layout_no_wrap(detail, egui::FontId::proportional(13.0), t.text_dim);
                             ui.painter().galley(pos2(rect.left() + views::AVATAR + 12.0, rect.top() + 3.0), name, t.text);
                             ui.painter().galley(pos2(rect.left() + views::AVATAR + 12.0, rect.top() + 23.0), date, t.text_dim);
+                            if !body.to.is_empty() {
+                                ui.add_space(6.0);
+                                ui.add(egui::Label::new(RichText::new(format!("To: {}", body.to.join(", "))).size(13.0).color(t.text_dim)).truncate());
+                            }
                             ui.add_space(16.0);
                             ui.separator();
                             ui.add_space(16.0);
-                            ui.label(RichText::new(body).size(16.0));
+                            ui.label(RichText::new(&body.text).size(16.0));
                             ui.add_space(28.0);
                         });
                     });

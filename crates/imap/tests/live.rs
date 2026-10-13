@@ -19,7 +19,7 @@ fn account_from_env() -> Result<(Account, String), String> {
         port: var("IMAP_PORT")?.trim().parse().map_err(|_| "IMAP_PORT is not a number".to_owned())?,
         tls,
     };
-    let account = Account { name: "test".into(), user: var("MAIL_USER")?, email: String::new(), smtp: imap.clone(), imap };
+    let account = Account { name: "test".into(), user: var("MAIL_USER")?, email: String::new(), smtp: imap.clone(), imap, save_sent: true };
     Ok((account, var("MAIL_PASSWORD")?))
 }
 
@@ -39,7 +39,7 @@ async fn reads_inbox() {
     eprintln!("INBOX: {} messages", messages.len());
     for m in &messages {
         let body = source.body(m.id).await.expect("fetch body");
-        eprintln!("{:?} from={:?} unread={} received={:?} body={} bytes", m.subject, m.from, m.unread, m.received, body.len());
+        eprintln!("{:?} from={:?} unread={} received={:?} body={} bytes", m.subject, m.from, m.unread, m.received, body.text.len());
     }
     assert!(source.messages("no/such/box").await.is_err());
 }

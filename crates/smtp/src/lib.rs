@@ -51,14 +51,28 @@ fn build(message: &Outgoing) -> Result<Message, MailError> {
     for cc in &message.cc {
         builder = builder.cc(address(cc)?);
     }
-    builder.body(message.body.clone()).map_err(backend)
+    if let Some(id) = &message.in_reply_to {
+        builder = builder.in_reply_to(bracketed(id));
+    }
+    if !message.references.is_empty() {
+        let refs: Vec<String> = message.references.iter().map(|r| bracketed(r)).collect();
+        builder = builder.references(refs.join(" "));
+    }
+    builder.date_now().message_id(None).body(message.body.clone()).map_err(backend)
+}
+
+/// A Message-ID as it appears in a header: inside angle brackets.
+fn bracketed(id: &str) -> String {
+    let id = id.trim().trim_start_matches('<').trim_end_matches('>');
+    format!("<{id}>")
 }
 
 impl MailSender for SmtpSender {
-    async fn send(&self, message: Outgoing) -> Result<(), MailError> {
+    async fn send(&self, message: Outgoing) -> Result<Vec<u8>, MailError> {
         let email = build(&message)?;
+        let raw = email.formatted();
         match self.transport()?.send(email).await {
-            Ok(_) => Ok(()),
+            Ok(_) => Ok(raw),
             Err(e) if e.status().is_some_and(|code| code.to_string() == "535") => Err(MailError::Auth(e.to_string())),
             Err(e) => Err(backend(e)),
         }
@@ -82,6 +96,18 @@ mod tests {
     #[test]
     fn a_valid_message_builds() {
         assert!(build(&outgoing()).is_ok());
+    }
+
+    #[test]
+    fn replies_carry_threading_headers() {
+        let mut reply = outgoing();
+        reply.in_reply_to = Some("b@host".into());
+        reply.references = vec!["a@host".into(), "<b@host>".into()];
+        let text = String::from_utf8(build(&reply).unwrap().formatted()).unwrap();
+        assert!(text.contains("In-Reply-To: <b@host>"), "{text}");
+        assert!(text.contains("References: <a@host> <b@host>"), "{text}");
+        assert!(text.contains("Message-ID: <"), "{text}");
+        assert!(text.contains("Date: "), "{text}");
     }
 
     #[test]

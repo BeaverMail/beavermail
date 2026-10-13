@@ -34,11 +34,27 @@ pub struct Mailbox {
 pub struct MessageSummary {
     pub id: MessageId,
     pub from: String,
+    /// The sender's address, empty when the message has none.
+    pub address: String,
     pub subject: String,
     pub preview: String,
     /// Display string for now; becomes a timestamp type once sync lands.
     pub received: String,
     pub unread: bool,
+}
+
+/// What opening a message needs beyond its summary: text, recipients and threading headers.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MessageBody {
+    /// Plain text; the text conversion of the HTML when the message has no plain part.
+    pub text: String,
+    /// "Name <address>" or a bare address, as shown to the user.
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub reply_to: Vec<String>,
+    /// Without angle brackets, as in the header value; empty when absent.
+    pub message_id: String,
+    pub references: Vec<String>,
 }
 
 /// Transport security of a mail server connection.
@@ -73,6 +89,13 @@ pub struct Account {
     pub email: String,
     pub imap: Server,
     pub smtp: Server,
+    /// Keep a copy of sent messages in the Sent folder. Turn off for providers that do it themselves.
+    #[serde(default = "yes")]
+    pub save_sent: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Account {
@@ -95,4 +118,8 @@ pub struct Outgoing {
     pub cc: Vec<String>,
     pub subject: String,
     pub body: String,
+    /// `Message-ID` of the message being answered, without angle brackets.
+    pub in_reply_to: Option<String>,
+    /// Message-IDs of the thread so far, oldest first, without angle brackets.
+    pub references: Vec<String>,
 }

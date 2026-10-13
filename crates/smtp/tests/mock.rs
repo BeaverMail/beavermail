@@ -26,7 +26,7 @@ async fn start(good_password: &'static str, password: &str) -> (SmtpSender, Arc<
         }
     });
     let server = Server { host: "127.0.0.1".into(), port, tls: Tls::None };
-    let account = Account { name: "mock".into(), user: "me@example.com".into(), email: String::new(), imap: server.clone(), smtp: server };
+    let account = Account { name: "mock".into(), user: "me@example.com".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true };
     (SmtpSender::new(&account, password.into()), transcript)
 }
 
@@ -92,13 +92,15 @@ fn message() -> Outgoing {
         cc: vec!["linus@example.com".into()],
         subject: "Lunch".into(),
         body: "See you at noon.".into(),
+        ..Outgoing::default()
     }
 }
 
 #[tokio::test]
 async fn delivers_to_every_recipient() {
     let (sender, transcript) = start("secret", "secret").await;
-    sender.send(message()).await.unwrap();
+    let raw = sender.send(message()).await.unwrap();
+    assert!(String::from_utf8(raw).unwrap().contains("Subject: Lunch"), "the returned bytes are the message as sent");
     let t = transcript.lock().unwrap();
     let rcpt: Vec<_> = t.commands.iter().filter(|c| c.starts_with("RCPT TO")).collect();
     assert_eq!(rcpt.len(), 3, "{:?}", t.commands);
