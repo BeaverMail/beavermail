@@ -281,6 +281,7 @@ mod tests {
             reply_to: vec![],
             message_id: "m2@host".into(),
             references: vec!["m1@host".into()],
+            html: None,
         };
         (summary, body)
     }

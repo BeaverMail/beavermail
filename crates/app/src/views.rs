@@ -7,6 +7,7 @@ use beavermail_core::{MessageSummary, Role};
 use eframe::egui::{self, Color32, CornerRadius, FontId, Margin, Rect, Response, Sense, Ui, pos2, vec2};
 use egui::text::{LayoutJob, TextWrapping};
 
+use crate::html::{self, Block, Kind, Run};
 use crate::icons::{self, Icon};
 use crate::theme::{self, CONTROL_H, CONTROL_RADIUS, Tokens};
 
@@ -219,4 +220,102 @@ pub fn primary_wide_fixed(ui: &mut Ui, t: &Tokens, icon: Icon, label: &str, enab
         .fill(t.accent)
         .min_size(vec2(width, CONTROL_H));
     ui.add_enabled(enabled, button)
+}
+
+fn heading_size(level: u8) -> f32 {
+    match level {
+        1 => 22.0,
+        2 => 20.0,
+        3 => 18.0,
+        _ => 16.5,
+    }
+}
+
+/// One line of runs that wraps like text. Returns the (cleaned) link the user clicked.
+fn runs_ui(ui: &mut Ui, t: &Tokens, runs: &[Run], size: f32, color: Color32, mono: bool) -> Option<String> {
+    let mut clicked = None;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        for run in runs {
+            match run {
+                Run::Text { text, bold, italic, code } => {
+                    let mut rich = egui::RichText::new(text).size(size).color(color);
+                    if *bold {
+                        rich = rich.strong();
+                    }
+                    if *italic {
+                        rich = rich.italics();
+                    }
+                    if *code || mono {
+                        rich = rich.monospace();
+                    }
+                    ui.label(rich);
+                }
+                Run::Link { text, url } => {
+                    let misleading = html::looks_misleading(text, url);
+                    let shown = if text.is_empty() { url } else { text };
+                    let tint = if misleading { t.danger } else { t.accent };
+                    let clean = html::clean_url(url);
+                    let tip = if misleading {
+                        format!("Careful: the text names another site.\nThis link goes to {}\n{clean}", html::host(url))
+                    } else {
+                        clean.clone()
+                    };
+                    let response = ui.add(egui::Link::new(egui::RichText::new(shown).size(size).color(tint))).on_hover_text(tip);
+                    if response.clicked() {
+                        clicked = Some(clean);
+                    }
+                }
+            }
+        }
+    });
+    clicked
+}
+
+/// A message body as blocks. Returns the link the user clicked, already cleaned of tracking parameters.
+pub fn body(ui: &mut Ui, t: &Tokens, blocks: &[Block]) -> Option<String> {
+    ui.spacing_mut().item_spacing.y = 2.0;
+    let mut clicked = None;
+    for block in blocks {
+        let indent = f32::from(block.depth) * 14.0;
+        match block.kind {
+            Kind::Rule => {
+                ui.separator();
+            }
+            Kind::Heading(level) => {
+                ui.add_space(6.0);
+                clicked = runs_ui(ui, t, &block.runs, heading_size(level), t.text, false).or(clicked);
+                ui.add_space(4.0);
+            }
+            Kind::Item => {
+                ui.horizontal_top(|ui| {
+                    ui.add_space(indent);
+                    ui.label(egui::RichText::new(block.marker.as_deref().unwrap_or("•")).size(16.0).color(t.text_dim));
+                    clicked = runs_ui(ui, t, &block.runs, 16.0, t.text, false).or(clicked.take());
+                });
+                ui.add_space(2.0);
+            }
+            Kind::Quote => {
+                let frame = egui::Frame::new().inner_margin(Margin { left: 12 + indent as i8, right: 0, top: 0, bottom: 0 });
+                let shown = frame.show(ui, |ui| runs_ui(ui, t, &block.runs, 15.5, t.text_dim, false));
+                let r = shown.response.rect;
+                ui.painter().line_segment([pos2(r.left() + indent, r.top()), pos2(r.left() + indent, r.bottom())], egui::Stroke::new(2.0, t.border_strong));
+                clicked = shown.inner.or(clicked);
+            }
+            Kind::Pre => {
+                clicked = runs_ui(ui, t, &block.runs, 14.5, t.text, true).or(clicked);
+            }
+            Kind::Para | Kind::Line => {
+                if block.runs.is_empty() {
+                    ui.add_space(8.0);
+                } else {
+                    clicked = runs_ui(ui, t, &block.runs, 16.0, t.text, false).or(clicked);
+                    if block.kind == Kind::Para {
+                        ui.add_space(8.0);
+                    }
+                }
+            }
+        }
+    }
+    clicked
 }

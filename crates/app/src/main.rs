@@ -8,12 +8,13 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 mod compose;
+mod html;
 mod icons;
 mod theme;
 mod views;
 
 use beavermail_accounts as store;
-use beavermail_core::{Account, MailError, MailSender, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Role, Server, Tls};
+use beavermail_core::{Account, DisplayMode, MailError, MailSender, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Role, Server, Settings, Tls};
 use beavermail_imap::ImapSource;
 use beavermail_smtp::SmtpSender;
 use eframe::egui::{self, Align, Layout, RichText, pos2, vec2};
@@ -58,6 +59,33 @@ struct SidebarOutcome {
     removed: Option<u64>,
     edit: Option<u64>,
     add: bool,
+}
+
+/// The open message's body, already reduced to blocks for both display modes.
+struct OpenBody {
+    data: MessageBody,
+    plain: Vec<html::Block>,
+    /// `None` when the message has no HTML part.
+    simplified: Option<Vec<html::Block>>,
+}
+
+impl OpenBody {
+    fn new(data: MessageBody) -> Self {
+        let plain = html::plain_blocks(&data.text);
+        let simplified = data.html.as_deref().map(html::blocks);
+        Self { data, plain, simplified }
+    }
+}
+
+/// What the user did in the reader this frame.
+struct ReaderOutcome {
+    action: Option<(MessageId, Action)>,
+    /// A link that was clicked, cleaned of tracking parameters.
+    url: Option<String>,
+    /// A display mode picked for this message only.
+    mode: Option<DisplayMode>,
+    /// A display mode to remember for the sender of this message.
+    remember: Option<DisplayMode>,
 }
 
 struct AccountView {
@@ -211,7 +239,7 @@ struct BeaverApp {
     selected: Option<(u64, usize)>,
     messages: Vec<MessageSummary>,
     message: Option<MessageId>,
-    body: Option<MessageBody>,
+    body: Option<OpenBody>,
     error: Option<String>,
     form: Option<NewAccount>,
     /// A message waiting for the user to confirm erasing it for good.
@@ -224,6 +252,10 @@ struct BeaverApp {
     confirm_discard: bool,
     /// Short confirmation ("Message sent") and when it was shown.
     notice: Option<(String, std::time::Instant)>,
+    settings: Settings,
+    show_settings: bool,
+    /// Display mode chosen for the open message only; forgotten when another is opened.
+    view_mode: Option<DisplayMode>,
 }
 
 impl BeaverApp {
@@ -248,7 +280,14 @@ impl BeaverApp {
             compose: None,
             confirm_discard: false,
             notice: None,
+            settings: Settings::default(),
+            show_settings: false,
+            view_mode: None,
         };
+        match store::load_settings() {
+            Ok(settings) => app.settings = settings,
+            Err(e) => app.error = Some(e),
+        }
         match store::load() {
             Ok(accounts) => accounts.into_iter().for_each(|a| app.add_view(a)),
             Err(e) => app.error = Some(e),
@@ -312,6 +351,7 @@ impl BeaverApp {
         let Some(source) = self.view(serial).and_then(|v| v.source.clone()) else { return };
         self.message = Some(id);
         self.body = None;
+        self.view_mode = None;
         self.spawn(async move { Event::Body(serial, id, source.body(id).await) });
         if self.messages.iter().any(|m| m.id == id && m.unread) {
             self.act(id, Action::Unread(false));
@@ -441,6 +481,79 @@ impl BeaverApp {
         self.compose = Some(compose);
     }
 
+    /// The sender's address of the open message.
+    fn current_address(&self) -> Option<String> {
+        let id = self.message?;
+        self.messages.iter().find(|m| m.id == id).map(|m| m.address.clone())
+    }
+
+    fn save_settings(&mut self) {
+        if let Err(e) = store::save_settings(&self.settings) {
+            self.error = Some(e);
+        }
+    }
+
+    fn settings_window(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
+        if !self.show_settings {
+            return;
+        }
+        let mut changed = false;
+        let modal = egui::Modal::new(egui::Id::new("settings")).show(ctx, |ui| {
+            ui.set_width(FORM_WIDTH);
+            ui.heading("Settings");
+            ui.add_space(8.0);
+            ui.label(RichText::new("Reading").strong());
+            ui.label(RichText::new("Most unwanted mail and tracking arrives as HTML, so messages start as text.").color(t.text_dim));
+            ui.add_space(6.0);
+            let modes = [
+                (DisplayMode::Plain, "Plain text", "The safest view. Links stay clickable; images and styling are dropped."),
+                (DisplayMode::Simplified, "Simplified HTML", "Keeps headings, lists, quotes and links. Never loads images, fonts or trackers."),
+            ];
+            for (mode, title, hint) in modes {
+                if ui.radio(self.settings.display == mode, title).clicked() && self.settings.display != mode {
+                    self.settings.display = mode;
+                    changed = true;
+                }
+                ui.label(RichText::new(hint).size(13.0).color(t.text_dim));
+                ui.add_space(4.0);
+            }
+            ui.add_enabled(false, egui::RadioButton::new(false, "Original HTML")).on_disabled_hover_text("Not available yet");
+            ui.label(RichText::new("Needs a full renderer. Not available yet.").size(13.0).color(t.text_dim));
+            if !self.settings.sender_display.is_empty() {
+                ui.add_space(12.0);
+                ui.label(RichText::new("Senders with their own setting").strong());
+                let mut forget = None;
+                for (address, mode) in &self.settings.sender_display {
+                    ui.horizontal(|ui| {
+                        let label = if *mode == DisplayMode::Simplified { "Simplified HTML" } else { "Plain text" };
+                        ui.label(format!("{address}  ·  {label}"));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.small_button("Remove").clicked() {
+                                forget = Some(address.clone());
+                            }
+                        });
+                    });
+                }
+                if let Some(address) = forget {
+                    self.settings.sender_display.remove(&address);
+                    changed = true;
+                }
+            }
+            ui.add_space(14.0);
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
+                if ui.button("Done").clicked() {
+                    self.show_settings = false;
+                }
+            });
+        });
+        if modal.should_close() {
+            self.show_settings = false;
+        }
+        if changed {
+            self.save_settings();
+        }
+    }
+
     /// Role of the folder being shown.
     fn role(&self) -> Role {
         let (serial, index) = self.selected.unzip();
@@ -461,7 +574,8 @@ impl BeaverApp {
     /// Opens a reply or a forward of the open message.
     fn answer(&mut self, id: MessageId, action: Action) {
         let Some((serial, _)) = self.selected else { return };
-        let (Some(summary), Some(body)) = (self.messages.iter().find(|m| m.id == id), &self.body) else { return };
+        let (Some(summary), Some(open)) = (self.messages.iter().find(|m| m.id == id), &self.body) else { return };
+        let body = &open.data;
         let Some(view) = self.view(serial).filter(|v| v.sender.is_some()) else { return };
         let own = view.account.address();
         let compose = match action {
@@ -475,7 +589,7 @@ impl BeaverApp {
 
     /// Up/Down move through the list, E archives, Delete trashes, U toggles unread.
     fn handle_keys(&mut self, ctx: &egui::Context) {
-        if self.form.is_some() || self.confirm_erase.is_some() || self.compose.is_some() || ctx.egui_wants_keyboard_input() {
+        if self.form.is_some() || self.confirm_erase.is_some() || self.compose.is_some() || self.show_settings || ctx.egui_wants_keyboard_input() {
             return;
         }
         let key = |k| ctx.input(|i| i.key_pressed(k));
@@ -603,7 +717,7 @@ impl BeaverApp {
                 if self.selected.is_some_and(|(s, _)| s == serial) && self.message == Some(id) =>
             {
                 match result {
-                    Ok(body) => self.body = Some(body),
+                    Ok(body) => self.body = Some(OpenBody::new(body)),
                     Err(e) => self.error = Some(e.to_string()),
                 }
             }
@@ -779,7 +893,13 @@ impl BeaverApp {
             }
             ui.add_space(8.0);
             ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-                add = ui.add_sized([ui.available_width(), theme::CONTROL_H], egui::Button::image_and_text(Icon::Plus.image(icons::SIZE, t.text_dim), "Add account")).clicked();
+                ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::left_to_right(Align::Center), |ui| {
+                    let width = ui.available_width() - theme::CONTROL_H;
+                    add = ui.add_sized([width, theme::CONTROL_H], egui::Button::image_and_text(Icon::Plus.image(icons::SIZE, t.text_dim), "Add account")).clicked();
+                    if icons::button(ui, t, Icon::Settings, "Settings", true, self.show_settings).clicked() {
+                        self.show_settings = true;
+                    }
+                });
                 ui.add_space(4.0);
                 ui.with_layout(Layout::top_down(Align::Min), |ui| {
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -868,8 +988,12 @@ impl BeaverApp {
     }
 
     /// The open message with its action bar. Returns the action the user chose.
-    fn reader(&mut self, ui: &mut egui::Ui, t: &theme::Tokens) -> Option<(MessageId, Action)> {
+    fn reader(&mut self, ui: &mut egui::Ui, t: &theme::Tokens) -> ReaderOutcome {
         let mut action = None;
+        let mut url = None;
+        let mut chosen_mode = None;
+        let mut remember = None;
+        let (settings_mode, view_mode) = (self.settings.clone(), self.view_mode);
         let role = self.role();
         let current = self.message.and_then(|id| self.messages.iter().find(|m| m.id == id)).cloned();
         let frame = egui::Frame::new().fill(t.surface);
@@ -933,21 +1057,41 @@ impl BeaverApp {
                             let date = ui.painter().layout_no_wrap(detail, egui::FontId::proportional(13.0), t.text_dim);
                             ui.painter().galley(pos2(rect.left() + views::AVATAR + 12.0, rect.top() + 3.0), name, t.text);
                             ui.painter().galley(pos2(rect.left() + views::AVATAR + 12.0, rect.top() + 23.0), date, t.text_dim);
-                            if !body.to.is_empty() {
+                            if !body.data.to.is_empty() {
                                 ui.add_space(6.0);
-                                ui.add(egui::Label::new(RichText::new(format!("To: {}", body.to.join(", "))).size(13.0).color(t.text_dim)).truncate());
+                                ui.add(egui::Label::new(RichText::new(format!("To: {}", body.data.to.join(", "))).size(13.0).color(t.text_dim)).truncate());
+                            }
+                            let stored = settings_mode.mode_for(&message.address);
+                            let mode = view_mode.unwrap_or(stored);
+                            if body.simplified.is_some() {
+                                ui.add_space(10.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("Show as").size(13.0).color(t.text_dim));
+                                    for (label, value) in [("Text", DisplayMode::Plain), ("Simplified", DisplayMode::Simplified)] {
+                                        if ui.selectable_label(mode == value, label).clicked() {
+                                            chosen_mode = Some(value);
+                                        }
+                                    }
+                                    if mode != stored && !message.address.is_empty() && ui.small_button("Always for this sender").clicked() {
+                                        remember = Some(mode);
+                                    }
+                                });
                             }
                             ui.add_space(16.0);
                             ui.separator();
                             ui.add_space(16.0);
-                            ui.label(RichText::new(&body.text).size(16.0));
+                            let blocks = match (&body.simplified, mode) {
+                                (Some(simplified), DisplayMode::Simplified) => simplified,
+                                _ => &body.plain,
+                            };
+                            url = views::body(ui, t, blocks);
                             ui.add_space(28.0);
                         });
                     });
                 }
             }
         });
-        action
+        ReaderOutcome { action, url, mode: chosen_mode, remember }
     }
 }
 
@@ -974,7 +1118,18 @@ impl eframe::App for BeaverApp {
         self.account_form(ui.ctx());
 
         self.handle_keys(ui.ctx());
-        let action = self.reader(ui, &t);
+        let ReaderOutcome { action, url, mode, remember } = self.reader(ui, &t);
+        if let Some(url) = url {
+            ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+        }
+        if mode.is_some() {
+            self.view_mode = mode;
+        }
+        if let (Some(mode), Some(address)) = (remember, self.current_address()) {
+            self.settings.set_sender_mode(&address, mode);
+            self.view_mode = None;
+            self.save_settings();
+        }
         let (opened, add_from_list) = self.message_list(ui, &t);
         add |= add_from_list;
 
@@ -985,6 +1140,7 @@ impl eframe::App for BeaverApp {
             self.request(id, what);
         }
         self.erase_dialog(ui.ctx(), &t);
+        self.settings_window(ui.ctx(), &t);
         self.compose_window(ui.ctx(), &t);
         if add {
             self.form = Some(NewAccount::default());

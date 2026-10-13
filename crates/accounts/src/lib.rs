@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use beavermail_core::Account;
+use beavermail_core::{Account, Settings};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
@@ -27,8 +27,35 @@ pub fn render(accounts: &[Account]) -> Result<String, String> {
 }
 
 fn path() -> Result<PathBuf, String> {
+    config_file("accounts.toml")
+}
+
+fn config_file(name: &str) -> Result<PathBuf, String> {
     let dirs = ProjectDirs::from("", "", "beavermail").ok_or("no home directory")?;
-    Ok(dirs.config_dir().join("accounts.toml"))
+    Ok(dirs.config_dir().join(name))
+}
+
+/// Writes `text` to `path` through a temp file, so a crash cannot leave it half-written.
+fn write_atomic(path: &std::path::Path, text: &str) -> Result<(), String> {
+    let io = |e: std::io::Error| format!("{}: {e}", path.display());
+    std::fs::create_dir_all(path.parent().ok_or("no config directory")?).map_err(io)?;
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, text).map_err(io)?;
+    std::fs::rename(&tmp, path).map_err(io)
+}
+
+/// Preferences from `settings.toml`; the defaults if the file does not exist yet.
+pub fn load_settings() -> Result<Settings, String> {
+    let path = config_file("settings.toml")?;
+    match std::fs::read_to_string(&path) {
+        Ok(text) => toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Settings::default()),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+pub fn save_settings(settings: &Settings) -> Result<(), String> {
+    write_atomic(&config_file("settings.toml")?, &toml::to_string_pretty(settings).map_err(|e| e.to_string())?)
 }
 
 /// Accounts from the config file; none if the file does not exist yet.
@@ -41,14 +68,9 @@ pub fn load() -> Result<Vec<Account>, String> {
     }
 }
 
-/// Replaces the config file. Written to a temp file first, so a crash cannot leave it half-written.
+/// Replaces the accounts file.
 pub fn save(accounts: &[Account]) -> Result<(), String> {
-    let path = path()?;
-    let io = |e: std::io::Error| format!("{}: {e}", path.display());
-    std::fs::create_dir_all(path.parent().ok_or("no config directory")?).map_err(io)?;
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, render(accounts)?).map_err(io)?;
-    std::fs::rename(&tmp, &path).map_err(io)
+    write_atomic(&path()?, &render(accounts)?)
 }
 
 fn entry(account: &Account) -> Result<keyring::Entry, String> {
@@ -94,6 +116,15 @@ mod tests {
         let accounts = parse(text).unwrap();
         assert_eq!(accounts[0].email, "");
         assert_eq!(accounts[0].address(), "a@example.org");
+    }
+
+    #[test]
+    fn settings_round_trip_and_tolerate_missing_keys() {
+        let mut settings = Settings { display: beavermail_core::DisplayMode::Simplified, ..Settings::default() };
+        settings.set_sender_mode("a@example.org", beavermail_core::DisplayMode::Plain);
+        let text = toml::to_string_pretty(&settings).unwrap();
+        assert_eq!(toml::from_str::<Settings>(&text).unwrap(), settings);
+        assert_eq!(toml::from_str::<Settings>("").unwrap(), Settings::default());
     }
 
     #[test]

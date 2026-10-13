@@ -343,6 +343,10 @@ impl MailSource for ImapSource {
             cc: addresses(message.cc()),
             reply_to: addresses(message.reply_to()),
             message_id: message.message_id().unwrap_or_default().to_owned(),
+            html: message.html_bodies().find_map(|part| match &part.body {
+                mail_parser::PartType::Html(html) => Some(html.to_string()),
+                _ => None,
+            }),
             references: message.references().as_text_list().map_or_else(
                 || message.references().as_text().map(|r| vec![r.to_owned()]).unwrap_or_default(),
                 |list| list.iter().map(|r| r.to_string()).collect(),

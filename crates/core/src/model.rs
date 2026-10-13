@@ -55,6 +55,8 @@ pub struct MessageBody {
     /// Without angle brackets, as in the header value; empty when absent.
     pub message_id: String,
     pub references: Vec<String>,
+    /// The `text/html` part, only when the message really has one. Untrusted: never run it.
+    pub html: Option<String>,
 }
 
 /// Transport security of a mail server connection.
@@ -122,4 +124,62 @@ pub struct Outgoing {
     pub in_reply_to: Option<String>,
     /// Message-IDs of the thread so far, oldest first, without angle brackets.
     pub references: Vec<String>,
+}
+
+/// How an incoming message is shown (PRD D9). Original HTML is not implemented yet.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DisplayMode {
+    /// The plain-text part, or a text conversion of the HTML.
+    #[default]
+    Plain,
+    /// A cleaned-up subset of the HTML: text structure and links, no images, styles or remote content.
+    Simplified,
+}
+
+/// User preferences, stored apart from the accounts.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Settings {
+    /// How messages are shown unless a sender has its own setting.
+    #[serde(default)]
+    pub display: DisplayMode,
+    /// Per-sender overrides, by lower-case address.
+    #[serde(default)]
+    pub sender_display: std::collections::BTreeMap<String, DisplayMode>,
+}
+
+impl Settings {
+    /// The display mode for a message from `address`.
+    pub fn mode_for(&self, address: &str) -> DisplayMode {
+        self.sender_display.get(&address.trim().to_lowercase()).copied().unwrap_or(self.display)
+    }
+
+    /// Remembers `mode` for `address`; a mode equal to the default clears the override.
+    pub fn set_sender_mode(&mut self, address: &str, mode: DisplayMode) {
+        let key = address.trim().to_lowercase();
+        if key.is_empty() {
+            return;
+        }
+        if mode == self.display {
+            self.sender_display.remove(&key);
+        } else {
+            self.sender_display.insert(key, mode);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sender_overrides_beat_the_default_and_clear_themselves() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.mode_for("a@x.org"), DisplayMode::Plain);
+        settings.set_sender_mode(" A@X.org ", DisplayMode::Simplified);
+        assert_eq!(settings.mode_for("a@x.org"), DisplayMode::Simplified);
+        assert_eq!(settings.mode_for("b@x.org"), DisplayMode::Plain);
+        settings.set_sender_mode("a@x.org", DisplayMode::Plain);
+        assert!(settings.sender_display.is_empty());
+    }
 }
