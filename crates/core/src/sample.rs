@@ -2,7 +2,7 @@
 
 //! An in-memory [`MailSource`] with generated data, for development and tests.
 
-use crate::{MailSource, Mailbox, MessageId, MessageSummary};
+use crate::{MailError, MailSource, Mailbox, MessageId, MessageSummary};
 
 const FOLDERS: [&str; 6] = ["Inbox", "Starred", "Drafts", "Sent", "Archive", "Trash"];
 const SENDERS: [&str; 8] = [
@@ -47,8 +47,8 @@ impl SampleSource {
 }
 
 impl MailSource for SampleSource {
-    fn mailboxes(&self) -> Vec<Mailbox> {
-        FOLDERS
+    async fn mailboxes(&self) -> Result<Vec<Mailbox>, MailError> {
+        Ok(FOLDERS
             .iter()
             .map(|name| Mailbox {
                 name: (*name).to_owned(),
@@ -58,39 +58,48 @@ impl MailSource for SampleSource {
                     .filter(|(folder, m, _)| folder == name && m.unread)
                     .count() as u32,
             })
-            .collect()
+            .collect())
     }
 
-    fn messages(&self, mailbox: &str) -> Vec<MessageSummary> {
-        self.messages
+    async fn messages(&self, mailbox: &str) -> Result<Vec<MessageSummary>, MailError> {
+        if !FOLDERS.contains(&mailbox) {
+            return Err(MailError::NotFound);
+        }
+        Ok(self
+            .messages
             .iter()
             .filter(|(folder, _, _)| folder == mailbox)
             .map(|(_, summary, _)| summary.clone())
-            .collect()
+            .collect())
     }
 
-    fn body(&self, id: MessageId) -> Option<String> {
-        self.messages.iter().find(|(_, m, _)| m.id == id).map(|(_, _, body)| body.clone())
+    async fn body(&self, id: MessageId) -> Result<String, MailError> {
+        self.messages
+            .iter()
+            .find(|(_, m, _)| m.id == id)
+            .map(|(_, _, body)| body.clone())
+            .ok_or(MailError::NotFound)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pollster::block_on;
 
     #[test]
     fn same_count_gives_same_data() {
         let a = SampleSource::new(100);
         let b = SampleSource::new(100);
-        assert_eq!(a.messages("Inbox"), b.messages("Inbox"));
+        assert_eq!(block_on(a.messages("Inbox")), block_on(b.messages("Inbox")));
     }
 
     #[test]
     fn every_message_has_a_body() {
         let source = SampleSource::new(50);
-        for mailbox in source.mailboxes() {
-            for m in source.messages(&mailbox.name) {
-                assert!(source.body(m.id).is_some());
+        for mailbox in block_on(source.mailboxes()).unwrap() {
+            for m in block_on(source.messages(&mailbox.name)).unwrap() {
+                assert!(block_on(source.body(m.id)).is_ok());
             }
         }
     }
@@ -98,9 +107,16 @@ mod tests {
     #[test]
     fn unread_counts_match_messages() {
         let source = SampleSource::new(200);
-        for mailbox in source.mailboxes() {
-            let unread = source.messages(&mailbox.name).iter().filter(|m| m.unread).count();
+        for mailbox in block_on(source.mailboxes()).unwrap() {
+            let unread = block_on(source.messages(&mailbox.name)).unwrap().iter().filter(|m| m.unread).count();
             assert_eq!(mailbox.unread as usize, unread);
         }
+    }
+
+    #[test]
+    fn missing_things_are_not_found() {
+        let source = SampleSource::new(10);
+        assert_eq!(block_on(source.messages("Nope")), Err(MailError::NotFound));
+        assert_eq!(block_on(source.body(MessageId(999))), Err(MailError::NotFound));
     }
 }

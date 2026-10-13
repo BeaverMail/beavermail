@@ -4,8 +4,9 @@
 //! over a [`MailSource`]. Milestone 0: sample data only, no protocols yet.
 
 use beavermail_core::sample::SampleSource;
-use beavermail_core::{MailSource, Mailbox, MessageId, MessageSummary};
+use beavermail_core::{MailError, MailSource, Mailbox, MessageId, MessageSummary};
 use eframe::egui::{self, Align, Layout, RichText, vec2};
+use pollster::block_on;
 
 /// Fixed row height, so the list can be virtualised with `show_rows`.
 const ROW_H: f32 = 52.0;
@@ -18,19 +19,44 @@ struct BeaverApp {
     selected_mailbox: usize,
     messages: Vec<MessageSummary>,
     selected: Option<MessageId>,
+    error: Option<MailError>,
 }
 
 impl BeaverApp {
+    // shortcut: block_on freezes the UI during a call; fine for in-memory data,
+    // move calls to a background task before the IMAP backend lands.
     fn new(source: SampleSource) -> Self {
-        let mailboxes = source.mailboxes();
-        let messages = source.messages(&mailboxes[0].name);
-        Self { source, mailboxes, selected_mailbox: 0, messages, selected: None }
+        let mut app = Self {
+            source,
+            mailboxes: Vec::new(),
+            selected_mailbox: 0,
+            messages: Vec::new(),
+            selected: None,
+            error: None,
+        };
+        match block_on(app.source.mailboxes()) {
+            Ok(mailboxes) => {
+                app.mailboxes = mailboxes;
+                app.select_mailbox(0);
+            }
+            Err(e) => app.error = Some(e),
+        }
+        app
     }
 
     fn select_mailbox(&mut self, index: usize) {
         self.selected_mailbox = index;
-        self.messages = self.source.messages(&self.mailboxes[index].name);
         self.selected = None;
+        match block_on(self.source.messages(&self.mailboxes[index].name)) {
+            Ok(messages) => {
+                self.messages = messages;
+                self.error = None;
+            }
+            Err(e) => {
+                self.messages.clear();
+                self.error = Some(e);
+            }
+        }
     }
 }
 
@@ -53,10 +79,16 @@ impl eframe::App for BeaverApp {
             self.select_mailbox(index);
         }
 
+        if let Some(error) = &self.error {
+            egui::Panel::top("error").show(ui, |ui| {
+                ui.colored_label(ui.visuals().error_fg_color, error.to_string());
+            });
+        }
+
         let mut opened = None;
         egui::Panel::right("reader").default_size(460.0).show(ui, |ui| match self.selected {
             Some(id) => {
-                let body = self.source.body(id).unwrap_or_default();
+                let body = block_on(self.source.body(id)).unwrap_or_else(|e| e.to_string());
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.label(RichText::new(body).size(14.0));
                 });

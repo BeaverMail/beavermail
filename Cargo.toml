@@ -2,7 +2,7 @@
 
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/app"]
+members = ["crates/core", "crates/app", "crates/imap"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,6 +13,8 @@ rust-version = "1.90"
 
 [workspace.dependencies]
 beavermail-core = { path = "crates/core" }
+pollster = "0.4"
+beavermail-imap = { path = "crates/imap" }
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
 
 [workspace.lints.rust]

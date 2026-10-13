@@ -13,3 +13,6 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+
+[dev-dependencies]
+pollster.workspace = true
