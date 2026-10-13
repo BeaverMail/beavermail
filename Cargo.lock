@@ -168,8 +168,10 @@ name = "beavermail"
 version = "0.1.0"
 dependencies = [
  "beavermail-core",
+ "beavermail-imap",
+ "dotenvy",
  "eframe",
- "pollster",
+ "tokio",
 ]
 
 [[package]]

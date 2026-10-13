@@ -15,4 +15,6 @@ workspace = true
 [dependencies]
 beavermail-core.workspace = true
 eframe.workspace = true
-pollster.workspace = true
+beavermail-imap.workspace = true
+dotenvy = "0.15"
+tokio = { version = "1", features = ["rt-multi-thread"] }
