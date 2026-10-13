@@ -7,13 +7,15 @@
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
+mod compose;
 mod icons;
 mod theme;
 mod views;
 
 use beavermail_accounts as store;
-use beavermail_core::{Account, MailError, MailSource, Mailbox, MessageId, MessageSummary, Role, Server, Tls};
+use beavermail_core::{Account, MailError, MailSender, MailSource, Mailbox, MessageId, MessageSummary, Role, Server, Tls};
 use beavermail_imap::ImapSource;
+use beavermail_smtp::SmtpSender;
 use eframe::egui::{self, Align, Layout, RichText, pos2, vec2};
 
 use crate::icons::Icon;
@@ -27,6 +29,8 @@ enum Event {
     Body(u64, MessageId, Result<String, MailError>),
     /// A write (read flag, archive, trash) finished; the UI already showed its result.
     Done(u64, usize, Result<(), MailError>),
+    /// The message in the compose window was sent, or the server refused it.
+    Sent(Result<(), MailError>),
 }
 
 #[derive(Clone, Copy)]
@@ -44,20 +48,34 @@ impl Action {
     }
 }
 
+/// What the user did in the sidebar this frame.
+struct SidebarOutcome {
+    chosen: Option<(u64, usize)>,
+    removed: Option<u64>,
+    edit: Option<u64>,
+    add: bool,
+}
+
 struct AccountView {
     /// Never reused within a run, unlike a position in the list.
     serial: u64,
     account: Account,
     /// `None` when the password could not be read; `error` says why.
     source: Option<Arc<ImapSource>>,
+    sender: Option<Arc<SmtpSender>>,
     mailboxes: Vec<Mailbox>,
     error: Option<String>,
 }
 
 /// The "Add account" form. Ports are text until submitted.
 struct NewAccount {
+    /// Serial of the account being edited; `None` when adding.
+    editing: Option<u64>,
     name: String,
     user: String,
+    /// The address mail is sent from. May stay empty when the login is itself an address.
+    email: String,
+    /// Empty while editing means "keep the stored password".
     password: String,
     imap_host: String,
     imap_port: String,
@@ -74,8 +92,10 @@ struct NewAccount {
 impl Default for NewAccount {
     fn default() -> Self {
         Self {
+            editing: None,
             name: String::new(),
             user: String::new(),
+            email: String::new(),
             password: String::new(),
             imap_host: String::new(),
             imap_port: "143".into(),
@@ -90,16 +110,48 @@ impl Default for NewAccount {
 }
 
 impl NewAccount {
+    /// The form filled with an existing account's settings; the password is left empty.
+    fn editing(serial: u64, account: &Account) -> Self {
+        let port = |s: &Server| s.port.to_string();
+        Self {
+            editing: Some(serial),
+            name: account.name.clone(),
+            user: account.user.clone(),
+            email: account.email.clone(),
+            imap_host: account.imap.host.clone(),
+            imap_port: port(&account.imap),
+            imap_tls: account.imap.tls,
+            smtp_host: if account.smtp.host == account.imap.host { String::new() } else { account.smtp.host.clone() },
+            smtp_port: port(&account.smtp),
+            smtp_tls: account.smtp.tls,
+            focus_first: true,
+            ..Self::default()
+        }
+    }
+
+    /// Whether the required fields are filled in.
+    fn ready(&self) -> bool {
+        let password = self.editing.is_some() || !self.password.is_empty();
+        !self.user.trim().is_empty() && !self.imap_host.trim().is_empty() && password
+    }
+
     fn build(&self) -> Result<Account, String> {
         let port = |text: &str, what: &str| text.trim().parse().map_err(|_| format!("{what} port is not a number"));
         let (user, imap_host) = (self.user.trim(), self.imap_host.trim());
-        if user.is_empty() || imap_host.is_empty() || self.password.is_empty() {
+        if !self.ready() {
             return Err("user, password and IMAP host are required".into());
         }
+        let email = match self.email.trim() {
+            "" if user.contains('@') => user,
+            "" => return Err("enter the email address to send from".into()),
+            email if email.contains('@') => email,
+            _ => return Err("the email address needs an @".into()),
+        };
         let smtp_host = if self.smtp_host.trim().is_empty() { imap_host } else { self.smtp_host.trim() };
         Ok(Account {
             name: if self.name.trim().is_empty() { user.to_owned() } else { self.name.trim().to_owned() },
             user: user.to_owned(),
+            email: email.to_owned(),
             imap: Server { host: imap_host.to_owned(), port: port(&self.imap_port, "IMAP")?, tls: self.imap_tls },
             smtp: Server { host: smtp_host.to_owned(), port: port(&self.smtp_port, "SMTP")?, tls: self.smtp_tls },
         })
@@ -108,10 +160,10 @@ impl NewAccount {
 
 const FORM_WIDTH: f32 = 460.0;
 /// Text field width in the account form: the form minus its label column and spacing.
-const FIELD_WIDTH: f32 = 330.0;
+const FIELD_WIDTH: f32 = 310.0;
 
 fn form_grid(ui: &mut egui::Ui, id: &str, add: impl FnOnce(&mut egui::Ui)) {
-    egui::Grid::new(id).num_columns(2).spacing([16.0, 12.0]).min_col_width(64.0).show(ui, add);
+    egui::Grid::new(id).num_columns(2).spacing([16.0, 12.0]).min_col_width(84.0).show(ui, add);
 }
 
 fn field(text: &mut String) -> egui::TextEdit<'_> {
@@ -159,6 +211,11 @@ struct BeaverApp {
     /// Text of the search box; filters the loaded messages by sender and subject.
     query: String,
     focus_search: bool,
+    compose: Option<compose::Compose>,
+    /// A compose window with text in it is being closed; waiting for the user to confirm.
+    confirm_discard: bool,
+    /// Short confirmation ("Message sent") and when it was shown.
+    notice: Option<(String, std::time::Instant)>,
 }
 
 impl BeaverApp {
@@ -180,6 +237,9 @@ impl BeaverApp {
             confirm_erase: None,
             query: String::new(),
             focus_search: false,
+            compose: None,
+            confirm_discard: false,
+            notice: None,
         };
         match store::load() {
             Ok(accounts) => accounts.into_iter().for_each(|a| app.add_view(a)),
@@ -199,16 +259,29 @@ impl BeaverApp {
 
     /// Shows an account and starts loading its folders.
     fn add_view(&mut self, account: Account) {
+        self.insert_view(account, None);
+    }
+
+    /// Shows an account, at `position` or at the end, and returns its serial.
+    fn insert_view(&mut self, account: Account, position: Option<usize>) -> u64 {
         let serial = self.next_serial;
         self.next_serial += 1;
-        let (source, error) = match store::password(&account) {
-            Ok(password) => (Some(Arc::new(ImapSource::new(&account, password))), None),
-            Err(e) => (None, Some(e)),
+        let (source, sender, error) = match store::password(&account) {
+            Ok(password) => {
+                let sender = Arc::new(SmtpSender::new(&account, password.clone()));
+                (Some(Arc::new(ImapSource::new(&account, password))), Some(sender), None)
+            }
+            Err(e) => (None, None, Some(e)),
         };
         if let Some(source) = source.clone() {
             self.spawn(async move { Event::Mailboxes(serial, source.mailboxes().await) });
         }
-        self.accounts.push(AccountView { serial, account, source, mailboxes: Vec::new(), error });
+        let view = AccountView { serial, account, source, sender, mailboxes: Vec::new(), error };
+        match position {
+            Some(at) => self.accounts.insert(at.min(self.accounts.len()), view),
+            None => self.accounts.push(view),
+        }
+        serial
     }
 
     fn view(&self, serial: u64) -> Option<&AccountView> {
@@ -293,6 +366,64 @@ impl BeaverApp {
         self.spawn(async move { Event::Messages(serial, index, source.messages(&name).await) });
     }
 
+    /// Accounts that can send, as (serial, address).
+    fn senders(&self) -> Vec<(u64, String)> {
+        self.accounts.iter().filter(|v| v.sender.is_some()).map(|v| (v.serial, v.account.address().to_owned())).collect()
+    }
+
+    /// Opens the compose window from the selected account, or the first one that can send.
+    fn new_message(&mut self) {
+        if self.compose.is_some() {
+            return;
+        }
+        let senders = self.senders();
+        let from = self.selected.map(|(s, _)| s).filter(|s| senders.iter().any(|(x, _)| x == s)).or_else(|| senders.first().map(|(s, _)| *s));
+        self.compose = from.map(compose::Compose::new);
+    }
+
+    fn compose_window(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
+        let Some(mut compose) = self.compose.take() else { return };
+        let senders = self.senders();
+        match compose::window(ctx, t, &mut compose, &senders) {
+            compose::Outcome::Keep => {}
+            compose::Outcome::Discard if compose.is_empty() => return,
+            compose::Outcome::Discard => self.confirm_discard = true,
+            compose::Outcome::Send => {
+                if let Some(view) = self.view(compose.from) {
+                    let (account, sender) = (view.account.clone(), view.sender.clone());
+                    if let Some(sender) = sender {
+                        let message = compose.outgoing(account.address());
+                        compose.sending = true;
+                        compose.error = None;
+                        self.spawn(async move { Event::Sent(sender.send(message).await) });
+                    }
+                }
+            }
+        }
+        if self.confirm_discard {
+            let (mut discard, mut keep) = (false, false);
+            let modal = egui::Modal::new(egui::Id::new("confirm_discard")).show(ctx, |ui| {
+                ui.set_width(FORM_WIDTH * 0.8);
+                ui.heading("Discard this message?");
+                ui.label(RichText::new("What you wrote will be lost.").color(t.text_dim));
+                ui.add_space(12.0);
+                ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
+                    let button = egui::Button::new(RichText::new("Discard").color(t.on_accent)).fill(t.danger);
+                    discard = ui.add(button).clicked();
+                    keep = ui.button("Keep editing").clicked();
+                });
+            });
+            if discard {
+                self.confirm_discard = false;
+                return;
+            }
+            if keep || modal.should_close() {
+                self.confirm_discard = false;
+            }
+        }
+        self.compose = Some(compose);
+    }
+
     /// Role of the folder being shown.
     fn role(&self) -> Role {
         let (serial, index) = self.selected.unzip();
@@ -310,10 +441,14 @@ impl BeaverApp {
 
     /// Up/Down move through the list, E archives, Delete trashes, U toggles unread.
     fn handle_keys(&mut self, ctx: &egui::Context) {
-        if self.form.is_some() || self.confirm_erase.is_some() || ctx.egui_wants_keyboard_input() {
+        if self.form.is_some() || self.confirm_erase.is_some() || self.compose.is_some() || ctx.egui_wants_keyboard_input() {
             return;
         }
         let key = |k| ctx.input(|i| i.key_pressed(k));
+        if key(egui::Key::C) {
+            self.new_message();
+            return;
+        }
         if key(egui::Key::Slash) {
             self.focus_search = true;
             return;
@@ -338,20 +473,52 @@ impl BeaverApp {
         }
     }
 
-    /// Stores the password, then the settings, then shows the account.
-    fn add_account(&mut self, form: &NewAccount) -> Result<(), String> {
+    /// Adds the account, or applies an edit. The password goes to the credential store first and
+    /// the settings file second, so a failure never leaves one without the other.
+    fn save_account(&mut self, form: &NewAccount) -> Result<(), String> {
         let account = form.build()?;
-        if self.accounts.iter().any(|v| v.account.key() == account.key()) {
+        let editing = form.editing.and_then(|serial| self.accounts.iter().position(|v| v.serial == serial));
+        let old = editing.map(|at| self.accounts[at].account.clone());
+        if self.accounts.iter().enumerate().any(|(i, v)| Some(i) != editing && v.account.key() == account.key()) {
             return Err("this account is already configured".into());
         }
-        store::set_password(&account, &form.password)?;
-        let all: Vec<Account> =
-            self.accounts.iter().map(|v| v.account.clone()).chain([account.clone()]).collect();
+        let password = match (&old, form.password.is_empty()) {
+            (Some(old), true) => store::password(old)?, // moving the stored password to the new key
+            _ => form.password.clone(),
+        };
+        store::set_password(&account, &password)?;
+        let mut all: Vec<Account> = self.accounts.iter().map(|v| v.account.clone()).collect();
+        match editing {
+            Some(at) => all[at] = account.clone(),
+            None => all.push(account.clone()),
+        }
+        let key_changed = old.as_ref().is_none_or(|o| o.key() != account.key());
         if let Err(e) = store::save(&all) {
-            let _ = store::forget_password(&account); // do not leave a secret without settings
+            if key_changed {
+                let _ = store::forget_password(&account); // do not leave a secret without settings
+            }
             return Err(e);
         }
-        self.add_view(account);
+        let Some(at) = editing else {
+            self.add_view(account);
+            return Ok(());
+        };
+        let old = self.accounts.remove(at);
+        if key_changed {
+            let _ = store::forget_password(&old.account);
+        }
+        let serial = self.insert_view(account, Some(at));
+        if self.selected.is_some_and(|(s, _)| s == old.serial) {
+            self.selected = None;
+            self.messages.clear();
+            self.message = None;
+            self.body = None;
+        }
+        if let Some(compose) = &mut self.compose
+            && compose.from == old.serial
+        {
+            compose.from = serial;
+        }
         Ok(())
     }
 
@@ -407,6 +574,18 @@ impl BeaverApp {
                 }
             }
             Event::Done(..) => {}
+            Event::Sent(result) => match result {
+                Ok(()) => {
+                    self.compose = None;
+                    self.notice = Some(("Message sent".into(), std::time::Instant::now()));
+                }
+                Err(e) => {
+                    if let Some(compose) = &mut self.compose {
+                        compose.sending = false;
+                        compose.error = Some(e.to_string());
+                    }
+                }
+            },
             _ => {} // answer for a folder or message that is no longer selected
         }
     }
@@ -437,10 +616,11 @@ impl BeaverApp {
         let Some(mut form) = self.form.take() else { return };
         let t = theme::Tokens::get(ctx);
         let (mut submit, mut cancel) = (false, false);
-        let ready = !form.user.trim().is_empty() && !form.imap_host.trim().is_empty() && !form.password.is_empty();
+        let ready = form.ready();
+        let editing = form.editing.is_some();
         let modal = egui::Modal::new(egui::Id::new("add_account")).show(ctx, |ui| {
             ui.set_width(FORM_WIDTH);
-            ui.heading("Add account");
+            ui.heading(if editing { "Edit account" } else { "Add account" });
             ui.label(RichText::new("Connect an existing mailbox over IMAP and SMTP.").color(t.text_dim));
             ui.add_space(8.0);
             form_grid(ui, "account_form", |ui| {
@@ -450,11 +630,15 @@ impl BeaverApp {
                     name.request_focus();
                 }
                 ui.end_row();
+                ui.label("Email");
+                ui.add(field(&mut form.email).hint_text("Address mail is sent from"));
+                ui.end_row();
                 ui.label("User");
-                ui.add(field(&mut form.user).hint_text("name@example.com"));
+                ui.add(field(&mut form.user).hint_text("Login name, often the same address"));
                 ui.end_row();
                 ui.label("Password");
-                ui.add(field(&mut form.password).password(true));
+                let hint = if editing { "Leave empty to keep the current one" } else { "" };
+                ui.add(field(&mut form.password).password(true).hint_text(hint));
                 ui.end_row();
             });
             ui.add_space(8.0);
@@ -490,7 +674,7 @@ impl BeaverApp {
             ui.add_space(12.0);
             // A fixed-height row: a bare right-to-left layout would claim the rest of the window.
             ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
-                let add = egui::Button::new(RichText::new("Add account").color(t.on_accent)).fill(t.accent);
+                let add = egui::Button::new(RichText::new(if editing { "Save changes" } else { "Add account" }).color(t.on_accent)).fill(t.accent);
                 let add = ui.add_enabled(ready, add).on_disabled_hover_text("User, password and IMAP server are required");
                 submit = add.clicked() || (ready && ui.input(|i| i.key_pressed(egui::Key::Enter)));
                 cancel = ui.button("Cancel").clicked();
@@ -498,7 +682,7 @@ impl BeaverApp {
         });
         let mut open = !(cancel || modal.should_close());
         if submit {
-            match self.add_account(&form) {
+            match self.save_account(&form) {
                 Ok(()) => open = false,
                 Err(e) => form.error = Some(e),
             }
@@ -511,6 +695,19 @@ impl BeaverApp {
 
 impl BeaverApp {
     fn error_banner(&mut self, ui: &mut egui::Ui, t: &theme::Tokens) {
+        const NOTICE_SECS: f32 = 4.0;
+        if let Some((text, since)) = self.notice.clone() {
+            let left = NOTICE_SECS - since.elapsed().as_secs_f32();
+            if left <= 0.0 {
+                self.notice = None;
+            } else {
+                ui.ctx().request_repaint_after(std::time::Duration::from_secs_f32(left));
+                let banner = egui::Frame::new().fill(t.accent.gamma_multiply(0.16)).inner_margin(egui::Margin::symmetric(16, 10));
+                egui::Panel::top("notice").frame(banner).show(ui, |ui| {
+                    ui.label(RichText::new(text).color(t.accent));
+                });
+            }
+        }
         let Some(error) = self.error.clone() else { return };
         let banner = egui::Frame::new().fill(t.danger.gamma_multiply(0.14)).inner_margin(egui::Margin::symmetric(16, 10));
         egui::Panel::top("error").frame(banner).show(ui, |ui| {
@@ -525,13 +722,16 @@ impl BeaverApp {
         });
     }
 
-    /// Accounts and their folders. Returns (folder chosen, account to remove, add-account clicked).
-    fn sidebar(&mut self, ui: &mut egui::Ui, t: &theme::Tokens) -> (Option<(u64, usize)>, Option<u64>, bool) {
-        let (mut chosen, mut removed, mut add) = (None, None, false);
+    /// Accounts and their folders. Returns (folder chosen, account to remove, account to edit, add-account clicked).
+    fn sidebar(&mut self, ui: &mut egui::Ui, t: &theme::Tokens) -> SidebarOutcome {
+        let (mut chosen, mut removed, mut edit, mut add) = (None, None, None, false);
         let frame = egui::Frame::new().fill(t.bg).inner_margin(egui::Margin::same(12));
         egui::Panel::left("accounts").frame(frame).default_size(260.0).size_range(210.0..=340.0).show(ui, |ui| {
-            // Compose arrives with SMTP; the button is here so the layout is final.
-            views::primary_wide(ui, t, Icon::Pencil, "New email", Some("Sending is not available yet"));
+            let can_send = !self.senders().is_empty();
+            let why = if can_send { None } else { Some("Add an account to send mail") };
+            if views::primary_wide(ui, t, Icon::Pencil, "New email", why).on_hover_text("New message (C)").clicked() && can_send {
+                self.new_message();
+            }
             ui.add_space(8.0);
             ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
                 add = ui.add_sized([ui.available_width(), theme::CONTROL_H], egui::Button::image_and_text(Icon::Plus.image(icons::SIZE, t.text_dim), "Add account")).clicked();
@@ -559,6 +759,10 @@ impl BeaverApp {
                                     }
                                 });
                             header.header_response.context_menu(|ui| {
+                                if ui.button("Edit account…").clicked() {
+                                    edit = Some(view.serial);
+                                    ui.close();
+                                }
                                 if ui.button("Remove account").clicked() {
                                     removed = Some(view.serial);
                                     ui.close();
@@ -572,7 +776,7 @@ impl BeaverApp {
                 });
             });
         });
-        (chosen, removed, add)
+        SidebarOutcome { chosen, removed, edit, add }
     }
 
     /// Search, refresh and the message list. Returns the message the user clicked and whether to add an account.
@@ -693,7 +897,12 @@ impl eframe::App for BeaverApp {
         let t = theme::Tokens::get(ui.ctx());
         self.error_banner(ui, &t);
 
-        let (chosen, removed, mut add) = self.sidebar(ui, &t);
+        let SidebarOutcome { chosen, removed, edit, mut add } = self.sidebar(ui, &t);
+        if let Some(serial) = edit
+            && let Some(view) = self.view(serial)
+        {
+            self.form = Some(NewAccount::editing(serial, &view.account));
+        }
         if let Some((serial, index)) = chosen {
             self.select_mailbox(serial, index);
         }
@@ -714,6 +923,7 @@ impl eframe::App for BeaverApp {
             self.request(id, what);
         }
         self.erase_dialog(ui.ctx(), &t);
+        self.compose_window(ui.ctx(), &t);
         if add {
             self.form = Some(NewAccount::default());
         }
@@ -738,4 +948,39 @@ fn main() -> eframe::Result {
             Ok(Box::new(BeaverApp::new(cc.egui_ctx.clone())))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn filled() -> NewAccount {
+        NewAccount { user: "ada@example.org".into(), password: "pw".into(), imap_host: "mail.example.org".into(), ..NewAccount::default() }
+    }
+
+    #[test]
+    fn the_login_is_the_address_when_it_looks_like_one() {
+        assert_eq!(filled().build().unwrap().address(), "ada@example.org");
+    }
+
+    #[test]
+    fn a_plain_login_needs_an_explicit_address() {
+        let mut form = filled();
+        form.user = "ada".into();
+        assert!(form.build().is_err());
+        form.email = "ada@example.org".into();
+        assert_eq!(form.build().unwrap().address(), "ada@example.org");
+        form.email = "not an address".into();
+        assert!(form.build().is_err());
+    }
+
+    #[test]
+    fn editing_keeps_the_password_when_left_empty() {
+        let account = filled().build().unwrap();
+        let mut form = NewAccount::editing(7, &account);
+        assert!(form.ready(), "no password needed while editing");
+        assert_eq!(form.build().unwrap(), account);
+        form.imap_host.clear();
+        assert!(!form.ready());
+    }
 }

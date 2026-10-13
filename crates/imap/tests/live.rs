@@ -19,7 +19,7 @@ fn account_from_env() -> Result<(Account, String), String> {
         port: var("IMAP_PORT")?.trim().parse().map_err(|_| "IMAP_PORT is not a number".to_owned())?,
         tls,
     };
-    let account = Account { name: "test".into(), user: var("MAIL_USER")?, smtp: imap.clone(), imap };
+    let account = Account { name: "test".into(), user: var("MAIL_USER")?, email: String::new(), smtp: imap.clone(), imap };
     Ok((account, var("MAIL_PASSWORD")?))
 }
 

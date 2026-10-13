@@ -212,3 +212,11 @@ pub fn primary_wide(ui: &mut Ui, t: &Tokens, icon: Icon, label: &str, why_disabl
         None => ui.add(button),
     }
 }
+
+/// The filled button with a leading icon and a fixed width.
+pub fn primary_wide_fixed(ui: &mut Ui, t: &Tokens, icon: Icon, label: &str, enabled: bool, width: f32) -> Response {
+    let button = egui::Button::image_and_text(icon.image(icons::SIZE, t.on_accent), egui::RichText::new(label).color(t.on_accent).strong())
+        .fill(t.accent)
+        .min_size(vec2(width, CONTROL_H));
+    ui.add_enabled(enabled, button)
+}

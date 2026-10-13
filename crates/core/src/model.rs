@@ -66,15 +66,33 @@ pub struct Server {
 pub struct Account {
     /// Label shown in the UI.
     pub name: String,
-    /// Login name, shared by IMAP and SMTP.
+    /// Login name, shared by IMAP and SMTP. Often, but not always, the email address.
     pub user: String,
+    /// The address mail is sent from. Empty in files written before this field existed.
+    #[serde(default)]
+    pub email: String,
     pub imap: Server,
     pub smtp: Server,
 }
 
 impl Account {
+    /// The address to send from: the configured one, else the login name.
+    pub fn address(&self) -> &str {
+        if self.email.trim().is_empty() { &self.user } else { self.email.trim() }
+    }
+
     /// Stable identity of the account: also the key of its secret in the credential store.
     pub fn key(&self) -> String {
         format!("{}@{}", self.user, self.imap.host)
     }
+}
+
+/// A message to send. Addresses are free text until the sender parses them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Outgoing {
+    pub from: String,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub subject: String,
+    pub body: String,
 }

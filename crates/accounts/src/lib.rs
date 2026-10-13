@@ -79,13 +79,21 @@ mod tests {
     fn account(user: &str) -> Account {
         let imap = Server { host: "mail.example.org".into(), port: 143, tls: Tls::StartTls };
         let smtp = Server { host: "mail.example.org".into(), port: 465, tls: Tls::Tls };
-        Account { name: "Work".into(), user: user.into(), imap, smtp }
+        Account { name: "Work".into(), user: user.into(), email: user.into(), imap, smtp }
     }
 
     #[test]
     fn file_round_trips() {
         let accounts = vec![account("a@example.org"), account("b@example.org")];
         assert_eq!(parse(&render(&accounts).unwrap()).unwrap(), accounts);
+    }
+
+    #[test]
+    fn files_without_an_email_still_load() {
+        let text = "[[account]]\nname = \"Old\"\nuser = \"a@example.org\"\n[account.imap]\nhost = \"h\"\nport = 143\ntls = \"starttls\"\n[account.smtp]\nhost = \"h\"\nport = 587\ntls = \"starttls\"\n";
+        let accounts = parse(text).unwrap();
+        assert_eq!(accounts[0].email, "");
+        assert_eq!(accounts[0].address(), "a@example.org");
     }
 
     #[test]

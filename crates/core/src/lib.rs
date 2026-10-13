@@ -8,7 +8,7 @@
 pub mod model;
 pub mod sample;
 
-pub use model::{Account, Mailbox, MessageId, MessageSummary, Role, Server, Tls};
+pub use model::{Account, Mailbox, MessageId, MessageSummary, Outgoing, Role, Server, Tls};
 
 use std::fmt;
 use std::future::Future;
@@ -61,4 +61,11 @@ pub trait MailSource {
 
     /// Erases a message for good. Only messages already in the trash folder may be erased.
     fn erase(&self, id: MessageId) -> impl Future<Output = Result<(), MailError>> + Send;
+}
+
+/// Sends mail for one account. Kept apart from [`MailSource`]: sending and reading use different servers.
+pub trait MailSender {
+    /// Delivers `message` to the account's outgoing server. Addresses that do not parse are
+    /// reported as [`MailError::Backend`] before anything is sent.
+    fn send(&self, message: Outgoing) -> impl Future<Output = Result<(), MailError>> + Send;
 }

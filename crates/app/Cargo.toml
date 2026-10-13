@@ -18,4 +18,5 @@ eframe.workspace = true
 egui_extras.workspace = true
 beavermail-accounts.workspace = true
 beavermail-imap.workspace = true
+beavermail-smtp.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread"] }

@@ -42,7 +42,7 @@ async fn start(move_works: bool) -> Mock {
         }
     });
     let server = Server { host: "127.0.0.1".into(), port, tls: Tls::None };
-    let account = Account { name: "mock".into(), user: "u".into(), imap: server.clone(), smtp: server };
+    let account = Account { name: "mock".into(), user: "u".into(), email: String::new(), imap: server.clone(), smtp: server };
     Mock { source: ImapSource::new(&account, "p".into()), log }
 }
 
