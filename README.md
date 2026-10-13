@@ -23,8 +23,10 @@ sender); images and styling are never loaded and tracking parameters are removed
 Mail is kept locally: the window opens from a SQLite index, and each downloaded message is an
 file under the data directory, encrypted by default (XChaCha20-Poly1305). Settings choose between a key
 kept by the system, a passphrase, or no encryption.
-New mail, flags, deletions and older history sync in the background. The index itself is not
-encrypted yet. No offline-retention setting, attachments view, original HTML or end-to-end
+New mail, flags, deletions and older history sync in the background, and the messages themselves
+download in the background (per account: everything, last 12 months, last 30 days, or only opened
+messages), with progress and a pause button in the status bar. The index itself is not
+encrypted yet. No attachments view, original HTML or end-to-end
 message encryption yet.
 
 ## Running

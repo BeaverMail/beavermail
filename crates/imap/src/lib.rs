@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use async_imap::types::{Fetch, Flag, NameAttribute};
 use async_imap::{Client, Session};
-use beavermail_core::{Account, MailError, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Role, Server, SyncReport, Tls};
+use beavermail_core::{Account, Keep, MailError, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Progress, Role, Server, SyncReport, Tls};
 use beavermail_store::{Header, Location, Store};
 use beavermail_vault::{Vault, folder_path, message_path};
 use futures::TryStreamExt;
@@ -204,6 +204,7 @@ fn header(fetch: &Fetch) -> Option<Header> {
         message_id: message.message_id().unwrap_or_default().to_owned(),
         in_reply_to: ids(message.in_reply_to()).join(" "),
         references: ids(message.references()).join(" "),
+        size: fetch.size.unwrap_or(0),
     })
 }
 
@@ -281,7 +282,7 @@ impl ImapSource {
     }
 
     async fn fetch_headers(session: &mut Session<Stream>, set: &str, by_uid: bool) -> Result<Vec<Header>, async_imap::error::Error> {
-        let query = format!("(UID FLAGS INTERNALDATE {HEADER_FIELDS})");
+        let query = format!("(UID FLAGS INTERNALDATE RFC822.SIZE {HEADER_FIELDS})");
         let fetches: Vec<Fetch> = if by_uid {
             session.uid_fetch(set, &query).await?.try_collect().await?
         } else {
@@ -289,6 +290,11 @@ impl ImapSource {
         };
         Ok(fetches.iter().filter_map(header).collect())
     }
+
+    /// Messages fetched together: enough to keep the connection busy, small enough that opening
+    /// a message in the meantime does not wait long.
+    const BATCH_MESSAGES: usize = 25;
+    const BATCH_BYTES: u64 = 4 * 1024 * 1024;
 
     /// The synchronisation itself; see [`MailSource::sync`].
     async fn sync_folder(&self, folder: &str) -> Result<SyncReport, MailError> {
@@ -366,6 +372,35 @@ impl ImapSource {
     }
 }
 
+impl ImapSource {
+    /// Downloads one batch of `pending` messages of `folder` into the vault. Returns how many arrived.
+    async fn download_batch(&self, folder: &str, pending: &[beavermail_store::Pending]) -> Result<(), MailError> {
+        let uids = pending.iter().map(|p| p.uid.to_string()).collect::<Vec<_>>().join(",");
+        let mut state = self.state.lock().await;
+        let session = state.session(&self.config).await?;
+        let result = async {
+            session.examine(folder).await?;
+            let fetches: Vec<Fetch> = session.uid_fetch(&uids, "(UID BODY.PEEK[])").await?.try_collect().await?;
+            Ok(fetches)
+        }
+        .await;
+        let fetches = result.map_err(|e| state.failed(e))?;
+        drop(state);
+        for fetch in &fetches {
+            let (Some(uid), Some(raw)) = (fetch.uid, fetch.body()) else { continue };
+            let path = self.file_of(&self.account, folder, uid)?;
+            self.files.write(&path, raw)?;
+            if let Some(id) = self.store.id_of(&self.account, folder, uid)?
+                && let Ok(body) = parse_body(raw)
+            {
+                self.store.set_preview(id, &body.text)?;
+            }
+            self.store.mark_stored(&self.account, folder, uid)?;
+        }
+        Ok(())
+    }
+}
+
 /// Why a sync step failed: the connection (drop it) or the local archive (keep it).
 enum SyncError {
     Imap(async_imap::error::Error),
@@ -419,7 +454,7 @@ impl ImapSource {
 
 impl MailSource for ImapSource {
     async fn cached_mailboxes(&self) -> Result<Vec<Mailbox>, MailError> {
-        Ok(self.store.folders(&self.account)?.into_iter().map(|f| Mailbox { name: f.name, unread: f.unread, role: f.role }).collect())
+        Ok(self.store.folders(&self.account)?.into_iter().map(|f| Mailbox { name: f.name, unread: f.unread, role: f.role, total: f.total, stored: f.stored }).collect())
     }
 
     async fn mailboxes(&self) -> Result<Vec<Mailbox>, MailError> {
@@ -439,15 +474,24 @@ impl MailSource for ImapSource {
             resolve_roles(&mut folders);
             let mut mailboxes = Vec::with_capacity(folders.len());
             for (name, role) in &folders {
-                let status = session.status(name, "(UNSEEN)").await.map_err(backend)?;
-                mailboxes.push(Mailbox { name: name.clone(), unread: status.unseen.unwrap_or(0), role: *role });
+                let status = session.status(name, "(UNSEEN MESSAGES)").await.map_err(backend)?;
+                mailboxes.push(Mailbox { name: name.clone(), unread: status.unseen.unwrap_or(0), role: *role, total: status.exists, stored: 0 });
             }
             Ok((folders, mailboxes))
         }
         .await;
         match result {
-            Ok((folders, mailboxes)) => {
+            Ok((folders, mut mailboxes)) => {
                 self.store.set_folders(&self.account, &folders)?;
+                for m in &mut mailboxes {
+                    self.store.set_total(&self.account, &m.name, m.total)?;
+                }
+                // The counts of what is stored come from the archive, the rest from the server.
+                for row in self.store.folders(&self.account)? {
+                    if let Some(m) = mailboxes.iter_mut().find(|m| m.name == row.name) {
+                        m.stored = row.stored;
+                    }
+                }
                 Ok(mailboxes)
             }
             Err(e) => {
@@ -465,6 +509,71 @@ impl MailSource for ImapSource {
         self.sync_folder(mailbox).await
     }
 
+    async fn download(&self, keep: Keep, progress: &Progress) -> Result<(), MailError> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+        let Some(since) = keep.since(now) else { return Ok(()) };
+        let mut folders: Vec<String> = self.store.folders(&self.account)?.into_iter().filter(|f| !matches!(f.role, Role::Junk | Role::Trash)).map(|f| f.name).collect();
+        folders.sort_by_key(|n| n != "INBOX");
+
+        // The folders must be known far enough back before there is anything to count.
+        for folder in &folders {
+            progress.set_activity(format!("Checking {folder}"));
+            loop {
+                if progress.cancel.load(Relaxed) {
+                    return Ok(());
+                }
+                let report = self.sync_folder(folder).await?;
+                let oldest = self.store.oldest_timestamp(&self.account, folder)?;
+                if report.remaining == 0 || oldest.is_some_and(|t| t < since) {
+                    break;
+                }
+            }
+        }
+        let mut total = 0;
+        for folder in &folders {
+            total += self.store.count_pending(&self.account, folder, since)?;
+        }
+        progress.total.store(total, Relaxed);
+        progress.done.store(0, Relaxed);
+
+        for folder in &folders {
+            progress.set_activity(format!("Downloading {folder}"));
+            loop {
+                while progress.paused.load(Relaxed) && !progress.cancel.load(Relaxed) {
+                    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                }
+                if progress.cancel.load(Relaxed) {
+                    return Ok(());
+                }
+                let pending = self.store.pending(&self.account, folder, since, Self::BATCH_MESSAGES)?;
+                // A batch ends at the byte limit; a single large message is a batch of its own.
+                let mut bytes = 0u64;
+                let batch: Vec<_> = pending
+                    .iter()
+                    .take_while(|p| {
+                        let fits = bytes == 0 || bytes + u64::from(p.size) <= Self::BATCH_BYTES;
+                        bytes += u64::from(p.size);
+                        fits
+                    })
+                    .copied()
+                    .collect();
+                if batch.is_empty() {
+                    break;
+                }
+                self.download_batch(folder, &batch).await?;
+                // A message the server no longer has (deleted meanwhile) must not be asked for forever;
+                // the next sync removes it from the list.
+                for p in &batch {
+                    self.store.mark_stored(&self.account, folder, p.uid)?;
+                }
+                progress.done.fetch_add(batch.len() as u32, Relaxed);
+            }
+        }
+        progress.set_activity("");
+        Ok(())
+    }
+
     async fn body(&self, id: MessageId) -> Result<MessageBody, MailError> {
         let at = self.store.locate(id)?.ok_or(MailError::NotFound)?;
         let path = self.file_of(&at.account, &at.folder, at.uid)?;
@@ -478,6 +587,7 @@ impl MailSource for ImapSource {
         // Not being able to keep the file (a locked vault) must not stop the message from opening.
         if self.files.write(&path, &raw).is_ok() {
             self.store.set_preview(id, &body.text)?;
+            self.store.mark_stored(&at.account, &at.folder, at.uid)?;
         }
         Ok(body)
     }

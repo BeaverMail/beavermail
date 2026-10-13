@@ -2,7 +2,7 @@
 
 //! An in-memory [`MailSource`] with generated data, for development and tests.
 
-use crate::{MailError, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Role, SyncReport};
+use crate::{Keep, MailError, Progress, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Role, SyncReport};
 
 const FOLDERS: [&str; 6] = ["Inbox", "Starred", "Drafts", "Sent", "Archive", "Trash"];
 const SENDERS: [&str; 8] = [
@@ -80,6 +80,8 @@ impl MailSource for SampleSource {
                     .iter()
                     .filter(|(folder, m, _)| folder == name && m.unread)
                     .count() as u32,
+                total: self.messages.iter().filter(|(folder, _, _)| folder == name).count() as u32,
+                stored: 0,
             })
             .collect())
     }
@@ -102,6 +104,10 @@ impl MailSource for SampleSource {
             .find(|(_, m, _)| m.id == id)
             .map(|(_, _, text)| MessageBody { text: text.clone(), ..MessageBody::default() })
             .ok_or(MailError::NotFound)
+    }
+
+    async fn download(&self, _: Keep, _: &Progress) -> Result<(), MailError> {
+        Ok(())
     }
 
     async fn save_sent(&self, _: Vec<u8>) -> Result<(), MailError> {

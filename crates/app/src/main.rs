@@ -15,7 +15,7 @@ mod theme;
 mod views;
 
 use beavermail_accounts as store;
-use beavermail_core::{Account, DisplayMode, MailError, MailSender, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Role, Server, Settings, SyncReport, Tls};
+use beavermail_core::{Account, DisplayMode, Keep, MailError, MailSender, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Progress, Role, Server, Settings, SyncReport, Tls};
 use beavermail_imap::ImapSource;
 use beavermail_smtp::SmtpSender;
 use beavermail_store::Store;
@@ -28,7 +28,10 @@ use tokio::runtime::Runtime;
 /// Result of a background mail call. Tagged with the account's serial, so answers
 /// for an account that was removed meanwhile are dropped.
 enum Event {
-    Mailboxes(u64, Result<Vec<Mailbox>, MailError>),
+    /// The folders of an account. The flag is true when the answer came from the server.
+    Mailboxes(u64, Result<Vec<Mailbox>, MailError>, bool),
+    /// The background download of an account ended.
+    Downloaded(u64, Result<(), MailError>),
     /// One sync of the selected folder finished; more history may remain.
     Synced(u64, usize, Result<SyncReport, MailError>),
     Messages(u64, usize, Result<Vec<MessageSummary>, MailError>),
@@ -110,6 +113,8 @@ struct AccountView {
     sender: Option<Arc<SmtpSender>>,
     mailboxes: Vec<Mailbox>,
     error: Option<String>,
+    /// The background download, shared with the status bar.
+    progress: Arc<Progress>,
 }
 
 /// The "Add account" form. Ports are text until submitted.
@@ -130,6 +135,7 @@ struct NewAccount {
     smtp_port: String,
     smtp_tls: Tls,
     save_sent: bool,
+    keep: Keep,
     error: Option<String>,
     /// Focus the first field on the first frame only.
     focus_first: bool,
@@ -150,6 +156,7 @@ impl Default for NewAccount {
             smtp_port: "587".into(),
             smtp_tls: Tls::StartTls,
             save_sent: true,
+            keep: Keep::default(),
             error: None,
             focus_first: true,
         }
@@ -172,6 +179,7 @@ impl NewAccount {
             smtp_port: port(&account.smtp),
             smtp_tls: account.smtp.tls,
             save_sent: account.save_sent,
+            keep: account.keep,
             focus_first: true,
             ..Self::default()
         }
@@ -203,6 +211,7 @@ impl NewAccount {
             imap: Server { host: imap_host.to_owned(), port: port(&self.imap_port, "IMAP")?, tls: self.imap_tls },
             smtp: Server { host: smtp_host.to_owned(), port: port(&self.smtp_port, "SMTP")?, tls: self.smtp_tls },
             save_sent: self.save_sent,
+            keep: self.keep,
         })
     }
 }
@@ -273,6 +282,8 @@ struct BeaverApp {
     /// Syncs in flight; the list shows a spinner while it is not zero.
     syncing: u32,
     show_settings: bool,
+    /// The user paused the background downloads.
+    downloads_paused: bool,
     /// Settings and prompt state for the stored-mail protection.
     security: security::Form,
     /// A mode change rewriting files in the background.
@@ -322,6 +333,7 @@ impl BeaverApp {
             vault: Arc::new(vault),
             syncing: 0,
             show_settings: false,
+            downloads_paused: false,
             security: security::Form::default(),
             vault_job: None,
             unlock_skipped: false,
@@ -368,10 +380,12 @@ impl BeaverApp {
         if let Some(source) = source.clone() {
             // The archive answers at once; the server's list follows and replaces it.
             let cached = source.clone();
-            self.spawn(async move { Event::Mailboxes(serial, cached.cached_mailboxes().await) });
-            self.spawn(async move { Event::Mailboxes(serial, source.mailboxes().await) });
+            self.spawn(async move { Event::Mailboxes(serial, cached.cached_mailboxes().await, false) });
+            self.spawn(async move { Event::Mailboxes(serial, source.mailboxes().await, true) });
         }
-        let view = AccountView { serial, account, source, sender, mailboxes: Vec::new(), error };
+        let progress = Arc::new(Progress::default());
+        progress.paused.store(self.downloads_paused, std::sync::atomic::Ordering::Relaxed);
+        let view = AccountView { serial, account, source, sender, mailboxes: Vec::new(), error, progress };
         match position {
             Some(at) => self.accounts.insert(at.min(self.accounts.len()), view),
             None => self.accounts.push(view),
@@ -395,6 +409,35 @@ impl BeaverApp {
         let folder = name.clone();
         self.spawn(async move { Event::Messages(serial, index, local.messages(&folder).await) });
         self.start_sync(serial, index, source, name);
+    }
+
+    /// Starts the background download for an account unless one is running.
+    fn start_download(&mut self, serial: u64) {
+        let Some(view) = self.view(serial) else { return };
+        let (Some(source), keep, progress) = (view.source.clone(), view.account.keep, view.progress.clone()) else { return };
+        if keep == Keep::Opened || progress.running.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        progress.total.store(0, std::sync::atomic::Ordering::Relaxed);
+        progress.done.store(0, std::sync::atomic::Ordering::Relaxed);
+        let ctx = self.ctx.clone();
+        self.spawn(async move {
+            // Wake the window now and then so the status bar moves while batches arrive.
+            let ticker = tokio::spawn({
+                let ctx = ctx.clone();
+                async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                        ctx.request_repaint();
+                    }
+                }
+            });
+            let result = source.download(keep, &progress).await;
+            ticker.abort();
+            progress.running.store(false, std::sync::atomic::Ordering::Relaxed);
+            progress.set_activity("");
+            Event::Downloaded(serial, result)
+        });
     }
 
     /// Brings a folder of the archive up to date in the background.
@@ -455,6 +498,28 @@ impl BeaverApp {
         }
     }
 
+    /// "1,240 messages · 3 unread · 980 stored offline" for the folder being shown.
+    fn folder_summary(&self, shown: usize) -> Option<String> {
+        let (serial, index) = self.selected?;
+        let view = self.view(serial)?;
+        let folder = view.mailboxes.get(index)?;
+        if !self.query.trim().is_empty() {
+            return Some(format!("{} results", views::thousands(shown as u32)));
+        }
+        let total = folder.total.max(self.messages.len() as u32);
+        let mut parts = vec![format!("{} message{}", views::thousands(total), if total == 1 { "" } else { "s" })];
+        if folder.unread > 0 {
+            parts.push(format!("{} unread", views::thousands(folder.unread)));
+        }
+        if folder.stored > 0 && view.account.keep != Keep::Opened {
+            parts.push(format!("{} stored offline", views::thousands(folder.stored)));
+        }
+        if (self.messages.len() as u32) < total {
+            parts.push(if self.syncing > 0 { "loading older mail".to_owned() } else { format!("newest {} loaded", views::thousands(self.messages.len() as u32)) });
+        }
+        Some(parts.join("  ·  "))
+    }
+
     /// The loaded messages that match the search box, in list order.
     fn visible(&self) -> Vec<&MessageSummary> {
         let query = self.query.trim().to_lowercase();
@@ -469,8 +534,9 @@ impl BeaverApp {
         let (Some(source), Some(mailbox)) = (view.source.clone(), view.mailboxes.get(index)) else { return };
         let name = mailbox.name.clone();
         let folders = source.clone();
-        self.spawn(async move { Event::Mailboxes(serial, folders.mailboxes().await) });
+        self.spawn(async move { Event::Mailboxes(serial, folders.mailboxes().await, true) });
         self.start_sync(serial, index, source, name);
+        self.start_download(serial);
     }
 
     /// Accounts that can send, as (serial, address).
@@ -805,6 +871,7 @@ impl BeaverApp {
             return Ok(());
         };
         let old = self.accounts.remove(at);
+        old.progress.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         if key_changed {
             let _ = store::forget_password(&old.account);
             self.forget_archive(&old.account); // its UIDs mean nothing on another server
@@ -836,6 +903,7 @@ impl BeaverApp {
     fn remove_account(&mut self, serial: u64) {
         let Some(position) = self.accounts.iter().position(|v| v.serial == serial) else { return };
         let view = self.accounts.remove(position);
+        view.progress.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         self.forget_archive(&view.account);
         let all: Vec<Account> = self.accounts.iter().map(|v| v.account.clone()).collect();
         if let Err(e) = store::save(&all).and_then(|()| store::forget_password(&view.account)) {
@@ -851,11 +919,24 @@ impl BeaverApp {
 
     fn apply(&mut self, event: Event) {
         match event {
-            Event::Mailboxes(serial, result) => {
+            Event::Mailboxes(serial, result, fresh) => {
                 let selected_name = self.selected.filter(|(s, _)| *s == serial).and_then(|(_, i)| self.view(serial)?.mailboxes.get(i)).map(|m| m.name.clone());
                 let Some(view) = self.accounts.iter_mut().find(|v| v.serial == serial) else { return };
+                if !fresh && !view.mailboxes.is_empty() {
+                    // The archive only has fresher counts of what is stored; the server's unread counts stay.
+                    if let Ok(cached) = result {
+                        for folder in &mut view.mailboxes {
+                            if let Some(row) = cached.iter().find(|c| c.name == folder.name) {
+                                folder.stored = row.stored;
+                            }
+                        }
+                    }
+                    return;
+                }
+                let mut download = false;
                 match result {
                     Ok(mut mailboxes) => {
+                        download = fresh;
                         // Same order for the archive's list and the server's, so a position means the same folder.
                         mailboxes.sort_by_key(|m| (views::folder_rank(m.role), m.name.clone()));
                         view.mailboxes = mailboxes;
@@ -870,6 +951,26 @@ impl BeaverApp {
                     }
                     Err(e) => view.error = Some(e.to_string()),
                 }
+                if download {
+                    self.start_download(serial);
+                }
+            }
+            Event::Downloaded(serial, result) => {
+                match result {
+                    Ok(()) => {}
+                    // The status bar already says the stored mail is locked.
+                    Err(MailError::Auth(_)) if self.vault.is_locked() => {}
+                    Err(e) => self.error = Some(format!("Downloading mail stopped: {e}")),
+                }
+                // Previews arrive with the files.
+                if let Some((s, index)) = self.selected.filter(|(s, _)| *s == serial)
+                    && let Some(view) = self.view(s)
+                    && let (Some(source), Some(name)) = (view.source.clone(), view.mailboxes.get(index).map(|m| m.name.clone()))
+                {
+                    let counts = source.clone();
+                    self.spawn(async move { Event::Messages(serial, index, source.messages(&name).await) });
+                    self.spawn(async move { Event::Mailboxes(serial, counts.cached_mailboxes().await, false) });
+                }
             }
             Event::Synced(serial, index, result) => {
                 self.syncing = self.syncing.saturating_sub(1);
@@ -882,6 +983,8 @@ impl BeaverApp {
                         let (Some(source), Some(name)) = (view.source.clone(), view.mailboxes.get(index).map(|m| m.name.clone())) else { return };
                         let (local, folder) = (source.clone(), name.clone());
                         self.spawn(async move { Event::Messages(serial, index, local.messages(&folder).await) });
+                        let counts = source.clone();
+                        self.spawn(async move { Event::Mailboxes(serial, counts.cached_mailboxes().await, false) });
                         if report.remaining > 0 {
                             self.start_sync(serial, index, source, name);
                         }
@@ -1008,6 +1111,20 @@ impl BeaverApp {
                 });
                 ui.end_row();
             });
+            ui.horizontal(|ui| {
+                ui.label("Keep mail offline");
+                let label = |k: Keep| match k {
+                    Keep::All => "Everything",
+                    Keep::Year => "Last 12 months",
+                    Keep::Month => "Last 30 days",
+                    Keep::Opened => "Only messages I open",
+                };
+                egui::ComboBox::from_id_salt("keep").selected_text(label(form.keep)).show_ui(ui, |ui| {
+                    for keep in [Keep::All, Keep::Year, Keep::Month, Keep::Opened] {
+                        ui.selectable_value(&mut form.keep, keep, label(keep));
+                    }
+                });
+            });
             ui.checkbox(&mut form.save_sent, "Keep a copy of sent messages in Sent")
                 .on_hover_text("Turn off for providers that already do it, such as Gmail and Microsoft 365");
             if let Some(error) = &form.error {
@@ -1037,6 +1154,68 @@ impl BeaverApp {
 }
 
 impl BeaverApp {
+    /// The slim bar at the bottom: what the app is doing with the server and how stored mail is protected.
+    fn status_bar(&mut self, ui: &mut egui::Ui, t: &theme::Tokens) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (mut total, mut done, mut running) = (0u32, 0u32, false);
+        let mut activity = String::new();
+        for view in &self.accounts {
+            total += view.progress.total.load(Relaxed);
+            done += view.progress.done.load(Relaxed);
+            running |= view.progress.running.load(Relaxed);
+            if activity.is_empty() {
+                activity = view.progress.activity();
+            }
+        }
+        let locked = self.vault.is_locked();
+        let mode = self.vault.mode();
+        let dim = |text: String| RichText::new(text).size(13.0).color(t.text_dim);
+        let mut toggle_pause = false;
+        let frame = egui::Frame::new().fill(t.bg).inner_margin(egui::Margin::symmetric(14, 5));
+        egui::Panel::bottom("status").frame(frame).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if locked {
+                    ui.label(RichText::new("Stored mail is locked. Downloads wait for the passphrase.").size(13.0).color(t.danger));
+                } else if running && total > 0 && done < total {
+                    ui.label(dim("Downloading mail".to_owned()));
+                    let fraction = done as f32 / total as f32;
+                    ui.add(egui::ProgressBar::new(fraction).desired_width(220.0).desired_height(8.0).corner_radius(4.0).fill(t.accent));
+                    ui.label(dim(format!("{done} of {total}")));
+                    let label = if self.downloads_paused { "Resume" } else { "Pause" };
+                    if ui.small_button(label).clicked() {
+                        toggle_pause = true;
+                    }
+                    if self.downloads_paused {
+                        ui.label(dim("Paused".to_owned()));
+                    }
+                } else if running || self.syncing > 0 {
+                    ui.add(egui::Spinner::new().size(12.0));
+                    ui.label(dim(if activity.is_empty() { "Syncing…".to_owned() } else { format!("{activity}…") }));
+                } else {
+                    ui.label(dim("Up to date".to_owned()));
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let protection = match (locked, mode) {
+                        (true, _) => "Locked",
+                        (_, Mode::Off) => "Mail on this computer is not encrypted",
+                        (_, Mode::System) => "Mail on this computer is encrypted",
+                        (_, Mode::Passphrase) => "Mail on this computer is encrypted with your passphrase",
+                    };
+                    ui.label(dim(protection.to_owned()));
+                });
+            });
+        });
+        if toggle_pause {
+            self.downloads_paused = !self.downloads_paused;
+            for view in &self.accounts {
+                view.progress.paused.store(self.downloads_paused, Relaxed);
+            }
+        }
+        if running {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(300));
+        }
+    }
+
     fn error_banner(&mut self, ui: &mut egui::Ui, t: &theme::Tokens) {
         const NOTICE_SECS: f32 = 4.0;
         if let Some((text, since)) = self.notice.clone() {
@@ -1103,7 +1282,8 @@ impl BeaverApp {
                                         let mailbox = &view.mailboxes[i];
                                         let title = views::folder_title(&mailbox.name, mailbox.role);
                                         let selected = self.selected == Some((view.serial, i));
-                                        if views::folder_row(ui, t, &title, mailbox.role, mailbox.unread, selected).clicked() {
+                                        let tip = format!("{} message{}  ·  {} unread", views::thousands(mailbox.total), if mailbox.total == 1 { "" } else { "s" }, views::thousands(mailbox.unread));
+                                        if views::folder_row(ui, t, &title, mailbox.role, mailbox.unread, selected).on_hover_text(tip).clicked() {
                                             chosen = Some((view.serial, i));
                                         }
                                     }
@@ -1150,8 +1330,15 @@ impl BeaverApp {
                     refresh = icons::button(ui, t, Icon::Refresh, "Refresh", true, false).clicked();
                 }
             });
-            ui.add_space(8.0);
             let shown = self.visible();
+            if let Some(summary) = self.folder_summary(shown.len()) {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(16.0);
+                    ui.label(RichText::new(summary).size(13.0).color(t.text_dim));
+                });
+            }
+            ui.add_space(6.0);
             if shown.is_empty() {
                 let (title, hint) = if self.query.trim().is_empty() {
                     ("Nothing here", "This folder has no messages.")
@@ -1291,6 +1478,7 @@ impl eframe::App for BeaverApp {
         }
         let t = theme::Tokens::get(ui.ctx());
         self.error_banner(ui, &t);
+        self.status_bar(ui, &t);
 
         let SidebarOutcome { chosen, removed, edit, mut add } = self.sidebar(ui, &t);
         if let Some(serial) = edit

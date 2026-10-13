@@ -5,7 +5,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use beavermail_core::{Account, MailError, MailSource, MessageId, Role, Server, Tls};
+use beavermail_core::{Account, Keep, MailError, MailSource, MessageId, Progress, Role, Server, Tls};
 use beavermail_imap::ImapSource;
 use beavermail_store::Store;
 use beavermail_vault::Vault;
@@ -50,7 +50,7 @@ async fn start(move_works: bool) -> Mock {
         }
     });
     let server = Server { host: "127.0.0.1".into(), port, tls: Tls::None };
-    let account = Account { name: "mock".into(), user: "u".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true };
+    let account = Account { name: "mock".into(), user: "u".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true, keep: beavermail_core::Keep::default() };
     let store = Arc::new(Store::in_memory().unwrap());
     let files = Arc::new(Vault::in_memory());
     Mock { source: ImapSource::new(&account, "p".into(), store.clone(), files.clone()), account, store, files, log }
@@ -76,7 +76,7 @@ async fn serve(socket: TcpStream, log: Arc<Mutex<Vec<String>>>, move_works: bool
             )
         } else if verb.starts_with("STATUS") {
             let name = command.split(' ').nth(1).unwrap_or("\"INBOX\"");
-            format!("* STATUS {name} (UNSEEN 1)\r\n{tag} OK done\r\n")
+            format!("* STATUS {name} (MESSAGES 1240 UNSEEN 1)\r\n{tag} OK done\r\n")
         } else if verb.starts_with("SELECT") || verb.starts_with("EXAMINE") {
             format!("* 1 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 1] ok\r\n{tag} OK [READ-WRITE] done\r\n")
         } else if verb.contains("BODY.PEEK[]") {
@@ -287,4 +287,60 @@ async fn a_locked_vault_still_opens_messages_from_the_server() {
     let body = source.body(id).await.expect("the message still opens, straight from the server");
     assert_eq!(body.text.trim(), "Hi there.");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn the_background_download_stores_what_the_window_asks_for_and_reports_progress() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mock = start(true).await;
+    mock.source.mailboxes().await.unwrap();
+    let path = beavermail_vault::message_path(&mock.account.key(), "INBOX", 1, 5);
+
+    // The only message is from January 2024: outside a 30-day window, so nothing is fetched.
+    let progress = Progress::default();
+    mock.source.download(Keep::Month, &progress).await.unwrap();
+    assert_eq!(progress.total.load(Relaxed), 0);
+    assert_eq!(mock.files.read(&path).unwrap(), None);
+    assert!(!mock.commands().iter().any(|c| c.contains("BODY.PEEK[]")));
+
+    // "Opened only" never downloads.
+    mock.source.download(Keep::Opened, &progress).await.unwrap();
+    assert!(!mock.commands().iter().any(|c| c.contains("BODY.PEEK[]")));
+
+    // "Everything" does, and counts.
+    let progress = Progress::default();
+    mock.source.download(Keep::All, &progress).await.unwrap();
+    // The scripted server answers every folder with the same message: INBOX, Archive and Sent; Trash is skipped.
+    assert_eq!((progress.done.load(Relaxed), progress.total.load(Relaxed)), (3, 3));
+    assert!(mock.files.read(&path).unwrap().is_some());
+    // Run again: nothing is left to fetch.
+    let fetches = mock.commands().iter().filter(|c| c.contains("BODY.PEEK[]")).count();
+    mock.source.download(Keep::All, &Progress::default()).await.unwrap();
+    assert_eq!(mock.commands().iter().filter(|c| c.contains("BODY.PEEK[]")).count(), fetches);
+    // The list preview came with the download.
+    assert_eq!(mock.source.messages("INBOX").await.unwrap()[0].preview, "Hi there.");
+}
+
+#[tokio::test]
+async fn a_cancelled_download_stops_before_fetching() {
+    let mock = start(true).await;
+    mock.source.mailboxes().await.unwrap();
+    let progress = Progress::default();
+    progress.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    mock.source.download(Keep::All, &progress).await.unwrap();
+    assert!(!mock.commands().iter().any(|c| c.contains("BODY.PEEK[]")));
+}
+
+#[tokio::test]
+async fn folders_report_how_many_messages_the_server_holds_and_how_many_are_stored() {
+    let mock = start(true).await;
+    let listed = mock.source.mailboxes().await.unwrap();
+    assert_eq!(listed.iter().find(|m| m.name == "INBOX").unwrap().total, 1240);
+    // Offline, the archive still knows the server's count; nothing is stored yet.
+    let cached = mock.source.cached_mailboxes().await.unwrap();
+    let inbox = cached.iter().find(|m| m.name == "INBOX").unwrap();
+    assert_eq!((inbox.total, inbox.stored), (1240, 0));
+    mock.source.download(Keep::All, &Progress::default()).await.unwrap();
+    let inbox = mock.source.cached_mailboxes().await.unwrap().into_iter().find(|m| m.name == "INBOX").unwrap();
+    assert_eq!((inbox.total, inbox.stored), (1240, 1));
 }

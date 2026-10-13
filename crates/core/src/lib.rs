@@ -8,7 +8,7 @@
 pub mod model;
 pub mod sample;
 
-pub use model::{Account, DisplayMode, Mailbox, MessageBody, MessageId, MessageSummary, Outgoing, Role, Server, Settings, SyncReport, Tls};
+pub use model::{Account, DisplayMode, Keep, Mailbox, MessageBody, MessageId, MessageSummary, Outgoing, Progress, Role, Server, Settings, SyncReport, Tls};
 
 use std::fmt;
 use std::future::Future;
@@ -55,6 +55,11 @@ pub trait MailSource {
     /// messages, and one more chunk of older history. Call again while
     /// [`SyncReport::remaining`] is not zero.
     fn sync(&self, mailbox: &str) -> impl Future<Output = Result<SyncReport, MailError>> + Send;
+
+    /// Downloads the messages `keep` asks for, newest first, folder by folder, after synchronising
+    /// the folders far enough back. Reports through `progress`, waits while it is paused and returns
+    /// early when it is cancelled.
+    fn download(&self, keep: Keep, progress: &Progress) -> impl Future<Output = Result<(), MailError>> + Send;
 
     /// Text, recipients and threading headers of a message, from the archive or else downloaded;
     /// [`MailError::NotFound`] if it does not exist.

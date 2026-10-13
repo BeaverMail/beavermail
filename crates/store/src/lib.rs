@@ -84,6 +84,15 @@ pub struct Header {
     pub in_reply_to: String,
     /// Message-IDs separated by spaces.
     pub references: String,
+    /// Size of the whole message in bytes; 0 when the server did not say.
+    pub size: u32,
+}
+
+/// A message whose file has not been downloaded yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pending {
+    pub uid: u32,
+    pub size: u32,
 }
 
 /// What the archive remembers about a folder.
@@ -99,6 +108,10 @@ pub struct FolderRow {
     pub name: String,
     pub role: Role,
     pub unread: u32,
+    /// Messages on the server at the last listing; the number of cached ones before that.
+    pub total: u32,
+    /// Messages whose file is stored.
+    pub stored: u32,
 }
 
 /// Where a message lives on the server.
@@ -175,6 +188,20 @@ impl Store {
         if version < 2 {
             conn.execute_batch("DROP TABLE IF EXISTS bodies; PRAGMA user_version = 2;").map_err(db)?;
         }
+        // Version 3: the size of each message and whether its file is stored, for the background download.
+        if version < 3 {
+            conn.execute_batch(
+                "ALTER TABLE messages ADD COLUMN size INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE messages ADD COLUMN stored INTEGER NOT NULL DEFAULT 0;
+                 CREATE INDEX IF NOT EXISTS messages_pending ON messages (account, folder, stored, timestamp DESC);
+                 PRAGMA user_version = 3;",
+            )
+            .map_err(db)?;
+        }
+        // Version 4: how many messages the server said a folder holds.
+        if version < 4 {
+            conn.execute_batch("ALTER TABLE folders ADD COLUMN total INTEGER; PRAGMA user_version = 4;").map_err(db)?;
+        }
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -223,14 +250,24 @@ impl Store {
         let conn = self.conn();
         let mut stmt = conn
             .prepare(
-                "SELECT f.name, f.role, (SELECT COUNT(*) FROM messages m WHERE m.account = f.account AND m.folder = f.name AND m.unread = 1)
+                "SELECT f.name, f.role,
+                        (SELECT COUNT(*) FROM messages m WHERE m.account = f.account AND m.folder = f.name AND m.unread = 1),
+                        COALESCE(f.total, (SELECT COUNT(*) FROM messages m WHERE m.account = f.account AND m.folder = f.name)),
+                        (SELECT COUNT(*) FROM messages m WHERE m.account = f.account AND m.folder = f.name AND m.stored = 1)
                  FROM folders f WHERE f.account = ?1",
             )
             .map_err(db)?;
         let rows = stmt
-            .query_map([account], |r| Ok(FolderRow { name: r.get(0)?, role: role_from_int(r.get(1)?), unread: r.get::<_, i64>(2)? as u32 }))
+            .query_map([account], |r| {
+                Ok(FolderRow { name: r.get(0)?, role: role_from_int(r.get(1)?), unread: r.get::<_, i64>(2)? as u32, total: r.get::<_, i64>(3)? as u32, stored: r.get::<_, i64>(4)? as u32 })
+            })
             .map_err(db)?;
         rows.collect::<Result<_, _>>().map_err(db)
+    }
+
+    /// Remembers how many messages the server says a folder holds.
+    pub fn set_total(&self, account: &str, folder: &str, total: u32) -> Result<(), MailError> {
+        self.conn().execute("UPDATE folders SET total = ?3 WHERE account = ?1 AND name = ?2", params![account, folder, i64::from(total)]).map(|_| ()).map_err(db)
     }
 
     pub fn folder_state(&self, account: &str, folder: &str) -> Result<FolderState, MailError> {
@@ -273,14 +310,14 @@ impl Store {
             let mut stmt = tx
                 .prepare(
                     "INSERT OR IGNORE INTO messages
-                     (account, folder, uid, from_name, from_addr, subject, received, timestamp, unread, message_id, in_reply_to, refs)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                     (account, folder, uid, from_name, from_addr, subject, received, timestamp, unread, message_id, in_reply_to, refs, size)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 )
                 .map_err(db)?;
             for h in headers {
                 stmt.execute(params![
                     account, folder, i64::from(h.uid), h.from_name, h.from_addr, h.subject, h.received, h.timestamp, i64::from(h.unread),
-                    h.message_id, h.in_reply_to, h.references
+                    h.message_id, h.in_reply_to, h.references, i64::from(h.size)
                 ])
                 .map_err(db)?;
             }
@@ -334,6 +371,36 @@ impl Store {
             tx.execute("DELETE FROM messages WHERE account = ?1 AND folder = ?2 AND uid = ?3", params![account, folder, i64::from(*uid)]).map_err(db)?;
         }
         tx.commit().map_err(db)
+    }
+
+    /// Messages dated `since` or later whose file is not stored, newest first.
+    pub fn pending(&self, account: &str, folder: &str, since: i64, limit: usize) -> Result<Vec<Pending>, MailError> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT uid, size FROM messages WHERE account = ?1 AND folder = ?2 AND stored = 0 AND timestamp >= ?3 ORDER BY timestamp DESC, uid DESC LIMIT ?4")
+            .map_err(db)?;
+        let rows = stmt.query_map(params![account, folder, since, limit as i64], |r| Ok(Pending { uid: r.get::<_, i64>(0)? as u32, size: r.get::<_, i64>(1)? as u32 })).map_err(db)?;
+        rows.collect::<Result<_, _>>().map_err(db)
+    }
+
+    /// How many messages [`Store::pending`] would list in all.
+    pub fn count_pending(&self, account: &str, folder: &str, since: i64) -> Result<u32, MailError> {
+        let conn = self.conn();
+        conn.query_row("SELECT COUNT(*) FROM messages WHERE account = ?1 AND folder = ?2 AND stored = 0 AND timestamp >= ?3", params![account, folder, since], |r| r.get::<_, i64>(0).map(|n| n as u32)).map_err(db)
+    }
+
+    /// Records that the message's file is in the vault.
+    pub fn mark_stored(&self, account: &str, folder: &str, uid: u32) -> Result<(), MailError> {
+        self.conn()
+            .execute("UPDATE messages SET stored = 1 WHERE account = ?1 AND folder = ?2 AND uid = ?3", params![account, folder, i64::from(uid)])
+            .map(|_| ())
+            .map_err(db)
+    }
+
+    /// The date of the oldest cached message of a folder.
+    pub fn oldest_timestamp(&self, account: &str, folder: &str) -> Result<Option<i64>, MailError> {
+        let conn = self.conn();
+        conn.query_row("SELECT MIN(timestamp) FROM messages WHERE account = ?1 AND folder = ?2", params![account, folder], |r| r.get(0)).map_err(db)
     }
 
     /// The UID of the `n`-th newest cached message (1 is the newest) of a folder.
@@ -451,6 +518,18 @@ mod tests {
     }
 
     #[test]
+    fn a_folder_reports_the_servers_total_and_how_many_files_are_stored() {
+        let store = store();
+        store.add_headers("me", "INBOX", &[header(1, "a", 1, true), header(2, "b", 2, false)]).unwrap();
+        let inbox = |s: &Store| s.folders("me").unwrap().into_iter().find(|f| f.name == "INBOX").unwrap();
+        assert_eq!((inbox(&store).total, inbox(&store).stored), (2, 0), "before the server is asked: what is cached");
+        store.set_total("me", "INBOX", 1_240).unwrap();
+        store.mark_stored("me", "INBOX", 2).unwrap();
+        let row = inbox(&store);
+        assert_eq!((row.total, row.unread, row.stored), (1_240, 1, 1));
+    }
+
+    #[test]
     fn a_new_uidvalidity_empties_the_folder() {
         let store = store();
         store.add_headers("me", "INBOX", &[header(1, "a", 1, false)]).unwrap();
@@ -469,6 +548,35 @@ mod tests {
         assert!(!store.messages("me", "INBOX").unwrap()[0].unread);
         store.remove(id).unwrap();
         assert_eq!(store.locate(id).unwrap(), None);
+    }
+
+    #[test]
+    fn pending_lists_newest_first_inside_the_window_and_shrinks_as_files_are_stored() {
+        let store = store();
+        let mut old = header(1, "old", 100, false);
+        old.size = 10;
+        let mut new = header(2, "new", 900, false);
+        new.size = 20;
+        store.add_headers("me", "INBOX", &[old, new, header(3, "newer", 1000, false)]).unwrap();
+        let pending = store.pending("me", "INBOX", 500, 10).unwrap();
+        assert_eq!(pending.iter().map(|p| p.uid).collect::<Vec<_>>(), [3, 2], "the old one is outside the window");
+        assert_eq!(pending[1].size, 20);
+        assert_eq!(store.count_pending("me", "INBOX", 500).unwrap(), 2);
+        assert_eq!(store.count_pending("me", "INBOX", i64::MIN).unwrap(), 3);
+        store.mark_stored("me", "INBOX", 3).unwrap();
+        assert_eq!(store.pending("me", "INBOX", 500, 10).unwrap().iter().map(|p| p.uid).collect::<Vec<_>>(), [2]);
+        assert_eq!(store.oldest_timestamp("me", "INBOX").unwrap(), Some(100));
+        assert_eq!(store.pending("me", "INBOX", 500, 1).unwrap().len(), 1, "the limit applies");
+    }
+
+    #[test]
+    fn a_database_from_before_the_download_columns_is_upgraded() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute_batch("PRAGMA user_version = 2;").unwrap();
+        let store = Store::with(conn).unwrap();
+        store.add_headers("me", "INBOX", &[header(1, "a", 1, false)]).unwrap();
+        assert_eq!(store.count_pending("me", "INBOX", 0).unwrap(), 1);
     }
 
     #[test]

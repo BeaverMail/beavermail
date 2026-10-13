@@ -27,6 +27,10 @@ pub struct Mailbox {
     pub name: String,
     pub unread: u32,
     pub role: Role,
+    /// Messages in the folder on the server, as of the last time it was listed; 0 until then.
+    pub total: u32,
+    /// Messages of the folder whose file is stored on this computer.
+    pub stored: u32,
 }
 
 /// What the message list needs to show a row. The body is loaded separately.
@@ -103,6 +107,63 @@ pub struct Account {
     /// Keep a copy of sent messages in the Sent folder. Turn off for providers that do it themselves.
     #[serde(default = "yes")]
     pub save_sent: bool,
+    /// How much of the mailbox is downloaded for offline use.
+    #[serde(default)]
+    pub keep: Keep,
+}
+
+/// How much mail is kept on this computer. Headers and flags are always synchronised.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Keep {
+    /// Every message.
+    All,
+    /// Messages of the last 12 months.
+    Year,
+    /// Messages of the last 30 days.
+    #[default]
+    Month,
+    /// Only messages that were opened.
+    Opened,
+}
+
+impl Keep {
+    /// The oldest date (seconds since the Unix epoch) to download at `now`, or `None` for nothing.
+    pub fn since(self, now: i64) -> Option<i64> {
+        const DAY: i64 = 86_400;
+        match self {
+            Self::All => Some(i64::MIN),
+            Self::Year => Some(now - 365 * DAY),
+            Self::Month => Some(now - 30 * DAY),
+            Self::Opened => None,
+        }
+    }
+}
+
+/// Progress of the background download of one account, shared with the window that shows it.
+#[derive(Debug, Default)]
+pub struct Progress {
+    /// Messages to download, known once the folders are synchronised.
+    pub total: std::sync::atomic::AtomicU32,
+    pub done: std::sync::atomic::AtomicU32,
+    /// A download is running (set by whoever starts it).
+    pub running: std::sync::atomic::AtomicBool,
+    /// The user paused it; the worker waits.
+    pub paused: std::sync::atomic::AtomicBool,
+    /// Stop as soon as possible (the account was removed or changed).
+    pub cancel: std::sync::atomic::AtomicBool,
+    /// What it is doing now, for the status bar.
+    pub activity: std::sync::Mutex<String>,
+}
+
+impl Progress {
+    pub fn set_activity(&self, text: impl Into<String>) {
+        *self.activity.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = text.into();
+    }
+
+    pub fn activity(&self) -> String {
+        self.activity.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
 }
 
 fn yes() -> bool {

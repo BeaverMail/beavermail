@@ -319,3 +319,26 @@ pub fn body(ui: &mut Ui, t: &Tokens, blocks: &[Block]) -> Option<String> {
     }
     clicked
 }
+
+/// 1240 as "1,240".
+pub fn thousands(n: u32) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::thousands;
+
+    #[test]
+    fn thousands_separators() {
+        assert_eq!([0, 12, 999, 1_000, 1_240, 50_000, 1_234_567].map(thousands), ["0", "12", "999", "1,000", "1,240", "50,000", "1,234,567"]);
+    }
+}
