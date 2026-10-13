@@ -39,6 +39,12 @@ pub struct Compose {
     seen: u64,
     changed_at: std::time::Instant,
     saved: u64,
+    /// What the text looked like when the copy on the server was last stored (0: never), and whether
+    /// a copy is being stored right now.
+    pub server_saved: u64,
+    pub pushing: bool,
+    /// A draft of this message exists (or may exist) on the server: it was saved, pushed, or reopened.
+    touched: bool,
 }
 
 pub enum Outcome {
@@ -87,6 +93,9 @@ impl Compose {
             seen: 0,
             changed_at: std::time::Instant::now(),
             saved: 0,
+            server_saved: 0,
+            pushing: false,
+            touched: false,
         }
         .settled()
     }
@@ -121,6 +130,22 @@ impl Compose {
 
     pub fn mark_saved(&mut self) {
         self.saved = self.fingerprint();
+        self.touched = true;
+    }
+
+    /// Whether discarding this message must also look for a copy on the server.
+    pub fn may_be_on_server(&self) -> bool {
+        self.touched || self.server_saved != 0 || self.pushing
+    }
+
+    /// Whether the text, as it is now, is not yet on the server and has been still for `quiet`.
+    pub fn server_due(&self, quiet: std::time::Duration) -> bool {
+        !self.pushing && !self.is_empty() && self.fingerprint() != self.server_saved && self.changed_at.elapsed() >= quiet
+    }
+
+    /// The same number [`Compose::autosave_due`] uses, to remember what was stored.
+    pub fn snapshot(&self) -> u64 {
+        self.fingerprint()
     }
 
     /// The text has changed since the last save.
@@ -164,6 +189,7 @@ impl Compose {
             next_file: 1000, // above any slot number the draft used before
             focus_to: false,
             focus_body: true,
+            touched: true,
             ..Self::new(from)
         }
         .settled()
@@ -494,7 +520,12 @@ pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &
                     if ui.add_enabled(!compose.sending, egui::Button::image_and_text(Icon::X.image(crate::icons::SIZE, t.text_dim), "Close")).on_hover_text("Close and keep it as a draft").clicked() {
                         outcome = Outcome::Close;
                     }
-                    ui.label(RichText::new("Saved as a draft while you write").size(12.5).color(t.text_dim));
+                    // Only when there is room: squeezed in, it would be drawn over the buttons.
+                    let hint = RichText::new("Saved as a draft while you write").size(12.5).color(t.text_dim);
+                    let width = ui.painter().layout_no_wrap("Saved as a draft while you write".to_owned(), egui::FontId::proportional(12.5), t.text_dim).size().x;
+                    if ui.available_width() > width + 24.0 {
+                        ui.label(hint);
+                    }
                 });
             });
         });
@@ -530,6 +561,7 @@ mod tests {
             received: "2026-10-13 12:00".into(),
             timestamp: 0,
             has_attachments: false,
+            message_id: String::new(),
             unread: false,
         };
         let body = MessageBody {
@@ -626,6 +658,16 @@ mod tests {
         c.subject = "Lunch at noon".into();
         assert!(!c.autosave_due(quiet), "changed again");
         assert!(c.unsaved());
+    }
+
+    #[test]
+    fn only_a_message_that_was_saved_or_reopened_can_have_a_copy_on_the_server() {
+        let mut fresh = Compose::new(0);
+        assert!(!fresh.may_be_on_server(), "nothing was ever saved");
+        fresh.subject = "x".into();
+        fresh.mark_saved();
+        assert!(fresh.may_be_on_server());
+        assert!(Compose::from_draft(0, Compose::new(0).to_draft(1)).may_be_on_server(), "a reopened draft may have a copy");
     }
 
     #[test]

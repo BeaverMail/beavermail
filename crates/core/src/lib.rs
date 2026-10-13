@@ -56,6 +56,11 @@ pub trait MailSource {
     /// [`SyncReport::remaining`] is not zero.
     fn sync(&self, mailbox: &str) -> impl Future<Output = Result<SyncReport, MailError>> + Send;
 
+    /// Watches `mailbox` and calls `changed` whenever the server reports something there (new mail,
+    /// deletions, flag changes), using IDLE where the server has it and polling where not. Returns
+    /// `Ok` once `stop` is set; an error means the connection is lost and the caller should retry.
+    fn watch(&self, mailbox: &str, changed: &(dyn Fn() + Send + Sync), stop: &std::sync::atomic::AtomicBool) -> impl Future<Output = Result<(), MailError>> + Send;
+
     /// Downloads the messages `keep` asks for, newest first, folder by folder, after synchronising
     /// the folders far enough back. Reports through `progress`, waits while it is paused and returns
     /// early when it is cancelled.
@@ -67,6 +72,13 @@ pub trait MailSource {
 
     /// The name and bytes of one attachment of a message (see [`Attachment::index`]).
     fn attachment(&self, id: MessageId, index: u32) -> impl Future<Output = Result<(String, Vec<u8>), MailError>> + Send;
+
+    /// Keeps `raw` (RFC 5322 bytes carrying the header `X-BeaverMail-Draft: <id>`) in the Drafts folder,
+    /// replacing any earlier copy of the draft `id`.
+    fn save_draft(&self, id: &str, raw: Vec<u8>) -> impl Future<Output = Result<(), MailError>> + Send;
+
+    /// Removes every copy of the draft `id` from the Drafts folder.
+    fn delete_draft(&self, id: &str) -> impl Future<Output = Result<(), MailError>> + Send;
 
     /// Stores a copy of a sent message (RFC 5322 bytes) in the Sent folder, marked as read.
     fn save_sent(&self, raw: Vec<u8>) -> impl Future<Output = Result<(), MailError>> + Send;

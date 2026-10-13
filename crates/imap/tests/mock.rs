@@ -15,6 +15,8 @@ use tokio::net::{TcpListener, TcpStream};
 const HEADER: &str = "From: Ada <ada@example.com>\r\nSubject: Hello\r\nDate: Mon, 1 Jan 2024 10:00:00 +0000\r\n\r\n";
 
 /// The one message the server holds, complete.
+const DRAFT: &[u8] = b"From: me@example.com\r\nX-BeaverMail-Draft: d1\r\nSubject: wip\r\n\r\ntext\r\n";
+
 const MESSAGE: &str = "From: Ada <ada@example.com>\r\nTo: Me <me@example.com>, grace@example.com\r\nCc: Linus <linus@example.com>\r\nReply-To: lists@example.com\r\nSubject: Hello\r\nMessage-ID: <m2@example.com>\r\nReferences: <m0@example.com> <m1@example.com>\r\nDate: Mon, 1 Jan 2024 10:00:00 +0000\r\n\r\nHi there.\r\n";
 
 const PLAIN_STRUCTURE: &str = "BODYSTRUCTURE (\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 9 1 NIL NIL NIL) ";
@@ -46,15 +48,24 @@ async fn start(move_works: bool) -> Mock {
     start_with(move_works, false).await
 }
 
+/// A server that does not offer IDLE, so changes can only be found by asking.
+async fn start_without_idle() -> Mock {
+    start_opts(true, false, false).await
+}
+
 /// `attachment`: the server describes its message as having a PDF attached.
 async fn start_with(move_works: bool, attachment: bool) -> Mock {
+    start_opts(move_works, attachment, true).await
+}
+
+async fn start_opts(move_works: bool, attachment: bool, idle: bool) -> Mock {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let log = Arc::new(Mutex::new(Vec::new()));
     let served = log.clone();
     tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
-            tokio::spawn(serve(socket, served.clone(), move_works, attachment));
+            tokio::spawn(serve(socket, served.clone(), move_works, attachment, idle));
         }
     });
     let server = Server { host: "127.0.0.1".into(), port, tls: Tls::None };
@@ -64,7 +75,7 @@ async fn start_with(move_works: bool, attachment: bool) -> Mock {
     Mock { source: ImapSource::new(&account, "p".into(), store.clone(), files.clone()), account, store, files, log }
 }
 
-async fn serve(socket: TcpStream, log: Arc<Mutex<Vec<String>>>, move_works: bool, attachment: bool) {
+async fn serve(socket: TcpStream, log: Arc<Mutex<Vec<String>>>, move_works: bool, attachment: bool, idle: bool) {
     let (read, mut write) = socket.into_split();
     let mut read = BufReader::new(read);
     let _ = write.write_all(b"* OK ready\r\n").await;
@@ -78,9 +89,35 @@ async fn serve(socket: TcpStream, log: Arc<Mutex<Vec<String>>>, move_works: bool
         let Some((tag, command)) = line.split_once(' ') else { continue };
         log.lock().unwrap().push(command.to_owned());
         let verb = command.to_ascii_uppercase();
-        let reply = if verb.starts_with("LIST") {
+        let reply = if verb.starts_with("CAPABILITY") {
+            let extra = if idle { " IDLE" } else { "" };
+            format!("* CAPABILITY IMAP4rev1{extra}\r\n{tag} OK done\r\n")
+        } else if verb.starts_with("IDLE") {
+            // Say something changed after a moment, then wait for the client to end IDLE.
+            if write.write_all(b"+ idling\r\n").await.is_err() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            if write.write_all(b"* 2 EXISTS\r\n").await.is_err() {
+                return;
+            }
+            let mut ended = String::new();
+            loop {
+                ended.clear();
+                if !matches!(read.read_line(&mut ended).await, Ok(n) if n > 0) {
+                    return;
+                }
+                if ended.trim().eq_ignore_ascii_case("DONE") {
+                    log.lock().unwrap().push("DONE".to_owned());
+                    break;
+                }
+            }
+            format!("{tag} OK IDLE terminated\r\n")
+        } else if verb.starts_with("NOOP") {
+            format!("{tag} OK done\r\n")
+        } else if verb.starts_with("LIST") {
             format!(
-                "* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n* LIST (\\Archive) \"/\" \"Archive\"\r\n* LIST (\\Sent) \"/\" \"Sent\"\r\n* LIST (\\Trash) \"/\" \"Trash\"\r\n{tag} OK done\r\n"
+                "* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n* LIST (\\Archive) \"/\" \"Archive\"\r\n* LIST (\\Sent) \"/\" \"Sent\"\r\n* LIST (\\Drafts) \"/\" \"Drafts\"\r\n* LIST (\\Trash) \"/\" \"Trash\"\r\n{tag} OK done\r\n"
             )
         } else if verb.starts_with("STATUS") {
             let name = command.split(' ').nth(1).unwrap_or("\"INBOX\"");
@@ -119,6 +156,9 @@ async fn serve(socket: TcpStream, log: Arc<Mutex<Vec<String>>>, move_works: bool
             format!("{tag} OK [APPENDUID 1 1] done\r\n")
         } else if verb.starts_with("UID MOVE") && !move_works {
             format!("{tag} NO [CANNOT] MOVE is not supported\r\n")
+        } else if verb.starts_with("UID SEARCH") {
+            // Two copies of the same draft: the older (5) and the one just appended (9).
+            format!("* SEARCH 5 9\r\n{tag} OK done\r\n")
         } else if verb.starts_with("UID EXPUNGE") {
             format!("* 1 EXPUNGE\r\n{tag} OK done\r\n")
         } else {
@@ -249,7 +289,7 @@ async fn the_archive_works_without_the_server() {
     let mut account = mock.account.clone();
     account.imap.port = 1;
     let offline = ImapSource::new(&account, "p".into(), mock.store.clone(), mock.files.clone());
-    assert_eq!(offline.cached_mailboxes().await.unwrap().len(), 4);
+    assert_eq!(offline.cached_mailboxes().await.unwrap().len(), 5);
     assert_eq!(offline.messages("INBOX").await.unwrap().len(), 1);
     assert_eq!(offline.body(id).await.unwrap(), body, "an opened message is readable offline");
     assert!(offline.sync("INBOX").await.is_err());
@@ -326,8 +366,8 @@ async fn the_background_download_stores_what_the_window_asks_for_and_reports_pro
     // "Everything" does, and counts.
     let progress = Progress::default();
     mock.source.download(Keep::All, &progress).await.unwrap();
-    // The scripted server answers every folder with the same message: INBOX, Archive and Sent; Trash is skipped.
-    assert_eq!((progress.done.load(Relaxed), progress.total.load(Relaxed)), (3, 3));
+    // The scripted server answers every folder with the same message: INBOX, Archive, Sent and Drafts; Trash is skipped.
+    assert_eq!((progress.done.load(Relaxed), progress.total.load(Relaxed)), (4, 4));
     assert!(mock.files.read(&path).unwrap().is_some());
     // Run again: nothing is left to fetch.
     let fetches = mock.commands().iter().filter(|c| c.contains("BODY.PEEK[]")).count();
@@ -381,4 +421,79 @@ async fn opening_a_message_settles_its_attachment_flag_from_the_message_itself()
     assert!(!mock.source.messages("INBOX").await.unwrap()[0].has_attachments);
     mock.source.body(id).await.unwrap();
     assert!(!mock.source.messages("INBOX").await.unwrap()[0].has_attachments, "the mock's message has none");
+}
+
+#[tokio::test]
+async fn saving_a_draft_stores_it_flagged_and_replaces_the_older_copy() {
+    let mock = start(true).await;
+    mock.source.mailboxes().await.unwrap();
+    mock.source.save_draft("d1", DRAFT.to_vec()).await.unwrap();
+    let commands = mock.commands();
+    let position = |needle: &str| commands.iter().position(|c| c.contains(needle)).unwrap_or_else(|| panic!("no {needle:?} in {commands:?}"));
+    assert!(commands[position("APPEND")].starts_with("APPEND \"Drafts\" (\\Draft \\Seen)"), "{commands:?}");
+    assert!(position("APPEND") < position("UID SEARCH"), "search for the copies after storing the new one");
+    assert!(commands.iter().any(|c| c == "UID SEARCH HEADER X-BeaverMail-Draft d1"), "{commands:?}");
+    assert!(commands.iter().any(|c| c.starts_with("UID STORE 5 +FLAGS.SILENT (\\Deleted)")), "the older copy goes: {commands:?}");
+    assert!(commands.iter().any(|c| c == "UID EXPUNGE 5"), "{commands:?}");
+    assert!(!commands.iter().any(|c| c.contains("UID STORE 9") || c.contains("EXPUNGE 9")), "the new copy stays: {commands:?}");
+}
+
+#[tokio::test]
+async fn deleting_a_draft_removes_every_copy() {
+    let mock = start(true).await;
+    mock.source.mailboxes().await.unwrap();
+    mock.source.delete_draft("d1").await.unwrap();
+    let commands = mock.commands();
+    assert!(commands.iter().any(|c| c.starts_with("UID STORE 5,9 +FLAGS.SILENT (\\Deleted)")) || commands.iter().any(|c| c.starts_with("UID STORE 9,5")), "{commands:?}");
+    assert!(commands.iter().any(|c| c == "UID EXPUNGE 5,9" || c == "UID EXPUNGE 9,5"), "{commands:?}");
+}
+
+#[tokio::test]
+async fn an_account_without_a_drafts_folder_says_so_instead_of_guessing() {
+    let mock = start(true).await;
+    // Nothing listed yet and the scripted server's list has one, so make the archive forget it.
+    mock.store.set_folders(&mock.account.key(), &[("INBOX".into(), Role::Inbox)]).unwrap();
+    let error = mock.source.save_draft("d1", DRAFT.to_vec()).await.unwrap_err();
+    assert!(error.to_string().contains("Drafts"), "{error}");
+}
+
+#[tokio::test]
+async fn idle_reports_what_the_server_says_and_stops_when_asked() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+    let mock = start(true).await;
+    let (stop, changes) = (AtomicBool::new(false), AtomicUsize::new(0));
+    let changed = || {
+        changes.fetch_add(1, Relaxed);
+        stop.store(true, Relaxed); // one report is enough for the test
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), mock.source.watch("INBOX", &changed, &stop)).await.expect("the watcher stops").unwrap();
+    assert_eq!(changes.load(Relaxed), 1);
+    let commands = mock.commands();
+    assert!(commands.iter().any(|c| c == "IDLE"), "{commands:?}");
+    assert!(commands.iter().any(|c| c.starts_with("EXAMINE")), "the folder is only watched, never changed: {commands:?}");
+    assert!(commands.iter().any(|c| c == "DONE"), "IDLE is ended properly: {commands:?}");
+}
+
+#[tokio::test]
+async fn a_watcher_told_to_stop_before_it_starts_returns_at_once() {
+    let mock = start(true).await;
+    let stop = std::sync::atomic::AtomicBool::new(true);
+    tokio::time::timeout(std::time::Duration::from_secs(5), mock.source.watch("INBOX", &|| panic!("nothing changed"), &stop)).await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn without_idle_the_server_is_polled() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+    let mock = start_without_idle().await;
+    let source = ImapSource::new(&mock.account, "p".into(), mock.store.clone(), mock.files.clone()).with_poll_interval(std::time::Duration::from_millis(300));
+    let (stop, changes) = (AtomicBool::new(false), AtomicUsize::new(0));
+    let changed = || {
+        changes.fetch_add(1, Relaxed);
+        stop.store(true, Relaxed);
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), source.watch("INBOX", &changed, &stop)).await.expect("the watcher stops").unwrap();
+    assert_eq!(changes.load(Relaxed), 1);
+    let commands = mock.commands();
+    assert!(!commands.iter().any(|c| c == "IDLE"), "{commands:?}");
+    assert!(commands.iter().any(|c| c == "NOOP"), "{commands:?}");
 }

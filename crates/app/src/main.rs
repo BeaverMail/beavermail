@@ -19,7 +19,7 @@ mod views;
 use beavermail_accounts as store;
 use beavermail_core::{Account, DisplayMode, Keep, MailError, MailSender, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Progress, Role, Server, Settings, SyncReport, Tls};
 use beavermail_imap::ImapSource;
-use beavermail_smtp::SmtpSender;
+use beavermail_smtp::{SmtpSender, render_draft};
 use beavermail_store::Store;
 use beavermail_vault::{Mode, SystemStore, Vault};
 use eframe::egui::{self, Align, Layout, RichText, pos2, vec2};
@@ -34,6 +34,8 @@ enum Event {
     Mailboxes(u64, Result<Vec<Mailbox>, MailError>, bool),
     /// The background download of an account ended.
     Downloaded(u64, Result<(), MailError>),
+    /// The server says something changed in the Inbox of an account.
+    Changed(u64),
     /// One sync of the selected folder finished; more history may remain.
     Synced(u64, usize, Result<SyncReport, MailError>),
     Messages(u64, usize, Result<Vec<MessageSummary>, MailError>),
@@ -51,6 +53,8 @@ enum Event {
     Saved(Result<Option<String>, String>),
     /// Files chosen in the "attach" dialog.
     Picked(Vec<std::path::PathBuf>),
+    /// The copy of a draft on the server was stored (or not): (account serial, draft id, what the text was, result).
+    DraftPushed(u64, String, u64, Result<(), MailError>),
     /// A copy of an attachment was made in the vault for a draft: (draft id, where in the vault, result).
     FileStored(String, std::path::PathBuf, Result<(), String>),
 }
@@ -129,6 +133,9 @@ struct AccountView {
     error: Option<String>,
     /// The background download, shared with the status bar.
     progress: Arc<Progress>,
+    /// Set to stop the Inbox watcher; `watching` says whether one is running.
+    watch_stop: Arc<std::sync::atomic::AtomicBool>,
+    watching: bool,
 }
 
 /// The "Add account" form. Ports are text until submitted.
@@ -286,6 +293,8 @@ struct BeaverApp {
     compose: Option<compose::Compose>,
     /// Drafts on this computer for the account being shown (filled while a Drafts folder is open).
     drafts: Vec<drafts::DraftData>,
+    /// Why the last attempt to keep a draft on the server failed; shown in the status bar until one works.
+    draft_error: Option<String>,
     /// A compose window with text in it is being closed; waiting for the user to confirm.
     confirm_discard: bool,
     /// Short confirmation ("Message sent") and when it was shown.
@@ -349,6 +358,7 @@ impl BeaverApp {
             focus_search: false,
             compose: None,
             drafts: Vec::new(),
+            draft_error: None,
             confirm_discard: false,
             notice: None,
             settings: Settings::default(),
@@ -412,7 +422,7 @@ impl BeaverApp {
         }
         let progress = Arc::new(Progress::default());
         progress.paused.store(self.downloads_paused, std::sync::atomic::Ordering::Relaxed);
-        let view = AccountView { serial, account, source, sender, mailboxes: Vec::new(), error, progress };
+        let view = AccountView { serial, account, source, sender, mailboxes: Vec::new(), error, progress, watch_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)), watching: false };
         match position {
             Some(at) => self.accounts.insert(at.min(self.accounts.len()), view),
             None => self.accounts.push(view),
@@ -437,6 +447,32 @@ impl BeaverApp {
         let folder = name.clone();
         self.spawn(async move { Event::Messages(serial, index, local.messages(&folder).await) });
         self.start_sync(serial, index, source, name);
+    }
+
+    /// Starts watching an account's Inbox (IDLE, or polling) so new mail shows up by itself.
+    fn start_watch(&mut self, serial: u64) {
+        let Some(view) = self.accounts.iter_mut().find(|v| v.serial == serial) else { return };
+        let (Some(source), Some(inbox)) = (view.source.clone(), view.mailboxes.iter().find(|m| m.role == Role::Inbox).map(|m| m.name.clone())) else { return };
+        if std::mem::replace(&mut view.watching, true) {
+            return;
+        }
+        let (stop, tx, ctx) = (view.watch_stop.clone(), self.tx.clone(), self.ctx.clone());
+        self.runtime.spawn(async move {
+            use std::sync::atomic::Ordering::Relaxed;
+            let mut wait = std::time::Duration::from_secs(15);
+            let notify = || {
+                let _ = tx.send(Event::Changed(serial));
+                ctx.request_repaint();
+            };
+            while !stop.load(Relaxed) {
+                if source.watch(&inbox, &notify, &stop).await.is_ok() {
+                    break; // asked to stop
+                }
+                // The connection was lost (or never worked): try again, less and less often.
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(std::time::Duration::from_secs(300));
+            }
+        });
     }
 
     /// Starts the background download for an account unless one is running.
@@ -553,7 +589,13 @@ impl BeaverApp {
     fn visible(&self) -> Vec<&MessageSummary> {
         let query = self.query.trim().to_lowercase();
         let matches = |m: &MessageSummary| m.from.to_lowercase().contains(&query) || m.subject.to_lowercase().contains(&query);
-        self.messages.iter().filter(|m| query.is_empty() || matches(m)).collect()
+        // In the Drafts folder, the copy of a draft that is also kept here is shown once, from here.
+        let ours: Vec<String> = if self.role() == Role::Drafts {
+            self.drafts.iter().map(|d| d.id.clone()).chain(self.compose.iter().map(|c| c.id.clone())).map(|id| beavermail_smtp::draft_message_id(&id)).collect()
+        } else {
+            Vec::new()
+        };
+        self.messages.iter().filter(|m| !ours.contains(&m.message_id)).filter(|m| query.is_empty() || matches(m)).collect()
     }
 
     /// Asks the server again for the selected folder and its account's folder list.
@@ -622,6 +664,9 @@ impl BeaverApp {
             compose::Outcome::Keep => {}
             compose::Outcome::Close => {
                 self.save_draft(&mut compose);
+                if !compose.is_empty() && compose.snapshot() != compose.server_saved {
+                    self.push_draft(&mut compose);
+                }
                 return;
             }
             compose::Outcome::Discard if compose.is_empty() => {
@@ -668,6 +713,12 @@ impl BeaverApp {
                 self.save_draft(&mut compose);
             } else if compose.unsaved() {
                 ctx.request_repaint_after(std::time::Duration::from_millis(600));
+            }
+            // A copy on the server after a longer pause: it is uploaded whole, attachments included.
+            if compose.server_due(std::time::Duration::from_secs(15)) && !compose.unsaved() {
+                self.push_draft(&mut compose);
+            } else if !compose.is_empty() && compose.snapshot() != compose.server_saved {
+                ctx.request_repaint_after(std::time::Duration::from_secs(2));
             }
         }
         if self.confirm_discard {
@@ -1023,7 +1074,42 @@ impl BeaverApp {
         if let Err(e) = drafts::delete(&self.vault, &compose.key, &compose.id) {
             self.error = Some(format!("Could not delete the draft: {e}"));
         }
+        // A copy was put on the server: take it away too.
+        if compose.may_be_on_server() {
+            let source = self.view(compose.from).and_then(|v| v.source.clone());
+            if let Some(source) = source {
+                let id = compose.id.clone();
+                let serial = compose.from;
+                self.spawn(async move { Event::DraftPushed(serial, id.clone(), 0, source.delete_draft(&id).await) });
+            }
+        }
         self.refresh_drafts();
+    }
+
+    /// Stores a copy of the draft in the account's Drafts folder, so other devices see it. The files are
+    /// read from the vault and the message is built off the window's thread.
+    fn push_draft(&mut self, compose: &mut compose::Compose) {
+        let Some(view) = self.view(compose.from) else { return };
+        let Some(source) = view.source.clone() else { return };
+        let message = compose.outgoing(view.account.address());
+        let (files, vault, id, snapshot, serial) = (compose.file_list(), self.vault.clone(), compose.id.clone(), compose.snapshot(), compose.from);
+        compose.pushing = true;
+        self.spawn(async move {
+            let built = tokio::task::spawn_blocking({
+                let (id, mut message) = (id.clone(), message);
+                move || -> Result<Vec<u8>, String> {
+                    message.attachments = attachments::read_files(&vault, &files)?;
+                    render_draft(&message, &id).map_err(|e| e.to_string())
+                }
+            })
+            .await;
+            let result = match built {
+                Ok(Ok(raw)) => source.save_draft(&id, raw).await,
+                Ok(Err(e)) => Err(MailError::Backend(e)),
+                Err(e) => Err(MailError::Backend(e.to_string())),
+            };
+            Event::DraftPushed(serial, id, snapshot, result)
+        });
     }
 
     /// Reads the drafts of the account whose Drafts folder is open.
@@ -1112,6 +1198,7 @@ impl BeaverApp {
         };
         let old = self.accounts.remove(at);
         old.progress.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        old.watch_stop.store(true, std::sync::atomic::Ordering::Relaxed);
         if key_changed {
             let _ = store::forget_password(&old.account);
             self.forget_archive(&old.account); // its UIDs mean nothing on another server
@@ -1144,6 +1231,7 @@ impl BeaverApp {
         let Some(position) = self.accounts.iter().position(|v| v.serial == serial) else { return };
         let view = self.accounts.remove(position);
         view.progress.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        view.watch_stop.store(true, std::sync::atomic::Ordering::Relaxed);
         self.forget_archive(&view.account);
         let all: Vec<Account> = self.accounts.iter().map(|v| v.account.clone()).collect();
         if let Err(e) = store::save(&all).and_then(|()| store::forget_password(&view.account)) {
@@ -1174,9 +1262,15 @@ impl BeaverApp {
                     return;
                 }
                 let mut download = false;
+                let unread_before = view.mailboxes.iter().find(|m| m.role == Role::Inbox).map(|m| m.unread);
                 match result {
                     Ok(mut mailboxes) => {
                         download = fresh;
+                        // New mail since the last time the server was asked (not the first answer).
+                        let unread_now = mailboxes.iter().find(|m| m.role == Role::Inbox).map(|m| m.unread);
+                        if fresh && let (Some(before), Some(now)) = (unread_before, unread_now) && now > before && !view.mailboxes.is_empty() {
+                            self.notice = Some((format!("{} new message{}", now - before, if now - before == 1 { "" } else { "s" }), std::time::Instant::now()));
+                        }
                         // Same order for the archive's list and the server's, so a position means the same folder.
                         mailboxes.sort_by_key(|m| (views::folder_rank(m.role), m.name.clone()));
                         view.mailboxes = mailboxes;
@@ -1193,6 +1287,18 @@ impl BeaverApp {
                 }
                 if download {
                     self.start_download(serial);
+                    self.start_watch(serial);
+                }
+            }
+            Event::Changed(serial) => {
+                // Bring the Inbox up to date and refresh the counts; the list reloads if the Inbox is open.
+                if let Some(view) = self.view(serial)
+                    && let Some(source) = view.source.clone()
+                    && let Some((index, name)) = view.mailboxes.iter().enumerate().find(|(_, m)| m.role == Role::Inbox).map(|(i, m)| (i, m.name.clone()))
+                {
+                    let folders = source.clone();
+                    self.spawn(async move { Event::Mailboxes(serial, folders.mailboxes().await, true) });
+                    self.start_sync(serial, index, source, name);
                 }
             }
             Event::Downloaded(serial, result) => {
@@ -1262,6 +1368,38 @@ impl BeaverApp {
                 },
                 Err(e) => self.error = Some(format!("Could not get the attachment: {e}")),
             },
+            Event::DraftPushed(serial, id, snapshot, result) => {
+                if let Some(compose) = self.compose.as_mut().filter(|c| c.id == id) {
+                    compose.pushing = false;
+                    if result.is_ok() && snapshot != 0 {
+                        compose.server_saved = snapshot;
+                    }
+                }
+                // A copy that was being stored while the draft was discarded would live on, hidden from nobody.
+                if result.is_ok() && snapshot != 0 && self.compose.as_ref().is_none_or(|c| c.id != id) {
+                    let key = self.view(serial).map(|v| v.account.key());
+                    let source = self.view(serial).and_then(|v| v.source.clone());
+                    if let (Some(key), Some(source)) = (key, source)
+                        && !drafts::exists(&self.vault, &key, &id)
+                    {
+                        let gone = id.clone();
+                        self.spawn(async move { Event::DraftPushed(serial, gone.clone(), 0, source.delete_draft(&gone).await) });
+                    }
+                }
+                match result {
+                    Ok(()) => {
+                        self.draft_error = None;
+                        // The account's Drafts folder changed: bring that into the list.
+                        if let Some(view) = self.view(serial)
+                            && let Some(source) = view.source.clone()
+                            && let Some((index, name)) = view.mailboxes.iter().enumerate().find(|(_, m)| m.role == Role::Drafts).map(|(i, m)| (i, m.name.clone()))
+                        {
+                            self.start_sync(serial, index, source, name);
+                        }
+                    }
+                    Err(e) => self.draft_error = Some(e.to_string()),
+                }
+            }
             Event::Picked(paths) => self.attach_files(paths),
             Event::FileStored(draft, slot, result) => {
                 if let Some(compose) = self.compose.as_mut().filter(|c| c.id == draft) {
@@ -1457,6 +1595,8 @@ impl BeaverApp {
                 } else if running || self.syncing > 0 {
                     ui.add(egui::Spinner::new().size(12.0));
                     ui.label(dim(if activity.is_empty() { "Syncing…".to_owned() } else { format!("{activity}…") }));
+                } else if let Some(why) = &self.draft_error {
+                    ui.label(RichText::new(format!("Draft not saved on the server: {why}")).size(13.0).color(t.danger));
                 } else {
                     ui.label(dim("Up to date".to_owned()));
                 }
@@ -1656,6 +1796,11 @@ impl BeaverApp {
         {
             if let Err(e) = drafts::delete(&self.vault, &key, &id) {
                 self.error = Some(format!("Could not delete the draft: {e}"));
+            }
+            // Its copy in the server's Drafts folder goes too.
+            if let Some(source) = self.view(serial).and_then(|v| v.source.clone()) {
+                let gone = id.clone();
+                self.spawn(async move { Event::DraftPushed(serial, gone.clone(), 0, source.delete_draft(&gone).await) });
             }
             self.refresh_drafts();
         }

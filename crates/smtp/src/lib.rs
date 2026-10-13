@@ -3,7 +3,7 @@
 //! SMTP backend: implements [`MailSender`] over one account's outgoing server.
 
 use beavermail_core::{Account, MailError, MailSender, Outgoing, Server, Tls};
-use lettre::message::header::ContentType;
+use lettre::message::header::{ContentType, Header, HeaderName, HeaderValue};
 use lettre::message::{Attachment, Mailbox, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
@@ -71,6 +71,87 @@ fn build(message: &Outgoing) -> Result<Message, MailError> {
     builder.multipart(parts).map_err(backend)
 }
 
+/// Marks the copy of a draft kept on the server, so that a later save can find and replace it.
+#[derive(Clone)]
+struct DraftId(String);
+
+impl Header for DraftId {
+    fn name() -> HeaderName {
+        HeaderName::new_from_ascii("X-BeaverMail-Draft".to_owned()).expect("a valid header name")
+    }
+
+    fn parse(s: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Self(s.trim().to_owned()))
+    }
+
+    fn display(&self) -> HeaderValue {
+        HeaderValue::new(Self::name(), self.0.clone())
+    }
+}
+
+/// The Message-ID every saved copy of draft `id` carries.
+pub fn draft_message_id(id: &str) -> String {
+    format!("{id}@beavermail.draft")
+}
+
+/// The message as it is kept in the server's Drafts folder: the same as one to be sent, but a draft
+/// may be unfinished, so addresses that do not parse are left out and no recipient is needed.
+pub fn render_draft(message: &Outgoing, id: &str) -> Result<Vec<u8>, MailError> {
+    let mut builder = Message::builder().from(address(&message.from)?).subject(message.subject.clone()).header(DraftId(id.to_owned()));
+    let recipients: Vec<Mailbox> = message.to.iter().filter_map(|a| a.trim().parse::<Mailbox>().ok()).collect();
+    // The message builder wants a recipient; a draft without one gets a stand-in that is removed again below.
+    let none_yet = recipients.is_empty() && message.cc.iter().all(|a| a.trim().parse::<Mailbox>().is_err());
+    for to in recipients {
+        builder = builder.to(to);
+    }
+    if none_yet {
+        builder = builder.to("draft@beavermail.invalid".parse::<Mailbox>().map_err(backend)?);
+    }
+    for cc in message.cc.iter().filter_map(|a| a.trim().parse::<Mailbox>().ok()) {
+        builder = builder.cc(cc);
+    }
+    if let Some(reply) = &message.in_reply_to {
+        builder = builder.in_reply_to(bracketed(reply));
+    }
+    if !message.references.is_empty() {
+        let refs: Vec<String> = message.references.iter().map(|r| bracketed(r)).collect();
+        builder = builder.references(refs.join(" "));
+    }
+    let builder = builder.date_now().message_id(Some(bracketed(&draft_message_id(id))));
+    let email = if message.attachments.is_empty() {
+        builder.body(message.body.clone())
+    } else {
+        let mut parts = MultiPart::mixed().singlepart(SinglePart::plain(message.body.clone()));
+        for file in &message.attachments {
+            let kind = ContentType::parse(&file.mime).unwrap_or_else(|_| ContentType::parse("application/octet-stream").expect("a valid type"));
+            parts = parts.singlepart(Attachment::new(file.name.clone()).body(file.data.clone(), kind));
+        }
+        builder.multipart(parts)
+    };
+    let raw = email.map(|m| m.formatted()).map_err(backend)?;
+    Ok(if none_yet { without_header(&raw, "To") } else { raw })
+}
+
+/// The message without the header `name` (and its continuation lines); the body is untouched.
+fn without_header(raw: &[u8], name: &str) -> Vec<u8> {
+    let end = raw.windows(4).position(|w| w == b"\r\n\r\n").map_or(raw.len(), |p| p + 2);
+    let (head, rest) = raw.split_at(end);
+    let prefix = format!("{}:", name.to_ascii_lowercase());
+    let mut out = Vec::with_capacity(raw.len());
+    let mut skipping = false;
+    for line in head.split_inclusive(|b| *b == b'\n') {
+        let continued = line.first().is_some_and(|b| *b == b' ' || *b == b'\t');
+        if !continued {
+            skipping = String::from_utf8_lossy(line).to_ascii_lowercase().starts_with(&prefix);
+        }
+        if !skipping {
+            out.extend_from_slice(line);
+        }
+    }
+    out.extend_from_slice(rest);
+    out
+}
+
 /// A Message-ID as it appears in a header: inside angle brackets.
 fn bracketed(id: &str) -> String {
     let id = id.trim().trim_start_matches('<').trim_end_matches('>');
@@ -106,6 +187,25 @@ mod tests {
     #[test]
     fn a_valid_message_builds() {
         assert!(build(&outgoing()).is_ok());
+    }
+
+    #[test]
+    fn a_draft_renders_even_when_unfinished_and_carries_its_marker_and_id() {
+        let mut draft = outgoing();
+        draft.to = vec!["Ada <ada@example.com>".into(), "half typed".into()];
+        draft.subject = String::new();
+        let text = String::from_utf8(render_draft(&draft, "abc-1").unwrap()).unwrap();
+        assert!(text.contains("X-BeaverMail-Draft: abc-1"), "{text}");
+        assert!(text.contains("Message-ID: <abc-1@beavermail.draft>"), "{text}");
+        assert!(text.contains("ada@example.com") && !text.contains("half typed"), "only addresses that parse are kept: {text}");
+        draft.to.clear();
+        let bare = String::from_utf8(render_draft(&draft, "abc-2").unwrap()).unwrap();
+        assert!(!bare.contains("To:") && !bare.contains("invalid") && bare.contains("Hello"), "no recipient is fine for a draft: {bare}");
+        draft.from = "not an address".into();
+        assert!(render_draft(&draft, "abc-3").is_err(), "the sender must be valid");
+        draft.from = "me@example.com".into();
+        draft.attachments = vec![beavermail_core::OutgoingFile { name: "a.txt".into(), mime: "text/plain".into(), data: b"x".to_vec() }];
+        assert!(String::from_utf8(render_draft(&draft, "abc-4").unwrap()).unwrap().contains("multipart/mixed"));
     }
 
     #[test]

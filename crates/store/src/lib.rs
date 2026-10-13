@@ -164,10 +164,11 @@ fn summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageSummary> {
         timestamp: row.get(6)?,
         unread: row.get::<_, i64>(7)? != 0,
         has_attachments: row.get::<_, i64>(8)? != 0,
+        message_id: row.get(9)?,
     })
 }
 
-const SUMMARY_COLUMNS: &str = "id, CASE WHEN from_name = '' THEN from_addr ELSE from_name END, from_addr, subject, preview, received, timestamp, unread, attach";
+const SUMMARY_COLUMNS: &str = "id, CASE WHEN from_name = '' THEN from_addr ELSE from_name END, from_addr, subject, preview, received, timestamp, unread, attach, message_id";
 
 impl Store {
     /// Opens (and creates) the archive at `path`.

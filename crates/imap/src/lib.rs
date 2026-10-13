@@ -48,6 +48,8 @@ enum Op {
 
 pub struct ImapSource {
     config: Config,
+    /// How often a server without IDLE is asked whether anything changed.
+    poll_interval: std::time::Duration,
     /// Identity of the account in the archive.
     account: String,
     store: Arc<Store>,
@@ -67,7 +69,14 @@ impl ImapSource {
     /// Creates the source over the shared archive; the connection is opened on first use.
     pub fn new(account: &Account, password: String, store: Arc<Store>, files: Arc<Vault>) -> Self {
         let config = Config { server: account.imap.clone(), user: account.user.clone(), password };
-        Self { config, account: account.key(), store, files, state: Mutex::new(State::default()) }
+        Self { config, poll_interval: std::time::Duration::from_secs(180), account: account.key(), store, files, state: Mutex::new(State::default()) }
+    }
+
+    /// Changes how often a server without IDLE is polled (3 minutes by default).
+    #[must_use]
+    pub fn with_poll_interval(mut self, interval: std::time::Duration) -> Self {
+        self.poll_interval = interval;
+        self
     }
 
     /// Path of a message's file in the vault.
@@ -583,6 +592,56 @@ impl MailSource for ImapSource {
         self.sync_folder(mailbox).await
     }
 
+    async fn watch(&self, mailbox: &str, changed: &(dyn Fn() + Send + Sync), stop: &std::sync::atomic::AtomicBool) -> Result<(), MailError> {
+        use std::sync::atomic::Ordering::Relaxed;
+        use std::time::Duration;
+        // Its own connection: IDLE keeps one busy for as long as it runs.
+        let mut session = connect(&self.config).await?;
+        let idle_supported = session.capabilities().await.map_err(backend)?.has_str("IDLE");
+        session.examine(mailbox).await.map_err(backend)?;
+        // Some networks drop quiet connections after five minutes; IDLE is renewed before that.
+        let renew = Duration::from_secs(4 * 60);
+        while !stop.load(Relaxed) {
+            if !idle_supported {
+                // No IDLE: wait, then ask, and tell the caller to look again.
+                let mut waited = Duration::ZERO;
+                while waited < self.poll_interval && !stop.load(Relaxed) {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    waited += Duration::from_millis(250);
+                }
+                if !stop.load(Relaxed) {
+                    session.noop().await.map_err(backend)?;
+                    changed();
+                }
+                continue;
+            }
+            let mut idle = session.idle();
+            idle.init().await.map_err(backend)?;
+            // The waiting future borrows `idle`; it ends with this block so that `done()` can take it.
+            let response = {
+                let (waiting, interrupt) = idle.wait_with_timeout(renew);
+                tokio::pin!(waiting);
+                let mut interrupt = Some(interrupt);
+                loop {
+                    tokio::select! {
+                        response = &mut waiting => break response.map_err(backend)?,
+                        () = tokio::time::sleep(Duration::from_millis(250)) => {
+                            if stop.load(Relaxed) {
+                                interrupt.take(); // dropping the source ends the wait
+                            }
+                        }
+                    }
+                }
+            };
+            if matches!(response, async_imap::extensions::idle::IdleResponse::NewData(_)) {
+                changed();
+            }
+            session = idle.done().await.map_err(backend)?;
+        }
+        let _ = session.logout().await;
+        Ok(())
+    }
+
     async fn download(&self, keep: Keep, progress: &Progress) -> Result<(), MailError> {
         use std::sync::atomic::Ordering::Relaxed;
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
@@ -682,6 +741,57 @@ impl MailSource for ImapSource {
             }
         };
         attachment_data(&raw, index)
+    }
+
+    async fn save_draft(&self, id: &str, raw: Vec<u8>) -> Result<(), MailError> {
+        let folder = self.folder_with_role(Role::Drafts).await?.ok_or_else(|| backend("this account has no Drafts folder"))?;
+        let mut state = self.state.lock().await;
+        let session = state.session(&self.config).await?;
+        let result = async {
+            session.append(&folder, Some("(\\Draft \\Seen)"), None, &raw).await?;
+            session.select(&folder).await?;
+            let found = session.uid_search(format!("HEADER X-BeaverMail-Draft {id}")).await?;
+            // The newest copy is the one just stored; any older copies of the same draft are dropped.
+            let newest = found.iter().max().copied();
+            let older: Vec<u32> = found.into_iter().filter(|u| Some(*u) != newest).collect();
+            if !older.is_empty() {
+                let set = older.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+                session.uid_store(&set, "+FLAGS.SILENT (\\Deleted)").await?.try_collect::<Vec<_>>().await?;
+                // Without UIDPLUS the copies stay flagged as deleted, which clients hide.
+                if let Ok(expunged) = session.uid_expunge(&set).await {
+                    let _ = expunged.try_collect::<Vec<_>>().await;
+                }
+            }
+            Ok::<Vec<u32>, async_imap::error::Error>(older)
+        }
+        .await;
+        let older = result.map_err(|e| state.failed(e))?;
+        drop(state);
+        self.drop_files(&folder, &older);
+        self.store.remove_uids(&self.account, &folder, &older)
+    }
+
+    async fn delete_draft(&self, id: &str) -> Result<(), MailError> {
+        let Some(folder) = self.folder_with_role(Role::Drafts).await? else { return Ok(()) };
+        let mut state = self.state.lock().await;
+        let session = state.session(&self.config).await?;
+        let result = async {
+            session.select(&folder).await?;
+            let found: Vec<u32> = session.uid_search(format!("HEADER X-BeaverMail-Draft {id}")).await?.into_iter().collect();
+            if !found.is_empty() {
+                let set = found.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+                session.uid_store(&set, "+FLAGS.SILENT (\\Deleted)").await?.try_collect::<Vec<_>>().await?;
+                if let Ok(expunged) = session.uid_expunge(&set).await {
+                    let _ = expunged.try_collect::<Vec<_>>().await;
+                }
+            }
+            Ok::<Vec<u32>, async_imap::error::Error>(found)
+        }
+        .await;
+        let found = result.map_err(|e| state.failed(e))?;
+        drop(state);
+        self.drop_files(&folder, &found);
+        self.store.remove_uids(&self.account, &folder, &found)
     }
 
     async fn save_sent(&self, raw: Vec<u8>) -> Result<(), MailError> {

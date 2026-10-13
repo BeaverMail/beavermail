@@ -40,6 +40,7 @@ impl SampleSource {
                     received: format!("{:02}:{:02}", next() % 24, next() % 60),
                     timestamp: 0,
                     has_attachments: false,
+                    message_id: String::new(),
                     unread: next() % 3 == 0,
                 };
                 (folder, summary, body)
@@ -107,12 +108,24 @@ impl MailSource for SampleSource {
             .ok_or(MailError::NotFound)
     }
 
+    async fn watch(&self, _: &str, _: &(dyn Fn() + Send + Sync), _: &std::sync::atomic::AtomicBool) -> Result<(), MailError> {
+        Ok(())
+    }
+
     async fn download(&self, _: Keep, _: &Progress) -> Result<(), MailError> {
         Ok(())
     }
 
     async fn attachment(&self, _: MessageId, _: u32) -> Result<(String, Vec<u8>), MailError> {
         Err(MailError::NotFound)
+    }
+
+    async fn save_draft(&self, _: &str, _: Vec<u8>) -> Result<(), MailError> {
+        Err(read_only())
+    }
+
+    async fn delete_draft(&self, _: &str) -> Result<(), MailError> {
+        Err(read_only())
     }
 
     async fn save_sent(&self, _: Vec<u8>) -> Result<(), MailError> {

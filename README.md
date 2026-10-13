@@ -23,7 +23,8 @@ sender); images and styling are never loaded and tracking parameters are removed
 Mail is kept locally: the window opens from a SQLite index, and each downloaded message is an
 file under the data directory, encrypted by default (XChaCha20-Poly1305). Settings choose between a key
 kept by the system, a passphrase, or no encryption.
-New mail, flags, deletions and older history sync in the background, and the messages themselves
+New mail shows up by itself: the Inbox is watched with IDLE (or polled every few minutes on servers without it),
+and mail, flags, deletions and older history sync in the background, and the messages themselves
 download in the background (per account: everything, last 12 months, last 30 days, or only opened
 messages), with progress and a pause button in the status bar. The index itself is not
 encrypted yet.
@@ -34,8 +35,9 @@ messages with the Attach button or by dragging them in (drag and drop works on W
 on Wayland the toolkit does not support it yet, so start the app with `WAYLAND_DISPLAY=` to use X11). Forwards carry the original attachments.
 
 What you write is kept as a draft on this computer (saved a moment after you stop typing, inside the
-encrypted vault, with its attachments); open the Drafts folder to pick it up again. Drafts are not yet
-sent to the server's Drafts folder. No original HTML or end-to-end message encryption yet.
+encrypted vault, with its attachments); open the Drafts folder to pick it up again. A copy of the draft is also
+kept in the server's Drafts folder (after a longer pause, and when you close the window), so other devices see it;
+opening a draft made elsewhere is not supported yet. No original HTML or end-to-end message encryption yet.
 
 ## Running
 

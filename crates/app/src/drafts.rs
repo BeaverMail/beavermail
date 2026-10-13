@@ -59,6 +59,11 @@ pub fn save(vault: &Vault, account: &str, draft: &DraftData) -> Result<(), MailE
     vault.write(&json_path(account, &draft.id), &json)
 }
 
+/// Whether the draft is still kept here.
+pub fn exists(vault: &Vault, account: &str, id: &str) -> bool {
+    vault.read(&json_path(account, id)).ok().flatten().is_some()
+}
+
 /// The account's drafts, the most recently changed first. One that cannot be read is skipped.
 pub fn load_all(vault: &Vault, account: &str) -> Vec<DraftData> {
     let mut drafts: Vec<DraftData> = vault
@@ -111,6 +116,16 @@ mod tests {
         delete(&vault, "me", "a").unwrap();
         assert!(load_all(&vault, "me").is_empty());
         assert_eq!(vault.read(&copy).unwrap(), None);
+    }
+
+    #[test]
+    fn a_draft_is_known_to_exist_until_it_is_deleted() {
+        let vault = Vault::in_memory();
+        assert!(!exists(&vault, "me", "a"));
+        save(&vault, "me", &draft("a", "x", 1)).unwrap();
+        assert!(exists(&vault, "me", "a"));
+        delete(&vault, "me", "a").unwrap();
+        assert!(!exists(&vault, "me", "a"));
     }
 
     #[test]

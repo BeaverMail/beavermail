@@ -49,6 +49,8 @@ pub struct MessageSummary {
     pub unread: bool,
     /// The message looks like it carries attachments (a `multipart/mixed` body).
     pub has_attachments: bool,
+    /// The `Message-ID` header without angle brackets; empty when the message has none.
+    pub message_id: String,
 }
 
 /// What one synchronisation of a folder did.
