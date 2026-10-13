@@ -1,18 +1,20 @@
 # BeaverMail client
 
 Desktop mail client written in Rust with [egui](https://github.com/emilk/egui) (eframe).
-Licensed under AGPL-3.0-only (see [LICENSE](LICENSE)). Product requirements are in
-[docs/prd.md](docs/prd.md).
+Licensed under AGPL-3.0-only (see [LICENSE](LICENSE)).
 
 ## Layout
 
 - `crates/core`: domain model and the `MailSource` trait. No GUI or network dependencies.
+- `crates/imap`: IMAP backend (`ImapSource`).
+- `crates/accounts`: `accounts.toml` and the system credential store.
 - `crates/app`: the egui desktop shell (binary `beavermail`).
 
 ## Status
 
-Milestone 0: a three-pane window (folders, message list, reader) over generated sample
-data. No protocols, storage or encryption yet.
+Several IMAP accounts, folders, message list and reader. Messages can be marked read or unread,
+archived and moved to Trash (keys: Up/Down, E, Delete, U). No sending, search, cache or
+encryption yet.
 
 ## Running
 

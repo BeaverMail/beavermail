@@ -11,7 +11,7 @@ mod theme;
 mod views;
 
 use beavermail_accounts as store;
-use beavermail_core::{Account, MailError, MailSource, Mailbox, MessageId, MessageSummary, Server, Tls};
+use beavermail_core::{Account, MailError, MailSource, Mailbox, MessageId, MessageSummary, Role, Server, Tls};
 use beavermail_imap::ImapSource;
 use eframe::egui::{self, Align, Layout, RichText, vec2};
 use tokio::runtime::Runtime;
@@ -22,6 +22,23 @@ enum Event {
     Mailboxes(u64, Result<Vec<Mailbox>, MailError>),
     Messages(u64, usize, Result<Vec<MessageSummary>, MailError>),
     Body(u64, MessageId, Result<String, MailError>),
+    /// A write (read flag, archive, trash) finished; the UI already showed its result.
+    Done(u64, usize, Result<(), MailError>),
+}
+
+#[derive(Clone, Copy)]
+enum Action {
+    Unread(bool),
+    Archive,
+    Trash,
+    Erase,
+}
+
+impl Action {
+    /// Whether the message leaves the folder being shown.
+    fn removes(self) -> bool {
+        !matches!(self, Self::Unread(_))
+    }
 }
 
 struct AccountView {
@@ -134,6 +151,8 @@ struct BeaverApp {
     body: Option<String>,
     error: Option<String>,
     form: Option<NewAccount>,
+    /// A message waiting for the user to confirm erasing it for good.
+    confirm_erase: Option<MessageId>,
 }
 
 impl BeaverApp {
@@ -152,6 +171,7 @@ impl BeaverApp {
             body: None,
             error: None,
             form: None,
+            confirm_erase: None,
         };
         match store::load() {
             Ok(accounts) => accounts.into_iter().for_each(|a| app.add_view(a)),
@@ -204,6 +224,87 @@ impl BeaverApp {
         self.message = Some(id);
         self.body = None;
         self.spawn(async move { Event::Body(serial, id, source.body(id).await) });
+        if self.messages.iter().any(|m| m.id == id && m.unread) {
+            self.act(id, Action::Unread(false));
+        }
+    }
+
+    /// Applies a write to the list at once and sends it to the server; a failure reloads the folder.
+    fn act(&mut self, id: MessageId, action: Action) {
+        let Some((serial, index)) = self.selected else { return };
+        let Some(source) = self.view(serial).and_then(|v| v.source.clone()) else { return };
+        let Some(pos) = self.messages.iter().position(|m| m.id == id) else { return };
+        let was_unread = self.messages[pos].unread;
+        let unread_change = match action {
+            Action::Unread(unread) => {
+                self.messages[pos].unread = unread;
+                i32::from(unread) - i32::from(was_unread)
+            }
+            Action::Archive | Action::Trash | Action::Erase => {
+                self.messages.remove(pos);
+                -i32::from(was_unread)
+            }
+        };
+        if let Some(mailbox) = self.accounts.iter_mut().find(|v| v.serial == serial).and_then(|v| v.mailboxes.get_mut(index)) {
+            mailbox.unread = mailbox.unread.saturating_add_signed(unread_change);
+        }
+        self.spawn(async move {
+            let result = match action {
+                Action::Unread(unread) => source.set_unread(id, unread).await,
+                Action::Archive => source.archive(id).await,
+                Action::Trash => source.trash(id).await,
+                Action::Erase => source.erase(id).await,
+            };
+            Event::Done(serial, index, result)
+        });
+        if action.removes() && self.message == Some(id) {
+            // Keep triaging: open the message that took its place.
+            self.message = None;
+            self.body = None;
+            if let Some(next) = self.messages.get(pos).or(self.messages.last()).map(|m| m.id) {
+                self.select_message(next);
+            }
+        }
+    }
+
+    /// Role of the folder being shown.
+    fn role(&self) -> Role {
+        let (serial, index) = self.selected.unzip();
+        serial.zip(index).and_then(|(s, i)| self.view(s)?.mailboxes.get(i)).map_or(Role::Other, |m| m.role)
+    }
+
+    /// Runs a user action; trashing from the trash asks first, because that erases for good.
+    fn request(&mut self, id: MessageId, action: Action) {
+        if matches!(action, Action::Trash) && self.role() == Role::Trash {
+            self.confirm_erase = Some(id);
+        } else {
+            self.act(id, action);
+        }
+    }
+
+    /// Up/Down move through the list, E archives, Delete trashes, U toggles unread.
+    fn handle_keys(&mut self, ctx: &egui::Context) {
+        if self.form.is_some() || self.confirm_erase.is_some() || ctx.egui_wants_keyboard_input() {
+            return;
+        }
+        let key = |k| ctx.input(|i| i.key_pressed(k));
+        let pos = self.message.and_then(|id| self.messages.iter().position(|m| m.id == id));
+        let step = if key(egui::Key::ArrowDown) { Some(1) } else if key(egui::Key::ArrowUp) { Some(-1) } else { None };
+        if let Some(step) = step {
+            let next = pos.map_or(0, |p| p.saturating_add_signed(step)).min(self.messages.len().saturating_sub(1));
+            if let Some(id) = self.messages.get(next).map(|m| m.id).filter(|id| Some(*id) != self.message) {
+                self.select_message(id);
+            }
+        }
+        let (Some(id), Some(pos)) = (self.message, pos) else { return };
+        if key(egui::Key::E) {
+            self.request(id, Action::Archive);
+        } else if key(egui::Key::Delete) {
+            self.request(id, Action::Trash);
+        } else if key(egui::Key::U) {
+            let unread = self.messages[pos].unread;
+            self.request(id, Action::Unread(!unread));
+        }
     }
 
     /// Stores the password, then the settings, then shows the account.
@@ -268,7 +369,36 @@ impl BeaverApp {
                     Err(e) => self.error = Some(e.to_string()),
                 }
             }
+            Event::Done(serial, index, Err(e)) => {
+                self.error = Some(e.to_string());
+                if self.selected == Some((serial, index)) {
+                    self.select_mailbox(serial, index); // show what the server really has
+                }
+            }
+            Event::Done(..) => {}
             _ => {} // answer for a folder or message that is no longer selected
+        }
+    }
+
+    fn erase_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
+        let Some(id) = self.confirm_erase else { return };
+        let (mut confirm, mut cancel) = (false, false);
+        let modal = egui::Modal::new(egui::Id::new("confirm_erase")).show(ctx, |ui| {
+            ui.set_width(FORM_WIDTH * 0.8);
+            ui.heading("Delete permanently?");
+            ui.label(RichText::new("This message will be erased from the server and cannot be recovered.").color(t.text_dim));
+            ui.add_space(12.0);
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
+                let erase = egui::Button::new(RichText::new("Delete permanently").color(t.on_accent)).fill(t.danger);
+                confirm = ui.add(erase).clicked();
+                cancel = ui.button("Cancel").clicked();
+            });
+        });
+        if confirm {
+            self.act(id, Action::Erase);
+        }
+        if confirm || cancel || modal.should_close() {
+            self.confirm_erase = None;
         }
     }
 
@@ -415,6 +545,9 @@ impl eframe::App for BeaverApp {
         self.account_form(ui.ctx());
 
         let surface = egui::Frame::new().fill(t.surface);
+        self.handle_keys(ui.ctx());
+        let mut action = None;
+        let role = self.role();
         let current = self.message.and_then(|id| self.messages.iter().find(|m| m.id == id)).cloned();
         egui::Panel::right("reader").frame(surface).default_size(560.0).size_range(360.0..=900.0).show(ui, |ui| match (&current, &self.body) {
             (Some(message), Some(body)) => {
@@ -426,6 +559,30 @@ impl eframe::App for BeaverApp {
                             ui.set_max_width(720.0);
                             ui.heading(&message.subject);
                             ui.label(RichText::new(format!("{}  ·  {}", message.from, message.received)).color(t.text_dim));
+                            ui.add_space(12.0);
+                            ui.horizontal(|ui| {
+                                let tools = [
+                                    ("Archive", "Archive (E)", Action::Archive),
+                                    if role == Role::Trash {
+                                        ("Delete permanently", "Erase for good (Delete)", Action::Trash)
+                                    } else {
+                                        ("Delete", "Move to Trash (Delete)", Action::Trash)
+                                    },
+                                    (
+                                        if message.unread { "Mark read" } else { "Mark unread" },
+                                        "Toggle unread (U)",
+                                        Action::Unread(!message.unread),
+                                    ),
+                                ];
+                                for (label, tip, what) in tools {
+                                    let archived = matches!(what, Action::Archive) && role == Role::Archive;
+                                    let button = ui.add_enabled(!archived, egui::Button::new(label));
+                                    let button = if archived { button.on_disabled_hover_text("Already in the archive") } else { button.on_hover_text(tip) };
+                                    if button.clicked() {
+                                        action = Some((message.id, what));
+                                    }
+                                }
+                            });
                             ui.add_space(12.0);
                             ui.separator();
                             ui.add_space(12.0);
@@ -476,6 +633,10 @@ impl eframe::App for BeaverApp {
         if let Some(id) = opened {
             self.select_message(id);
         }
+        if let Some((id, what)) = action {
+            self.request(id, what);
+        }
+        self.erase_dialog(ui.ctx(), &t);
         if add {
             self.form = Some(NewAccount::default());
         }

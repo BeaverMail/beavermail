@@ -2,7 +2,7 @@
 
 //! An in-memory [`MailSource`] with generated data, for development and tests.
 
-use crate::{MailError, MailSource, Mailbox, MessageId, MessageSummary};
+use crate::{MailError, MailSource, Mailbox, MessageId, MessageSummary, Role};
 
 const FOLDERS: [&str; 6] = ["Inbox", "Starred", "Drafts", "Sent", "Archive", "Trash"];
 const SENDERS: [&str; 8] = [
@@ -46,12 +46,21 @@ impl SampleSource {
     }
 }
 
+fn read_only() -> MailError {
+    MailError::Backend("sample data is read-only".into())
+}
+
 impl MailSource for SampleSource {
     async fn mailboxes(&self) -> Result<Vec<Mailbox>, MailError> {
         Ok(FOLDERS
             .iter()
             .map(|name| Mailbox {
                 name: (*name).to_owned(),
+                role: match *name {
+                    "Archive" => Role::Archive,
+                    "Trash" => Role::Trash,
+                    _ => Role::Other,
+                },
                 unread: self
                     .messages
                     .iter()
@@ -79,6 +88,22 @@ impl MailSource for SampleSource {
             .find(|(_, m, _)| m.id == id)
             .map(|(_, _, body)| body.clone())
             .ok_or(MailError::NotFound)
+    }
+
+    async fn set_unread(&self, _: MessageId, _: bool) -> Result<(), MailError> {
+        Err(read_only())
+    }
+
+    async fn archive(&self, _: MessageId) -> Result<(), MailError> {
+        Err(read_only())
+    }
+
+    async fn trash(&self, _: MessageId) -> Result<(), MailError> {
+        Err(read_only())
+    }
+
+    async fn erase(&self, _: MessageId) -> Result<(), MailError> {
+        Err(read_only())
     }
 }
 

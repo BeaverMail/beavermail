@@ -8,7 +8,7 @@
 pub mod model;
 pub mod sample;
 
-pub use model::{Account, Mailbox, MessageId, MessageSummary, Server, Tls};
+pub use model::{Account, Mailbox, MessageId, MessageSummary, Role, Server, Tls};
 
 use std::fmt;
 use std::future::Future;
@@ -36,7 +36,7 @@ impl fmt::Display for MailError {
 
 impl std::error::Error for MailError {}
 
-/// Read access to one account's mail. The UI talks only to this trait.
+/// Access to one account's mail. The UI talks only to this trait.
 ///
 /// Methods return `Send` futures so a backend can be driven from any executor;
 /// implementors can still write plain `async fn`.
@@ -49,4 +49,16 @@ pub trait MailSource {
 
     /// Plain-text body of a message; [`MailError::NotFound`] if it does not exist.
     fn body(&self, id: MessageId) -> impl Future<Output = Result<String, MailError>> + Send;
+
+    /// Marks a message unread (`true`) or read (`false`).
+    fn set_unread(&self, id: MessageId, unread: bool) -> impl Future<Output = Result<(), MailError>> + Send;
+
+    /// Moves a message to the account's archive folder.
+    fn archive(&self, id: MessageId) -> impl Future<Output = Result<(), MailError>> + Send;
+
+    /// Moves a message to the account's trash folder.
+    fn trash(&self, id: MessageId) -> impl Future<Output = Result<(), MailError>> + Send;
+
+    /// Erases a message for good. Only messages already in the trash folder may be erased.
+    fn erase(&self, id: MessageId) -> impl Future<Output = Result<(), MailError>> + Send;
 }

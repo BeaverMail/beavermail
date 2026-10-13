@@ -8,11 +8,20 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct MessageId(pub u64);
 
+/// What a folder is for, when the UI must treat it specially.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    Archive,
+    Trash,
+    Other,
+}
+
 /// A folder of messages.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Mailbox {
     pub name: String,
     pub unread: u32,
+    pub role: Role,
 }
 
 /// What the message list needs to show a row. The body is loaded separately.
