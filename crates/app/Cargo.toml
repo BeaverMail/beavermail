@@ -16,8 +16,8 @@ workspace = true
 beavermail-core.workspace = true
 eframe.workspace = true
 egui_extras.workspace = true
-directories = "6"
 opener = { version = "0.8", default-features = false }
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 scraper.workspace = true
 beavermail-accounts.workspace = true
 beavermail-imap.workspace = true

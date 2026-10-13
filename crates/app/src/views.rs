@@ -325,8 +325,18 @@ pub fn body(ui: &mut Ui, t: &Tokens, blocks: &[Block]) -> Option<String> {
     clicked
 }
 
-/// One attached file: its name and size, with Open and Save. Returns what the user chose.
-pub fn attachment_chip(ui: &mut Ui, t: &Tokens, file: &Attachment) -> Option<crate::AttachmentUse> {
+/// What the user did to an attachment's chip.
+#[derive(Clone, Copy)]
+pub enum ChipAction {
+    Open,
+    SaveAs,
+    /// Ticked or unticked, to save several together.
+    Toggle,
+}
+
+/// One attached file: its name and size, with Open and Save as…; a tick box when there are several.
+/// `ticked` is `None` when the message has a single attachment.
+pub fn attachment_chip(ui: &mut Ui, t: &Tokens, file: &Attachment, ticked: Option<bool>) -> Option<ChipAction> {
     let mut chosen = None;
     egui::Frame::new()
         .fill(t.input)
@@ -335,19 +345,24 @@ pub fn attachment_chip(ui: &mut Ui, t: &Tokens, file: &Attachment) -> Option<cra
         .inner_margin(Margin::symmetric(10, 6))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
+                if let Some(mut on) = ticked
+                    && ui.checkbox(&mut on, "").on_hover_text("Select to save several together").changed()
+                {
+                    chosen = Some(ChipAction::Toggle);
+                }
                 ui.add(Icon::Paperclip.image(icons::SIZE, t.text_dim));
                 let name = crate::attachments::safe_name(&file.name);
                 let shown: String = if name.chars().count() > 32 { format!("{}…", name.chars().take(31).collect::<String>()) } else { name };
                 let open = ui.add(egui::Label::new(egui::RichText::new(shown).color(t.text)).sense(Sense::click())).on_hover_text(format!("{}  ·  {}", file.name, file.mime)).on_hover_cursor(egui::CursorIcon::PointingHand);
                 if open.clicked() {
-                    chosen = Some(crate::AttachmentUse::Open);
+                    chosen = Some(ChipAction::Open);
                 }
                 ui.label(egui::RichText::new(crate::attachments::human_size(file.size)).size(13.0).color(t.text_dim));
                 if ui.small_button("Open").clicked() {
-                    chosen = Some(crate::AttachmentUse::Open);
+                    chosen = Some(ChipAction::Open);
                 }
-                if ui.small_button("Save").on_hover_text("Save to your Downloads folder").clicked() {
-                    chosen = Some(crate::AttachmentUse::Save);
+                if ui.small_button("Save as…").clicked() {
+                    chosen = Some(ChipAction::SaveAs);
                 }
             });
         });

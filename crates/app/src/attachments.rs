@@ -5,8 +5,6 @@
 
 use std::path::{Path, PathBuf};
 
-use directories::UserDirs;
-
 /// A name that is safe to use as a file name on any system: no folders, no control characters, no
 /// leading dots, nothing too long, never empty.
 pub fn safe_name(name: &str) -> String {
@@ -51,7 +49,7 @@ pub fn human_size(bytes: u64) -> String {
 }
 
 /// `name`, or `name (1).ext`, `name (2).ext`… so nothing already there is overwritten.
-fn unique(dir: &Path, name: &str) -> PathBuf {
+pub fn unique(dir: &Path, name: &str) -> PathBuf {
     let first = dir.join(name);
     if !first.exists() {
         return first;
@@ -61,15 +59,6 @@ fn unique(dir: &Path, name: &str) -> PathBuf {
         .map(|n| dir.join(format!("{stem} ({n}){ext}")))
         .find(|p| !p.exists())
         .expect("an unused name exists")
-}
-
-/// Saves into the user's Downloads folder and returns where.
-pub fn save(name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
-    let dir = UserDirs::new().and_then(|d| d.download_dir().map(Path::to_path_buf)).or_else(|| UserDirs::new().map(|d| d.home_dir().to_path_buf())).ok_or("no Downloads folder")?;
-    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let path = unique(&dir, &safe_name(name));
-    std::fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
-    Ok(path)
 }
 
 /// Writes a private copy under `temp_root` and opens it with the system's default program.

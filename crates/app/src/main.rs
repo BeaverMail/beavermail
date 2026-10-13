@@ -44,14 +44,10 @@ enum Event {
     Sent(Result<(), MailError>, Option<String>),
     /// A change to how stored mail is protected finished.
     Vault(VaultOutcome),
-    /// The bytes of an attachment, to open or to save.
-    Attachment(AttachmentUse, Result<(String, Vec<u8>), MailError>),
-}
-
-#[derive(Clone, Copy)]
-enum AttachmentUse {
-    Open,
-    Save,
+    /// The bytes of an attachment, to open with another program.
+    Attachment(Result<(String, Vec<u8>), MailError>),
+    /// Saving attachments through a file dialog ended: `None` when the user cancelled, else what to tell them.
+    Saved(Result<Option<String>, String>),
 }
 
 enum VaultOutcome {
@@ -112,7 +108,9 @@ struct ReaderOutcome {
     /// A display mode to remember for the sender of this message.
     remember: Option<DisplayMode>,
     /// An attachment to open or save: its position and what to do.
-    attachment: Option<(u32, AttachmentUse)>,
+    attachment: Option<(u32, views::ChipAction)>,
+    /// "Save all" or "Save selected" was pressed.
+    save_many: bool,
 }
 
 struct AccountView {
@@ -297,6 +295,8 @@ struct BeaverApp {
     downloads_paused: bool,
     /// An attachment that runs code, waiting for the user to say yes to opening it.
     confirm_open: Option<(u32, String)>,
+    /// Attachments ticked in the reader, to save together.
+    attach_selected: std::collections::BTreeSet<u32>,
     /// Where private copies of opened attachments go; emptied at start and exit.
     open_dir: std::path::PathBuf,
     /// Settings and prompt state for the stored-mail protection.
@@ -350,6 +350,7 @@ impl BeaverApp {
             show_settings: false,
             downloads_paused: false,
             confirm_open: None,
+            attach_selected: std::collections::BTreeSet::new(),
             open_dir: store::data_dir().unwrap_or_else(|_| std::env::temp_dir()).join("open"),
             security: security::Form::default(),
             vault_job: None,
@@ -470,6 +471,7 @@ impl BeaverApp {
         self.message = Some(id);
         self.body = None;
         self.view_mode = None;
+        self.attach_selected.clear();
         self.spawn(async move { Event::Body(serial, id, source.body(id).await) });
         if self.messages.iter().any(|m| m.id == id && m.unread) {
             self.act(id, Action::Unread(false));
@@ -627,23 +629,65 @@ impl BeaverApp {
         self.vault.is_locked() && !self.unlock_skipped
     }
 
-    /// Fetches an attachment of the open message; opening one that runs code asks first.
-    fn use_attachment(&mut self, index: u32, what: AttachmentUse) {
+    /// What the user did to an attachment chip.
+    fn use_attachment(&mut self, index: u32, what: views::ChipAction) {
         let name = self.body.as_ref().and_then(|b| b.data.attachments.iter().find(|a| a.index == index)).map(|a| a.name.clone());
-        if let (Some(name), AttachmentUse::Open) = (&name, what)
-            && attachments::is_risky(name)
-            && self.confirm_open.as_ref().is_none_or(|(i, _)| *i != index)
-        {
-            self.confirm_open = Some((index, name.clone()));
-            return;
+        match what {
+            views::ChipAction::Toggle => {
+                if !self.attach_selected.remove(&index) {
+                    self.attach_selected.insert(index);
+                }
+            }
+            views::ChipAction::SaveAs => self.save_attachments(vec![index]),
+            views::ChipAction::Open => {
+                if let Some(name) = name.filter(|n| attachments::is_risky(n)) {
+                    self.confirm_open = Some((index, name));
+                } else {
+                    self.fetch_attachment(index);
+                }
+            }
         }
-        self.fetch_attachment(index, what);
     }
 
-    fn fetch_attachment(&mut self, index: u32, what: AttachmentUse) {
+    /// The ticked attachments, or all of them when none is ticked.
+    fn chosen_attachments(&self) -> Vec<u32> {
+        let all = self.body.iter().flat_map(|b| b.data.attachments.iter().map(|a| a.index));
+        if self.attach_selected.is_empty() { all.collect() } else { self.attach_selected.iter().copied().collect() }
+    }
+
+    fn fetch_attachment(&mut self, index: u32) {
         let (Some((serial, _)), Some(id)) = (self.selected, self.message) else { return };
         let Some(source) = self.view(serial).and_then(|v| v.source.clone()) else { return };
-        self.spawn(async move { Event::Attachment(what, source.attachment(id, index).await) });
+        self.spawn(async move { Event::Attachment(source.attachment(id, index).await) });
+    }
+
+    /// Asks where to save, then saves: one attachment into a file of the user's choosing, several into
+    /// a folder (names that exist get a number, nothing is overwritten).
+    fn save_attachments(&mut self, indexes: Vec<u32>) {
+        let (Some((serial, _)), Some(id)) = (self.selected, self.message) else { return };
+        let Some(source) = self.view(serial).and_then(|v| v.source.clone()) else { return };
+        let names: Vec<(u32, String)> = indexes.iter().filter_map(|i| self.body.as_ref()?.data.attachments.iter().find(|a| a.index == *i)).map(|a| (a.index, attachments::safe_name(&a.name))).collect();
+        let Some(first) = names.first().map(|(_, n)| n.clone()) else { return };
+        self.spawn(async move {
+            let one = names.len() == 1;
+            let dialog = rfd::AsyncFileDialog::new();
+            let target = if one { dialog.set_title("Save attachment").set_file_name(&first).save_file().await } else { dialog.set_title("Save attachments to…").pick_folder().await };
+            let Some(target) = target else { return Event::Saved(Ok(None)) };
+            let target = target.path().to_path_buf();
+            let mut saved = Vec::new();
+            for (index, name) in &names {
+                let (_, bytes) = match source.attachment(id, *index).await {
+                    Ok(file) => file,
+                    Err(e) => return Event::Saved(Err(format!("Could not get {name}: {e}"))),
+                };
+                let path = if one { target.clone() } else { attachments::unique(&target, name) };
+                if let Err(e) = std::fs::write(&path, &bytes) {
+                    return Event::Saved(Err(format!("{}: {e}", path.display())));
+                }
+                saved.push(path);
+            }
+            Event::Saved(Ok(Some(if one { format!("Saved to {}", saved[0].display()) } else { format!("Saved {} files to {}", saved.len(), target.display()) })))
+        });
     }
 
     fn open_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
@@ -660,7 +704,7 @@ impl BeaverApp {
             });
         });
         if open {
-            self.fetch_attachment(index, AttachmentUse::Open);
+            self.fetch_attachment(index);
         }
         if open || cancel || modal.should_close() {
             self.confirm_open = None;
@@ -1073,18 +1117,20 @@ impl BeaverApp {
             }
             Event::Done(..) => {}
             Event::Vault(outcome) => self.apply_vault(outcome),
-            Event::Attachment(what, result) => match result {
-                Ok((name, bytes)) => {
-                    let done = match what {
-                        AttachmentUse::Save => attachments::save(&name, &bytes).map(|path| format!("Saved to {}", path.display())),
-                        AttachmentUse::Open => attachments::open(&self.open_dir, &name, &bytes).map(|()| format!("Opening {}", attachments::safe_name(&name))),
-                    };
-                    match done {
-                        Ok(text) => self.notice = Some((text, std::time::Instant::now())),
-                        Err(e) => self.error = Some(e),
-                    }
-                }
+            Event::Attachment(result) => match result {
+                Ok((name, bytes)) => match attachments::open(&self.open_dir, &name, &bytes) {
+                    Ok(()) => self.notice = Some((format!("Opening {}", attachments::safe_name(&name)), std::time::Instant::now())),
+                    Err(e) => self.error = Some(e),
+                },
                 Err(e) => self.error = Some(format!("Could not get the attachment: {e}")),
+            },
+            Event::Saved(result) => match result {
+                Ok(Some(text)) => {
+                    self.notice = Some((text, std::time::Instant::now()));
+                    self.attach_selected.clear();
+                }
+                Ok(None) => {}
+                Err(e) => self.error = Some(e),
             },
             Event::Sent(result, copy_error) => match result {
                 Ok(()) => {
@@ -1441,7 +1487,9 @@ impl BeaverApp {
         let mut chosen_mode = None;
         let mut remember = None;
         let mut attachment = None;
+        let mut save_many = false;
         let (settings_mode, view_mode) = (self.settings.clone(), self.view_mode);
+        let selected_files = self.attach_selected.clone();
         let role = self.role();
         let current = self.message.and_then(|id| self.messages.iter().find(|m| m.id == id)).cloned();
         let frame = egui::Frame::new().fill(t.surface);
@@ -1511,11 +1559,20 @@ impl BeaverApp {
                             }
                             if !body.data.attachments.is_empty() {
                                 ui.add_space(10.0);
-                                ui.label(RichText::new(format!("{} attachment{}", body.data.attachments.len(), if body.data.attachments.len() == 1 { "" } else { "s" })).size(13.0).color(t.text_dim));
+                                let many = body.data.attachments.len() > 1;
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(format!("{} attachment{}", body.data.attachments.len(), if many { "s" } else { "" })).size(13.0).color(t.text_dim));
+                                    if many {
+                                        let label = if selected_files.is_empty() { "Save all…".to_owned() } else { format!("Save selected ({})…", selected_files.len()) };
+                                        if ui.small_button(label).clicked() {
+                                            save_many = true;
+                                        }
+                                    }
+                                });
                                 ui.add_space(2.0);
                                 ui.horizontal_wrapped(|ui| {
                                     for file in &body.data.attachments {
-                                        if let Some(what) = views::attachment_chip(ui, t, file) {
+                                        if let Some(what) = views::attachment_chip(ui, t, file, many.then(|| selected_files.contains(&file.index))) {
                                             attachment = Some((file.index, what));
                                         }
                                     }
@@ -1551,7 +1608,7 @@ impl BeaverApp {
                 }
             }
         });
-        ReaderOutcome { action, url, mode: chosen_mode, remember, attachment }
+        ReaderOutcome { action, url, mode: chosen_mode, remember, attachment, save_many }
     }
 }
 
@@ -1583,9 +1640,12 @@ impl eframe::App for BeaverApp {
         self.account_form(ui.ctx());
 
         self.handle_keys(ui.ctx());
-        let ReaderOutcome { action, url, mode, remember, attachment } = self.reader(ui, &t);
+        let ReaderOutcome { action, url, mode, remember, attachment, save_many } = self.reader(ui, &t);
         if let Some((index, what)) = attachment {
             self.use_attachment(index, what);
+        }
+        if save_many {
+            self.save_attachments(self.chosen_attachments());
         }
         if let Some(url) = url {
             ui.ctx().open_url(egui::OpenUrl::new_tab(url));
