@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use async_imap::types::{Fetch, Flag, NameAttribute};
 use async_imap::{Client, Session};
-use beavermail_core::{MailError, MailSource, Mailbox, MessageId, MessageSummary};
+use beavermail_core::{Account, MailError, MailSource, Mailbox, MessageId, MessageSummary, Server, Tls};
 use futures::TryStreamExt;
 use mail_parser::MessageParser;
 use rustls::pki_types::ServerName;
@@ -19,51 +19,6 @@ use tokio_rustls::TlsConnector;
 /// How many of the newest messages a mailbox listing fetches.
 // shortcut: no paging, a mailbox shows only its latest messages; add paging with the local cache.
 const LIST_LIMIT: u32 = 200;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Tls {
-    /// Plain text. Only for a local test server.
-    None,
-    /// Plain connection upgraded with STARTTLS (usually port 143).
-    StartTls,
-    /// TLS from the first byte (usually port 993).
-    Tls,
-}
-
-#[derive(Clone)]
-pub struct Config {
-    pub host: String,
-    pub port: u16,
-    pub tls: Tls,
-    pub user: String,
-    pub password: String,
-}
-
-impl fmt::Debug for Config {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Config").field("host", &self.host).field("user", &self.user).finish_non_exhaustive()
-    }
-}
-
-impl Config {
-    /// Reads `IMAP_HOST`, `IMAP_PORT`, `IMAP_TLS`, `MAIL_USER` and `MAIL_PASSWORD`.
-    pub fn from_env() -> Result<Self, String> {
-        let var = |name: &str| std::env::var(name).map_err(|_| format!("{name} is not set"));
-        let tls = match var("IMAP_TLS")?.trim() {
-            "none" => Tls::None,
-            "starttls" => Tls::StartTls,
-            "tls" => Tls::Tls,
-            other => return Err(format!("IMAP_TLS: unknown mode {other:?}")),
-        };
-        Ok(Self {
-            host: var("IMAP_HOST")?,
-            port: var("IMAP_PORT")?.trim().parse().map_err(|_| "IMAP_PORT is not a number".to_owned())?,
-            tls,
-            user: var("MAIL_USER")?,
-            password: var("MAIL_PASSWORD")?,
-        })
-    }
-}
 
 trait Conn: AsyncRead + AsyncWrite + Unpin + Send + fmt::Debug {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + fmt::Debug> Conn for T {}
@@ -81,9 +36,17 @@ pub struct ImapSource {
     state: Mutex<State>,
 }
 
+/// What a connection needs: the account's IMAP server and its credentials.
+struct Config {
+    server: Server,
+    user: String,
+    password: String,
+}
+
 impl ImapSource {
     /// Creates the source; the connection is opened on first use.
-    pub fn new(config: Config) -> Self {
+    pub fn new(account: &Account, password: String) -> Self {
+        let config = Config { server: account.imap.clone(), user: account.user.clone(), password };
         Self { config, state: Mutex::new(State::default()) }
     }
 }
@@ -106,15 +69,16 @@ async fn tls(tcp: TcpStream, host: &str) -> Result<Stream, MailError> {
 }
 
 async fn connect(c: &Config) -> Result<Session<Stream>, MailError> {
-    let tcp = TcpStream::connect((c.host.as_str(), c.port)).await.map_err(backend)?;
-    let client = match c.tls {
+    let Server { host, port, tls: mode } = &c.server;
+    let tcp = TcpStream::connect((host.as_str(), *port)).await.map_err(backend)?;
+    let client = match mode {
         Tls::None => Client::new(Box::new(tcp) as Stream),
-        Tls::Tls => Client::new(tls(tcp, &c.host).await?),
+        Tls::Tls => Client::new(tls(tcp, host).await?),
         Tls::StartTls => {
             let mut plain = Client::new(tcp);
             plain.read_response().await.map_err(backend)?; // server greeting
             plain.run_command_and_check_ok("STARTTLS", None).await.map_err(backend)?;
-            Client::new(tls(plain.into_inner(), &c.host).await?)
+            Client::new(tls(plain.into_inner(), host).await?)
         }
     };
     client.login(&c.user, &c.password).await.map_err(|(e, _)| MailError::Auth(e.to_string()))

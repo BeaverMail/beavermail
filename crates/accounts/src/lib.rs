@@ -1,0 +1,100 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Account storage. Settings live in `accounts.toml` in the user's config directory;
+//! passwords live only in the system credential store (Keychain, Credential Manager,
+//! Secret Service), keyed by [`Account::key`]. A password is never written to the file.
+
+use std::path::PathBuf;
+
+use beavermail_core::Account;
+use directories::ProjectDirs;
+use serde::{Deserialize, Serialize};
+
+const SERVICE: &str = "beavermail";
+
+#[derive(Serialize, Deserialize, Default)]
+struct File {
+    #[serde(default)]
+    account: Vec<Account>,
+}
+
+pub fn parse(text: &str) -> Result<Vec<Account>, String> {
+    toml::from_str::<File>(text).map(|f| f.account).map_err(|e| e.to_string())
+}
+
+pub fn render(accounts: &[Account]) -> Result<String, String> {
+    toml::to_string_pretty(&File { account: accounts.to_vec() }).map_err(|e| e.to_string())
+}
+
+fn path() -> Result<PathBuf, String> {
+    let dirs = ProjectDirs::from("", "", "beavermail").ok_or("no home directory")?;
+    Ok(dirs.config_dir().join("accounts.toml"))
+}
+
+/// Accounts from the config file; none if the file does not exist yet.
+pub fn load() -> Result<Vec<Account>, String> {
+    let path = path()?;
+    match std::fs::read_to_string(&path) {
+        Ok(text) => parse(&text).map_err(|e| format!("{}: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+/// Replaces the config file. Written to a temp file first, so a crash cannot leave it half-written.
+pub fn save(accounts: &[Account]) -> Result<(), String> {
+    let path = path()?;
+    let io = |e: std::io::Error| format!("{}: {e}", path.display());
+    std::fs::create_dir_all(path.parent().ok_or("no config directory")?).map_err(io)?;
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, render(accounts)?).map_err(io)?;
+    std::fs::rename(&tmp, &path).map_err(io)
+}
+
+fn entry(account: &Account) -> Result<keyring::Entry, String> {
+    keyring::Entry::new(SERVICE, &account.key()).map_err(|e| format!("credential store: {e}"))
+}
+
+pub fn password(account: &Account) -> Result<String, String> {
+    entry(account)?.get_password().map_err(|e| format!("credential store: {e}"))
+}
+
+pub fn set_password(account: &Account, password: &str) -> Result<(), String> {
+    entry(account)?.set_password(password).map_err(|e| format!("credential store: {e}"))
+}
+
+/// Removes the stored password; a missing one is not an error.
+pub fn forget_password(account: &Account) -> Result<(), String> {
+    match entry(account)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(format!("credential store: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use beavermail_core::{Server, Tls};
+
+    fn account(user: &str) -> Account {
+        let imap = Server { host: "mail.example.org".into(), port: 143, tls: Tls::StartTls };
+        let smtp = Server { host: "mail.example.org".into(), port: 465, tls: Tls::Tls };
+        Account { name: "Work".into(), user: user.into(), imap, smtp }
+    }
+
+    #[test]
+    fn file_round_trips() {
+        let accounts = vec![account("a@example.org"), account("b@example.org")];
+        assert_eq!(parse(&render(&accounts).unwrap()).unwrap(), accounts);
+    }
+
+    #[test]
+    fn empty_file_means_no_accounts() {
+        assert_eq!(parse("").unwrap(), vec![]);
+    }
+
+    #[test]
+    fn rendered_file_has_no_secret_field() {
+        assert!(!render(&[account("a@example.org")]).unwrap().contains("password"));
+    }
+}

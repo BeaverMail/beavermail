@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+
+[package]
+name = "beavermail-accounts"
+description = "Where BeaverMail keeps account settings (file) and passwords (system credential store)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+beavermail-core.workspace = true
+directories = "6"
+keyring = "4"
+serde = { version = "1", features = ["derive"] }
+toml = "1"

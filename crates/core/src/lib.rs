@@ -8,7 +8,7 @@
 pub mod model;
 pub mod sample;
 
-pub use model::{Mailbox, MessageId, MessageSummary};
+pub use model::{Account, Mailbox, MessageId, MessageSummary, Server, Tls};
 
 use std::fmt;
 use std::future::Future;

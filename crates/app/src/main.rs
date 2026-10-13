@@ -1,113 +1,304 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! BeaverMail desktop shell: a three-pane mail view (folders, message list, reader)
-//! over a [`MailSource`]. Uses the IMAP account in the environment (or `.env`) when
-//! set, otherwise generated sample data. Mail calls run on a background runtime.
+//! BeaverMail desktop shell: accounts with their folders, a message list and a reader.
+//! Accounts come from `accounts.toml` and the system credential store (see
+//! `beavermail-accounts`). Mail calls run on a background runtime.
 
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
-use beavermail_core::sample::SampleSource;
-use beavermail_core::{MailError, MailSource, Mailbox, MessageId, MessageSummary};
-use beavermail_imap::{Config, ImapSource};
+use beavermail_accounts as store;
+use beavermail_core::{Account, MailError, MailSource, Mailbox, MessageId, MessageSummary, Server, Tls};
+use beavermail_imap::ImapSource;
 use eframe::egui::{self, Align, Layout, RichText, vec2};
 use tokio::runtime::Runtime;
 
 /// Fixed row height, so the list can be virtualised with `show_rows`.
 const ROW_H: f32 = 52.0;
-/// Number of generated messages in the sample source.
-const SAMPLE_MESSAGES: usize = 10_000;
 
-/// Result of a background mail call, tagged so stale answers can be dropped.
+/// Result of a background mail call. Tagged with the account's serial, so answers
+/// for an account that was removed meanwhile are dropped.
 enum Event {
-    Mailboxes(Result<Vec<Mailbox>, MailError>),
-    Messages(usize, Result<Vec<MessageSummary>, MailError>),
-    Body(MessageId, Result<String, MailError>),
+    Mailboxes(u64, Result<Vec<Mailbox>, MailError>),
+    Messages(u64, usize, Result<Vec<MessageSummary>, MailError>),
+    Body(u64, MessageId, Result<String, MailError>),
 }
 
-struct BeaverApp<S> {
-    source: Arc<S>,
+struct AccountView {
+    /// Never reused within a run, unlike a position in the list.
+    serial: u64,
+    account: Account,
+    /// `None` when the password could not be read; `error` says why.
+    source: Option<Arc<ImapSource>>,
+    mailboxes: Vec<Mailbox>,
+    error: Option<String>,
+}
+
+/// The "Add account" form. Ports are text until submitted.
+struct NewAccount {
+    name: String,
+    user: String,
+    password: String,
+    imap_host: String,
+    imap_port: String,
+    imap_tls: Tls,
+    /// Empty means the same host as IMAP.
+    smtp_host: String,
+    smtp_port: String,
+    smtp_tls: Tls,
+    error: Option<String>,
+}
+
+impl Default for NewAccount {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            user: String::new(),
+            password: String::new(),
+            imap_host: String::new(),
+            imap_port: "143".into(),
+            imap_tls: Tls::StartTls,
+            smtp_host: String::new(),
+            smtp_port: "587".into(),
+            smtp_tls: Tls::StartTls,
+            error: None,
+        }
+    }
+}
+
+impl NewAccount {
+    fn build(&self) -> Result<Account, String> {
+        let port = |text: &str, what: &str| text.trim().parse().map_err(|_| format!("{what} port is not a number"));
+        let (user, imap_host) = (self.user.trim(), self.imap_host.trim());
+        if user.is_empty() || imap_host.is_empty() || self.password.is_empty() {
+            return Err("user, password and IMAP host are required".into());
+        }
+        let smtp_host = if self.smtp_host.trim().is_empty() { imap_host } else { self.smtp_host.trim() };
+        Ok(Account {
+            name: if self.name.trim().is_empty() { user.to_owned() } else { self.name.trim().to_owned() },
+            user: user.to_owned(),
+            imap: Server { host: imap_host.to_owned(), port: port(&self.imap_port, "IMAP")?, tls: self.imap_tls },
+            smtp: Server { host: smtp_host.to_owned(), port: port(&self.smtp_port, "SMTP")?, tls: self.smtp_tls },
+        })
+    }
+}
+
+fn tls_picker(ui: &mut egui::Ui, id: &str, tls: &mut Tls) {
+    let label = |t: Tls| match t {
+        Tls::StartTls => "STARTTLS",
+        Tls::Tls => "TLS",
+        Tls::None => "None (insecure)",
+    };
+    egui::ComboBox::from_id_salt(id).selected_text(label(*tls)).show_ui(ui, |ui| {
+        for t in [Tls::StartTls, Tls::Tls, Tls::None] {
+            ui.selectable_value(tls, t, label(t));
+        }
+    });
+}
+
+struct BeaverApp {
     runtime: Runtime,
     ctx: egui::Context,
     tx: Sender<Event>,
     rx: Receiver<Event>,
-    mailboxes: Vec<Mailbox>,
-    selected_mailbox: usize,
+    accounts: Vec<AccountView>,
+    next_serial: u64,
+    /// Selected folder: account serial and index in that account's mailboxes.
+    selected: Option<(u64, usize)>,
     messages: Vec<MessageSummary>,
-    selected: Option<MessageId>,
+    message: Option<MessageId>,
     body: Option<String>,
-    error: Option<MailError>,
+    error: Option<String>,
+    form: Option<NewAccount>,
 }
 
-impl<S: MailSource + Send + Sync + 'static> BeaverApp<S> {
-    fn new(source: S, ctx: egui::Context) -> Self {
+impl BeaverApp {
+    fn new(ctx: egui::Context) -> Self {
         let (tx, rx) = channel();
-        let app = Self {
-            source: Arc::new(source),
+        let mut app = Self {
             runtime: Runtime::new().expect("tokio runtime"),
             ctx,
             tx,
             rx,
-            mailboxes: Vec::new(),
-            selected_mailbox: 0,
-            messages: Vec::new(),
+            accounts: Vec::new(),
+            next_serial: 0,
             selected: None,
+            messages: Vec::new(),
+            message: None,
             body: None,
             error: None,
+            form: None,
         };
-        app.spawn(|source| async move { Event::Mailboxes(source.mailboxes().await) });
+        match store::load() {
+            Ok(accounts) => accounts.into_iter().for_each(|a| app.add_view(a)),
+            Err(e) => app.error = Some(e),
+        }
         app
     }
 
     /// Runs one mail call in the background and wakes the UI with its result.
-    fn spawn<F, Fut>(&self, call: F)
-    where
-        F: FnOnce(Arc<S>) -> Fut,
-        Fut: Future<Output = Event> + Send + 'static,
-    {
+    fn spawn(&self, fut: impl Future<Output = Event> + Send + 'static) {
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
-        let fut = call(Arc::clone(&self.source));
         self.runtime.spawn(async move {
             let _ = tx.send(fut.await); // the receiver is gone only when the app is closing
             ctx.request_repaint();
         });
     }
 
-    fn select_mailbox(&mut self, index: usize) {
-        self.selected_mailbox = index;
-        self.selected = None;
+    /// Shows an account and starts loading its folders.
+    fn add_view(&mut self, account: Account) {
+        let serial = self.next_serial;
+        self.next_serial += 1;
+        let (source, error) = match store::password(&account) {
+            Ok(password) => (Some(Arc::new(ImapSource::new(&account, password))), None),
+            Err(e) => (None, Some(e)),
+        };
+        if let Some(source) = source.clone() {
+            self.spawn(async move { Event::Mailboxes(serial, source.mailboxes().await) });
+        }
+        self.accounts.push(AccountView { serial, account, source, mailboxes: Vec::new(), error });
+    }
+
+    fn view(&self, serial: u64) -> Option<&AccountView> {
+        self.accounts.iter().find(|v| v.serial == serial)
+    }
+
+    fn select_mailbox(&mut self, serial: u64, index: usize) {
+        let Some(view) = self.view(serial) else { return };
+        let (Some(source), Some(mailbox)) = (view.source.clone(), view.mailboxes.get(index)) else { return };
+        let name = mailbox.name.clone();
+        self.selected = Some((serial, index));
+        self.message = None;
         self.body = None;
         self.messages.clear();
-        let name = self.mailboxes[index].name.clone();
-        self.spawn(move |source| async move { Event::Messages(index, source.messages(&name).await) });
+        self.spawn(async move { Event::Messages(serial, index, source.messages(&name).await) });
     }
 
     fn select_message(&mut self, id: MessageId) {
-        self.selected = Some(id);
+        let Some((serial, _)) = self.selected else { return };
+        let Some(source) = self.view(serial).and_then(|v| v.source.clone()) else { return };
+        self.message = Some(id);
         self.body = None;
-        self.spawn(move |source| async move { Event::Body(id, source.body(id).await) });
+        self.spawn(async move { Event::Body(serial, id, source.body(id).await) });
+    }
+
+    /// Stores the password, then the settings, then shows the account.
+    fn add_account(&mut self, form: &NewAccount) -> Result<(), String> {
+        let account = form.build()?;
+        if self.accounts.iter().any(|v| v.account.key() == account.key()) {
+            return Err("this account is already configured".into());
+        }
+        store::set_password(&account, &form.password)?;
+        let all: Vec<Account> =
+            self.accounts.iter().map(|v| v.account.clone()).chain([account.clone()]).collect();
+        if let Err(e) = store::save(&all) {
+            let _ = store::forget_password(&account); // do not leave a secret without settings
+            return Err(e);
+        }
+        self.add_view(account);
+        Ok(())
+    }
+
+    fn remove_account(&mut self, serial: u64) {
+        let Some(position) = self.accounts.iter().position(|v| v.serial == serial) else { return };
+        let view = self.accounts.remove(position);
+        let all: Vec<Account> = self.accounts.iter().map(|v| v.account.clone()).collect();
+        if let Err(e) = store::save(&all).and_then(|()| store::forget_password(&view.account)) {
+            self.error = Some(e);
+        }
+        if self.selected.is_some_and(|(s, _)| s == serial) {
+            self.selected = None;
+            self.messages.clear();
+            self.message = None;
+            self.body = None;
+        }
     }
 
     fn apply(&mut self, event: Event) {
         match event {
-            Event::Mailboxes(Ok(mailboxes)) if !mailboxes.is_empty() => {
-                self.mailboxes = mailboxes;
-                self.error = None;
-                self.select_mailbox(0);
+            Event::Mailboxes(serial, result) => {
+                let Some(view) = self.accounts.iter_mut().find(|v| v.serial == serial) else { return };
+                match result {
+                    Ok(mailboxes) => {
+                        view.mailboxes = mailboxes;
+                        view.error = None;
+                        if self.selected.is_none() {
+                            self.select_mailbox(serial, 0);
+                        }
+                    }
+                    Err(e) => view.error = Some(e.to_string()),
+                }
             }
-            Event::Mailboxes(Ok(_)) => self.error = Some(MailError::Backend("the account has no mailboxes".into())),
-            Event::Messages(index, Ok(messages)) if index == self.selected_mailbox => {
-                self.messages = messages;
-                self.error = None;
+            Event::Messages(serial, index, result) if self.selected == Some((serial, index)) => match result {
+                Ok(messages) => {
+                    self.messages = messages;
+                    self.error = None;
+                }
+                Err(e) => self.error = Some(e.to_string()),
+            },
+            Event::Body(serial, id, result)
+                if self.selected.is_some_and(|(s, _)| s == serial) && self.message == Some(id) =>
+            {
+                match result {
+                    Ok(body) => self.body = Some(body),
+                    Err(e) => self.error = Some(e.to_string()),
+                }
             }
-            Event::Body(id, Ok(body)) if self.selected == Some(id) => self.body = Some(body),
-            Event::Mailboxes(Err(e)) | Event::Messages(_, Err(e)) | Event::Body(_, Err(e)) => self.error = Some(e),
-            _ => {} // answer for a mailbox or message that is no longer selected
+            _ => {} // answer for a folder or message that is no longer selected
+        }
+    }
+
+    fn account_form(&mut self, ctx: &egui::Context) {
+        let Some(mut form) = self.form.take() else { return };
+        let (mut open, mut submit) = (true, false);
+        egui::Window::new("Add account").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
+            egui::Grid::new("account_form").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                ui.label("Name");
+                ui.text_edit_singleline(&mut form.name);
+                ui.end_row();
+                ui.label("User");
+                ui.text_edit_singleline(&mut form.user);
+                ui.end_row();
+                ui.label("Password");
+                ui.add(egui::TextEdit::singleline(&mut form.password).password(true));
+                ui.end_row();
+                ui.label("IMAP server");
+                ui.text_edit_singleline(&mut form.imap_host);
+                ui.end_row();
+                ui.label("IMAP port");
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut form.imap_port).desired_width(60.0));
+                    tls_picker(ui, "imap_tls", &mut form.imap_tls);
+                });
+                ui.end_row();
+                ui.label("SMTP server");
+                ui.add(egui::TextEdit::singleline(&mut form.smtp_host).hint_text("same as IMAP"));
+                ui.end_row();
+                ui.label("SMTP port");
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut form.smtp_port).desired_width(60.0));
+                    tls_picker(ui, "smtp_tls", &mut form.smtp_tls);
+                });
+                ui.end_row();
+            });
+            if let Some(error) = &form.error {
+                ui.colored_label(ui.visuals().error_fg_color, error);
+            }
+            submit = ui.button("Add").clicked();
+        });
+        if submit {
+            match self.add_account(&form) {
+                Ok(()) => open = false,
+                Err(e) => form.error = Some(e),
+            }
+        }
+        if open {
+            self.form = Some(form);
         }
     }
 }
 
-impl<S: MailSource + Send + Sync + 'static> eframe::App for BeaverApp<S> {
+impl eframe::App for BeaverApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         while let Ok(event) = self.rx.try_recv() {
             self.apply(event);
@@ -115,28 +306,58 @@ impl<S: MailSource + Send + Sync + 'static> eframe::App for BeaverApp<S> {
 
         if let Some(error) = &self.error {
             egui::Panel::top("error").show(ui, |ui| {
-                ui.colored_label(ui.visuals().error_fg_color, error.to_string());
+                ui.colored_label(ui.visuals().error_fg_color, error);
             });
         }
 
-        let mut chosen_mailbox = None;
-        egui::Panel::left("folders").exact_size(200.0).resizable(false).show(ui, |ui| {
-            for (i, mailbox) in self.mailboxes.iter().enumerate() {
-                let label = if mailbox.unread > 0 {
-                    format!("{}  ({})", mailbox.name, mailbox.unread)
-                } else {
-                    mailbox.name.clone()
-                };
-                if ui.selectable_label(i == self.selected_mailbox, label).clicked() {
-                    chosen_mailbox = Some(i);
+        let (mut chosen, mut removed, mut add) = (None, None, false);
+        egui::Panel::left("accounts").default_size(220.0).show(ui, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                for view in &self.accounts {
+                    let header = egui::CollapsingHeader::new(&view.account.name)
+                        .id_salt(view.serial)
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            if let Some(error) = &view.error {
+                                ui.colored_label(ui.visuals().error_fg_color, error);
+                            }
+                            for (i, mailbox) in view.mailboxes.iter().enumerate() {
+                                let label = if mailbox.unread > 0 {
+                                    format!("{}  ({})", mailbox.name, mailbox.unread)
+                                } else {
+                                    mailbox.name.clone()
+                                };
+                                if ui.selectable_label(self.selected == Some((view.serial, i)), label).clicked() {
+                                    chosen = Some((view.serial, i));
+                                }
+                            }
+                        });
+                    header.header_response.context_menu(|ui| {
+                        if ui.button("Remove account").clicked() {
+                            removed = Some(view.serial);
+                            ui.close();
+                        }
+                    });
                 }
-            }
+                if self.accounts.is_empty() {
+                    ui.weak("No accounts yet");
+                }
+            });
+            ui.separator();
+            add = ui.button("Add account…").clicked();
         });
-        if let Some(index) = chosen_mailbox {
-            self.select_mailbox(index);
+        if let Some((serial, index)) = chosen {
+            self.select_mailbox(serial, index);
         }
+        if let Some(serial) = removed {
+            self.remove_account(serial);
+        }
+        if add {
+            self.form = Some(NewAccount::default());
+        }
+        self.account_form(ui.ctx());
 
-        egui::Panel::right("reader").default_size(460.0).show(ui, |ui| match (self.selected, &self.body) {
+        egui::Panel::right("reader").default_size(460.0).show(ui, |ui| match (self.message, &self.body) {
             (Some(_), Some(body)) => {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.label(RichText::new(body).size(14.0));
@@ -191,24 +412,14 @@ impl<S: MailSource + Send + Sync + 'static> eframe::App for BeaverApp<S> {
     }
 }
 
-fn run<S: MailSource + Send + Sync + 'static>(title: &str, source: S) -> eframe::Result {
+fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_title(title).with_inner_size([1280.0, 800.0]),
+        viewport: egui::ViewportBuilder::default().with_title("BeaverMail").with_inner_size([1280.0, 800.0]),
         ..Default::default()
     };
-    eframe::run_native(title, options, Box::new(|cc| Ok(Box::new(BeaverApp::new(source, cc.egui_ctx.clone())))))
-}
-
-fn main() -> eframe::Result {
-    let _ = dotenvy::dotenv(); // optional: a missing .env just means sample data
-    match Config::from_env() {
-        Ok(config) => {
-            let title = format!("BeaverMail — {}", config.user);
-            run(&title, ImapSource::new(config))
-        }
-        Err(why) => {
-            eprintln!("sample data ({why})");
-            run("BeaverMail (sample data)", SampleSource::new(SAMPLE_MESSAGES))
-        }
-    }
+    eframe::run_native(
+        "BeaverMail",
+        options,
+        Box::new(|cc| Ok(Box::new(BeaverApp::new(cc.egui_ctx.clone())))),
+    )
 }
