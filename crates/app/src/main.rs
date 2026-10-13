@@ -7,6 +7,7 @@
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
+mod attachments;
 mod compose;
 mod html;
 mod icons;
@@ -43,6 +44,14 @@ enum Event {
     Sent(Result<(), MailError>, Option<String>),
     /// A change to how stored mail is protected finished.
     Vault(VaultOutcome),
+    /// The bytes of an attachment, to open or to save.
+    Attachment(AttachmentUse, Result<(String, Vec<u8>), MailError>),
+}
+
+#[derive(Clone, Copy)]
+enum AttachmentUse {
+    Open,
+    Save,
 }
 
 enum VaultOutcome {
@@ -102,6 +111,8 @@ struct ReaderOutcome {
     mode: Option<DisplayMode>,
     /// A display mode to remember for the sender of this message.
     remember: Option<DisplayMode>,
+    /// An attachment to open or save: its position and what to do.
+    attachment: Option<(u32, AttachmentUse)>,
 }
 
 struct AccountView {
@@ -284,6 +295,10 @@ struct BeaverApp {
     show_settings: bool,
     /// The user paused the background downloads.
     downloads_paused: bool,
+    /// An attachment that runs code, waiting for the user to say yes to opening it.
+    confirm_open: Option<(u32, String)>,
+    /// Where private copies of opened attachments go; emptied at start and exit.
+    open_dir: std::path::PathBuf,
     /// Settings and prompt state for the stored-mail protection.
     security: security::Form,
     /// A mode change rewriting files in the background.
@@ -334,6 +349,8 @@ impl BeaverApp {
             syncing: 0,
             show_settings: false,
             downloads_paused: false,
+            confirm_open: None,
+            open_dir: store::data_dir().unwrap_or_else(|_| std::env::temp_dir()).join("open"),
             security: security::Form::default(),
             vault_job: None,
             unlock_skipped: false,
@@ -341,6 +358,7 @@ impl BeaverApp {
             view_mode: None,
         };
         app.error = archive_error.or(vault_error);
+        let _ = std::fs::remove_dir_all(&app.open_dir); // copies of attachments from an earlier run
         match store::load_settings() {
             Ok(settings) => app.settings = settings,
             Err(e) => app.error = Some(e),
@@ -607,6 +625,46 @@ impl BeaverApp {
     /// The stored mail is protected by a passphrase that has not been entered, and the prompt is showing.
     fn locked(&self) -> bool {
         self.vault.is_locked() && !self.unlock_skipped
+    }
+
+    /// Fetches an attachment of the open message; opening one that runs code asks first.
+    fn use_attachment(&mut self, index: u32, what: AttachmentUse) {
+        let name = self.body.as_ref().and_then(|b| b.data.attachments.iter().find(|a| a.index == index)).map(|a| a.name.clone());
+        if let (Some(name), AttachmentUse::Open) = (&name, what)
+            && attachments::is_risky(name)
+            && self.confirm_open.as_ref().is_none_or(|(i, _)| *i != index)
+        {
+            self.confirm_open = Some((index, name.clone()));
+            return;
+        }
+        self.fetch_attachment(index, what);
+    }
+
+    fn fetch_attachment(&mut self, index: u32, what: AttachmentUse) {
+        let (Some((serial, _)), Some(id)) = (self.selected, self.message) else { return };
+        let Some(source) = self.view(serial).and_then(|v| v.source.clone()) else { return };
+        self.spawn(async move { Event::Attachment(what, source.attachment(id, index).await) });
+    }
+
+    fn open_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
+        let Some((index, name)) = self.confirm_open.clone() else { return };
+        let (mut open, mut cancel) = (false, false);
+        let modal = egui::Modal::new(egui::Id::new("confirm_open")).show(ctx, |ui| {
+            ui.set_width(FORM_WIDTH * 0.85);
+            ui.heading("Open this file?");
+            ui.label(RichText::new(format!("{} can run programs or change your computer when opened. Only open it if you were expecting it from someone you trust.", attachments::safe_name(&name))).color(t.text_dim));
+            ui.add_space(12.0);
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
+                open = ui.add(egui::Button::new(RichText::new("Open anyway").color(t.on_accent)).fill(t.danger)).clicked();
+                cancel = ui.button("Cancel").clicked();
+            });
+        });
+        if open {
+            self.fetch_attachment(index, AttachmentUse::Open);
+        }
+        if open || cancel || modal.should_close() {
+            self.confirm_open = None;
+        }
     }
 
     /// The sender's address of the open message.
@@ -1015,6 +1073,19 @@ impl BeaverApp {
             }
             Event::Done(..) => {}
             Event::Vault(outcome) => self.apply_vault(outcome),
+            Event::Attachment(what, result) => match result {
+                Ok((name, bytes)) => {
+                    let done = match what {
+                        AttachmentUse::Save => attachments::save(&name, &bytes).map(|path| format!("Saved to {}", path.display())),
+                        AttachmentUse::Open => attachments::open(&self.open_dir, &name, &bytes).map(|()| format!("Opening {}", attachments::safe_name(&name))),
+                    };
+                    match done {
+                        Ok(text) => self.notice = Some((text, std::time::Instant::now())),
+                        Err(e) => self.error = Some(e),
+                    }
+                }
+                Err(e) => self.error = Some(format!("Could not get the attachment: {e}")),
+            },
             Event::Sent(result, copy_error) => match result {
                 Ok(()) => {
                     self.compose = None;
@@ -1369,6 +1440,7 @@ impl BeaverApp {
         let mut url = None;
         let mut chosen_mode = None;
         let mut remember = None;
+        let mut attachment = None;
         let (settings_mode, view_mode) = (self.settings.clone(), self.view_mode);
         let role = self.role();
         let current = self.message.and_then(|id| self.messages.iter().find(|m| m.id == id)).cloned();
@@ -1437,6 +1509,18 @@ impl BeaverApp {
                                 ui.add_space(6.0);
                                 ui.add(egui::Label::new(RichText::new(format!("To: {}", body.data.to.join(", "))).size(13.0).color(t.text_dim)).truncate());
                             }
+                            if !body.data.attachments.is_empty() {
+                                ui.add_space(10.0);
+                                ui.label(RichText::new(format!("{} attachment{}", body.data.attachments.len(), if body.data.attachments.len() == 1 { "" } else { "s" })).size(13.0).color(t.text_dim));
+                                ui.add_space(2.0);
+                                ui.horizontal_wrapped(|ui| {
+                                    for file in &body.data.attachments {
+                                        if let Some(what) = views::attachment_chip(ui, t, file) {
+                                            attachment = Some((file.index, what));
+                                        }
+                                    }
+                                });
+                            }
                             let stored = settings_mode.mode_for(&message.address);
                             let mode = view_mode.unwrap_or(stored);
                             if body.simplified.is_some() {
@@ -1467,11 +1551,15 @@ impl BeaverApp {
                 }
             }
         });
-        ReaderOutcome { action, url, mode: chosen_mode, remember }
+        ReaderOutcome { action, url, mode: chosen_mode, remember, attachment }
     }
 }
 
 impl eframe::App for BeaverApp {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        let _ = std::fs::remove_dir_all(&self.open_dir); // the decrypted copies made to open attachments
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         while let Ok(event) = self.rx.try_recv() {
             self.apply(event);
@@ -1495,7 +1583,10 @@ impl eframe::App for BeaverApp {
         self.account_form(ui.ctx());
 
         self.handle_keys(ui.ctx());
-        let ReaderOutcome { action, url, mode, remember } = self.reader(ui, &t);
+        let ReaderOutcome { action, url, mode, remember, attachment } = self.reader(ui, &t);
+        if let Some((index, what)) = attachment {
+            self.use_attachment(index, what);
+        }
         if let Some(url) = url {
             ui.ctx().open_url(egui::OpenUrl::new_tab(url));
         }
@@ -1517,6 +1608,7 @@ impl eframe::App for BeaverApp {
             self.request(id, what);
         }
         self.erase_dialog(ui.ctx(), &t);
+        self.open_dialog(ui.ctx(), &t);
         self.settings_window(ui.ctx(), &t);
         if self.locked()
             && let Some(request) = security::unlock_prompt(ui.ctx(), &t, &mut self.security, self.unlocking)

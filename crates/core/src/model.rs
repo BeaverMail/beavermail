@@ -47,6 +47,8 @@ pub struct MessageSummary {
     /// Seconds since the Unix epoch, for ordering; 0 when the message has no valid date.
     pub timestamp: i64,
     pub unread: bool,
+    /// The message looks like it carries attachments (a `multipart/mixed` body).
+    pub has_attachments: bool,
 }
 
 /// What one synchronisation of a folder did.
@@ -54,6 +56,17 @@ pub struct MessageSummary {
 pub struct SyncReport {
     /// Older messages on the server that are not in the archive yet (an estimate).
     pub remaining: u32,
+}
+
+/// A file attached to a message. The bytes stay in the message file until asked for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Attachment {
+    /// Position among the message's attachments; the key to fetch the bytes.
+    pub index: u32,
+    /// The name the sender gave it, or a made-up one. Untrusted: it is a hint, not a path.
+    pub name: String,
+    pub mime: String,
+    pub size: u64,
 }
 
 /// What opening a message needs beyond its summary: text, recipients and threading headers.
@@ -70,6 +83,7 @@ pub struct MessageBody {
     pub references: Vec<String>,
     /// The `text/html` part, only when the message really has one. Untrusted: never run it.
     pub html: Option<String>,
+    pub attachments: Vec<Attachment>,
 }
 
 /// Transport security of a mail server connection.

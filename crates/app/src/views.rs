@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use beavermail_core::{MessageSummary, Role};
+use beavermail_core::{Attachment, MessageSummary, Role};
 use eframe::egui::{self, Color32, CornerRadius, FontId, Margin, Rect, Response, Sense, Ui, pos2, vec2};
 use egui::text::{LayoutJob, TextWrapping};
 
@@ -129,9 +129,14 @@ pub fn message_row(ui: &mut Ui, t: &Tokens, message: &MessageSummary, selected: 
     let date_w = date.size().x;
     ui.painter().galley(pos2(card.right() - 14.0 - date_w, card.top() + 13.0), date, t.text_dim);
 
+    // The paperclip sits just left of the date, where the eye already is.
+    let clip = if message.has_attachments { 20.0 } else { 0.0 };
+    if message.has_attachments {
+        Icon::Paperclip.image(15.0, t.text_dim).paint_at(ui, Rect::from_center_size(pos2(card.right() - 14.0 - date_w - 17.0, card.top() + 21.0), vec2(15.0, 15.0)));
+    }
     let primary = if message.unread { t.text } else { t.text_dim };
     let dot = if message.unread { 16.0 } else { 0.0 };
-    let sender = truncated(ui, &message.from, FontId::proportional(15.5), primary, width - date_w - 12.0 - dot);
+    let sender = truncated(ui, &message.from, FontId::proportional(15.5), primary, width - date_w - 12.0 - dot - clip);
     let sender_w = sender.size().x;
     ui.painter().galley(pos2(left, card.top() + 11.0), sender, primary);
     if message.unread {
@@ -318,6 +323,35 @@ pub fn body(ui: &mut Ui, t: &Tokens, blocks: &[Block]) -> Option<String> {
         }
     }
     clicked
+}
+
+/// One attached file: its name and size, with Open and Save. Returns what the user chose.
+pub fn attachment_chip(ui: &mut Ui, t: &Tokens, file: &Attachment) -> Option<crate::AttachmentUse> {
+    let mut chosen = None;
+    egui::Frame::new()
+        .fill(t.input)
+        .stroke(egui::Stroke::new(1.0, t.border_strong))
+        .corner_radius(CornerRadius::same(CONTROL_RADIUS))
+        .inner_margin(Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.add(Icon::Paperclip.image(icons::SIZE, t.text_dim));
+                let name = crate::attachments::safe_name(&file.name);
+                let shown: String = if name.chars().count() > 32 { format!("{}…", name.chars().take(31).collect::<String>()) } else { name };
+                let open = ui.add(egui::Label::new(egui::RichText::new(shown).color(t.text)).sense(Sense::click())).on_hover_text(format!("{}  ·  {}", file.name, file.mime)).on_hover_cursor(egui::CursorIcon::PointingHand);
+                if open.clicked() {
+                    chosen = Some(crate::AttachmentUse::Open);
+                }
+                ui.label(egui::RichText::new(crate::attachments::human_size(file.size)).size(13.0).color(t.text_dim));
+                if ui.small_button("Open").clicked() {
+                    chosen = Some(crate::AttachmentUse::Open);
+                }
+                if ui.small_button("Save").on_hover_text("Save to your Downloads folder").clicked() {
+                    chosen = Some(crate::AttachmentUse::Save);
+                }
+            });
+        });
+    chosen
 }
 
 /// 1240 as "1,240".

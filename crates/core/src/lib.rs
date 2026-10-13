@@ -8,7 +8,7 @@
 pub mod model;
 pub mod sample;
 
-pub use model::{Account, DisplayMode, Keep, Mailbox, MessageBody, MessageId, MessageSummary, Outgoing, Progress, Role, Server, Settings, SyncReport, Tls};
+pub use model::{Account, Attachment, DisplayMode, Keep, Mailbox, MessageBody, MessageId, MessageSummary, Outgoing, Progress, Role, Server, Settings, SyncReport, Tls};
 
 use std::fmt;
 use std::future::Future;
@@ -64,6 +64,9 @@ pub trait MailSource {
     /// Text, recipients and threading headers of a message, from the archive or else downloaded;
     /// [`MailError::NotFound`] if it does not exist.
     fn body(&self, id: MessageId) -> impl Future<Output = Result<MessageBody, MailError>> + Send;
+
+    /// The name and bytes of one attachment of a message (see [`Attachment::index`]).
+    fn attachment(&self, id: MessageId, index: u32) -> impl Future<Output = Result<(String, Vec<u8>), MailError>> + Send;
 
     /// Stores a copy of a sent message (RFC 5322 bytes) in the Sent folder, marked as read.
     fn save_sent(&self, raw: Vec<u8>) -> impl Future<Output = Result<(), MailError>> + Send;

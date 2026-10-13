@@ -7,11 +7,11 @@ use std::sync::Arc;
 
 use async_imap::types::{Fetch, Flag, NameAttribute};
 use async_imap::{Client, Session};
-use beavermail_core::{Account, Keep, MailError, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Progress, Role, Server, SyncReport, Tls};
+use beavermail_core::{Account, Attachment, Keep, MailError, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Progress, Role, Server, SyncReport, Tls};
 use beavermail_store::{Header, Location, Store};
 use beavermail_vault::{Vault, folder_path, message_path};
 use futures::TryStreamExt;
-use mail_parser::MessageParser;
+use mail_parser::{MessageParser, MimeHeaders};
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -25,7 +25,7 @@ const BACKFILL_SPAN: u32 = 1000;
 /// Cached messages whose flags and existence are re-checked on every sync.
 const RECONCILE_WINDOW: u32 = 1000;
 /// Header fields the list and threading need; the rest of the header is not downloaded.
-const HEADER_FIELDS: &str = "BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES)]";
+const HEADER_FIELDS: &str = "BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES CONTENT-TYPE)]";
 
 trait Conn: AsyncRead + AsyncWrite + Unpin + Send + fmt::Debug {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + fmt::Debug> Conn for T {}
@@ -176,6 +176,25 @@ fn resolve_roles(folders: &mut [(String, Role)]) {
     }
 }
 
+fn has_param(params: &async_imap::imap_proto::BodyParams<'_>, name: &str) -> bool {
+    params.as_ref().is_some_and(|list| list.iter().any(|(key, _)| key.eq_ignore_ascii_case(name)))
+}
+
+/// Whether the message structure has a file attached: a part marked as an attachment, or a named
+/// one that is not embedded in the text (embedded parts have a Content-ID).
+fn carries_file(structure: &async_imap::imap_proto::BodyStructure<'_>) -> bool {
+    use async_imap::imap_proto::BodyStructure::{Basic, Message, Multipart, Text};
+    match structure {
+        Multipart { bodies, .. } => bodies.iter().any(carries_file),
+        Basic { common, other, .. } | Text { common, other, .. } | Message { common, other, .. } => {
+            let disposition = common.disposition.as_ref();
+            let attached = disposition.is_some_and(|d| d.ty.eq_ignore_ascii_case("attachment"));
+            let named = disposition.is_some_and(|d| has_param(&d.params, "filename")) || has_param(&common.ty.params, "name");
+            attached || (named && other.id.is_none())
+        }
+    }
+}
+
 /// The Message-IDs of a header such as `References`, without angle brackets.
 fn ids(value: &mail_parser::HeaderValue<'_>) -> Vec<String> {
     match value.as_text_list() {
@@ -205,6 +224,12 @@ fn header(fetch: &Fetch) -> Option<Header> {
         in_reply_to: ids(message.in_reply_to()).join(" "),
         references: ids(message.references()).join(" "),
         size: fetch.size.unwrap_or(0),
+        // The server's description of the message is exact; the Content-Type is a guess for servers
+        // that do not send it.
+        has_attachments: fetch.bodystructure().map_or_else(
+            || message.root_part().content_type().is_some_and(|c| c.ctype().eq_ignore_ascii_case("multipart") && c.subtype().is_some_and(|s| s.eq_ignore_ascii_case("mixed"))),
+            carries_file,
+        ),
     })
 }
 
@@ -282,7 +307,7 @@ impl ImapSource {
     }
 
     async fn fetch_headers(session: &mut Session<Stream>, set: &str, by_uid: bool) -> Result<Vec<Header>, async_imap::error::Error> {
-        let query = format!("(UID FLAGS INTERNALDATE RFC822.SIZE {HEADER_FIELDS})");
+        let query = format!("(UID FLAGS INTERNALDATE RFC822.SIZE BODYSTRUCTURE {HEADER_FIELDS})");
         let fetches: Vec<Fetch> = if by_uid {
             session.uid_fetch(set, &query).await?.try_collect().await?
         } else {
@@ -340,6 +365,27 @@ impl ImapSource {
         }
         store.add_headers(account, folder, &fresh)?;
 
+        // Rows from before attachments were tracked: ask the server about a chunk of them.
+        for _ in 0..20 {
+            let unknown = store.unknown_attachments(account, folder, 300)?;
+            if unknown.is_empty() {
+                break;
+            }
+            let set = unknown.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+            let fetches: Vec<Fetch> = session.uid_fetch(&set, "(UID BODYSTRUCTURE)").await?.try_collect().await?;
+            for fetch in &fetches {
+                if let (Some(uid), Some(structure)) = (fetch.uid, fetch.bodystructure()) {
+                    store.set_attachments(account, folder, uid, carries_file(structure))?;
+                }
+            }
+            // The server no longer has the ones that did not answer; they are settled as "none".
+            for uid in &unknown {
+                if !fetches.iter().any(|f| f.uid == Some(*uid)) {
+                    store.set_attachments(account, folder, *uid, false)?;
+                }
+            }
+        }
+
         // Flags and deletions among the newest cached messages.
         if let Some(from) = store.nth_newest_uid(account, folder, RECONCILE_WINDOW)?.or(store.uid_range(account, folder)?.map(|(lo, _, _)| lo)) {
             let fetches: Vec<Fetch> = session.uid_fetch(format!("{from}:*"), "(UID FLAGS)").await?.try_collect().await?;
@@ -394,6 +440,7 @@ impl ImapSource {
                 && let Ok(body) = parse_body(raw)
             {
                 self.store.set_preview(id, &body.text)?;
+                self.store.set_attachments(&self.account, folder, uid, !body.attachments.is_empty())?;
             }
             self.store.mark_stored(&self.account, folder, uid)?;
         }
@@ -419,10 +466,37 @@ impl From<MailError> for SyncError {
     }
 }
 
+/// The files attached to a message: parts that are not the text, named or marked as attachments.
+/// Pictures embedded in the HTML (they have a `Content-ID` and no attachment marking) are not listed.
+fn attachments(message: &mail_parser::Message<'_>) -> Vec<Attachment> {
+    message
+        .attachments()
+        .enumerate()
+        .filter(|(_, part)| {
+            let marked = part.content_disposition().is_some_and(|d| d.ctype().eq_ignore_ascii_case("attachment"));
+            marked || (part.attachment_name().is_some() && part.content_id().is_none())
+        })
+        .map(|(index, part)| Attachment {
+            index: index as u32,
+            name: part.attachment_name().map_or_else(|| format!("attachment-{}", index + 1), str::to_owned),
+            mime: part.content_type().map_or_else(|| "application/octet-stream".to_owned(), |c| format!("{}/{}", c.ctype(), c.subtype().unwrap_or("octet-stream"))),
+            size: part.contents().len() as u64,
+        })
+        .collect()
+}
+
+/// The name and decoded bytes of attachment number `index` of a complete message.
+fn attachment_data(raw: &[u8], index: u32) -> Result<(String, Vec<u8>), MailError> {
+    let message = MessageParser::default().parse(raw).ok_or(MailError::NotFound)?;
+    let part = message.attachment(index).ok_or(MailError::NotFound)?;
+    Ok((part.attachment_name().map_or_else(|| format!("attachment-{}", index + 1), str::to_owned), part.contents().to_vec()))
+}
+
 /// The text, recipients and threading headers of a complete message.
 fn parse_body(raw: &[u8]) -> Result<MessageBody, MailError> {
     let message = MessageParser::default().parse(raw).ok_or(MailError::NotFound)?;
     Ok(MessageBody {
+        attachments: attachments(&message),
         text: message.body_text(0).map(|t| t.into_owned()).unwrap_or_default(),
         to: addresses(message.to()),
         cc: addresses(message.cc()),
@@ -588,8 +662,26 @@ impl MailSource for ImapSource {
         if self.files.write(&path, &raw).is_ok() {
             self.store.set_preview(id, &body.text)?;
             self.store.mark_stored(&at.account, &at.folder, at.uid)?;
+            self.store.set_attachments(&at.account, &at.folder, at.uid, !body.attachments.is_empty())?;
         }
         Ok(body)
+    }
+
+    async fn attachment(&self, id: MessageId, index: u32) -> Result<(String, Vec<u8>), MailError> {
+        let at = self.store.locate(id)?.ok_or(MailError::NotFound)?;
+        let path = self.file_of(&at.account, &at.folder, at.uid)?;
+        let raw = match self.files.read(&path).ok().flatten() {
+            Some(raw) => raw,
+            None => {
+                let raw = self.download(&at).await?;
+                // As for the body: failing to keep the file does not stop the attachment from opening.
+                if self.files.write(&path, &raw).is_ok() {
+                    self.store.mark_stored(&at.account, &at.folder, at.uid)?;
+                }
+                raw
+            }
+        };
+        attachment_data(&raw, index)
     }
 
     async fn save_sent(&self, raw: Vec<u8>) -> Result<(), MailError> {
@@ -620,6 +712,27 @@ impl MailSource for ImapSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const WITH_FILES: &str = "From: a@x.org\r\nSubject: files\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: multipart/related; boundary=\"r\"\r\n\r\n--r\r\nContent-Type: text/html\r\n\r\n<p>hi <img src=\"cid:logo\"></p>\r\n--r\r\nContent-Type: image/png\r\nContent-ID: <logo>\r\nContent-Disposition: inline\r\nContent-Transfer-Encoding: base64\r\n\r\niVBORw0K\r\n--r--\r\n--b\r\nContent-Type: application/pdf; name=\"plan.pdf\"\r\nContent-Disposition: attachment; filename=\"plan.pdf\"\r\nContent-Transfer-Encoding: base64\r\n\r\nSGVsbG8gd29ybGQ=\r\n--b\r\nContent-Type: text/plain\r\nContent-Disposition: attachment; filename=\"notes.txt\"\r\n\r\nremember\r\n--b--\r\n";
+
+    #[test]
+    fn attachments_are_listed_without_the_pictures_embedded_in_the_text() {
+        let body = parse_body(WITH_FILES.as_bytes()).unwrap();
+        let names: Vec<_> = body.attachments.iter().map(|a| (a.name.as_str(), a.mime.as_str(), a.size)).collect();
+        assert_eq!(names, [("plan.pdf", "application/pdf", 11), ("notes.txt", "text/plain", 8)]);
+    }
+
+    #[test]
+    fn an_attachment_comes_back_decoded_by_its_position() {
+        let first = body_index(WITH_FILES, "plan.pdf");
+        let (name, bytes) = attachment_data(WITH_FILES.as_bytes(), first).unwrap();
+        assert_eq!((name.as_str(), bytes.as_slice()), ("plan.pdf", &b"Hello world"[..]));
+        assert!(matches!(attachment_data(WITH_FILES.as_bytes(), 99), Err(MailError::NotFound)));
+    }
+
+    fn body_index(raw: &str, name: &str) -> u32 {
+        parse_body(raw.as_bytes()).unwrap().attachments.into_iter().find(|a| a.name == name).unwrap().index
+    }
 
     #[test]
     fn roles_come_from_flags_then_names() {

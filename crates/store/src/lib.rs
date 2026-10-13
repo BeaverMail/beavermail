@@ -86,6 +86,7 @@ pub struct Header {
     pub references: String,
     /// Size of the whole message in bytes; 0 when the server did not say.
     pub size: u32,
+    pub has_attachments: bool,
 }
 
 /// A message whose file has not been downloaded yet.
@@ -162,10 +163,11 @@ fn summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageSummary> {
         received: row.get(5)?,
         timestamp: row.get(6)?,
         unread: row.get::<_, i64>(7)? != 0,
+        has_attachments: row.get::<_, i64>(8)? != 0,
     })
 }
 
-const SUMMARY_COLUMNS: &str = "id, CASE WHEN from_name = '' THEN from_addr ELSE from_name END, from_addr, subject, preview, received, timestamp, unread";
+const SUMMARY_COLUMNS: &str = "id, CASE WHEN from_name = '' THEN from_addr ELSE from_name END, from_addr, subject, preview, received, timestamp, unread, attach";
 
 impl Store {
     /// Opens (and creates) the archive at `path`.
@@ -201,6 +203,15 @@ impl Store {
         // Version 4: how many messages the server said a folder holds.
         if version < 4 {
             conn.execute_batch("ALTER TABLE folders ADD COLUMN total INTEGER; PRAGMA user_version = 4;").map_err(db)?;
+        }
+        // Version 5: whether a message looks like it has attachments, for the paperclip in the list.
+        if version < 5 {
+            conn.execute_batch("ALTER TABLE messages ADD COLUMN attach INTEGER NOT NULL DEFAULT 0; PRAGMA user_version = 5;").map_err(db)?;
+        }
+        // Version 6: whether `attach` is a real answer (from BODYSTRUCTURE or the message itself) or
+        // only the default of a row written before it existed.
+        if version < 6 {
+            conn.execute_batch("ALTER TABLE messages ADD COLUMN attach_known INTEGER NOT NULL DEFAULT 0; PRAGMA user_version = 6;").map_err(db)?;
         }
         Ok(Self { conn: Mutex::new(conn) })
     }
@@ -310,14 +321,14 @@ impl Store {
             let mut stmt = tx
                 .prepare(
                     "INSERT OR IGNORE INTO messages
-                     (account, folder, uid, from_name, from_addr, subject, received, timestamp, unread, message_id, in_reply_to, refs, size)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                     (account, folder, uid, from_name, from_addr, subject, received, timestamp, unread, message_id, in_reply_to, refs, size, attach, attach_known)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 1)",
                 )
                 .map_err(db)?;
             for h in headers {
                 stmt.execute(params![
                     account, folder, i64::from(h.uid), h.from_name, h.from_addr, h.subject, h.received, h.timestamp, i64::from(h.unread),
-                    h.message_id, h.in_reply_to, h.references, i64::from(h.size)
+                    h.message_id, h.in_reply_to, h.references, i64::from(h.size), i64::from(h.has_attachments)
                 ])
                 .map_err(db)?;
             }
@@ -371,6 +382,27 @@ impl Store {
             tx.execute("DELETE FROM messages WHERE account = ?1 AND folder = ?2 AND uid = ?3", params![account, folder, i64::from(*uid)]).map_err(db)?;
         }
         tx.commit().map_err(db)
+    }
+
+    /// UIDs of a folder whose attachment flag was never set from the server's answer.
+    pub fn unknown_attachments(&self, account: &str, folder: &str, limit: usize) -> Result<Vec<u32>, MailError> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT uid FROM messages WHERE account = ?1 AND folder = ?2 AND attach_known = 0 ORDER BY timestamp DESC LIMIT ?3")
+            .map_err(db)?;
+        let rows = stmt.query_map(params![account, folder, limit as i64], |r| r.get::<_, i64>(0).map(|u| u as u32)).map_err(db)?;
+        rows.collect::<Result<_, _>>().map_err(db)
+    }
+
+    /// Records whether a message carries attachments, as the server or the message itself says.
+    pub fn set_attachments(&self, account: &str, folder: &str, uid: u32, has: bool) -> Result<(), MailError> {
+        self.conn()
+            .execute(
+                "UPDATE messages SET attach = ?4, attach_known = 1 WHERE account = ?1 AND folder = ?2 AND uid = ?3",
+                params![account, folder, i64::from(uid), i64::from(has)],
+            )
+            .map(|_| ())
+            .map_err(db)
     }
 
     /// Messages dated `since` or later whose file is not stored, newest first.
@@ -577,6 +609,30 @@ mod tests {
         let store = Store::with(conn).unwrap();
         store.add_headers("me", "INBOX", &[header(1, "a", 1, false)]).unwrap();
         assert_eq!(store.count_pending("me", "INBOX", 0).unwrap(), 1);
+    }
+
+    #[test]
+    fn the_paperclip_flag_comes_back_with_the_list() {
+        let store = store();
+        let mut with = header(1, "with", 2, false);
+        with.has_attachments = true;
+        store.add_headers("me", "INBOX", &[with, header(2, "without", 1, false)]).unwrap();
+        let list = store.messages("me", "INBOX").unwrap();
+        assert_eq!(list.iter().map(|m| m.has_attachments).collect::<Vec<_>>(), [true, false]);
+    }
+
+    #[test]
+    fn rows_of_unknown_attachment_status_are_found_and_settled() {
+        let store = store();
+        store.add_headers("me", "INBOX", &[header(1, "a", 1, false), header(2, "b", 2, false)]).unwrap();
+        // Rows written by this version already know their answer.
+        assert!(store.unknown_attachments("me", "INBOX", 10).unwrap().is_empty());
+        // A row from before the column existed does not.
+        store.conn().execute("UPDATE messages SET attach_known = 0 WHERE uid = 1", []).unwrap();
+        assert_eq!(store.unknown_attachments("me", "INBOX", 10).unwrap(), [1]);
+        store.set_attachments("me", "INBOX", 1, true).unwrap();
+        assert!(store.unknown_attachments("me", "INBOX", 10).unwrap().is_empty());
+        assert!(store.messages("me", "INBOX").unwrap().iter().find(|m| m.subject == "a").unwrap().has_attachments);
     }
 
     #[test]

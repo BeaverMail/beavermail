@@ -1,0 +1,141 @@
+//! Opening and saving the files attached to a message.
+//!
+//! An attachment is untrusted: its name is a suggestion (never a path), and some kinds of file run
+//! code when opened, so those ask first.
+
+use std::path::{Path, PathBuf};
+
+use directories::UserDirs;
+
+/// A name that is safe to use as a file name on any system: no folders, no control characters, no
+/// leading dots, nothing too long, never empty.
+pub fn safe_name(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let cleaned: String = base.chars().map(|c| if c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*') { '_' } else { c }).collect();
+    let cleaned = cleaned.trim().trim_start_matches('.').trim_end_matches(['.', ' ']);
+    let cleaned: String = cleaned.chars().take(120).collect();
+    // Names Windows reserves for devices.
+    let stem = cleaned.split('.').next().unwrap_or("").to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL") || (stem.len() == 4 && (stem.starts_with("COM") || stem.starts_with("LPT")) && stem.ends_with(|c: char| c.is_ascii_digit()));
+    if cleaned.is_empty() {
+        "attachment".to_owned()
+    } else if reserved {
+        format!("_{cleaned}")
+    } else {
+        cleaned
+    }
+}
+
+/// Files that run code, install software or carry macros: opening one asks first.
+pub fn is_risky(name: &str) -> bool {
+    const RISKY: [&str; 44] = [
+        "exe", "msi", "bat", "cmd", "com", "scr", "pif", "vbs", "vbe", "js", "jse", "wsf", "wsh", "ps1", "psm1", "jar", "app", "dmg", "pkg", "deb", "rpm", "sh", "bash", "run", "appimage", "desktop", "lnk", "reg",
+        "hta", "cpl", "apk", "iso", "dll", "sys", "docm", "xlsm", "pptm", "dotm", "xlam", "ps2", "gadget", "inf", "py", "pl",
+    ];
+    name.rsplit_once('.').is_some_and(|(_, ext)| RISKY.contains(&ext.to_ascii_lowercase().as_str()))
+}
+
+/// "1.2 MB", "340 KB", "12 B".
+pub fn human_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    let b = bytes as f64;
+    if b < KB {
+        format!("{bytes} B")
+    } else if b < KB * KB {
+        format!("{:.0} KB", b / KB)
+    } else if b < KB * KB * KB {
+        format!("{:.1} MB", b / (KB * KB))
+    } else {
+        format!("{:.1} GB", b / (KB * KB * KB))
+    }
+}
+
+/// `name`, or `name (1).ext`, `name (2).ext`… so nothing already there is overwritten.
+fn unique(dir: &Path, name: &str) -> PathBuf {
+    let first = dir.join(name);
+    if !first.exists() {
+        return first;
+    }
+    let (stem, ext) = name.rsplit_once('.').filter(|(stem, _)| !stem.is_empty()).map_or((name, String::new()), |(s, e)| (s, format!(".{e}")));
+    (1..)
+        .map(|n| dir.join(format!("{stem} ({n}){ext}")))
+        .find(|p| !p.exists())
+        .expect("an unused name exists")
+}
+
+/// Saves into the user's Downloads folder and returns where.
+pub fn save(name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    let dir = UserDirs::new().and_then(|d| d.download_dir().map(Path::to_path_buf)).or_else(|| UserDirs::new().map(|d| d.home_dir().to_path_buf())).ok_or("no Downloads folder")?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let path = unique(&dir, &safe_name(name));
+    std::fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// Writes a private copy under `temp_root` and opens it with the system's default program.
+pub fn open(temp_root: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
+    let dir = temp_root.join(format!("{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos())));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    restrict(temp_root);
+    restrict(&dir);
+    let path = dir.join(safe_name(name));
+    std::fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    opener::open(&path).map_err(|e| format!("could not open {}: {e}", path.display()))
+}
+
+#[cfg(unix)]
+fn restrict(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+}
+
+#[cfg(not(unix))]
+fn restrict(_: &Path) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_are_reduced_to_a_harmless_file_name() {
+        assert_eq!(safe_name("plan.pdf"), "plan.pdf");
+        assert_eq!(safe_name("../../etc/passwd"), "passwd");
+        assert_eq!(safe_name("C:\\Windows\\evil.exe"), "evil.exe");
+        assert_eq!(safe_name(".bashrc"), "bashrc");
+        assert_eq!(safe_name("a<b>c:d|e?.txt"), "a_b_c_d_e_.txt");
+        assert_eq!(safe_name("report.pdf  "), "report.pdf");
+        assert_eq!(safe_name(""), "attachment");
+        assert_eq!(safe_name(".."), "attachment");
+        assert_eq!(safe_name("NUL.txt"), "_NUL.txt");
+        assert_eq!(safe_name("com1"), "_com1");
+        assert_eq!(safe_name(&"x".repeat(300)).len(), 120);
+        assert_eq!(safe_name("bad\u{0}name.txt"), "bad_name.txt");
+    }
+
+    #[test]
+    fn programs_and_macro_documents_are_risky_pictures_and_pdfs_are_not() {
+        for risky in ["setup.EXE", "run.sh", "invoice.docm", "Tool.AppImage", "a.b.js", "x.desktop"] {
+            assert!(is_risky(risky), "{risky}");
+        }
+        for fine in ["plan.pdf", "photo.jpg", "notes.txt", "exe", "archive.zip", "sheet.xlsx"] {
+            assert!(!is_risky(fine), "{fine}");
+        }
+    }
+
+    #[test]
+    fn sizes_read_naturally() {
+        assert_eq!([12, 340 * 1024, 1_300_000, 3 << 30].map(human_size), ["12 B", "340 KB", "1.2 MB", "3.0 GB"]);
+    }
+
+    #[test]
+    fn an_existing_file_is_never_overwritten() {
+        let dir = std::env::temp_dir().join(format!("beavermail-attach-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("plan.pdf"), b"1").unwrap();
+        std::fs::write(dir.join("plan (1).pdf"), b"2").unwrap();
+        assert_eq!(unique(&dir, "plan.pdf"), dir.join("plan (2).pdf"));
+        assert_eq!(unique(&dir, "other.pdf"), dir.join("other.pdf"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

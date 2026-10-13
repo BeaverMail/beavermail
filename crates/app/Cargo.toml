@@ -16,6 +16,8 @@ workspace = true
 beavermail-core.workspace = true
 eframe.workspace = true
 egui_extras.workspace = true
+directories = "6"
+opener = { version = "0.8", default-features = false }
 scraper.workspace = true
 beavermail-accounts.workspace = true
 beavermail-imap.workspace = true

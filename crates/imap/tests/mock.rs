@@ -17,6 +17,9 @@ const HEADER: &str = "From: Ada <ada@example.com>\r\nSubject: Hello\r\nDate: Mon
 /// The one message the server holds, complete.
 const MESSAGE: &str = "From: Ada <ada@example.com>\r\nTo: Me <me@example.com>, grace@example.com\r\nCc: Linus <linus@example.com>\r\nReply-To: lists@example.com\r\nSubject: Hello\r\nMessage-ID: <m2@example.com>\r\nReferences: <m0@example.com> <m1@example.com>\r\nDate: Mon, 1 Jan 2024 10:00:00 +0000\r\n\r\nHi there.\r\n";
 
+const PLAIN_STRUCTURE: &str = "BODYSTRUCTURE (\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 9 1 NIL NIL NIL) ";
+const MIXED_STRUCTURE: &str = "BODYSTRUCTURE ((\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 9 1 NIL NIL NIL)(\"APPLICATION\" \"PDF\" (\"NAME\" \"plan.pdf\") NIL NIL \"BASE64\" 100 NIL (\"ATTACHMENT\" (\"FILENAME\" \"plan.pdf\")) NIL) \"MIXED\" (\"BOUNDARY\" \"b\") NIL NIL) ";
+
 struct Mock {
     source: ImapSource,
     account: Account,
@@ -40,13 +43,18 @@ impl Mock {
 
 /// `move_works = false` makes `UID MOVE` fail, as on a server without the MOVE extension.
 async fn start(move_works: bool) -> Mock {
+    start_with(move_works, false).await
+}
+
+/// `attachment`: the server describes its message as having a PDF attached.
+async fn start_with(move_works: bool, attachment: bool) -> Mock {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let log = Arc::new(Mutex::new(Vec::new()));
     let served = log.clone();
     tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
-            tokio::spawn(serve(socket, served.clone(), move_works));
+            tokio::spawn(serve(socket, served.clone(), move_works, attachment));
         }
     });
     let server = Server { host: "127.0.0.1".into(), port, tls: Tls::None };
@@ -56,7 +64,7 @@ async fn start(move_works: bool) -> Mock {
     Mock { source: ImapSource::new(&account, "p".into(), store.clone(), files.clone()), account, store, files, log }
 }
 
-async fn serve(socket: TcpStream, log: Arc<Mutex<Vec<String>>>, move_works: bool) {
+async fn serve(socket: TcpStream, log: Arc<Mutex<Vec<String>>>, move_works: bool, attachment: bool) {
     let (read, mut write) = socket.into_split();
     let mut read = BufReader::new(read);
     let _ = write.write_all(b"* OK ready\r\n").await;
@@ -84,7 +92,15 @@ async fn serve(socket: TcpStream, log: Arc<Mutex<Vec<String>>>, move_works: bool
             format!("* 1 FETCH (UID 5 BODY[] {{{n}}}\r\n{MESSAGE})\r\n{tag} OK done\r\n")
         } else if verb.contains("FETCH") && verb.contains("HEADER") {
             let n = HEADER.len();
-            format!("* 1 FETCH (UID 5 FLAGS () BODY[HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES)] {{{n}}}\r\n{HEADER})\r\n{tag} OK done\r\n")
+            let structure = match (verb.contains("BODYSTRUCTURE"), attachment) {
+                (false, _) => "",
+                (true, false) => PLAIN_STRUCTURE,
+                (true, true) => MIXED_STRUCTURE,
+            };
+            format!("* 1 FETCH (UID 5 FLAGS () {structure}BODY[HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES)] {{{n}}}\r\n{HEADER})\r\n{tag} OK done\r\n")
+        } else if verb.contains("FETCH") && verb.contains("BODYSTRUCTURE") {
+            let structure = if attachment { MIXED_STRUCTURE } else { PLAIN_STRUCTURE };
+            format!("* 1 FETCH (UID 5 {structure})\r\n{tag} OK done\r\n")
         } else if verb.contains("FETCH") {
             format!("* 1 FETCH (UID 5 FLAGS ())\r\n{tag} OK done\r\n")
         } else if verb.starts_with("APPEND") {
@@ -343,4 +359,26 @@ async fn folders_report_how_many_messages_the_server_holds_and_how_many_are_stor
     mock.source.download(Keep::All, &Progress::default()).await.unwrap();
     let inbox = mock.source.cached_mailboxes().await.unwrap().into_iter().find(|m| m.name == "INBOX").unwrap();
     assert_eq!((inbox.total, inbox.stored), (1240, 1));
+}
+
+#[tokio::test]
+async fn the_list_knows_which_messages_carry_a_file_from_the_servers_structure() {
+    let with = start_with(true, true).await;
+    with.source.mailboxes().await.unwrap();
+    with.source.sync("INBOX").await.unwrap();
+    assert!(with.source.messages("INBOX").await.unwrap()[0].has_attachments);
+
+    let without = start_with(true, false).await;
+    without.source.mailboxes().await.unwrap();
+    without.source.sync("INBOX").await.unwrap();
+    assert!(!without.source.messages("INBOX").await.unwrap()[0].has_attachments);
+}
+
+#[tokio::test]
+async fn opening_a_message_settles_its_attachment_flag_from_the_message_itself() {
+    let mock = start(true).await;
+    let id = message_in(&mock, "INBOX").await;
+    assert!(!mock.source.messages("INBOX").await.unwrap()[0].has_attachments);
+    mock.source.body(id).await.unwrap();
+    assert!(!mock.source.messages("INBOX").await.unwrap()[0].has_attachments, "the mock's message has none");
 }

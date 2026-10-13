@@ -273,6 +273,7 @@ mod tests {
             preview: String::new(),
             received: "2026-10-13 12:00".into(),
             timestamp: 0,
+            has_attachments: false,
             unread: false,
         };
         let body = MessageBody {
@@ -283,6 +284,7 @@ mod tests {
             message_id: "m2@host".into(),
             references: vec!["m1@host".into()],
             html: None,
+            attachments: Vec::new(),
         };
         (summary, body)
     }

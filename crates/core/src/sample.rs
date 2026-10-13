@@ -39,6 +39,7 @@ impl SampleSource {
                     preview: body.chars().take(90).collect(),
                     received: format!("{:02}:{:02}", next() % 24, next() % 60),
                     timestamp: 0,
+                    has_attachments: false,
                     unread: next() % 3 == 0,
                 };
                 (folder, summary, body)
@@ -108,6 +109,10 @@ impl MailSource for SampleSource {
 
     async fn download(&self, _: Keep, _: &Progress) -> Result<(), MailError> {
         Ok(())
+    }
+
+    async fn attachment(&self, _: MessageId, _: u32) -> Result<(String, Vec<u8>), MailError> {
+        Err(MailError::NotFound)
     }
 
     async fn save_sent(&self, _: Vec<u8>) -> Result<(), MailError> {
