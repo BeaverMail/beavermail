@@ -256,13 +256,35 @@ async fn a_downloaded_message_is_kept_in_the_vault_and_not_fetched_twice() {
     mock.source.body(id).await.unwrap();
     mock.source.body(id).await.unwrap();
     let path = beavermail_vault::message_path(&mock.account.key(), "INBOX", 1, 5);
-    let context = format!("{}/INBOX/1-5", mock.account.key());
-    assert!(mock.files.read(&path, &context).unwrap().is_some(), "the message is stored under its UID");
+    assert!(mock.files.read(&path).unwrap().is_some(), "the message is stored under its UID");
     let fetched = mock.commands().iter().filter(|c| c.contains("BODY.PEEK[]")).count() - before;
     assert_eq!(fetched, 1, "the second read comes from the file");
     // Deleting the message on the server removes the file with it.
     mock.source.archive(id).await.unwrap();
     let path = beavermail_vault::message_path(&mock.account.key(), "INBOX", 1, 5);
-    let context = format!("{}/INBOX/1-5", mock.account.key());
-    assert_eq!(mock.files.read(&path, &context).unwrap(), None, "the file went with the message");
+    assert_eq!(mock.files.read(&path).unwrap(), None, "the file went with the message");
+}
+
+#[tokio::test]
+async fn a_locked_vault_still_opens_messages_from_the_server() {
+    let mock = start(true).await;
+    let id = message_in(&mock, "INBOX").await;
+    // A vault protected by a passphrase that was not entered: nothing can be stored or read.
+    let dir = std::env::temp_dir().join(format!("beavermail-imap-locked-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = std::sync::Arc::new(beavermail_vault::MemoryStore::default());
+    struct Shared(std::sync::Arc<beavermail_vault::MemoryStore>);
+    impl beavermail_vault::CredentialStore for Shared {
+        fn get(&self, id: &str) -> Result<Option<Vec<u8>>, MailError> { self.0.get(id) }
+        fn set(&self, id: &str, secret: &[u8]) -> Result<(), MailError> { self.0.set(id, secret) }
+        fn remove(&self, id: &str) -> Result<(), MailError> { self.0.remove(id) }
+    }
+    let vault = Vault::open(&dir, Box::new(Shared(store.clone()))).unwrap();
+    vault.set_mode(beavermail_vault::Mode::Passphrase, Some("a long passphrase"), &|_, _| {}).unwrap();
+    let locked = Vault::open(&dir, Box::new(Shared(store))).unwrap();
+    assert!(locked.is_locked());
+    let source = ImapSource::new(&mock.account, "p".into(), mock.store.clone(), Arc::new(locked));
+    let body = source.body(id).await.expect("the message still opens, straight from the server");
+    assert_eq!(body.text.trim(), "Hi there.");
+    let _ = std::fs::remove_dir_all(&dir);
 }

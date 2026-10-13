@@ -70,16 +70,16 @@ impl ImapSource {
         Self { config, account: account.key(), store, files, state: Mutex::new(State::default()) }
     }
 
-    /// Path and authenticated context of a message's file in the vault.
-    fn file_of(&self, account: &str, folder: &str, uid: u32) -> Result<(std::path::PathBuf, String), MailError> {
+    /// Path of a message's file in the vault.
+    fn file_of(&self, account: &str, folder: &str, uid: u32) -> Result<std::path::PathBuf, MailError> {
         let validity = self.store.folder_state(account, folder)?.uidvalidity.unwrap_or(0);
-        Ok((message_path(account, folder, validity, uid), format!("{account}/{folder}/{validity}-{uid}")))
+        Ok(message_path(account, folder, validity, uid))
     }
 
     /// Deletes the files of messages that no longer exist on the server.
     fn drop_files(&self, folder: &str, uids: &[u32]) {
         for uid in uids {
-            if let Ok((path, _)) = self.file_of(&self.account, folder, *uid) {
+            if let Ok(path) = self.file_of(&self.account, folder, *uid) {
                 let _ = self.files.remove(&path); // a leftover file is harmless; the next reset removes the folder
             }
         }
@@ -467,15 +467,18 @@ impl MailSource for ImapSource {
 
     async fn body(&self, id: MessageId) -> Result<MessageBody, MailError> {
         let at = self.store.locate(id)?.ok_or(MailError::NotFound)?;
-        let (path, context) = self.file_of(&at.account, &at.folder, at.uid)?;
-        // A file that cannot be read (damaged, or written under another key) is downloaded again.
-        if let Some(raw) = self.files.read(&path, &context).ok().flatten() {
+        let path = self.file_of(&at.account, &at.folder, at.uid)?;
+        // A file that cannot be read (damaged, written under another key, or the vault is locked) is
+        // downloaded again.
+        if let Some(raw) = self.files.read(&path).ok().flatten() {
             return parse_body(&raw);
         }
         let raw = self.download(&at).await?;
         let body = parse_body(&raw)?;
-        self.files.write(&path, &context, &raw)?;
-        self.store.set_preview(id, &body.text)?;
+        // Not being able to keep the file (a locked vault) must not stop the message from opening.
+        if self.files.write(&path, &raw).is_ok() {
+            self.store.set_preview(id, &body.text)?;
+        }
         Ok(body)
     }
 

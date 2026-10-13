@@ -10,6 +10,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 mod compose;
 mod html;
 mod icons;
+mod security;
 mod theme;
 mod views;
 
@@ -18,7 +19,7 @@ use beavermail_core::{Account, DisplayMode, MailError, MailSender, MailSource, M
 use beavermail_imap::ImapSource;
 use beavermail_smtp::SmtpSender;
 use beavermail_store::Store;
-use beavermail_vault::{SystemStore, Vault};
+use beavermail_vault::{Mode, SystemStore, Vault};
 use eframe::egui::{self, Align, Layout, RichText, pos2, vec2};
 
 use crate::icons::Icon;
@@ -37,6 +38,14 @@ enum Event {
     /// The message in the compose window was sent, or the server refused it.
     /// Second field: why the copy in Sent could not be saved, when the message itself went out.
     Sent(Result<(), MailError>, Option<String>),
+    /// A change to how stored mail is protected finished.
+    Vault(VaultOutcome),
+}
+
+enum VaultOutcome {
+    Applied(Mode, Result<(), MailError>),
+    Unlocked(Result<(), MailError>),
+    Reset(Result<(), MailError>),
 }
 
 #[derive(Clone, Copy)]
@@ -264,6 +273,14 @@ struct BeaverApp {
     /// Syncs in flight; the list shows a spinner while it is not zero.
     syncing: u32,
     show_settings: bool,
+    /// Settings and prompt state for the stored-mail protection.
+    security: security::Form,
+    /// A mode change rewriting files in the background.
+    vault_job: Option<Arc<security::Job>>,
+    /// The unlock prompt was dismissed for this run.
+    unlock_skipped: bool,
+    /// An unlock or reset is running.
+    unlocking: bool,
     /// Display mode chosen for the open message only; forgotten when another is opened.
     view_mode: Option<DisplayMode>,
 }
@@ -276,7 +293,7 @@ impl BeaverApp {
             // Without a usable file the app still works, but nothing is kept between runs.
             Err(e) => (Store::in_memory().expect("in-memory archive"), Some(format!("The local mail archive is unavailable: {e}"))),
         };
-        let (vault, vault_error) = match store::data_dir().and_then(|dir| Vault::open(&dir, &SystemStore).map_err(|e| e.to_string())) {
+        let (vault, vault_error) = match store::data_dir().and_then(|dir| Vault::open(&dir, Box::new(SystemStore)).map_err(|e| e.to_string())) {
             Ok(vault) => (vault, None),
             // Never a plain-text fallback: without the key, messages are kept in memory only.
             Err(e) => (Vault::in_memory(), Some(format!("Downloaded messages cannot be stored safely: {e}"))),
@@ -305,6 +322,10 @@ impl BeaverApp {
             vault: Arc::new(vault),
             syncing: 0,
             show_settings: false,
+            security: security::Form::default(),
+            vault_job: None,
+            unlock_skipped: false,
+            unlocking: false,
             view_mode: None,
         };
         app.error = archive_error.or(vault_error);
@@ -517,6 +538,11 @@ impl BeaverApp {
         self.compose = Some(compose);
     }
 
+    /// The stored mail is protected by a passphrase that has not been entered, and the prompt is showing.
+    fn locked(&self) -> bool {
+        self.vault.is_locked() && !self.unlock_skipped
+    }
+
     /// The sender's address of the open message.
     fn current_address(&self) -> Option<String> {
         let id = self.message?;
@@ -529,15 +555,86 @@ impl BeaverApp {
         }
     }
 
+    /// Starts a change to how stored mail is protected, on a worker thread.
+    fn run_vault(&mut self, request: security::Request, ctx: &egui::Context) {
+        let (vault, tx, ctx) = (self.vault.clone(), self.tx.clone(), ctx.clone());
+        match request {
+            security::Request::Skip => self.unlock_skipped = true,
+            security::Request::Apply(mode, passphrase) => {
+                let job = Arc::new(security::Job::default());
+                self.vault_job = Some(job.clone());
+                self.runtime.spawn_blocking(move || {
+                    let progress = |done: usize, total: usize| {
+                        job.done.store(done, std::sync::atomic::Ordering::Relaxed);
+                        job.total.store(total, std::sync::atomic::Ordering::Relaxed);
+                        ctx.request_repaint();
+                    };
+                    let result = vault.set_mode(mode, passphrase.as_deref(), &progress);
+                    let _ = tx.send(Event::Vault(VaultOutcome::Applied(mode, result)));
+                    ctx.request_repaint();
+                });
+            }
+            security::Request::Unlock(passphrase) => {
+                self.unlocking = true;
+                self.runtime.spawn_blocking(move || {
+                    let _ = tx.send(Event::Vault(VaultOutcome::Unlocked(vault.unlock(&passphrase))));
+                    ctx.request_repaint();
+                });
+            }
+            security::Request::Reset => {
+                self.unlocking = true;
+                self.runtime.spawn_blocking(move || {
+                    let _ = tx.send(Event::Vault(VaultOutcome::Reset(vault.reset())));
+                    ctx.request_repaint();
+                });
+            }
+        }
+    }
+
+    fn apply_vault(&mut self, outcome: VaultOutcome) {
+        self.unlocking = false;
+        match outcome {
+            VaultOutcome::Applied(mode, result) => {
+                self.vault_job = None;
+                self.security.clear_passphrases();
+                self.security.mode = None;
+                match result {
+                    Ok(()) => {
+                        let text = match mode {
+                            Mode::Off => "Stored mail is no longer encrypted",
+                            Mode::System => "Stored mail is encrypted with a key kept by this computer",
+                            Mode::Passphrase => "Stored mail is encrypted with your passphrase",
+                        };
+                        self.notice = Some((text.into(), std::time::Instant::now()));
+                    }
+                    Err(e) => self.error = Some(e.to_string()),
+                }
+            }
+            VaultOutcome::Unlocked(Ok(())) => self.security.clear_unlock(),
+            VaultOutcome::Unlocked(Err(MailError::Auth(_))) => self.security.unlock_error = Some("That passphrase does not open the stored mail.".into()),
+            VaultOutcome::Unlocked(Err(e)) => self.security.unlock_error = Some(e.to_string()),
+            VaultOutcome::Reset(Ok(())) => {
+                self.security.clear_unlock();
+                self.security.mode = None;
+                self.notice = Some(("Stored mail was deleted and will be downloaded again".into(), std::time::Instant::now()));
+            }
+            VaultOutcome::Reset(Err(e)) => self.error = Some(e.to_string()),
+        }
+    }
+
     fn settings_window(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
         if !self.show_settings {
             return;
         }
         let mut changed = false;
+        let mut vault_request = None;
+        let mut unlock_again = false;
+        let (mode, locked, job) = (self.vault.mode(), self.vault.is_locked(), self.vault_job.clone());
         let modal = egui::Modal::new(egui::Id::new("settings")).show(ctx, |ui| {
             ui.set_width(FORM_WIDTH);
             ui.heading("Settings");
             ui.add_space(8.0);
+            egui::ScrollArea::vertical().max_height((ctx.content_rect().height() - 220.0).max(160.0)).auto_shrink([false, true]).show(ui, |ui| {
             ui.label(RichText::new("Reading").strong());
             ui.label(RichText::new("Most unwanted mail and tracking arrives as HTML, so messages start as text.").color(t.text_dim));
             ui.add_space(6.0);
@@ -575,6 +672,14 @@ impl BeaverApp {
                     changed = true;
                 }
             }
+            ui.add_space(16.0);
+            ui.separator();
+            ui.add_space(8.0);
+            vault_request = security::section(ui, t, &mut self.security, mode, locked, job.as_deref());
+            if locked && ui.button("Unlock…").clicked() {
+                unlock_again = true;
+            }
+            });
             ui.add_space(14.0);
             ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
                 if ui.button("Done").clicked() {
@@ -587,6 +692,12 @@ impl BeaverApp {
         }
         if changed {
             self.save_settings();
+        }
+        if unlock_again {
+            self.unlock_skipped = false;
+        }
+        if let Some(request) = vault_request {
+            self.run_vault(request, ctx);
         }
     }
 
@@ -625,7 +736,7 @@ impl BeaverApp {
 
     /// Up/Down move through the list, E archives, Delete trashes, U toggles unread.
     fn handle_keys(&mut self, ctx: &egui::Context) {
-        if self.form.is_some() || self.confirm_erase.is_some() || self.compose.is_some() || self.show_settings || ctx.egui_wants_keyboard_input() {
+        if self.form.is_some() || self.confirm_erase.is_some() || self.compose.is_some() || self.show_settings || self.locked() || ctx.egui_wants_keyboard_input() {
             return;
         }
         let key = |k| ctx.input(|i| i.key_pressed(k));
@@ -800,6 +911,7 @@ impl BeaverApp {
                 }
             }
             Event::Done(..) => {}
+            Event::Vault(outcome) => self.apply_vault(outcome),
             Event::Sent(result, copy_error) => match result {
                 Ok(()) => {
                     self.compose = None;
@@ -970,6 +1082,7 @@ impl BeaverApp {
                     add = ui.add_sized([width, theme::CONTROL_H], egui::Button::image_and_text(Icon::Plus.image(icons::SIZE, t.text_dim), "Add account")).clicked();
                     if icons::button(ui, t, Icon::Settings, "Settings", true, self.show_settings).clicked() {
                         self.show_settings = true;
+                        self.security.mode = None;
                     }
                 });
                 ui.add_space(4.0);
@@ -1217,6 +1330,11 @@ impl eframe::App for BeaverApp {
         }
         self.erase_dialog(ui.ctx(), &t);
         self.settings_window(ui.ctx(), &t);
+        if self.locked()
+            && let Some(request) = security::unlock_prompt(ui.ctx(), &t, &mut self.security, self.unlocking)
+        {
+            self.run_vault(request, ui.ctx());
+        }
         self.compose_window(ui.ctx(), &t);
         if add {
             self.form = Some(NewAccount::default());
