@@ -113,57 +113,33 @@ impl State {
     }
 
     async fn list(&mut self, config: &Config) -> Result<Vec<Mailbox>, MailError> {
-        let mut special = (None, None);
         let result = async {
             let session = self.session(config).await?;
-            let mut names: Vec<String> = session
+            let mut names: Vec<(String, Role)> = session
                 .list(None, Some("*"))
                 .await
                 .map_err(backend)?
                 .try_filter(|n| futures::future::ready(!n.attributes().contains(&NameAttribute::NoSelect)))
-                .map_ok(|n| {
-                    let attrs = n.attributes();
-                    (n.name().to_owned(), attrs.contains(&NameAttribute::Archive), attrs.contains(&NameAttribute::Trash))
-                })
+                .map_ok(|n| (n.name().to_owned(), role_of(n.attributes())))
                 .try_collect::<Vec<_>>()
                 .await
-                .map_err(backend)?
-                .into_iter()
-                .map(|(name, archive, trash)| {
-                    if archive {
-                        special.0 = Some(name.clone());
-                    }
-                    if trash {
-                        special.1 = Some(name.clone());
-                    }
-                    name
-                })
-                .collect();
-            names.sort_by_key(|n| (n != "INBOX", n.clone()));
+                .map_err(backend)?;
+            names.sort_by_key(|(n, _)| (n != "INBOX", n.clone()));
+            resolve_roles(&mut names);
             let mut mailboxes = Vec::with_capacity(names.len());
-            for name in &names {
+            for (name, role) in &names {
                 let status = session.status(name, "(UNSEEN)").await.map_err(backend)?;
-                mailboxes.push(Mailbox { name: name.clone(), unread: status.unseen.unwrap_or(0), role: Role::Other });
+                mailboxes.push(Mailbox { name: name.clone(), unread: status.unseen.unwrap_or(0), role: *role });
             }
             Ok((names, mailboxes))
         }
         .await;
         match result {
-            Ok((names, mut mailboxes)) => {
-                // shortcut: servers without RFC 6154 flags fall back to common folder names.
-                let named = |wanted: &[&str]| names.iter().find(|n| wanted.iter().any(|w| n.eq_ignore_ascii_case(w))).cloned();
-                self.archive = special.0.or_else(|| named(&["Archive", "Archives"]));
-                self.trash = special.1.or_else(|| named(&["Trash", "Deleted Items", "Deleted Messages"]));
-                for mailbox in &mut mailboxes {
-                    mailbox.role = if self.archive.as_ref() == Some(&mailbox.name) {
-                        Role::Archive
-                    } else if self.trash.as_ref() == Some(&mailbox.name) {
-                        Role::Trash
-                    } else {
-                        Role::Other
-                    };
-                }
-                self.mailboxes = names;
+            Ok((names, mailboxes)) => {
+                let find = |role| names.iter().find(|(_, r)| *r == role).map(|(n, _)| n.clone());
+                self.archive = find(Role::Archive);
+                self.trash = find(Role::Trash);
+                self.mailboxes = names.into_iter().map(|(n, _)| n).collect();
                 Ok(mailboxes)
             }
             Err(e) => {
@@ -178,6 +154,47 @@ impl State {
             self.list(config).await?;
         }
         self.mailboxes.get(index).cloned().ok_or(MailError::NotFound)
+    }
+}
+
+/// The role an RFC 6154 special-use attribute announces.
+fn role_of(attributes: &[NameAttribute<'_>]) -> Role {
+    attributes
+        .iter()
+        .find_map(|a| match a {
+            NameAttribute::Archive => Some(Role::Archive),
+            NameAttribute::Drafts => Some(Role::Drafts),
+            NameAttribute::Flagged => Some(Role::Starred),
+            NameAttribute::Junk => Some(Role::Junk),
+            NameAttribute::Sent => Some(Role::Sent),
+            NameAttribute::Trash => Some(Role::Trash),
+            _ => None,
+        })
+        .unwrap_or(Role::Other)
+}
+
+/// Marks INBOX, then gives a role by its usual name to folders the server did not flag.
+// shortcut: servers without RFC 6154 flags are matched by English folder names.
+fn resolve_roles(folders: &mut [(String, Role)]) {
+    const BY_NAME: [(Role, &[&str]); 5] = [
+        (Role::Drafts, &["Drafts"]),
+        (Role::Sent, &["Sent", "Sent Items", "Sent Messages"]),
+        (Role::Archive, &["Archive", "Archives"]),
+        (Role::Junk, &["Junk", "Spam", "Junk Email"]),
+        (Role::Trash, &["Trash", "Deleted Items", "Deleted Messages"]),
+    ];
+    for (name, role) in folders.iter_mut() {
+        if name.eq_ignore_ascii_case("INBOX") {
+            *role = Role::Inbox;
+        }
+    }
+    for (wanted, names) in BY_NAME {
+        if folders.iter().any(|(_, r)| *r == wanted) {
+            continue;
+        }
+        if let Some((_, role)) = folders.iter_mut().find(|(n, r)| *r == Role::Other && names.iter().any(|w| n.eq_ignore_ascii_case(w))) {
+            *role = wanted;
+        }
     }
 }
 
@@ -329,6 +346,20 @@ impl MailSource for ImapSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn roles_come_from_flags_then_names() {
+        let mut folders = vec![
+            ("INBOX".to_owned(), Role::Other),
+            ("Sent Items".to_owned(), Role::Other),
+            ("Old".to_owned(), Role::Archive), // flagged by the server
+            ("Archive".to_owned(), Role::Other), // same name, but the flag wins
+            ("Spam".to_owned(), Role::Other),
+        ];
+        resolve_roles(&mut folders);
+        let roles: Vec<Role> = folders.into_iter().map(|(_, r)| r).collect();
+        assert_eq!(roles, [Role::Inbox, Role::Sent, Role::Archive, Role::Other, Role::Junk]);
+    }
 
     #[test]
     fn id_round_trips() {

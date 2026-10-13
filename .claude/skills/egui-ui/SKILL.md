@@ -32,7 +32,7 @@ One set of named metrics in `theme.rs`; views never invent sizes. Values: contro
 - **Radii:** 8 controls, 10 menus, 14 windows. Borders 1px. No double borders.
 - **Spacing:** 4px base unit. `item_spacing` 8, `button_padding` (16, 8), control height 40, window margin 20, 8/12/16/24 between groups. Group related fields tightly, separate groups clearly.
 - **Type:** one UI font (Inter, bundled in `crates/app/assets/fonts`). Body 15, small 13, heading 22 semibold. Never below 12. Sentence case everywhere ("Add account", not "Add Account"). Monospace only for raw headers/source.
-- **Icons:** one consistent set (Lucide-style, 1.5px stroke), 16px inline / 20px toolbar, tinted from tokens. Icon-only buttons need a tooltip.
+- **Icons:** Lucide SVGs in `crates/app/assets/icons` (see its README), drawn through `icons::Icon` and tinted from tokens (`Image::tint`; the SVGs use a white stroke so tinting works). 18px standard, 14px inside fields. New icon = copy the unmodified Lucide file, set `stroke="white"` and `stroke-width="1.75"`, add a variant. Icon-only buttons (`icons::button`) always have a tooltip. Folder icons use fixed semantic colours (`theme::role_color`); people use initial avatars (`views::avatar`, colour stable per name).
 - **Contrast:** text >= 4.5:1, UI boundaries >= 3:1, in light and dark. Never convey state by colour alone.
 
 ## Layout

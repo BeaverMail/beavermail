@@ -7,13 +7,16 @@
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
+mod icons;
 mod theme;
 mod views;
 
 use beavermail_accounts as store;
 use beavermail_core::{Account, MailError, MailSource, Mailbox, MessageId, MessageSummary, Role, Server, Tls};
 use beavermail_imap::ImapSource;
-use eframe::egui::{self, Align, Layout, RichText, vec2};
+use eframe::egui::{self, Align, Layout, RichText, pos2, vec2};
+
+use crate::icons::Icon;
 use tokio::runtime::Runtime;
 
 /// Result of a background mail call. Tagged with the account's serial, so answers
@@ -153,6 +156,9 @@ struct BeaverApp {
     form: Option<NewAccount>,
     /// A message waiting for the user to confirm erasing it for good.
     confirm_erase: Option<MessageId>,
+    /// Text of the search box; filters the loaded messages by sender and subject.
+    query: String,
+    focus_search: bool,
 }
 
 impl BeaverApp {
@@ -172,6 +178,8 @@ impl BeaverApp {
             error: None,
             form: None,
             confirm_erase: None,
+            query: String::new(),
+            focus_search: false,
         };
         match store::load() {
             Ok(accounts) => accounts.into_iter().for_each(|a| app.add_view(a)),
@@ -267,6 +275,24 @@ impl BeaverApp {
         }
     }
 
+    /// The loaded messages that match the search box, in list order.
+    fn visible(&self) -> Vec<&MessageSummary> {
+        let query = self.query.trim().to_lowercase();
+        let matches = |m: &MessageSummary| m.from.to_lowercase().contains(&query) || m.subject.to_lowercase().contains(&query);
+        self.messages.iter().filter(|m| query.is_empty() || matches(m)).collect()
+    }
+
+    /// Asks the server again for the selected folder and its account's folder list.
+    fn refresh(&mut self) {
+        let Some((serial, index)) = self.selected else { return };
+        let Some(view) = self.view(serial) else { return };
+        let (Some(source), Some(mailbox)) = (view.source.clone(), view.mailboxes.get(index)) else { return };
+        let name = mailbox.name.clone();
+        let folders = source.clone();
+        self.spawn(async move { Event::Mailboxes(serial, folders.mailboxes().await) });
+        self.spawn(async move { Event::Messages(serial, index, source.messages(&name).await) });
+    }
+
     /// Role of the folder being shown.
     fn role(&self) -> Role {
         let (serial, index) = self.selected.unzip();
@@ -288,21 +314,26 @@ impl BeaverApp {
             return;
         }
         let key = |k| ctx.input(|i| i.key_pressed(k));
-        let pos = self.message.and_then(|id| self.messages.iter().position(|m| m.id == id));
+        if key(egui::Key::Slash) {
+            self.focus_search = true;
+            return;
+        }
+        let ids: Vec<MessageId> = self.visible().iter().map(|m| m.id).collect();
+        let pos = self.message.and_then(|id| ids.iter().position(|i| *i == id));
         let step = if key(egui::Key::ArrowDown) { Some(1) } else if key(egui::Key::ArrowUp) { Some(-1) } else { None };
         if let Some(step) = step {
-            let next = pos.map_or(0, |p| p.saturating_add_signed(step)).min(self.messages.len().saturating_sub(1));
-            if let Some(id) = self.messages.get(next).map(|m| m.id).filter(|id| Some(*id) != self.message) {
+            let next = pos.map_or(0, |p| p.saturating_add_signed(step)).min(ids.len().saturating_sub(1));
+            if let Some(id) = ids.get(next).copied().filter(|id| Some(*id) != self.message) {
                 self.select_message(id);
             }
         }
-        let (Some(id), Some(pos)) = (self.message, pos) else { return };
+        let (Some(id), Some(_)) = (self.message, pos) else { return };
         if key(egui::Key::E) {
             self.request(id, Action::Archive);
         } else if key(egui::Key::Delete) {
             self.request(id, Action::Trash);
         } else if key(egui::Key::U) {
-            let unread = self.messages[pos].unread;
+            let unread = self.messages.iter().any(|m| m.id == id && m.unread);
             self.request(id, Action::Unread(!unread));
         }
     }
@@ -478,64 +509,191 @@ impl BeaverApp {
     }
 }
 
+impl BeaverApp {
+    fn error_banner(&mut self, ui: &mut egui::Ui, t: &theme::Tokens) {
+        let Some(error) = self.error.clone() else { return };
+        let banner = egui::Frame::new().fill(t.danger.gamma_multiply(0.14)).inner_margin(egui::Margin::symmetric(16, 10));
+        egui::Panel::top("error").frame(banner).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.colored_label(t.danger, error);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.small_button("Dismiss").clicked() {
+                        self.error = None;
+                    }
+                });
+            });
+        });
+    }
+
+    /// Accounts and their folders. Returns (folder chosen, account to remove, add-account clicked).
+    fn sidebar(&mut self, ui: &mut egui::Ui, t: &theme::Tokens) -> (Option<(u64, usize)>, Option<u64>, bool) {
+        let (mut chosen, mut removed, mut add) = (None, None, false);
+        let frame = egui::Frame::new().fill(t.bg).inner_margin(egui::Margin::same(12));
+        egui::Panel::left("accounts").frame(frame).default_size(260.0).size_range(210.0..=340.0).show(ui, |ui| {
+            // Compose arrives with SMTP; the button is here so the layout is final.
+            views::primary_wide(ui, t, Icon::Pencil, "New email", Some("Sending is not available yet"));
+            ui.add_space(8.0);
+            ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+                add = ui.add_sized([ui.available_width(), theme::CONTROL_H], egui::Button::image_and_text(Icon::Plus.image(icons::SIZE, t.text_dim), "Add account")).clicked();
+                ui.add_space(4.0);
+                ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        ui.label(RichText::new("ACCOUNTS").size(12.0).color(t.text_dim));
+                        for view in &self.accounts {
+                            let header = egui::CollapsingHeader::new(RichText::new(&view.account.name).strong())
+                                .id_salt(view.serial)
+                                .default_open(true)
+                                .show(ui, |ui| {
+                                    if let Some(error) = &view.error {
+                                        ui.colored_label(t.danger, error);
+                                    }
+                                    let mut order: Vec<usize> = (0..view.mailboxes.len()).collect();
+                                    order.sort_by_key(|&i| (views::folder_rank(view.mailboxes[i].role), view.mailboxes[i].name.clone()));
+                                    for i in order {
+                                        let mailbox = &view.mailboxes[i];
+                                        let title = views::folder_title(&mailbox.name, mailbox.role);
+                                        let selected = self.selected == Some((view.serial, i));
+                                        if views::folder_row(ui, t, &title, mailbox.role, mailbox.unread, selected).clicked() {
+                                            chosen = Some((view.serial, i));
+                                        }
+                                    }
+                                });
+                            header.header_response.context_menu(|ui| {
+                                if ui.button("Remove account").clicked() {
+                                    removed = Some(view.serial);
+                                    ui.close();
+                                }
+                            });
+                        }
+                        if self.accounts.is_empty() {
+                            ui.label(RichText::new("No accounts yet").color(t.text_dim));
+                        }
+                    });
+                });
+            });
+        });
+        (chosen, removed, add)
+    }
+
+    /// Search, refresh and the message list. Returns the message the user clicked and whether to add an account.
+    fn message_list(&mut self, ui: &mut egui::Ui, t: &theme::Tokens) -> (Option<MessageId>, bool) {
+        let (mut opened, mut add, mut refresh) = (None, false, false);
+        let frame = egui::Frame::new().fill(t.surface);
+        egui::CentralPanel::default().frame(frame).show(ui, |ui| {
+            if self.accounts.is_empty() {
+                add = views::empty_state(ui, t, "Welcome to BeaverMail", "Add an account to start reading your mail.", Some("Add account"));
+                return;
+            }
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                let width = ui.available_width() - theme::CONTROL_H - 20.0;
+                let focus = std::mem::take(&mut self.focus_search);
+                views::search_box(ui, t, &mut self.query, "Search mail  ( / )", width, focus);
+                refresh = icons::button(ui, t, Icon::Refresh, "Refresh", true, false).clicked();
+            });
+            ui.add_space(8.0);
+            let shown = self.visible();
+            if shown.is_empty() {
+                let (title, hint) = if self.query.trim().is_empty() {
+                    ("Nothing here", "This folder has no messages.")
+                } else {
+                    ("No results", "No loaded message matches your search.")
+                };
+                views::empty_state(ui, t, title, hint, None);
+                return;
+            }
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, views::MESSAGE_ROW_H, shown.len(), |ui, range| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                for message in &shown[range] {
+                    if views::message_row(ui, t, message, self.message == Some(message.id)).clicked() {
+                        opened = Some(message.id);
+                    }
+                }
+            });
+        });
+        if refresh {
+            self.refresh();
+        }
+        (opened, add)
+    }
+
+    /// The open message with its action bar. Returns the action the user chose.
+    fn reader(&mut self, ui: &mut egui::Ui, t: &theme::Tokens) -> Option<(MessageId, Action)> {
+        let mut action = None;
+        let role = self.role();
+        let current = self.message.and_then(|id| self.messages.iter().find(|m| m.id == id)).cloned();
+        let frame = egui::Frame::new().fill(t.surface);
+        egui::Panel::right("reader").frame(frame).default_size(470.0).size_range(360.0..=900.0).show(ui, |ui| {
+            let Some(message) = current else {
+                views::empty_state(ui, t, "No message selected", "Choose a message from the list to read it.", None);
+                return;
+            };
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                let archived = role == Role::Archive;
+                let tools = [
+                    (Icon::Archive, "Archive (E)", Action::Archive, !archived),
+                    (
+                        if message.unread { Icon::MailOpen } else { Icon::Mail },
+                        if message.unread { "Mark as read (U)" } else { "Mark as unread (U)" },
+                        Action::Unread(!message.unread),
+                        true,
+                    ),
+                    (Icon::Trash, if role == Role::Trash { "Delete permanently (Delete)" } else { "Move to Trash (Delete)" }, Action::Trash, true),
+                ];
+                for (icon, tip, what, enabled) in tools {
+                    let tip = if !enabled { "Already in the archive" } else { tip };
+                    if icons::button(ui, t, icon, tip, enabled, false).clicked() {
+                        action = Some((message.id, what));
+                    }
+                }
+            });
+            ui.add_space(6.0);
+            ui.separator();
+            match &self.body {
+                None => {
+                    ui.centered_and_justified(|ui| ui.spinner());
+                }
+                Some(body) => {
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        // A margin, not `ui.horizontal`: horizontal layouts do not wrap text, so a long
+                        // line would widen the whole panel.
+                        egui::Frame::new().inner_margin(egui::Margin::symmetric(28, 0)).show(ui, |ui| {
+                            ui.set_max_width(ui.available_width().min(720.0));
+                            ui.add_space(20.0);
+                            ui.heading(&message.subject);
+                            ui.add_space(12.0);
+                            let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), views::AVATAR), egui::Sense::hover());
+                            views::avatar(ui, t, &message.from, rect.left_center() + vec2(views::AVATAR / 2.0, 0.0), views::AVATAR);
+                            let name = ui.painter().layout_no_wrap(message.from.clone(), egui::FontId::proportional(15.5), t.text);
+                            let date = ui.painter().layout_no_wrap(message.received.clone(), egui::FontId::proportional(13.0), t.text_dim);
+                            ui.painter().galley(pos2(rect.left() + views::AVATAR + 12.0, rect.top() + 3.0), name, t.text);
+                            ui.painter().galley(pos2(rect.left() + views::AVATAR + 12.0, rect.top() + 23.0), date, t.text_dim);
+                            ui.add_space(16.0);
+                            ui.separator();
+                            ui.add_space(16.0);
+                            ui.label(RichText::new(body).size(16.0));
+                            ui.add_space(28.0);
+                        });
+                    });
+                }
+            }
+        });
+        action
+    }
+}
+
 impl eframe::App for BeaverApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         while let Ok(event) = self.rx.try_recv() {
             self.apply(event);
         }
-
         let t = theme::Tokens::get(ui.ctx());
-        if let Some(error) = self.error.clone() {
-            let banner = egui::Frame::new().fill(t.danger.gamma_multiply(0.14)).inner_margin(egui::Margin::symmetric(16, 10));
-            egui::Panel::top("error").frame(banner).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.colored_label(t.danger, error);
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.small_button("Dismiss").clicked() {
-                            self.error = None;
-                        }
-                    });
-                });
-            });
-        }
+        self.error_banner(ui, &t);
 
-        let (mut chosen, mut removed, mut add) = (None, None, false);
-        let sidebar = egui::Frame::new().fill(t.bg).inner_margin(egui::Margin::same(12));
-        egui::Panel::left("accounts").frame(sidebar).default_size(250.0).size_range(200.0..=340.0).show(ui, |ui| {
-            ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-                add = ui.add_sized([ui.available_width(), theme::CONTROL_H], egui::Button::new("Add account")).clicked();
-                ui.add_space(4.0);
-                ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                    for view in &self.accounts {
-                        let header = egui::CollapsingHeader::new(RichText::new(&view.account.name).color(t.text_dim))
-                            .id_salt(view.serial)
-                            .default_open(true)
-                            .show(ui, |ui| {
-                                if let Some(error) = &view.error {
-                                    ui.colored_label(t.danger, error);
-                                }
-                                for (i, mailbox) in view.mailboxes.iter().enumerate() {
-                                    let selected = self.selected == Some((view.serial, i));
-                                    if views::folder_row(ui, &t, &mailbox.name, mailbox.unread, selected).clicked() {
-                                        chosen = Some((view.serial, i));
-                                    }
-                                }
-                            });
-                        header.header_response.context_menu(|ui| {
-                            if ui.button("Remove account").clicked() {
-                                removed = Some(view.serial);
-                                ui.close();
-                            }
-                        });
-                    }
-                    if self.accounts.is_empty() {
-                        ui.label(RichText::new("No accounts yet").color(t.text_dim));
-                    }
-                });
-                });
-            });
-        });
+        let (chosen, removed, mut add) = self.sidebar(ui, &t);
         if let Some((serial, index)) = chosen {
             self.select_mailbox(serial, index);
         }
@@ -544,91 +702,10 @@ impl eframe::App for BeaverApp {
         }
         self.account_form(ui.ctx());
 
-        let surface = egui::Frame::new().fill(t.surface);
         self.handle_keys(ui.ctx());
-        let mut action = None;
-        let role = self.role();
-        let current = self.message.and_then(|id| self.messages.iter().find(|m| m.id == id)).cloned();
-        egui::Panel::right("reader").frame(surface).default_size(560.0).size_range(360.0..=900.0).show(ui, |ui| match (&current, &self.body) {
-            (Some(message), Some(body)) => {
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                    ui.add_space(24.0);
-                    ui.horizontal(|ui| {
-                        ui.add_space(28.0);
-                        ui.vertical(|ui| {
-                            ui.set_max_width(720.0);
-                            ui.heading(&message.subject);
-                            ui.label(RichText::new(format!("{}  ·  {}", message.from, message.received)).color(t.text_dim));
-                            ui.add_space(12.0);
-                            ui.horizontal(|ui| {
-                                let tools = [
-                                    ("Archive", "Archive (E)", Action::Archive),
-                                    if role == Role::Trash {
-                                        ("Delete permanently", "Erase for good (Delete)", Action::Trash)
-                                    } else {
-                                        ("Delete", "Move to Trash (Delete)", Action::Trash)
-                                    },
-                                    (
-                                        if message.unread { "Mark read" } else { "Mark unread" },
-                                        "Toggle unread (U)",
-                                        Action::Unread(!message.unread),
-                                    ),
-                                ];
-                                for (label, tip, what) in tools {
-                                    let archived = matches!(what, Action::Archive) && role == Role::Archive;
-                                    let button = ui.add_enabled(!archived, egui::Button::new(label));
-                                    let button = if archived { button.on_disabled_hover_text("Already in the archive") } else { button.on_hover_text(tip) };
-                                    if button.clicked() {
-                                        action = Some((message.id, what));
-                                    }
-                                }
-                            });
-                            ui.add_space(12.0);
-                            ui.separator();
-                            ui.add_space(12.0);
-                            ui.label(RichText::new(body).size(16.0));
-                            ui.add_space(24.0);
-                        });
-                    });
-                });
-            }
-            (Some(_), None) => {
-                ui.centered_and_justified(|ui| ui.spinner());
-            }
-            _ => {
-                views::empty_state(ui, &t, "No message selected", "Choose a message from the list to read it.", None);
-            }
-        });
-
-        let mut opened = None;
-        egui::CentralPanel::default().frame(surface).show(ui, |ui| {
-            if self.accounts.is_empty() {
-                add = views::empty_state(ui, &t, "Welcome to BeaverMail", "Add an account to start reading your mail.", Some("Add account"));
-                return;
-            }
-            let title = self.selected.and_then(|(serial, i)| self.view(serial)?.mailboxes.get(i)).map(|m| m.name.clone());
-            if let Some(title) = title {
-                ui.add_space(16.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(20.0);
-                    ui.heading(title);
-                    ui.label(RichText::new(format!("{} messages", self.messages.len())).color(t.text_dim));
-                });
-                ui.add_space(8.0);
-            }
-            if self.messages.is_empty() {
-                views::empty_state(ui, &t, "Nothing here", "This folder has no messages.", None);
-                return;
-            }
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, views::MESSAGE_ROW_H, self.messages.len(), |ui, range| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                for message in &self.messages[range] {
-                    if views::message_row(ui, &t, message, self.message == Some(message.id)).clicked() {
-                        opened = Some(message.id);
-                    }
-                }
-            });
-        });
+        let action = self.reader(ui, &t);
+        let (opened, add_from_list) = self.message_list(ui, &t);
+        add |= add_from_list;
 
         if let Some(id) = opened {
             self.select_message(id);
@@ -646,12 +723,17 @@ impl eframe::App for BeaverApp {
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_title("BeaverMail").with_inner_size([1280.0, 800.0]),
+        // With vsync, Mesa's Wayland swap blocks the UI thread until the compositor sends a frame
+        // callback, which it withholds for hidden windows; the compositor then reports the app as
+        // not responding. egui only repaints on demand, so tearing is not a concern.
+        glow_options: eframe::egui_glow::GlowConfiguration { vsync: false, ..Default::default() },
         ..Default::default()
     };
     eframe::run_native(
         "BeaverMail",
         options,
         Box::new(|cc| {
+            egui_extras::install_image_loaders(&cc.egui_ctx);
             theme::apply(&cc.egui_ctx);
             Ok(Box::new(BeaverApp::new(cc.egui_ctx.clone())))
         }),

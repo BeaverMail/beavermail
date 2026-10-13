@@ -11,7 +11,12 @@ pub struct MessageId(pub u64);
 /// What a folder is for, when the UI must treat it specially.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
+    Inbox,
+    Starred,
+    Drafts,
+    Sent,
     Archive,
+    Junk,
     Trash,
     Other,
 }

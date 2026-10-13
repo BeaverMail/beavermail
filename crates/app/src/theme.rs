@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use beavermail_core::Role;
 use eframe::egui::{self, Color32, CornerRadius, Margin, Shadow, Stroke, TextStyle, Theme, Visuals};
 
 /// One geometry contract for every view (mirrors the Flectar/Slint `LayoutMetrics`): views never invent sizes.
@@ -14,6 +15,7 @@ const fn rgb(hex: u32) -> Color32 {
 
 #[derive(Clone, Copy)]
 pub struct Tokens {
+    pub dark: bool,
     /// App background (side panels).
     pub bg: Color32,
     /// Raised surfaces: windows, menus, cards.
@@ -33,6 +35,7 @@ pub struct Tokens {
 impl Tokens {
     pub fn light() -> Self {
         Self {
+            dark: false,
             bg: rgb(0xF6F6F8),
             surface: rgb(0xFFFFFF),
             input: rgb(0xFFFFFF),
@@ -42,7 +45,7 @@ impl Tokens {
             text_dim: rgb(0x62626C),
             hover: rgb(0xEDEDF1),
             pressed: rgb(0xE1E1E7),
-            accent: rgb(0x4F46E5),
+            accent: rgb(0x1763D6),
             on_accent: rgb(0xFFFFFF),
             danger: rgb(0xDC2626),
         }
@@ -50,6 +53,7 @@ impl Tokens {
 
     pub fn dark() -> Self {
         Self {
+            dark: true,
             bg: rgb(0x141417),
             surface: rgb(0x1E1E23),
             input: rgb(0x121215),
@@ -59,8 +63,8 @@ impl Tokens {
             text_dim: rgb(0x9C9CA8),
             hover: rgb(0x2A2A31),
             pressed: rgb(0x34343C),
-            accent: rgb(0x7C83F5),
-            on_accent: rgb(0x0F0F14),
+            accent: rgb(0x2F7DF6),
+            on_accent: rgb(0xFFFFFF),
             danger: rgb(0xF87171),
         }
     }
@@ -139,4 +143,26 @@ pub fn apply(ctx: &egui::Context) {
         s.text_styles.insert(TextStyle::Heading, egui::FontId::proportional(22.0));
         s.interaction.tooltip_delay = 0.4;
     });
+}
+
+/// Folder icon colours: the same in both themes so a folder is recognisable at a glance.
+pub fn role_color(role: Role) -> Color32 {
+    match role {
+        Role::Inbox => rgb(0x2F9CF4),
+        Role::Starred => rgb(0xF5B301),
+        Role::Drafts => rgb(0xD946EF),
+        Role::Sent => rgb(0x00A8F3),
+        Role::Archive => rgb(0x8B5CF6),
+        Role::Junk => rgb(0xF59E0B),
+        Role::Trash => rgb(0xFF5B4D),
+        Role::Other => rgb(0x22A06B),
+    }
+}
+
+/// Background and initials colour of a person's avatar, stable for a given name.
+pub fn avatar_colors(name: &str, dark: bool) -> (Color32, Color32) {
+    const HUES: [u32; 6] = [0x3B82F6, 0x8B5CF6, 0xEC4899, 0xF59E0B, 0x22A06B, 0x06B6D4];
+    let hash = name.bytes().fold(5381u32, |h, b| h.wrapping_mul(33) ^ u32::from(b));
+    let hue = rgb(HUES[hash as usize % HUES.len()]);
+    if dark { (hue.gamma_multiply(0.28), hue) } else { (hue.gamma_multiply(0.18), hue.gamma_multiply(0.85)) }
 }

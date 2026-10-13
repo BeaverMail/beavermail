@@ -17,9 +17,15 @@ pollster = "0.4"
 beavermail-imap = { path = "crates/imap" }
 beavermail-accounts = { path = "crates/accounts" }
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+egui_extras = { version = "0.36", default-features = false, features = ["svg"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+
+# egui, resvg and the rest are unusably slow unoptimised (frames of half a second, which the
+# desktop reports as "Application Not Responding"); our own crates stay fast to rebuild.
+[profile.dev.package."*"]
+opt-level = 3
 
 [profile.release]
 opt-level = 3

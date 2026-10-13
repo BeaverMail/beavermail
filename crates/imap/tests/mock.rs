@@ -90,7 +90,7 @@ async fn folders_get_their_roles() {
     let mailboxes = mock.source.mailboxes().await.unwrap();
     let role = |name: &str| mailboxes.iter().find(|m| m.name == name).unwrap().role;
     assert_eq!(mailboxes[0].name, "INBOX");
-    assert_eq!(role("INBOX"), Role::Other);
+    assert_eq!(role("INBOX"), Role::Inbox);
     assert_eq!(role("Archive"), Role::Archive);
     assert_eq!(role("Trash"), Role::Trash);
 }

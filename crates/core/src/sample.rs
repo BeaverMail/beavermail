@@ -57,6 +57,10 @@ impl MailSource for SampleSource {
             .map(|name| Mailbox {
                 name: (*name).to_owned(),
                 role: match *name {
+                    "Inbox" => Role::Inbox,
+                    "Starred" => Role::Starred,
+                    "Drafts" => Role::Drafts,
+                    "Sent" => Role::Sent,
                     "Archive" => Role::Archive,
                     "Trash" => Role::Trash,
                     _ => Role::Other,
