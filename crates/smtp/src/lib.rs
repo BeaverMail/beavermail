@@ -3,7 +3,8 @@
 //! SMTP backend: implements [`MailSender`] over one account's outgoing server.
 
 use beavermail_core::{Account, MailError, MailSender, Outgoing, Server, Tls};
-use lettre::message::Mailbox;
+use lettre::message::header::ContentType;
+use lettre::message::{Attachment, Mailbox, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
@@ -58,7 +59,16 @@ fn build(message: &Outgoing) -> Result<Message, MailError> {
         let refs: Vec<String> = message.references.iter().map(|r| bracketed(r)).collect();
         builder = builder.references(refs.join(" "));
     }
-    builder.date_now().message_id(None).body(message.body.clone()).map_err(backend)
+    let builder = builder.date_now().message_id(None);
+    if message.attachments.is_empty() {
+        return builder.body(message.body.clone()).map_err(backend);
+    }
+    let mut parts = MultiPart::mixed().singlepart(SinglePart::plain(message.body.clone()));
+    for file in &message.attachments {
+        let kind = ContentType::parse(&file.mime).unwrap_or_else(|_| ContentType::parse("application/octet-stream").expect("a valid type"));
+        parts = parts.singlepart(Attachment::new(file.name.clone()).body(file.data.clone(), kind));
+    }
+    builder.multipart(parts).map_err(backend)
 }
 
 /// A Message-ID as it appears in a header: inside angle brackets.
@@ -108,6 +118,22 @@ mod tests {
         assert!(text.contains("References: <a@host> <b@host>"), "{text}");
         assert!(text.contains("Message-ID: <"), "{text}");
         assert!(text.contains("Date: "), "{text}");
+    }
+
+    #[test]
+    fn attachments_become_parts_of_a_mixed_message_with_the_text_first() {
+        let mut with = outgoing();
+        with.attachments = vec![
+            beavermail_core::OutgoingFile { name: "plan.pdf".into(), mime: "application/pdf".into(), data: b"%PDF-1.4\x00\xff\xfe binary".to_vec() },
+            beavermail_core::OutgoingFile { name: "notes.txt".into(), mime: "not a type".into(), data: b"remember".to_vec() },
+        ];
+        let text = String::from_utf8(build(&with).unwrap().formatted()).unwrap();
+        assert!(text.contains("Content-Type: multipart/mixed"), "{text}");
+        assert!(text.find("Hello").unwrap() < text.find("plan.pdf").unwrap(), "the text comes first");
+        assert!(text.contains("Content-Type: application/pdf"), "{text}");
+        assert!(text.contains("filename=\"plan.pdf\""), "{text}");
+        assert!(text.contains("Content-Transfer-Encoding: base64"), "binary data is base64: {text}");
+        assert!(text.contains("application/octet-stream"), "an unknown type falls back to plain bytes: {text}");
     }
 
     #[test]

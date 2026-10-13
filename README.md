@@ -26,9 +26,13 @@ kept by the system, a passphrase, or no encryption.
 New mail, flags, deletions and older history sync in the background, and the messages themselves
 download in the background (per account: everything, last 12 months, last 30 days, or only opened
 messages), with progress and a pause button in the status bar. The index itself is not
-encrypted yet. Attachments are listed in the reader and can be opened, or saved one by one or several together through
-a file dialog (programs and macro documents ask before opening); no attaching files to new messages yet, original HTML or end-to-end
-message encryption yet.
+encrypted yet.
+
+Attachments are listed in the reader and can be opened, or saved one by one or several together
+through a file dialog (programs and macro documents ask before opening). Files can be attached to new
+messages with the Attach button or by dragging them in (drag and drop works on Windows, macOS and X11;
+on Wayland the toolkit does not support it yet, so start the app with `WAYLAND_DISPLAY=` to use X11); forwards do not carry the original
+attachments yet. No original HTML or end-to-end message encryption yet.
 
 ## Running
 

@@ -125,3 +125,20 @@ async fn invalid_addresses_never_reach_the_server() {
     assert!(matches!(sender.send(bad).await.unwrap_err(), MailError::Backend(_)));
     assert!(transcript.lock().unwrap().commands.is_empty());
 }
+
+#[tokio::test]
+async fn attachments_reach_the_server_and_come_back_in_the_sent_copy() {
+    let (sender, transcript) = start("secret", "secret").await;
+    let mut with = message();
+    with.attachments = vec![beavermail_core::OutgoingFile { name: "plan.pdf".into(), mime: "application/pdf".into(), data: vec![0, 159, 146, 150, 37, 80, 68, 70] }];
+    let raw = sender.send(with).await.unwrap();
+    let sent = String::from_utf8_lossy(&raw).into_owned();
+    let t = transcript.lock().unwrap();
+    for text in [&t.data, &sent] {
+        assert!(text.contains("multipart/mixed"), "{text}");
+        assert!(text.contains("filename=\"plan.pdf\""), "{text}");
+        assert!(text.contains("See you at noon."), "{text}");
+    }
+    // The eight bytes above, base64-encoded.
+    assert!(t.data.contains("AJ+SliVQREY="), "{}", t.data);
+}

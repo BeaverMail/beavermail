@@ -61,6 +61,57 @@ pub fn unique(dir: &Path, name: &str) -> PathBuf {
         .expect("an unused name exists")
 }
 
+/// The media type for a file name, from its extension; plain bytes when it is not known.
+pub fn guess_mime(name: &str) -> String {
+    let ext = name.rsplit_once('.').map_or(String::new(), |(_, e)| e.to_ascii_lowercase());
+    match ext.as_str() {
+        "pdf" => "application/pdf",
+        "txt" | "log" => "text/plain",
+        "md" => "text/markdown",
+        "csv" => "text/csv",
+        "html" | "htm" => "text/html",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "zip" => "application/zip",
+        "gz" => "application/gzip",
+        "tar" => "application/x-tar",
+        "7z" => "application/x-7z-compressed",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "mp4" => "video/mp4",
+        "mov" => "video/quicktime",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "odt" => "application/vnd.oasis.opendocument.text",
+        "ods" => "application/vnd.oasis.opendocument.spreadsheet",
+        "odp" => "application/vnd.oasis.opendocument.presentation",
+        "ics" => "text/calendar",
+        "vcf" => "text/vcard",
+        _ => "application/octet-stream",
+    }
+    .to_owned()
+}
+
+/// Reads the files to send. Run it off the UI thread: they can be large.
+pub fn read_files(files: &[(PathBuf, String)]) -> Result<Vec<beavermail_core::OutgoingFile>, String> {
+    files
+        .iter()
+        .map(|(path, name)| {
+            let data = std::fs::read(path).map_err(|e| format!("{name}: {e}"))?;
+            Ok(beavermail_core::OutgoingFile { name: name.clone(), mime: guess_mime(name), data })
+        })
+        .collect()
+}
+
 /// Writes a private copy under `temp_root` and opens it with the system's default program.
 pub fn open(temp_root: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
     let dir = temp_root.join(format!("{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos())));
@@ -109,6 +160,27 @@ mod tests {
         for fine in ["plan.pdf", "photo.jpg", "notes.txt", "exe", "archive.zip", "sheet.xlsx"] {
             assert!(!is_risky(fine), "{fine}");
         }
+    }
+
+    #[test]
+    fn media_types_follow_the_extension_and_default_to_plain_bytes() {
+        assert_eq!(guess_mime("plan.PDF"), "application/pdf");
+        assert_eq!(guess_mime("photo.jpeg"), "image/jpeg");
+        assert_eq!(guess_mime("data.unknown"), "application/octet-stream");
+        assert_eq!(guess_mime("noextension"), "application/octet-stream");
+    }
+
+    #[test]
+    fn files_are_read_with_their_name_and_a_missing_one_is_reported_by_name() {
+        let dir = std::env::temp_dir().join(format!("beavermail-send-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"hello").unwrap();
+        let read = read_files(&[(dir.join("a.txt"), "a.txt".into())]).unwrap();
+        assert_eq!((read[0].name.as_str(), read[0].mime.as_str(), read[0].data.as_slice()), ("a.txt", "text/plain", &b"hello"[..]));
+        let error = read_files(&[(dir.join("gone.pdf"), "gone.pdf".into())]).unwrap_err();
+        assert!(error.starts_with("gone.pdf:"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

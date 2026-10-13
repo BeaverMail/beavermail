@@ -26,13 +26,27 @@ pub struct Compose {
     focus_to: bool,
     /// Put the caret at the top of the body on the first frame (replies and forwards).
     focus_body: bool,
+    pub files: Vec<AttachedFile>,
 }
 
 pub enum Outcome {
     Keep,
     Send,
     Discard,
+    /// Open the dialog to pick files to attach.
+    Attach,
 }
+
+/// A file chosen to go with the message; read only when the message is sent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttachedFile {
+    pub path: std::path::PathBuf,
+    pub name: String,
+    pub size: u64,
+}
+
+/// Above this many bytes many providers refuse a message (a common limit is 25 MB).
+pub const SIZE_WARNING: u64 = 25 * 1024 * 1024;
 
 impl Compose {
     pub fn new(from: u64) -> Self {
@@ -49,6 +63,7 @@ impl Compose {
             error: None,
             focus_to: true,
             focus_body: false,
+            files: Vec::new(),
         }
     }
 
@@ -101,7 +116,28 @@ impl Compose {
 
     /// Nothing typed yet, so closing loses nothing.
     pub fn is_empty(&self) -> bool {
-        [&self.to, &self.cc, &self.subject, &self.body].iter().all(|t| t.trim().is_empty())
+        [&self.to, &self.cc, &self.subject, &self.body].iter().all(|t| t.trim().is_empty()) && self.files.is_empty()
+    }
+
+    /// Adds files (a folder, a missing file or one already added is skipped).
+    pub fn attach(&mut self, paths: impl IntoIterator<Item = std::path::PathBuf>) {
+        for path in paths {
+            let Ok(meta) = std::fs::metadata(&path) else { continue };
+            if !meta.is_file() || self.files.iter().any(|f| f.path == path) {
+                continue;
+            }
+            let name = crate::attachments::safe_name(&path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned()));
+            self.files.push(AttachedFile { path, name, size: meta.len() });
+        }
+    }
+
+    pub fn attached_size(&self) -> u64 {
+        self.files.iter().map(|f| f.size).sum()
+    }
+
+    /// What the sender needs to read the files: path and the name the recipient sees.
+    pub fn file_list(&self) -> Vec<(std::path::PathBuf, String)> {
+        self.files.iter().map(|f| (f.path.clone(), f.name.clone())).collect()
     }
 
     pub fn outgoing(&self, from_address: &str) -> Outgoing {
@@ -113,6 +149,7 @@ impl Compose {
             body: self.body.clone(),
             in_reply_to: self.in_reply_to.clone(),
             references: self.references.clone(),
+            attachments: Vec::new(), // read from `files` when the message is sent
         }
     }
 }
@@ -146,6 +183,29 @@ fn prefixed(prefix: &str, subject: &str) -> String {
 /// Every line of `text` marked as a quotation.
 fn quote(text: &str) -> String {
     text.trim_end().lines().map(|l| if l.is_empty() { ">".to_owned() } else { format!("> {l}") }).collect::<Vec<_>>().join("\n")
+}
+
+/// The window system does not deliver dropped files here: the toolkit has no drag and drop on Wayland.
+fn on_wayland() -> bool {
+    cfg!(target_os = "linux") && std::env::var_os("WAYLAND_DISPLAY").is_some_and(|d| !d.is_empty())
+}
+
+/// Files dropped onto the window this frame.
+pub fn dropped(ctx: &egui::Context) -> Vec<std::path::PathBuf> {
+    ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect())
+}
+
+/// Files are being dragged over the window right now.
+pub fn hovering_files(ctx: &egui::Context) -> bool {
+    ctx.input(|i| !i.raw.hovered_files.is_empty())
+}
+
+/// A tinted plate with a sentence over `rect`, drawn above everything else.
+pub fn drop_hint(ctx: &egui::Context, t: &Tokens, rect: egui::Rect, text: &str) {
+    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drop_hint")));
+    painter.rect_filled(rect, egui::CornerRadius::same(theme::CONTROL_RADIUS), t.accent.gamma_multiply(0.22));
+    painter.rect_stroke(rect.shrink(2.0), egui::CornerRadius::same(theme::CONTROL_RADIUS), egui::Stroke::new(2.0, t.accent), egui::StrokeKind::Inside);
+    painter.text(rect.center(), Align2::CENTER_CENTER, text, egui::FontId::proportional(18.0), t.accent);
 }
 
 /// Splits a recipient field on commas, semicolons and newlines.
@@ -184,8 +244,10 @@ fn row(ui: &mut Ui, t: &Tokens, name: &str, text: &mut String, hint: &str) -> eg
 /// Shows the window. `senders` lists the accounts that can send, as (serial, address).
 pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &[(u64, String)]) -> Outcome {
     let mut outcome = Outcome::Keep;
+    // Files dragged onto the window while composing.
+    compose.attach(dropped(ctx));
     let ready = !compose.sending && !compose.to.trim().is_empty();
-    egui::Window::new(compose.title)
+    let shown = egui::Window::new(compose.title)
         .id(egui::Id::new("compose"))
         .anchor(Align2::RIGHT_BOTTOM, [-16.0, -16.0])
         .default_width(620.0)
@@ -227,6 +289,36 @@ pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &
                     }
                 });
             });
+            if !compose.files.is_empty() {
+                ui.add_space(6.0);
+                let mut remove = None;
+                ui.horizontal_wrapped(|ui| {
+                    for (i, file) in compose.files.iter().enumerate() {
+                        egui::Frame::new()
+                            .fill(t.input)
+                            .stroke(egui::Stroke::new(1.0, t.border_strong))
+                            .corner_radius(egui::CornerRadius::same(theme::CONTROL_RADIUS))
+                            .inner_margin(egui::Margin::symmetric(10, 5))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.add(Icon::Paperclip.image(crate::icons::SIZE, t.text_dim));
+                                    let shown: String = if file.name.chars().count() > 28 { format!("{}…", file.name.chars().take(27).collect::<String>()) } else { file.name.clone() };
+                                    ui.label(shown).on_hover_text(file.path.display().to_string());
+                                    ui.label(RichText::new(crate::attachments::human_size(file.size)).size(13.0).color(t.text_dim));
+                                    if !compose.sending && crate::icons::button_small(ui, t, Icon::X, "Remove").clicked() {
+                                        remove = Some(i);
+                                    }
+                                });
+                            });
+                    }
+                });
+                if let Some(i) = remove {
+                    compose.files.remove(i);
+                }
+                if compose.attached_size() > SIZE_WARNING {
+                    ui.label(RichText::new(format!("The attachments add up to {}. Many providers refuse messages over 25 MB.", crate::attachments::human_size(compose.attached_size()))).size(13.0).color(t.danger));
+                }
+            }
             if let Some(error) = &compose.error {
                 ui.add_space(4.0);
                 ui.colored_label(t.danger, error);
@@ -236,6 +328,9 @@ pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &
                 let send = views::primary_wide_fixed(ui, t, Icon::Send, if compose.sending { "Sending…" } else { "Send" }, ready, 120.0);
                 if send.clicked() {
                     outcome = Outcome::Send;
+                }
+                if ui.add_enabled(!compose.sending, egui::Button::image_and_text(Icon::Paperclip.image(crate::icons::SIZE, t.text_dim), "Attach")).on_hover_text(if on_wayland() { "Attach files. Dropping files in does not work on Wayland yet; start the app with WAYLAND_DISPLAY unset to use X11." } else { "Attach files, or drop them in the window" }).clicked() {
+                    outcome = Outcome::Attach;
                 }
                 if compose.sending {
                     ui.spinner();
@@ -248,6 +343,12 @@ pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &
                 });
             });
         });
+    // While files are being dragged over the app, say where they would go.
+    if let Some(window) = shown
+        && hovering_files(ctx)
+    {
+        drop_hint(ctx, t, window.response.rect, "Drop files to attach them");
+    }
     if ready && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Enter)) {
         outcome = Outcome::Send;
     }
@@ -329,6 +430,23 @@ mod tests {
         assert!(c.body.contains("---------- Forwarded message ----------\nFrom: Ada Lovelace <ada@example.org>"));
         assert!(c.body.ends_with("Bring the notes."));
         assert!(c.outgoing("me@example.org").in_reply_to.is_none());
+    }
+
+    #[test]
+    fn attaching_skips_folders_missing_and_repeated_files_and_counts_the_size() {
+        let dir = std::env::temp_dir().join(format!("beavermail-attach-compose-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a.txt"), b"12345").unwrap();
+        std::fs::write(dir.join("b.txt"), b"123").unwrap();
+        let mut c = Compose::new(0);
+        assert!(c.is_empty());
+        c.attach([dir.join("a.txt"), dir.join("a.txt"), dir.join("sub"), dir.join("missing"), dir.join("b.txt")]);
+        assert_eq!(c.files.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["a.txt", "b.txt"]);
+        assert_eq!(c.attached_size(), 8);
+        assert!(!c.is_empty(), "files alone are something to lose");
+        assert_eq!(c.file_list()[0].1, "a.txt");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

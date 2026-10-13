@@ -196,6 +196,16 @@ impl Account {
     }
 }
 
+/// A file to send with a message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutgoingFile {
+    /// The name the recipient sees.
+    pub name: String,
+    /// "type/subtype", e.g. "application/pdf".
+    pub mime: String,
+    pub data: Vec<u8>,
+}
+
 /// A message to send. Addresses are free text until the sender parses them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Outgoing {
@@ -208,6 +218,7 @@ pub struct Outgoing {
     pub in_reply_to: Option<String>,
     /// Message-IDs of the thread so far, oldest first, without angle brackets.
     pub references: Vec<String>,
+    pub attachments: Vec<OutgoingFile>,
 }
 
 /// How an incoming message is shown (PRD D9). Original HTML is not implemented yet.

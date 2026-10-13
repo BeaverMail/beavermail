@@ -48,6 +48,8 @@ enum Event {
     Attachment(Result<(String, Vec<u8>), MailError>),
     /// Saving attachments through a file dialog ended: `None` when the user cancelled, else what to tell them.
     Saved(Result<Option<String>, String>),
+    /// Files chosen in the "attach" dialog.
+    Picked(Vec<std::path::PathBuf>),
 }
 
 enum VaultOutcome {
@@ -574,6 +576,24 @@ impl BeaverApp {
         self.compose = from.map(compose::Compose::new);
     }
 
+    /// Files dropped onto the main window start a new message with them attached.
+    fn drop_files_on_the_app(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
+        let free = self.compose.is_none() && self.form.is_none() && !self.show_settings && !self.locked() && !self.senders().is_empty();
+        if !free {
+            return;
+        }
+        if compose::hovering_files(ctx) {
+            compose::drop_hint(ctx, t, ctx.content_rect(), "Drop files to write a new message");
+        }
+        let files = compose::dropped(ctx);
+        if !files.is_empty() {
+            self.new_message();
+            if let Some(compose) = &mut self.compose {
+                compose.attach(files);
+            }
+        }
+    }
+
     fn compose_window(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
         let Some(mut compose) = self.compose.take() else { return };
         let senders = self.senders();
@@ -581,14 +601,27 @@ impl BeaverApp {
             compose::Outcome::Keep => {}
             compose::Outcome::Discard if compose.is_empty() => return,
             compose::Outcome::Discard => self.confirm_discard = true,
+            compose::Outcome::Attach => {
+                self.spawn(async {
+                    let files = rfd::AsyncFileDialog::new().set_title("Attach files").pick_files().await;
+                    Event::Picked(files.unwrap_or_default().into_iter().map(|f| f.path().to_path_buf()).collect())
+                });
+            }
             compose::Outcome::Send => {
                 if let Some(view) = self.view(compose.from) {
                     let (account, sender, source) = (view.account.clone(), view.sender.clone(), view.source.clone());
                     if let Some(sender) = sender {
-                        let message = compose.outgoing(account.address());
+                        let mut message = compose.outgoing(account.address());
+                        let files = compose.file_list();
                         compose.sending = true;
                         compose.error = None;
                         self.spawn(async move {
+                            // The files are read now, off the window's thread, as they can be large.
+                            match tokio::task::spawn_blocking(move || attachments::read_files(&files)).await {
+                                Ok(Ok(read)) => message.attachments = read,
+                                Ok(Err(e)) => return Event::Sent(Err(MailError::Backend(e)), None),
+                                Err(e) => return Event::Sent(Err(MailError::Backend(e.to_string())), None),
+                            }
                             let result = sender.send(message).await;
                             let copy_error = match (&result, source) {
                                 (Ok(raw), Some(source)) if account.save_sent => source.save_sent(raw.clone()).await.err().map(|e| e.to_string()),
@@ -1124,6 +1157,11 @@ impl BeaverApp {
                 },
                 Err(e) => self.error = Some(format!("Could not get the attachment: {e}")),
             },
+            Event::Picked(paths) => {
+                if let Some(compose) = &mut self.compose {
+                    compose.attach(paths);
+                }
+            }
             Event::Saved(result) => match result {
                 Ok(Some(text)) => {
                     self.notice = Some((text, std::time::Instant::now()));
@@ -1675,6 +1713,7 @@ impl eframe::App for BeaverApp {
         {
             self.run_vault(request, ui.ctx());
         }
+        self.drop_files_on_the_app(ui.ctx(), &t);
         self.compose_window(ui.ctx(), &t);
         if add {
             self.form = Some(NewAccount::default());
