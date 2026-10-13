@@ -272,6 +272,7 @@ mod tests {
             subject: "Lunch".into(),
             preview: String::new(),
             received: "2026-10-13 12:00".into(),
+            timestamp: 0,
             unread: false,
         };
         let body = MessageBody {

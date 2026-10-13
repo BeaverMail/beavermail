@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex};
 
 use beavermail_core::{Account, MailError, MailSource, MessageId, Role, Server, Tls};
 use beavermail_imap::ImapSource;
+use beavermail_store::Store;
+use beavermail_vault::Vault;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -17,6 +19,9 @@ const MESSAGE: &str = "From: Ada <ada@example.com>\r\nTo: Me <me@example.com>, g
 
 struct Mock {
     source: ImapSource,
+    account: Account,
+    store: Arc<Store>,
+    files: Arc<Vault>,
     log: Arc<Mutex<Vec<String>>>,
 }
 
@@ -46,7 +51,9 @@ async fn start(move_works: bool) -> Mock {
     });
     let server = Server { host: "127.0.0.1".into(), port, tls: Tls::None };
     let account = Account { name: "mock".into(), user: "u".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true };
-    Mock { source: ImapSource::new(&account, "p".into()), log }
+    let store = Arc::new(Store::in_memory().unwrap());
+    let files = Arc::new(Vault::in_memory());
+    Mock { source: ImapSource::new(&account, "p".into(), store.clone(), files.clone()), account, store, files, log }
 }
 
 async fn serve(socket: TcpStream, log: Arc<Mutex<Vec<String>>>, move_works: bool) {
@@ -75,9 +82,11 @@ async fn serve(socket: TcpStream, log: Arc<Mutex<Vec<String>>>, move_works: bool
         } else if verb.contains("BODY.PEEK[]") {
             let n = MESSAGE.len();
             format!("* 1 FETCH (UID 5 BODY[] {{{n}}}\r\n{MESSAGE})\r\n{tag} OK done\r\n")
-        } else if verb.contains("FETCH") {
+        } else if verb.contains("FETCH") && verb.contains("HEADER") {
             let n = HEADER.len();
-            format!("* 1 FETCH (UID 5 FLAGS () BODY[HEADER] {{{n}}}\r\n{HEADER})\r\n{tag} OK done\r\n")
+            format!("* 1 FETCH (UID 5 FLAGS () BODY[HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES)] {{{n}}}\r\n{HEADER})\r\n{tag} OK done\r\n")
+        } else if verb.contains("FETCH") {
+            format!("* 1 FETCH (UID 5 FLAGS ())\r\n{tag} OK done\r\n")
         } else if verb.starts_with("APPEND") {
             // "APPEND "Sent" (\Seen) {123}": ask for the literal, read it, and record what arrived.
             let size: usize = command.rsplit('{').next().and_then(|n| n.trim_end_matches('}').parse().ok()).unwrap_or(0);
@@ -107,6 +116,8 @@ async fn serve(socket: TcpStream, log: Arc<Mutex<Vec<String>>>, move_works: bool
 
 /// The id of the one message the mock holds in `mailbox`.
 async fn message_in(mock: &Mock, mailbox: &str) -> MessageId {
+    mock.source.mailboxes().await.expect("list folders");
+    mock.source.sync(mailbox).await.expect("sync");
     mock.source.messages(mailbox).await.expect("list messages").first().expect("one message").id
 }
 
@@ -135,6 +146,9 @@ async fn archive_and_trash_move_to_their_folders() {
     let mock = start(true).await;
     let id = message_in(&mock, "INBOX").await;
     mock.source.archive(id).await.unwrap();
+    // The archive forgot the message at once; a sync brings it back (the server still lists it).
+    assert!(mock.source.messages("INBOX").await.unwrap().is_empty());
+    let id = message_in(&mock, "INBOX").await;
     mock.source.trash(id).await.unwrap();
     assert_eq!(mock.writes(), ["UID MOVE 5 \"Archive\"", "UID MOVE 5 \"Trash\""]);
 }
@@ -198,4 +212,57 @@ async fn a_sent_copy_is_appended_to_sent_as_read() {
     let commands = mock.commands();
     assert!(commands.iter().any(|c| c.starts_with("APPEND \"Sent\" (\\Seen)")), "{commands:?}");
     assert!(commands.iter().any(|c| c.starts_with("APPEND-DATA Subject: Sent one")), "{commands:?}");
+}
+
+#[tokio::test]
+async fn syncing_twice_does_not_duplicate_and_reports_no_more_history() {
+    let mock = start(true).await;
+    mock.source.mailboxes().await.unwrap();
+    let first = mock.source.sync("INBOX").await.unwrap();
+    mock.source.sync("INBOX").await.unwrap();
+    assert_eq!(mock.source.messages("INBOX").await.unwrap().len(), 1);
+    assert_eq!(first.remaining, 0, "a one-message folder has no older history");
+}
+
+#[tokio::test]
+async fn the_archive_works_without_the_server() {
+    let mock = start(true).await;
+    let id = message_in(&mock, "INBOX").await;
+    let body = mock.source.body(id).await.unwrap();
+    // A second source over the same archive whose server is unreachable (nothing listens on port 1).
+    let mut account = mock.account.clone();
+    account.imap.port = 1;
+    let offline = ImapSource::new(&account, "p".into(), mock.store.clone(), mock.files.clone());
+    assert_eq!(offline.cached_mailboxes().await.unwrap().len(), 4);
+    assert_eq!(offline.messages("INBOX").await.unwrap().len(), 1);
+    assert_eq!(offline.body(id).await.unwrap(), body, "an opened message is readable offline");
+    assert!(offline.sync("INBOX").await.is_err());
+    assert_eq!(offline.messages("INBOX").await.unwrap().len(), 1, "a failed sync loses nothing");
+}
+
+#[tokio::test]
+async fn a_message_keeps_its_id_across_syncs() {
+    let mock = start(true).await;
+    let first = message_in(&mock, "INBOX").await;
+    mock.source.sync("INBOX").await.unwrap();
+    assert_eq!(mock.source.messages("INBOX").await.unwrap()[0].id, first);
+}
+
+#[tokio::test]
+async fn a_downloaded_message_is_kept_in_the_vault_and_not_fetched_twice() {
+    let mock = start(true).await;
+    let id = message_in(&mock, "INBOX").await;
+    let before = mock.commands().iter().filter(|c| c.contains("BODY.PEEK[]")).count();
+    mock.source.body(id).await.unwrap();
+    mock.source.body(id).await.unwrap();
+    let path = beavermail_vault::message_path(&mock.account.key(), "INBOX", 1, 5);
+    let context = format!("{}/INBOX/1-5", mock.account.key());
+    assert!(mock.files.read(&path, &context).unwrap().is_some(), "the message is stored under its UID");
+    let fetched = mock.commands().iter().filter(|c| c.contains("BODY.PEEK[]")).count() - before;
+    assert_eq!(fetched, 1, "the second read comes from the file");
+    // Deleting the message on the server removes the file with it.
+    mock.source.archive(id).await.unwrap();
+    let path = beavermail_vault::message_path(&mock.account.key(), "INBOX", 1, 5);
+    let context = format!("{}/INBOX/1-5", mock.account.key());
+    assert_eq!(mock.files.read(&path, &context).unwrap(), None, "the file went with the message");
 }

@@ -14,9 +14,11 @@ mod theme;
 mod views;
 
 use beavermail_accounts as store;
-use beavermail_core::{Account, DisplayMode, MailError, MailSender, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Role, Server, Settings, Tls};
+use beavermail_core::{Account, DisplayMode, MailError, MailSender, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Role, Server, Settings, SyncReport, Tls};
 use beavermail_imap::ImapSource;
 use beavermail_smtp::SmtpSender;
+use beavermail_store::Store;
+use beavermail_vault::{SystemStore, Vault};
 use eframe::egui::{self, Align, Layout, RichText, pos2, vec2};
 
 use crate::icons::Icon;
@@ -26,6 +28,8 @@ use tokio::runtime::Runtime;
 /// for an account that was removed meanwhile are dropped.
 enum Event {
     Mailboxes(u64, Result<Vec<Mailbox>, MailError>),
+    /// One sync of the selected folder finished; more history may remain.
+    Synced(u64, usize, Result<SyncReport, MailError>),
     Messages(u64, usize, Result<Vec<MessageSummary>, MailError>),
     Body(u64, MessageId, Result<MessageBody, MailError>),
     /// A write (read flag, archive, trash) finished; the UI already showed its result.
@@ -253,6 +257,12 @@ struct BeaverApp {
     /// Short confirmation ("Message sent") and when it was shown.
     notice: Option<(String, std::time::Instant)>,
     settings: Settings,
+    /// The local mail archive every account reads from first.
+    archive: Arc<Store>,
+    /// The encrypted message files.
+    vault: Arc<Vault>,
+    /// Syncs in flight; the list shows a spinner while it is not zero.
+    syncing: u32,
     show_settings: bool,
     /// Display mode chosen for the open message only; forgotten when another is opened.
     view_mode: Option<DisplayMode>,
@@ -261,6 +271,16 @@ struct BeaverApp {
 impl BeaverApp {
     fn new(ctx: egui::Context) -> Self {
         let (tx, rx) = channel();
+        let (archive, archive_error) = match store::archive_path().and_then(|path| Store::open(&path).map_err(|e| e.to_string())) {
+            Ok(archive) => (archive, None),
+            // Without a usable file the app still works, but nothing is kept between runs.
+            Err(e) => (Store::in_memory().expect("in-memory archive"), Some(format!("The local mail archive is unavailable: {e}"))),
+        };
+        let (vault, vault_error) = match store::data_dir().and_then(|dir| Vault::open(&dir, &SystemStore).map_err(|e| e.to_string())) {
+            Ok(vault) => (vault, None),
+            // Never a plain-text fallback: without the key, messages are kept in memory only.
+            Err(e) => (Vault::in_memory(), Some(format!("Downloaded messages cannot be stored safely: {e}"))),
+        };
         let mut app = Self {
             runtime: Runtime::new().expect("tokio runtime"),
             ctx,
@@ -281,9 +301,13 @@ impl BeaverApp {
             confirm_discard: false,
             notice: None,
             settings: Settings::default(),
+            archive: Arc::new(archive),
+            vault: Arc::new(vault),
+            syncing: 0,
             show_settings: false,
             view_mode: None,
         };
+        app.error = archive_error.or(vault_error);
         match store::load_settings() {
             Ok(settings) => app.settings = settings,
             Err(e) => app.error = Some(e),
@@ -316,11 +340,14 @@ impl BeaverApp {
         let (source, sender, error) = match store::password(&account) {
             Ok(password) => {
                 let sender = Arc::new(SmtpSender::new(&account, password.clone()));
-                (Some(Arc::new(ImapSource::new(&account, password))), Some(sender), None)
+                (Some(Arc::new(ImapSource::new(&account, password, self.archive.clone(), self.vault.clone()))), Some(sender), None)
             }
             Err(e) => (None, None, Some(e)),
         };
         if let Some(source) = source.clone() {
+            // The archive answers at once; the server's list follows and replaces it.
+            let cached = source.clone();
+            self.spawn(async move { Event::Mailboxes(serial, cached.cached_mailboxes().await) });
             self.spawn(async move { Event::Mailboxes(serial, source.mailboxes().await) });
         }
         let view = AccountView { serial, account, source, sender, mailboxes: Vec::new(), error };
@@ -343,7 +370,16 @@ impl BeaverApp {
         self.message = None;
         self.body = None;
         self.messages.clear();
-        self.spawn(async move { Event::Messages(serial, index, source.messages(&name).await) });
+        let local = source.clone();
+        let folder = name.clone();
+        self.spawn(async move { Event::Messages(serial, index, local.messages(&folder).await) });
+        self.start_sync(serial, index, source, name);
+    }
+
+    /// Brings a folder of the archive up to date in the background.
+    fn start_sync(&mut self, serial: u64, index: usize, source: Arc<ImapSource>, folder: String) {
+        self.syncing += 1;
+        self.spawn(async move { Event::Synced(serial, index, source.sync(&folder).await) });
     }
 
     fn select_message(&mut self, id: MessageId) {
@@ -413,7 +449,7 @@ impl BeaverApp {
         let name = mailbox.name.clone();
         let folders = source.clone();
         self.spawn(async move { Event::Mailboxes(serial, folders.mailboxes().await) });
-        self.spawn(async move { Event::Messages(serial, index, source.messages(&name).await) });
+        self.start_sync(serial, index, source, name);
     }
 
     /// Accounts that can send, as (serial, address).
@@ -660,6 +696,7 @@ impl BeaverApp {
         let old = self.accounts.remove(at);
         if key_changed {
             let _ = store::forget_password(&old.account);
+            self.forget_archive(&old.account); // its UIDs mean nothing on another server
         }
         let serial = self.insert_view(account, Some(at));
         if self.selected.is_some_and(|(s, _)| s == old.serial) {
@@ -676,9 +713,19 @@ impl BeaverApp {
         Ok(())
     }
 
+    /// Deletes everything downloaded for an account: its index rows and its message files.
+    fn forget_archive(&mut self, account: &Account) {
+        let key = account.key();
+        let result = self.archive.forget_account(&key).and_then(|()| self.vault.remove_dir(&beavermail_vault::account_path(&key)));
+        if let Err(e) = result {
+            self.error = Some(e.to_string());
+        }
+    }
+
     fn remove_account(&mut self, serial: u64) {
         let Some(position) = self.accounts.iter().position(|v| v.serial == serial) else { return };
         let view = self.accounts.remove(position);
+        self.forget_archive(&view.account);
         let all: Vec<Account> = self.accounts.iter().map(|v| v.account.clone()).collect();
         if let Err(e) = store::save(&all).and_then(|()| store::forget_password(&view.account)) {
             self.error = Some(e);
@@ -694,16 +741,41 @@ impl BeaverApp {
     fn apply(&mut self, event: Event) {
         match event {
             Event::Mailboxes(serial, result) => {
+                let selected_name = self.selected.filter(|(s, _)| *s == serial).and_then(|(_, i)| self.view(serial)?.mailboxes.get(i)).map(|m| m.name.clone());
                 let Some(view) = self.accounts.iter_mut().find(|v| v.serial == serial) else { return };
                 match result {
-                    Ok(mailboxes) => {
+                    Ok(mut mailboxes) => {
+                        // Same order for the archive's list and the server's, so a position means the same folder.
+                        mailboxes.sort_by_key(|m| (views::folder_rank(m.role), m.name.clone()));
                         view.mailboxes = mailboxes;
                         view.error = None;
-                        if self.selected.is_none() {
-                            self.select_mailbox(serial, 0);
+                        let inbox = view.mailboxes.iter().position(|m| m.role == Role::Inbox).unwrap_or(0);
+                        let moved = selected_name.and_then(|name| view.mailboxes.iter().position(|m| m.name == name));
+                        if self.selected.is_some_and(|(s, _)| s == serial) {
+                            self.selected = moved.map(|i| (serial, i));
+                        } else if self.selected.is_none() && !view.mailboxes.is_empty() {
+                            self.select_mailbox(serial, inbox);
                         }
                     }
                     Err(e) => view.error = Some(e.to_string()),
+                }
+            }
+            Event::Synced(serial, index, result) => {
+                self.syncing = self.syncing.saturating_sub(1);
+                if self.selected != Some((serial, index)) {
+                    return;
+                }
+                match result {
+                    Ok(report) => {
+                        let Some(view) = self.view(serial) else { return };
+                        let (Some(source), Some(name)) = (view.source.clone(), view.mailboxes.get(index).map(|m| m.name.clone())) else { return };
+                        let (local, folder) = (source.clone(), name.clone());
+                        self.spawn(async move { Event::Messages(serial, index, local.messages(&folder).await) });
+                        if report.remaining > 0 {
+                            self.start_sync(serial, index, source, name);
+                        }
+                    }
+                    Err(e) => self.error = Some(e.to_string()),
                 }
             }
             Event::Messages(serial, index, result) if self.selected == Some((serial, index)) => match result {
@@ -959,7 +1031,11 @@ impl BeaverApp {
                 let width = ui.available_width() - theme::CONTROL_H - 20.0;
                 let focus = std::mem::take(&mut self.focus_search);
                 views::search_box(ui, t, &mut self.query, "Search mail  ( / )", width, focus);
-                refresh = icons::button(ui, t, Icon::Refresh, "Refresh", true, false).clicked();
+                if self.syncing > 0 {
+                    ui.add_sized([theme::CONTROL_H - 4.0, theme::CONTROL_H - 4.0], egui::Spinner::new().size(16.0)).on_hover_text("Syncing…");
+                } else {
+                    refresh = icons::button(ui, t, Icon::Refresh, "Refresh", true, false).clicked();
+                }
             });
             ui.add_space(8.0);
             let shown = self.visible();

@@ -6,7 +6,10 @@ Licensed under AGPL-3.0-only (see [LICENSE](LICENSE)).
 ## Layout
 
 - `crates/core`: domain model and the `MailSource` trait. No GUI or network dependencies.
-- `crates/imap`: IMAP backend (`ImapSource`).
+- `crates/store`: the local mail index (SQLite, full-text search); it holds no message bodies.
+- `crates/vault`: the encrypted message files and their key slots.
+- `crates/imap`: IMAP backend (`ImapSource`), which keeps the archive in sync.
+- `crates/smtp`: sending (`SmtpSender`).
 - `crates/accounts`: `accounts.toml` and the system credential store.
 - `crates/app`: the egui desktop shell (binary `beavermail`).
 
@@ -17,7 +20,11 @@ archived, moved to Trash and erased from Trash (keys: Up/Down, E, Delete, U). Ne
 reply all and forwards are sent over SMTP (keys: C, R, A, F), with a copy kept in Sent. Accounts can
 be edited from the sidebar. Messages open as plain text by default, or as simplified HTML (Settings, or per message and per
 sender); images and styling are never loaded and tracking parameters are removed from links.
-No search beyond the loaded list, no local cache, original HTML or encryption yet.
+Mail is kept locally: the window opens from a SQLite index, and each downloaded message is an
+encrypted file under the data directory (XChaCha20-Poly1305, key in the system credential store).
+New mail, flags, deletions and older history sync in the background. The index itself is not
+encrypted yet. No offline-retention setting, attachments view, original HTML or end-to-end
+message encryption yet.
 
 ## Running
 

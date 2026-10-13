@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+
+[package]
+name = "beavermail-store"
+description = "Local mail archive (SQLite) for BeaverMail"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+beavermail-core.workspace = true
+rusqlite = { version = "0.40", features = ["bundled"] }

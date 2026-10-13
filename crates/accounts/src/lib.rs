@@ -58,6 +58,17 @@ pub fn save_settings(settings: &Settings) -> Result<(), String> {
     write_atomic(&config_file("settings.toml")?, &toml::to_string_pretty(settings).map_err(|e| e.to_string())?)
 }
 
+/// Where the local mail archive lives: the user's data directory, not the config directory.
+pub fn archive_path() -> Result<PathBuf, String> {
+    Ok(data_dir()?.join("mail.sqlite3"))
+}
+
+/// The directory holding the archive, the message files and the key file.
+pub fn data_dir() -> Result<PathBuf, String> {
+    let dirs = ProjectDirs::from("", "", "beavermail").ok_or("no home directory")?;
+    Ok(dirs.data_dir().to_path_buf())
+}
+
 /// Accounts from the config file; none if the file does not exist yet.
 pub fn load() -> Result<Vec<Account>, String> {
     let path = path()?;

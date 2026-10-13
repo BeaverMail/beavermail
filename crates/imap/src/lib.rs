@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use async_imap::types::{Fetch, Flag, NameAttribute};
 use async_imap::{Client, Session};
-use beavermail_core::{Account, MailError, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Role, Server, Tls};
+use beavermail_core::{Account, MailError, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Role, Server, SyncReport, Tls};
+use beavermail_store::{Header, Location, Store};
+use beavermail_vault::{Vault, folder_path, message_path};
 use futures::TryStreamExt;
 use mail_parser::MessageParser;
 use rustls::pki_types::ServerName;
@@ -16,9 +18,14 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
 
-/// How many of the newest messages a mailbox listing fetches.
-// shortcut: no paging, a mailbox shows only its latest messages; add paging with the local cache.
-const LIST_LIMIT: u32 = 200;
+/// Messages fetched by the first sync of a folder: the newest, so the list can fill at once.
+const FIRST_CHUNK: u32 = 300;
+/// How many UIDs of older history one sync call downloads.
+const BACKFILL_SPAN: u32 = 1000;
+/// Cached messages whose flags and existence are re-checked on every sync.
+const RECONCILE_WINDOW: u32 = 1000;
+/// Header fields the list and threading need; the rest of the header is not downloaded.
+const HEADER_FIELDS: &str = "BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES)]";
 
 trait Conn: AsyncRead + AsyncWrite + Unpin + Send + fmt::Debug {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + fmt::Debug> Conn for T {}
@@ -27,12 +34,6 @@ type Stream = Box<dyn Conn>;
 #[derive(Default)]
 struct State {
     session: Option<Session<Stream>>,
-    /// Mailbox names from the last LIST; a [`MessageId`] holds an index into this.
-    mailboxes: Vec<String>,
-    /// Special-use folders from the last LIST (RFC 6154), by name.
-    archive: Option<String>,
-    trash: Option<String>,
-    sent: Option<String>,
 }
 
 /// What a write does to one message.
@@ -47,6 +48,11 @@ enum Op {
 
 pub struct ImapSource {
     config: Config,
+    /// Identity of the account in the archive.
+    account: String,
+    store: Arc<Store>,
+    /// Where the downloaded messages live, encrypted.
+    files: Arc<Vault>,
     state: Mutex<State>,
 }
 
@@ -58,10 +64,25 @@ struct Config {
 }
 
 impl ImapSource {
-    /// Creates the source; the connection is opened on first use.
-    pub fn new(account: &Account, password: String) -> Self {
+    /// Creates the source over the shared archive; the connection is opened on first use.
+    pub fn new(account: &Account, password: String, store: Arc<Store>, files: Arc<Vault>) -> Self {
         let config = Config { server: account.imap.clone(), user: account.user.clone(), password };
-        Self { config, state: Mutex::new(State::default()) }
+        Self { config, account: account.key(), store, files, state: Mutex::new(State::default()) }
+    }
+
+    /// Path and authenticated context of a message's file in the vault.
+    fn file_of(&self, account: &str, folder: &str, uid: u32) -> Result<(std::path::PathBuf, String), MailError> {
+        let validity = self.store.folder_state(account, folder)?.uidvalidity.unwrap_or(0);
+        Ok((message_path(account, folder, validity, uid), format!("{account}/{folder}/{validity}-{uid}")))
+    }
+
+    /// Deletes the files of messages that no longer exist on the server.
+    fn drop_files(&self, folder: &str, uids: &[u32]) {
+        for uid in uids {
+            if let Ok((path, _)) = self.file_of(&self.account, folder, *uid) {
+                let _ = self.files.remove(&path); // a leftover file is harmless; the next reset removes the folder
+            }
+        }
     }
 }
 
@@ -112,51 +133,6 @@ impl State {
         self.session = None;
         backend(e)
     }
-
-    async fn list(&mut self, config: &Config) -> Result<Vec<Mailbox>, MailError> {
-        let result = async {
-            let session = self.session(config).await?;
-            let mut names: Vec<(String, Role)> = session
-                .list(None, Some("*"))
-                .await
-                .map_err(backend)?
-                .try_filter(|n| futures::future::ready(!n.attributes().contains(&NameAttribute::NoSelect)))
-                .map_ok(|n| (n.name().to_owned(), role_of(n.attributes())))
-                .try_collect::<Vec<_>>()
-                .await
-                .map_err(backend)?;
-            names.sort_by_key(|(n, _)| (n != "INBOX", n.clone()));
-            resolve_roles(&mut names);
-            let mut mailboxes = Vec::with_capacity(names.len());
-            for (name, role) in &names {
-                let status = session.status(name, "(UNSEEN)").await.map_err(backend)?;
-                mailboxes.push(Mailbox { name: name.clone(), unread: status.unseen.unwrap_or(0), role: *role });
-            }
-            Ok((names, mailboxes))
-        }
-        .await;
-        match result {
-            Ok((names, mailboxes)) => {
-                let find = |role| names.iter().find(|(_, r)| *r == role).map(|(n, _)| n.clone());
-                self.archive = find(Role::Archive);
-                self.trash = find(Role::Trash);
-                self.sent = find(Role::Sent);
-                self.mailboxes = names.into_iter().map(|(n, _)| n).collect();
-                Ok(mailboxes)
-            }
-            Err(e) => {
-                self.session = None;
-                Err(e)
-            }
-        }
-    }
-
-    async fn mailbox_name(&mut self, config: &Config, index: usize) -> Result<String, MailError> {
-        if self.mailboxes.is_empty() {
-            self.list(config).await?;
-        }
-        self.mailboxes.get(index).cloned().ok_or(MailError::NotFound)
-    }
 }
 
 /// The role an RFC 6154 special-use attribute announces.
@@ -200,58 +176,78 @@ fn resolve_roles(folders: &mut [(String, Role)]) {
     }
 }
 
-/// A message id packs the mailbox index and the IMAP UID.
-// shortcut: ignores UIDVALIDITY; ids are only valid for the session that listed them, until the cache lands.
-fn encode(mailbox: usize, uid: u32) -> MessageId {
-    MessageId(((mailbox as u64) << 32) | u64::from(uid))
+/// The Message-IDs of a header such as `References`, without angle brackets.
+fn ids(value: &mail_parser::HeaderValue<'_>) -> Vec<String> {
+    match value.as_text_list() {
+        Some(list) => list.iter().map(|id| id.to_string()).collect(),
+        None => value.as_text().map(|id| vec![id.to_owned()]).unwrap_or_default(),
+    }
 }
 
-fn decode(id: MessageId) -> (usize, u32) {
-    ((id.0 >> 32) as usize, id.0 as u32)
-}
-
-fn summary(mailbox: usize, fetch: &Fetch) -> Option<MessageSummary> {
+/// A header block as the archive stores it, or `None` when the fetch has no UID or header.
+fn header(fetch: &Fetch) -> Option<Header> {
     let uid = fetch.uid?;
-    let message = MessageParser::default().parse_headers(fetch.header()?)?;
+    let raw = fetch.header().or_else(|| fetch.section(&async_imap::imap_proto::SectionPath::Full(async_imap::imap_proto::MessageSection::Header)))?;
+    let message = MessageParser::default().parse_headers(raw)?;
     let sender = message.from().and_then(|a| a.first());
-    let from = sender.map(|a| a.name().or(a.address()).unwrap_or_default().to_owned()).unwrap_or_default();
-    let address = sender.and_then(|a| a.address()).unwrap_or_default().to_owned();
-    let received = message.date().map_or_else(String::new, |d| {
-        format!("{:04}-{:02}-{:02} {:02}:{:02}", d.year, d.month, d.day, d.hour, d.minute)
-    });
-    Some(MessageSummary {
-        id: encode(mailbox, uid),
-        from,
-        address,
+    let date = message.date();
+    let received = date.map_or_else(String::new, |d| format!("{:04}-{:02}-{:02} {:02}:{:02}", d.year, d.month, d.day, d.hour, d.minute));
+    let timestamp = date.map(|d| d.to_timestamp()).or_else(|| fetch.internal_date().map(|d| d.timestamp())).unwrap_or(0);
+    Some(Header {
+        uid,
+        from_name: sender.and_then(|a| a.name()).unwrap_or_default().to_owned(),
+        from_addr: sender.and_then(|a| a.address()).unwrap_or_default().to_owned(),
         subject: message.subject().unwrap_or_default().to_owned(),
-        preview: String::new(), // shortcut: needs the body; filled once bodies are cached
         received,
+        timestamp,
         unread: !fetch.flags().any(|f| f == Flag::Seen),
+        message_id: message.message_id().unwrap_or_default().to_owned(),
+        in_reply_to: ids(message.in_reply_to()).join(" "),
+        references: ids(message.references()).join(" "),
     })
 }
 
+/// "Name <address>" or a bare address for each entry of an address header.
+fn addresses(header: Option<&mail_parser::Address<'_>>) -> Vec<String> {
+    header
+        .into_iter()
+        .flat_map(|h| h.iter())
+        .filter_map(|a| match (a.name(), a.address()) {
+            (Some(name), Some(address)) => Some(format!("{name} <{address}>")),
+            (None, Some(address)) => Some(address.to_owned()),
+            _ => None,
+        })
+        .collect()
+}
+
 impl ImapSource {
-    /// Applies `op` to one message. Moves use `MOVE` where the server has it, else copy and delete.
+    /// The folder with `role`, listing the account's folders first if the archive has none yet.
+    async fn folder_with_role(&self, role: Role) -> Result<Option<String>, MailError> {
+        if self.store.folders(&self.account)?.is_empty() {
+            self.mailboxes().await?;
+        }
+        self.store.folder_with_role(&self.account, role)
+    }
+
+    /// Applies `op` to one message on the server, then mirrors it in the archive.
     async fn write(&self, id: MessageId, op: Op) -> Result<(), MailError> {
-        let (index, uid) = decode(id);
-        let mut state = self.state.lock().await;
-        let mailbox = state.mailbox_name(&self.config, index).await?;
+        let at = self.store.locate(id)?.ok_or(MailError::NotFound)?;
         let target = match op {
-            Op::Seen(_) => None,
-            Op::Archive => Some(state.archive.clone().ok_or_else(|| backend("this account has no archive folder"))?),
-            Op::Trash => Some(state.trash.clone().ok_or_else(|| backend("this account has no trash folder"))?),
-            Op::Erase => None,
+            Op::Seen(_) | Op::Erase => None,
+            Op::Archive => Some(self.folder_with_role(Role::Archive).await?.ok_or_else(|| backend("this account has no archive folder"))?),
+            Op::Trash => Some(self.folder_with_role(Role::Trash).await?.ok_or_else(|| backend("this account has no trash folder"))?),
         };
-        if matches!(op, Op::Erase) && state.trash.as_deref() != Some(mailbox.as_str()) {
+        if matches!(op, Op::Erase) && self.folder_with_role(Role::Trash).await?.as_deref() != Some(at.folder.as_str()) {
             return Err(backend("only messages in Trash can be erased"));
         }
-        if target.as_deref() == Some(mailbox.as_str()) {
-            return Err(backend(format!("the message is already in {mailbox}")));
+        if target.as_deref() == Some(at.folder.as_str()) {
+            return Err(backend(format!("the message is already in {}", at.folder)));
         }
+        let mut state = self.state.lock().await;
         let session = state.session(&self.config).await?;
         let result = async {
-            session.select(&mailbox).await?;
-            let uid = uid.to_string();
+            session.select(&at.folder).await?;
+            let uid = at.uid.to_string();
             match (op, target) {
                 (Op::Seen(seen), _) => {
                     let query = if seen { "+FLAGS.SILENT (\\Seen)" } else { "-FLAGS.SILENT (\\Seen)" };
@@ -274,92 +270,218 @@ impl ImapSource {
             Ok::<(), async_imap::error::Error>(())
         }
         .await;
-        result.map_err(|e| state.failed(e))
+        result.map_err(|e| state.failed(e))?;
+        match op {
+            Op::Seen(seen) => self.store.set_unread(id, !seen),
+            Op::Archive | Op::Trash | Op::Erase => {
+                self.drop_files(&at.folder, &[at.uid]);
+                self.store.remove(id)
+            }
+        }
+    }
+
+    async fn fetch_headers(session: &mut Session<Stream>, set: &str, by_uid: bool) -> Result<Vec<Header>, async_imap::error::Error> {
+        let query = format!("(UID FLAGS INTERNALDATE {HEADER_FIELDS})");
+        let fetches: Vec<Fetch> = if by_uid {
+            session.uid_fetch(set, &query).await?.try_collect().await?
+        } else {
+            session.fetch(set, &query).await?.try_collect().await?
+        };
+        Ok(fetches.iter().filter_map(header).collect())
+    }
+
+    /// The synchronisation itself; see [`MailSource::sync`].
+    async fn sync_folder(&self, folder: &str) -> Result<SyncReport, MailError> {
+        let mut state = self.state.lock().await;
+        let session = state.session(&self.config).await?;
+        let result = self.sync_with(session, folder).await;
+        match result {
+            Ok(report) => Ok(report),
+            Err(SyncError::Archive(e)) => Err(e),
+            Err(SyncError::Imap(e)) => Err(state.failed(e)),
+        }
+    }
+
+    async fn sync_with(&self, session: &mut Session<Stream>, folder: &str) -> Result<SyncReport, SyncError> {
+        let (account, store) = (self.account.as_str(), &*self.store);
+        let selected = session.examine(folder).await?;
+        let validity = selected.uid_validity.unwrap_or(0);
+        let mut cached = store.folder_state(account, folder)?;
+        if cached.uidvalidity != Some(validity) {
+            store.reset_folder(account, folder, validity)?;
+            self.files.remove_dir(&folder_path(account, folder))?;
+            cached.floor_uid = None;
+        }
+        if selected.exists == 0 {
+            let all: Vec<u32> = store.flags_since(account, folder, 0)?.into_iter().map(|(u, _)| u).collect();
+            self.drop_files(folder, &all);
+            store.remove_uids(account, folder, &all)?;
+            return Ok(SyncReport::default());
+        }
+
+        // New messages. The first sync takes the newest few by sequence number.
+        let range = store.uid_range(account, folder)?;
+        let fresh = match range {
+            Some((_, highest, _)) => Self::fetch_headers(session, &format!("{}:*", highest + 1), true).await?.into_iter().filter(|h| h.uid > highest).collect(),
+            None => Self::fetch_headers(session, &format!("{}:*", selected.exists.saturating_sub(FIRST_CHUNK - 1).max(1)), false).await?,
+        };
+        if cached.floor_uid.is_none() {
+            let lowest = fresh.iter().map(|h| h.uid).min().or(range.map(|(lo, _, _)| lo));
+            // Everything fetched when the folder is small; otherwise history below the lowest UID is missing.
+            let floor = if selected.exists <= FIRST_CHUNK { 1 } else { lowest.unwrap_or(1) };
+            store.set_floor(account, folder, floor)?;
+            cached.floor_uid = Some(floor);
+        }
+        store.add_headers(account, folder, &fresh)?;
+
+        // Flags and deletions among the newest cached messages.
+        if let Some(from) = store.nth_newest_uid(account, folder, RECONCILE_WINDOW)?.or(store.uid_range(account, folder)?.map(|(lo, _, _)| lo)) {
+            let fetches: Vec<Fetch> = session.uid_fetch(format!("{from}:*"), "(UID FLAGS)").await?.try_collect().await?;
+            let server: std::collections::HashMap<u32, bool> = fetches.iter().filter_map(|f| Some((f.uid?, !f.flags().any(|fl| fl == Flag::Seen)))).collect();
+            let local = store.flags_since(account, folder, from)?;
+            let gone: Vec<u32> = local.iter().filter(|(uid, _)| !server.contains_key(uid)).map(|(uid, _)| *uid).collect();
+            let changed: Vec<(u32, bool)> = local.iter().filter_map(|(uid, unread)| server.get(uid).filter(|s| *s != unread).map(|s| (*uid, *s))).collect();
+            self.drop_files(folder, &gone);
+            store.remove_uids(account, folder, &gone)?;
+            store.set_unread_by_uid(account, folder, &changed)?;
+        }
+
+        // One more chunk of older history.
+        let mut floor = cached.floor_uid.unwrap_or(1);
+        for _ in 0..20 {
+            if floor <= 1 {
+                break;
+            }
+            let start = floor.saturating_sub(BACKFILL_SPAN).max(1);
+            let older = Self::fetch_headers(session, &format!("{start}:{}", floor - 1), true).await?;
+            store.add_headers(account, folder, &older)?;
+            floor = start;
+            store.set_floor(account, folder, floor)?;
+            if !older.is_empty() {
+                break;
+            }
+        }
+        let have = store.uid_range(account, folder)?.map_or(0, |(_, _, count)| count);
+        Ok(SyncReport { remaining: if floor <= 1 { 0 } else { selected.exists.saturating_sub(have) } })
     }
 }
 
-/// "Name <address>" or a bare address for each entry of an address header.
-fn addresses(header: Option<&mail_parser::Address<'_>>) -> Vec<String> {
-    header
-        .into_iter()
-        .flat_map(|h| h.iter())
-        .filter_map(|a| match (a.name(), a.address()) {
-            (Some(name), Some(address)) => Some(format!("{name} <{address}>")),
-            (None, Some(address)) => Some(address.to_owned()),
+/// Why a sync step failed: the connection (drop it) or the local archive (keep it).
+enum SyncError {
+    Imap(async_imap::error::Error),
+    Archive(MailError),
+}
+
+impl From<async_imap::error::Error> for SyncError {
+    fn from(e: async_imap::error::Error) -> Self {
+        Self::Imap(e)
+    }
+}
+
+impl From<MailError> for SyncError {
+    fn from(e: MailError) -> Self {
+        Self::Archive(e)
+    }
+}
+
+/// The text, recipients and threading headers of a complete message.
+fn parse_body(raw: &[u8]) -> Result<MessageBody, MailError> {
+    let message = MessageParser::default().parse(raw).ok_or(MailError::NotFound)?;
+    Ok(MessageBody {
+        text: message.body_text(0).map(|t| t.into_owned()).unwrap_or_default(),
+        to: addresses(message.to()),
+        cc: addresses(message.cc()),
+        reply_to: addresses(message.reply_to()),
+        message_id: message.message_id().unwrap_or_default().to_owned(),
+        html: message.html_bodies().find_map(|part| match &part.body {
+            mail_parser::PartType::Html(html) => Some(html.to_string()),
             _ => None,
-        })
-        .collect()
+        }),
+        references: ids(message.references()),
+    })
+}
+
+impl ImapSource {
+    /// The complete message from the server.
+    async fn download(&self, at: &Location) -> Result<Vec<u8>, MailError> {
+        let mut state = self.state.lock().await;
+        let session = state.session(&self.config).await?;
+        let result = async {
+            session.examine(&at.folder).await?;
+            let fetches: Vec<Fetch> = session.uid_fetch(at.uid.to_string(), "BODY.PEEK[]").await?.try_collect().await?;
+            Ok(fetches)
+        }
+        .await;
+        let fetches = result.map_err(|e| state.failed(e))?;
+        fetches.iter().find_map(|f| f.body().map(<[u8]>::to_vec)).ok_or(MailError::NotFound)
+    }
 }
 
 impl MailSource for ImapSource {
+    async fn cached_mailboxes(&self) -> Result<Vec<Mailbox>, MailError> {
+        Ok(self.store.folders(&self.account)?.into_iter().map(|f| Mailbox { name: f.name, unread: f.unread, role: f.role }).collect())
+    }
+
     async fn mailboxes(&self) -> Result<Vec<Mailbox>, MailError> {
-        self.state.lock().await.list(&self.config).await
+        let mut state = self.state.lock().await;
+        let result = async {
+            let session = state.session(&self.config).await?;
+            let mut folders: Vec<(String, Role)> = session
+                .list(None, Some("*"))
+                .await
+                .map_err(backend)?
+                .try_filter(|n| futures::future::ready(!n.attributes().contains(&NameAttribute::NoSelect)))
+                .map_ok(|n| (n.name().to_owned(), role_of(n.attributes())))
+                .try_collect::<Vec<_>>()
+                .await
+                .map_err(backend)?;
+            folders.sort_by_key(|(n, _)| (n != "INBOX", n.clone()));
+            resolve_roles(&mut folders);
+            let mut mailboxes = Vec::with_capacity(folders.len());
+            for (name, role) in &folders {
+                let status = session.status(name, "(UNSEEN)").await.map_err(backend)?;
+                mailboxes.push(Mailbox { name: name.clone(), unread: status.unseen.unwrap_or(0), role: *role });
+            }
+            Ok((folders, mailboxes))
+        }
+        .await;
+        match result {
+            Ok((folders, mailboxes)) => {
+                self.store.set_folders(&self.account, &folders)?;
+                Ok(mailboxes)
+            }
+            Err(e) => {
+                state.session = None;
+                Err(e)
+            }
+        }
     }
 
     async fn messages(&self, mailbox: &str) -> Result<Vec<MessageSummary>, MailError> {
-        let mut state = self.state.lock().await;
-        if state.mailboxes.is_empty() {
-            state.list(&self.config).await?;
-        }
-        let index = state.mailboxes.iter().position(|n| n == mailbox).ok_or(MailError::NotFound)?;
-        let session = state.session(&self.config).await?;
-        let result = async {
-            let selected = session.examine(mailbox).await?; // read-only: never marks messages seen
-            if selected.exists == 0 {
-                return Ok(Vec::new());
-            }
-            let first = selected.exists.saturating_sub(LIST_LIMIT - 1).max(1);
-            let fetches: Vec<Fetch> = session
-                .fetch(format!("{first}:*"), "(UID FLAGS BODY.PEEK[HEADER])")
-                .await?
-                .try_collect()
-                .await?;
-            Ok(fetches)
-        }
-        .await;
-        let fetches = result.map_err(|e| state.failed(e))?;
-        let mut messages: Vec<_> = fetches.iter().filter_map(|f| summary(index, f)).collect();
-        messages.sort_by_key(|m| std::cmp::Reverse(m.id.0));
-        Ok(messages)
+        self.store.messages(&self.account, mailbox)
+    }
+
+    async fn sync(&self, mailbox: &str) -> Result<SyncReport, MailError> {
+        self.sync_folder(mailbox).await
     }
 
     async fn body(&self, id: MessageId) -> Result<MessageBody, MailError> {
-        let (index, uid) = decode(id);
-        let mut state = self.state.lock().await;
-        let mailbox = state.mailbox_name(&self.config, index).await?;
-        let session = state.session(&self.config).await?;
-        let result = async {
-            session.examine(&mailbox).await?;
-            let fetches: Vec<Fetch> = session.uid_fetch(uid.to_string(), "BODY.PEEK[]").await?.try_collect().await?;
-            Ok(fetches)
+        let at = self.store.locate(id)?.ok_or(MailError::NotFound)?;
+        let (path, context) = self.file_of(&at.account, &at.folder, at.uid)?;
+        // A file that cannot be read (damaged, or written under another key) is downloaded again.
+        if let Some(raw) = self.files.read(&path, &context).ok().flatten() {
+            return parse_body(&raw);
         }
-        .await;
-        let fetches = result.map_err(|e| state.failed(e))?;
-        let raw = fetches.iter().find_map(|f| f.body()).ok_or(MailError::NotFound)?;
-        let message = MessageParser::default().parse(raw).ok_or(MailError::NotFound)?;
-        Ok(MessageBody {
-            text: message.body_text(0).map(|t| t.into_owned()).unwrap_or_default(),
-            to: addresses(message.to()),
-            cc: addresses(message.cc()),
-            reply_to: addresses(message.reply_to()),
-            message_id: message.message_id().unwrap_or_default().to_owned(),
-            html: message.html_bodies().find_map(|part| match &part.body {
-                mail_parser::PartType::Html(html) => Some(html.to_string()),
-                _ => None,
-            }),
-            references: message.references().as_text_list().map_or_else(
-                || message.references().as_text().map(|r| vec![r.to_owned()]).unwrap_or_default(),
-                |list| list.iter().map(|r| r.to_string()).collect(),
-            ),
-        })
+        let raw = self.download(&at).await?;
+        let body = parse_body(&raw)?;
+        self.files.write(&path, &context, &raw)?;
+        self.store.set_preview(id, &body.text)?;
+        Ok(body)
     }
 
     async fn save_sent(&self, raw: Vec<u8>) -> Result<(), MailError> {
+        let sent = self.folder_with_role(Role::Sent).await?.ok_or_else(|| backend("this account has no Sent folder"))?;
         let mut state = self.state.lock().await;
-        if state.mailboxes.is_empty() {
-            state.list(&self.config).await?;
-        }
-        let sent = state.sent.clone().ok_or_else(|| backend("this account has no Sent folder"))?;
         let session = state.session(&self.config).await?;
         let result = session.append(&sent, Some("(\\Seen)"), None, &raw).await;
         result.map_err(|e| state.failed(e))
@@ -400,8 +522,4 @@ mod tests {
         assert_eq!(roles, [Role::Inbox, Role::Sent, Role::Archive, Role::Other, Role::Junk]);
     }
 
-    #[test]
-    fn id_round_trips() {
-        assert_eq!(decode(encode(7, 4_000_000_000)), (7, 4_000_000_000));
-    }
 }

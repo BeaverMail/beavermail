@@ -8,7 +8,7 @@
 pub mod model;
 pub mod sample;
 
-pub use model::{Account, DisplayMode, Mailbox, MessageBody, MessageId, MessageSummary, Outgoing, Role, Server, Settings, Tls};
+pub use model::{Account, DisplayMode, Mailbox, MessageBody, MessageId, MessageSummary, Outgoing, Role, Server, Settings, SyncReport, Tls};
 
 use std::fmt;
 use std::future::Future;
@@ -41,13 +41,23 @@ impl std::error::Error for MailError {}
 /// Methods return `Send` futures so a backend can be driven from any executor;
 /// implementors can still write plain `async fn`.
 pub trait MailSource {
-    /// Mailboxes (folders) of the account, in display order.
+    /// Mailboxes (folders) as the local archive knows them, without touching the network.
+    fn cached_mailboxes(&self) -> impl Future<Output = Result<Vec<Mailbox>, MailError>> + Send;
+
+    /// Asks the server for the mailboxes, remembers them locally and returns them.
     fn mailboxes(&self) -> impl Future<Output = Result<Vec<Mailbox>, MailError>> + Send;
 
-    /// Summaries of the messages in `mailbox`, newest first.
+    /// Summaries of the messages in `mailbox` from the local archive, newest first. Instant and
+    /// available offline; [`MailSource::sync`] is what brings the archive up to date.
     fn messages(&self, mailbox: &str) -> impl Future<Output = Result<Vec<MessageSummary>, MailError>> + Send;
 
-    /// Text, recipients and threading headers of a message; [`MailError::NotFound`] if it does not exist.
+    /// Brings `mailbox` in the local archive up to date: new messages, changed flags, deleted
+    /// messages, and one more chunk of older history. Call again while
+    /// [`SyncReport::remaining`] is not zero.
+    fn sync(&self, mailbox: &str) -> impl Future<Output = Result<SyncReport, MailError>> + Send;
+
+    /// Text, recipients and threading headers of a message, from the archive or else downloaded;
+    /// [`MailError::NotFound`] if it does not exist.
     fn body(&self, id: MessageId) -> impl Future<Output = Result<MessageBody, MailError>> + Send;
 
     /// Stores a copy of a sent message (RFC 5322 bytes) in the Sent folder, marked as read.

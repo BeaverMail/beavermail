@@ -38,9 +38,18 @@ pub struct MessageSummary {
     pub address: String,
     pub subject: String,
     pub preview: String,
-    /// Display string for now; becomes a timestamp type once sync lands.
+    /// Display text of the date.
     pub received: String,
+    /// Seconds since the Unix epoch, for ordering; 0 when the message has no valid date.
+    pub timestamp: i64,
     pub unread: bool,
+}
+
+/// What one synchronisation of a folder did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SyncReport {
+    /// Older messages on the server that are not in the archive yet (an estimate).
+    pub remaining: u32,
 }
 
 /// What opening a message needs beyond its summary: text, recipients and threading headers.

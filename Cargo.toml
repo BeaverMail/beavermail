@@ -2,7 +2,7 @@
 
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/app", "crates/imap", "crates/accounts", "crates/smtp"]
+members = ["crates/core", "crates/app", "crates/imap", "crates/accounts", "crates/smtp", "crates/store", "crates/vault"]
 
 [workspace.package]
 version = "0.1.0"
@@ -17,6 +17,8 @@ pollster = "0.4"
 beavermail-imap = { path = "crates/imap" }
 beavermail-accounts = { path = "crates/accounts" }
 beavermail-smtp = { path = "crates/smtp" }
+beavermail-store = { path = "crates/store" }
+beavermail-vault = { path = "crates/vault" }
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
 egui_extras = { version = "0.36", default-features = false, features = ["svg"] }
 scraper = { version = "0.27", default-features = false }

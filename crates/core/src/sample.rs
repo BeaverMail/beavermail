@@ -2,7 +2,7 @@
 
 //! An in-memory [`MailSource`] with generated data, for development and tests.
 
-use crate::{MailError, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Role};
+use crate::{MailError, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Role, SyncReport};
 
 const FOLDERS: [&str; 6] = ["Inbox", "Starred", "Drafts", "Sent", "Archive", "Trash"];
 const SENDERS: [&str; 8] = [
@@ -38,6 +38,7 @@ impl SampleSource {
                     subject,
                     preview: body.chars().take(90).collect(),
                     received: format!("{:02}:{:02}", next() % 24, next() % 60),
+                    timestamp: 0,
                     unread: next() % 3 == 0,
                 };
                 (folder, summary, body)
@@ -52,6 +53,14 @@ fn read_only() -> MailError {
 }
 
 impl MailSource for SampleSource {
+    async fn cached_mailboxes(&self) -> Result<Vec<Mailbox>, MailError> {
+        self.mailboxes().await
+    }
+
+    async fn sync(&self, _: &str) -> Result<SyncReport, MailError> {
+        Ok(SyncReport::default())
+    }
+
     async fn mailboxes(&self) -> Result<Vec<Mailbox>, MailError> {
         Ok(FOLDERS
             .iter()

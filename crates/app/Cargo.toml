@@ -20,4 +20,6 @@ scraper.workspace = true
 beavermail-accounts.workspace = true
 beavermail-imap.workspace = true
 beavermail-smtp.workspace = true
+beavermail-store.workspace = true
+beavermail-vault.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread"] }
