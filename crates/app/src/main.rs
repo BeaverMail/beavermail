@@ -7,6 +7,8 @@
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
+mod theme;
+
 use beavermail_accounts as store;
 use beavermail_core::{Account, MailError, MailSource, Mailbox, MessageId, MessageSummary, Server, Tls};
 use beavermail_imap::ImapSource;
@@ -47,6 +49,8 @@ struct NewAccount {
     smtp_port: String,
     smtp_tls: Tls,
     error: Option<String>,
+    /// Focus the first field on the first frame only.
+    focus_first: bool,
 }
 
 impl Default for NewAccount {
@@ -62,6 +66,7 @@ impl Default for NewAccount {
             smtp_port: "587".into(),
             smtp_tls: Tls::StartTls,
             error: None,
+            focus_first: true,
         }
     }
 }
@@ -81,6 +86,27 @@ impl NewAccount {
             smtp: Server { host: smtp_host.to_owned(), port: port(&self.smtp_port, "SMTP")?, tls: self.smtp_tls },
         })
     }
+}
+
+const FORM_WIDTH: f32 = 460.0;
+/// Text field width in the account form: the form minus its label column and spacing.
+const FIELD_WIDTH: f32 = 330.0;
+
+fn form_grid(ui: &mut egui::Ui, id: &str, add: impl FnOnce(&mut egui::Ui)) {
+    egui::Grid::new(id).num_columns(2).spacing([16.0, 12.0]).min_col_width(64.0).show(ui, add);
+}
+
+fn field(text: &mut String) -> egui::TextEdit<'_> {
+    sized_field(text, FIELD_WIDTH)
+}
+
+/// A text field as tall as every other control; egui's default is a cramped 20px.
+fn sized_field(text: &mut String, width: f32) -> egui::TextEdit<'_> {
+    egui::TextEdit::singleline(text)
+        .desired_width(width)
+        .min_size(vec2(width, theme::CONTROL_H))
+        .margin(egui::Margin::symmetric(12, 0))
+        .vertical_align(Align::Center)
 }
 
 fn tls_picker(ui: &mut egui::Ui, id: &str, tls: &mut Tls) {
@@ -250,42 +276,68 @@ impl BeaverApp {
 
     fn account_form(&mut self, ctx: &egui::Context) {
         let Some(mut form) = self.form.take() else { return };
-        let (mut open, mut submit) = (true, false);
-        egui::Window::new("Add account").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
-            egui::Grid::new("account_form").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+        let t = theme::Tokens::get(ctx);
+        let (mut submit, mut cancel) = (false, false);
+        let ready = !form.user.trim().is_empty() && !form.imap_host.trim().is_empty() && !form.password.is_empty();
+        let modal = egui::Modal::new(egui::Id::new("add_account")).show(ctx, |ui| {
+            ui.set_width(FORM_WIDTH);
+            ui.heading("Add account");
+            ui.label(RichText::new("Connect an existing mailbox over IMAP and SMTP.").color(t.text_dim));
+            ui.add_space(8.0);
+            form_grid(ui, "account_form", |ui| {
                 ui.label("Name");
-                ui.text_edit_singleline(&mut form.name);
+                let name = ui.add(field(&mut form.name).hint_text("Optional"));
+                if std::mem::take(&mut form.focus_first) {
+                    name.request_focus();
+                }
                 ui.end_row();
                 ui.label("User");
-                ui.text_edit_singleline(&mut form.user);
+                ui.add(field(&mut form.user).hint_text("name@example.com"));
                 ui.end_row();
                 ui.label("Password");
-                ui.add(egui::TextEdit::singleline(&mut form.password).password(true));
+                ui.add(field(&mut form.password).password(true));
                 ui.end_row();
-                ui.label("IMAP server");
-                ui.text_edit_singleline(&mut form.imap_host);
+            });
+            ui.add_space(8.0);
+            ui.label(RichText::new("Incoming mail (IMAP)").strong());
+            form_grid(ui, "imap_form", |ui| {
+                ui.label("Server");
+                ui.add(field(&mut form.imap_host).hint_text("imap.example.com"));
                 ui.end_row();
-                ui.label("IMAP port");
+                ui.label("Port");
                 ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut form.imap_port).desired_width(60.0));
+                    ui.add(sized_field(&mut form.imap_port, 72.0));
                     tls_picker(ui, "imap_tls", &mut form.imap_tls);
                 });
                 ui.end_row();
-                ui.label("SMTP server");
-                ui.add(egui::TextEdit::singleline(&mut form.smtp_host).hint_text("same as IMAP"));
+            });
+            ui.add_space(8.0);
+            ui.label(RichText::new("Outgoing mail (SMTP)").strong());
+            form_grid(ui, "smtp_form", |ui| {
+                ui.label("Server");
+                ui.add(field(&mut form.smtp_host).hint_text("Same as IMAP"));
                 ui.end_row();
-                ui.label("SMTP port");
+                ui.label("Port");
                 ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut form.smtp_port).desired_width(60.0));
+                    ui.add(sized_field(&mut form.smtp_port, 72.0));
                     tls_picker(ui, "smtp_tls", &mut form.smtp_tls);
                 });
                 ui.end_row();
             });
             if let Some(error) = &form.error {
-                ui.colored_label(ui.visuals().error_fg_color, error);
+                ui.add_space(8.0);
+                ui.colored_label(t.danger, error);
             }
-            submit = ui.button("Add").clicked();
+            ui.add_space(12.0);
+            // A fixed-height row: a bare right-to-left layout would claim the rest of the window.
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
+                let add = egui::Button::new(RichText::new("Add account").color(t.on_accent)).fill(t.accent);
+                let add = ui.add_enabled(ready, add).on_disabled_hover_text("User, password and IMAP server are required");
+                submit = add.clicked() || (ready && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                cancel = ui.button("Cancel").clicked();
+            });
         });
+        let mut open = !(cancel || modal.should_close());
         if submit {
             match self.add_account(&form) {
                 Ok(()) => open = false,
@@ -420,6 +472,9 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "BeaverMail",
         options,
-        Box::new(|cc| Ok(Box::new(BeaverApp::new(cc.egui_ctx.clone())))),
+        Box::new(|cc| {
+            theme::apply(&cc.egui_ctx);
+            Ok(Box::new(BeaverApp::new(cc.egui_ctx.clone())))
+        }),
     )
 }

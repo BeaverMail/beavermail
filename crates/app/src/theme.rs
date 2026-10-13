@@ -1,0 +1,142 @@
+//! Design tokens (light and dark) and the egui style. Widgets never hard-code colours.
+
+use std::sync::Arc;
+
+use eframe::egui::{self, Color32, CornerRadius, Margin, Shadow, Stroke, TextStyle, Theme, Visuals};
+
+/// One geometry contract for every view (mirrors the Flectar/Slint `LayoutMetrics`): views never invent sizes.
+pub const CONTROL_H: f32 = 40.0;
+pub const CONTROL_RADIUS: u8 = 8;
+
+const fn rgb(hex: u32) -> Color32 {
+    Color32::from_rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
+}
+
+#[derive(Clone, Copy)]
+pub struct Tokens {
+    /// App background (side panels).
+    pub bg: Color32,
+    /// Raised surfaces: windows, menus, cards.
+    pub surface: Color32,
+    pub input: Color32,
+    pub border: Color32,
+    pub border_strong: Color32,
+    pub text: Color32,
+    pub text_dim: Color32,
+    pub hover: Color32,
+    pub pressed: Color32,
+    pub accent: Color32,
+    pub on_accent: Color32,
+    pub danger: Color32,
+}
+
+impl Tokens {
+    pub fn light() -> Self {
+        Self {
+            bg: rgb(0xF6F6F8),
+            surface: rgb(0xFFFFFF),
+            input: rgb(0xFFFFFF),
+            border: rgb(0xE4E4E9),
+            border_strong: rgb(0xC9C9D1),
+            text: rgb(0x18181B),
+            text_dim: rgb(0x62626C),
+            hover: rgb(0xEDEDF1),
+            pressed: rgb(0xE1E1E7),
+            accent: rgb(0x4F46E5),
+            on_accent: rgb(0xFFFFFF),
+            danger: rgb(0xDC2626),
+        }
+    }
+
+    pub fn dark() -> Self {
+        Self {
+            bg: rgb(0x141417),
+            surface: rgb(0x1E1E23),
+            input: rgb(0x121215),
+            border: rgb(0x2E2E35),
+            border_strong: rgb(0x474751),
+            text: rgb(0xEDEDF0),
+            text_dim: rgb(0x9C9CA8),
+            hover: rgb(0x2A2A31),
+            pressed: rgb(0x34343C),
+            accent: rgb(0x7C83F5),
+            on_accent: rgb(0x0F0F14),
+            danger: rgb(0xF87171),
+        }
+    }
+
+    pub fn get(ctx: &egui::Context) -> Self {
+        if ctx.global_style().visuals.dark_mode { Self::dark() } else { Self::light() }
+    }
+}
+
+fn visuals(t: &Tokens, dark: bool) -> Visuals {
+    let mut v = if dark { Visuals::dark() } else { Visuals::light() };
+    let radius = CornerRadius::same(CONTROL_RADIUS);
+    v.panel_fill = t.bg;
+    v.window_fill = t.surface;
+    v.extreme_bg_color = t.input;
+    v.faint_bg_color = t.hover;
+    v.window_stroke = Stroke::new(1.0, t.border);
+    v.window_corner_radius = CornerRadius::same(14);
+    v.menu_corner_radius = CornerRadius::same(10);
+    v.window_shadow = Shadow { offset: [0, 12], blur: 32, spread: 0, color: Color32::from_black_alpha(if dark { 150 } else { 45 }) };
+    v.popup_shadow = Shadow { offset: [0, 6], blur: 20, spread: 0, color: Color32::from_black_alpha(if dark { 130 } else { 40 }) };
+    v.selection.bg_fill = t.accent.gamma_multiply(0.35);
+    v.selection.stroke = Stroke::new(1.0, t.accent);
+    v.hyperlink_color = t.accent;
+    v.error_fg_color = t.danger;
+    let w = &mut v.widgets;
+    w.noninteractive.bg_stroke = Stroke::new(1.0, t.border);
+    w.noninteractive.fg_stroke = Stroke::new(1.0, t.text);
+    // Inputs and buttons share `inactive`: a visible border is what makes a field read as a field.
+    w.inactive.bg_fill = t.surface;
+    w.inactive.weak_bg_fill = t.surface;
+    w.inactive.bg_stroke = Stroke::new(1.0, t.border_strong);
+    w.inactive.fg_stroke = Stroke::new(1.0, t.text);
+    w.hovered.bg_fill = t.hover;
+    w.hovered.weak_bg_fill = t.hover;
+    w.hovered.bg_stroke = Stroke::new(1.0, t.text_dim);
+    w.hovered.fg_stroke = Stroke::new(1.0, t.text);
+    w.active.bg_fill = t.pressed;
+    w.active.weak_bg_fill = t.pressed;
+    w.active.bg_stroke = Stroke::new(1.0, t.accent);
+    w.active.fg_stroke = Stroke::new(1.0, t.text);
+    w.open.bg_fill = t.pressed;
+    w.open.weak_bg_fill = t.pressed;
+    for s in [&mut w.noninteractive, &mut w.inactive, &mut w.hovered, &mut w.active, &mut w.open] {
+        s.corner_radius = radius;
+        s.expansion = 0.0;
+    }
+    v
+}
+
+/// Inter (SIL OFL, see `assets/fonts/Inter-LICENSE.txt`) first in the proportional family; egui's defaults stay as fallback for symbols.
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert("Inter".into(), Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/InterVariable.ttf"))));
+    if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+        family.insert(0, "Inter".into());
+    }
+    ctx.set_fonts(fonts);
+}
+
+/// Install both themes; egui picks the one matching the system setting.
+pub fn apply(ctx: &egui::Context) {
+    install_fonts(ctx);
+    for (theme, dark, tokens) in [(Theme::Light, false, Tokens::light()), (Theme::Dark, true, Tokens::dark())] {
+        ctx.set_visuals_of(theme, visuals(&tokens, dark));
+    }
+    ctx.all_styles_mut(|s| {
+        s.spacing.item_spacing = egui::vec2(8.0, 8.0);
+        s.spacing.button_padding = egui::vec2(16.0, 8.0);
+        s.spacing.interact_size = egui::vec2(CONTROL_H, CONTROL_H);
+        s.spacing.menu_margin = Margin::same(8);
+        s.spacing.window_margin = Margin::same(20);
+        s.text_styles.insert(TextStyle::Body, egui::FontId::proportional(15.0));
+        s.text_styles.insert(TextStyle::Button, egui::FontId::proportional(15.0));
+        s.text_styles.insert(TextStyle::Small, egui::FontId::proportional(13.0));
+        s.text_styles.insert(TextStyle::Heading, egui::FontId::proportional(22.0));
+        s.interaction.tooltip_delay = 0.4;
+    });
+}
