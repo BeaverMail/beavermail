@@ -3,6 +3,7 @@
 use beavermail_core::{MessageBody, MessageSummary, Outgoing};
 use eframe::egui::{self, Align, Align2, Frame, Key, Layout, Modifiers, RichText, TextEdit, Ui, vec2};
 
+use crate::drafts::{self, DraftData, DraftFile};
 use crate::icons::Icon;
 use crate::theme::{self, Tokens};
 use crate::views;
@@ -27,22 +28,37 @@ pub struct Compose {
     /// Put the caret at the top of the body on the first frame (replies and forwards).
     focus_body: bool,
     pub files: Vec<AttachedFile>,
+    /// Names the draft and its attachments in the vault.
+    pub id: String,
+    /// The account (its key) whose drafts folder holds this draft.
+    pub key: String,
+    next_file: u32,
+    /// Original attachments of a forwarded message still to be copied: (position in the message, where).
+    pub carry: Vec<(u32, std::path::PathBuf)>,
+    /// What the text looked like when last seen, when it last changed, and when it was last saved.
+    seen: u64,
+    changed_at: std::time::Instant,
+    saved: u64,
 }
 
 pub enum Outcome {
     Keep,
     Send,
     Discard,
+    /// Close the window and keep what was written as a draft.
+    Close,
     /// Open the dialog to pick files to attach.
     Attach,
 }
 
-/// A file chosen to go with the message; read only when the message is sent.
+/// A file that goes with the message. Its content is a copy in the vault (under the draft), so it
+/// survives the original moving; `ready` is false while the copy is being made.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttachedFile {
-    pub path: std::path::PathBuf,
     pub name: String,
     pub size: u64,
+    pub vault: std::path::PathBuf,
+    pub ready: bool,
 }
 
 /// Above this many bytes many providers refuse a message (a common limit is 25 MB).
@@ -64,7 +80,130 @@ impl Compose {
             focus_to: true,
             focus_body: false,
             files: Vec::new(),
+            id: drafts::new_id(),
+            key: String::new(),
+            next_file: 0,
+            carry: Vec::new(),
+            seen: 0,
+            changed_at: std::time::Instant::now(),
+            saved: 0,
         }
+        .settled()
+    }
+
+    /// Treats the text as it is now as already saved: an untouched reply is not worth a draft.
+    fn settled(mut self) -> Self {
+        self.saved = self.fingerprint();
+        self.seen = self.saved;
+        self
+    }
+
+    /// A number for what is written, to tell when it changes.
+    fn fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (self.from, &self.to, &self.cc, &self.subject, &self.body, self.title, &self.in_reply_to, &self.references).hash(&mut hasher);
+        for f in &self.files {
+            (&f.name, f.size, &f.vault).hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    /// Call once per frame. True when the text changed and has stayed still for `quiet`: time to save a draft.
+    pub fn autosave_due(&mut self, quiet: std::time::Duration) -> bool {
+        let now = self.fingerprint();
+        if now != self.seen {
+            self.seen = now;
+            self.changed_at = std::time::Instant::now();
+        }
+        now != self.saved && self.changed_at.elapsed() >= quiet
+    }
+
+    pub fn mark_saved(&mut self) {
+        self.saved = self.fingerprint();
+    }
+
+    /// The text has changed since the last save.
+    pub fn unsaved(&self) -> bool {
+        self.fingerprint() != self.saved
+    }
+
+    pub fn to_draft(&self, updated: i64) -> DraftData {
+        DraftData {
+            id: self.id.clone(),
+            title: self.title.to_owned(),
+            to: self.to.clone(),
+            cc: self.cc.clone(),
+            subject: self.subject.clone(),
+            body: self.body.clone(),
+            in_reply_to: self.in_reply_to.clone(),
+            references: self.references.clone(),
+            files: self.files.iter().filter(|f| f.ready).map(|f| DraftFile { name: f.name.clone(), size: f.size, path: f.vault.clone() }).collect(),
+            updated,
+        }
+    }
+
+    /// A window reopened on a saved draft, sending from account `from`.
+    pub fn from_draft(from: u64, draft: DraftData) -> Self {
+        let title = match draft.title.as_str() {
+            "Reply" => "Reply",
+            "Reply all" => "Reply all",
+            "Forward" => "Forward",
+            _ => "New message",
+        };
+        Self {
+            to: draft.to,
+            cc: draft.cc,
+            subject: draft.subject,
+            body: draft.body,
+            title,
+            in_reply_to: draft.in_reply_to,
+            references: draft.references,
+            files: draft.files.into_iter().map(|f| AttachedFile { name: f.name, size: f.size, vault: f.path, ready: true }).collect(),
+            id: draft.id,
+            next_file: 1000, // above any slot number the draft used before
+            focus_to: false,
+            focus_body: true,
+            ..Self::new(from)
+        }
+        .settled()
+    }
+
+    /// Makes room for a file and says where its copy goes in the vault.
+    pub fn reserve(&mut self, account_key: &str, name: &str, size: u64, ready: bool) -> std::path::PathBuf {
+        let vault = drafts::files_dir(account_key, &self.id).join(format!("{}-{}", self.next_file, name));
+        self.next_file += 1;
+        self.files.push(AttachedFile { name: name.to_owned(), size, vault: vault.clone(), ready });
+        vault
+    }
+
+    /// Adds placeholders for `files` (see [`usable`]) and returns, for each, where to copy it from and to.
+    /// A file with the same name and size as one already attached is skipped.
+    pub fn add_pending(&mut self, account_key: &str, files: Vec<(std::path::PathBuf, String, u64)>) -> Vec<(std::path::PathBuf, std::path::PathBuf)> {
+        let mut jobs = Vec::new();
+        for (source, name, size) in files {
+            if self.files.iter().any(|f| f.name == name && f.size == size) {
+                continue;
+            }
+            jobs.push((source, self.reserve(account_key, &name, size, false)));
+        }
+        jobs
+    }
+
+    /// A copy was made (`ok`) or failed (the placeholder goes away).
+    pub fn file_done(&mut self, vault: &std::path::Path, ok: bool) {
+        if ok {
+            if let Some(f) = self.files.iter_mut().find(|f| f.vault == vault) {
+                f.ready = true;
+            }
+        } else {
+            self.files.retain(|f| f.vault != vault);
+        }
+    }
+
+    /// Files still being copied.
+    pub fn pending(&self) -> usize {
+        self.files.iter().filter(|f| !f.ready).count()
     }
 
     /// A reply to `message`, to the sender only or to everyone but `own` (the sending address).
@@ -97,21 +236,28 @@ impl Compose {
             focus_body: true,
             ..Self::new(from)
         }
+        .settled()
     }
 
-    /// `message` forwarded inline. Attachments are not carried over yet.
-    pub fn forward(from: u64, message: &MessageSummary, body: &MessageBody) -> Self {
+    /// `message` forwarded inline, with its attachments: their copies are made in the background
+    /// (see [`Compose::carry`]).
+    pub fn forward(from: u64, account_key: &str, message: &MessageSummary, body: &MessageBody, attachments: &[beavermail_core::Attachment]) -> Self {
         let mut header = format!("---------- Forwarded message ----------\nFrom: {}\nDate: {}\nSubject: {}\n", sender(message), message.received, message.subject);
         if !body.to.is_empty() {
             header.push_str(&format!("To: {}\n", body.to.join(", ")));
         }
-        Self {
+        let mut forward = Self {
             subject: prefixed("Fwd", &message.subject),
             body: format!("\n\n{header}\n{}", body.text),
             title: "Forward",
             focus_to: true,
             ..Self::new(from)
+        };
+        for attachment in attachments {
+            let to = forward.reserve(account_key, &crate::attachments::safe_name(&attachment.name), attachment.size, false);
+            forward.carry.push((attachment.index, to));
         }
+        forward.settled()
     }
 
     /// Nothing typed yet, so closing loses nothing.
@@ -119,25 +265,13 @@ impl Compose {
         [&self.to, &self.cc, &self.subject, &self.body].iter().all(|t| t.trim().is_empty()) && self.files.is_empty()
     }
 
-    /// Adds files (a folder, a missing file or one already added is skipped).
-    pub fn attach(&mut self, paths: impl IntoIterator<Item = std::path::PathBuf>) {
-        for path in paths {
-            let Ok(meta) = std::fs::metadata(&path) else { continue };
-            if !meta.is_file() || self.files.iter().any(|f| f.path == path) {
-                continue;
-            }
-            let name = crate::attachments::safe_name(&path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned()));
-            self.files.push(AttachedFile { path, name, size: meta.len() });
-        }
-    }
-
     pub fn attached_size(&self) -> u64 {
         self.files.iter().map(|f| f.size).sum()
     }
 
-    /// What the sender needs to read the files: path and the name the recipient sees.
+    /// What the sender needs to read the files: where in the vault, and the name the recipient sees.
     pub fn file_list(&self) -> Vec<(std::path::PathBuf, String)> {
-        self.files.iter().map(|f| (f.path.clone(), f.name.clone())).collect()
+        self.files.iter().map(|f| (f.vault.clone(), f.name.clone())).collect()
     }
 
     pub fn outgoing(&self, from_address: &str) -> Outgoing {
@@ -152,6 +286,19 @@ impl Compose {
             attachments: Vec::new(), // read from `files` when the message is sent
         }
     }
+}
+
+/// The files among `paths` that can be attached (folders and missing files are left out), with the
+/// name the recipient will see and the size.
+pub fn usable(paths: impl IntoIterator<Item = std::path::PathBuf>) -> Vec<(std::path::PathBuf, String, u64)> {
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let meta = std::fs::metadata(&path).ok().filter(|m| m.is_file())?;
+            let name = crate::attachments::safe_name(&path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned()));
+            Some((path, name, meta.len()))
+        })
+        .collect()
 }
 
 /// "Name <address>" for a message's sender.
@@ -244,9 +391,8 @@ fn row(ui: &mut Ui, t: &Tokens, name: &str, text: &mut String, hint: &str) -> eg
 /// Shows the window. `senders` lists the accounts that can send, as (serial, address).
 pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &[(u64, String)]) -> Outcome {
     let mut outcome = Outcome::Keep;
-    // Files dragged onto the window while composing.
-    compose.attach(dropped(ctx));
-    let ready = !compose.sending && !compose.to.trim().is_empty();
+    let waiting_for_files = compose.pending() > 0;
+    let ready = !compose.sending && !compose.to.trim().is_empty() && !waiting_for_files;
     let shown = egui::Window::new(compose.title)
         .id(egui::Id::new("compose"))
         .anchor(Align2::RIGHT_BOTTOM, [-16.0, -16.0])
@@ -303,8 +449,13 @@ pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &
                                 ui.horizontal(|ui| {
                                     ui.add(Icon::Paperclip.image(crate::icons::SIZE, t.text_dim));
                                     let shown: String = if file.name.chars().count() > 28 { format!("{}…", file.name.chars().take(27).collect::<String>()) } else { file.name.clone() };
-                                    ui.label(shown).on_hover_text(file.path.display().to_string());
-                                    ui.label(RichText::new(crate::attachments::human_size(file.size)).size(13.0).color(t.text_dim));
+                                    ui.label(shown).on_hover_text(&file.name);
+                                    if file.ready {
+                                        ui.label(RichText::new(crate::attachments::human_size(file.size)).size(13.0).color(t.text_dim));
+                                    } else {
+                                        ui.add(egui::Spinner::new().size(12.0));
+                                        ui.label(RichText::new("adding…").size(13.0).color(t.text_dim));
+                                    }
                                     if !compose.sending && crate::icons::button_small(ui, t, Icon::X, "Remove").clicked() {
                                         remove = Some(i);
                                     }
@@ -326,6 +477,7 @@ pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &
             ui.add_space(8.0);
             ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::left_to_right(Align::Center), |ui| {
                 let send = views::primary_wide_fixed(ui, t, Icon::Send, if compose.sending { "Sending…" } else { "Send" }, ready, 120.0);
+                let send = if waiting_for_files { send.on_disabled_hover_text("Waiting for the attachments to be added") } else { send };
                 if send.clicked() {
                     outcome = Outcome::Send;
                 }
@@ -336,10 +488,13 @@ pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &
                     ui.spinner();
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.add_enabled(!compose.sending, egui::Button::image_and_text(Icon::Trash.image(crate::icons::SIZE, t.text_dim), "Discard")).clicked() {
+                    if ui.add_enabled(!compose.sending, egui::Button::image_and_text(Icon::Trash.image(crate::icons::SIZE, t.text_dim), "Discard")).on_hover_text("Delete this message and its draft").clicked() {
                         outcome = Outcome::Discard;
                     }
-                    ui.label(RichText::new("Ctrl+Enter to send").size(12.5).color(t.text_dim));
+                    if ui.add_enabled(!compose.sending, egui::Button::image_and_text(Icon::X.image(crate::icons::SIZE, t.text_dim), "Close")).on_hover_text("Close and keep it as a draft").clicked() {
+                        outcome = Outcome::Close;
+                    }
+                    ui.label(RichText::new("Saved as a draft while you write").size(12.5).color(t.text_dim));
                 });
             });
         });
@@ -424,7 +579,7 @@ mod tests {
     #[test]
     fn a_forward_quotes_the_original_without_threading() {
         let (summary, body) = message();
-        let c = Compose::forward(0, &summary, &body);
+        let c = Compose::forward(0, "me", &summary, &body, &[]);
         assert_eq!(c.subject, "Fwd: Lunch");
         assert!(c.to.is_empty());
         assert!(c.body.contains("---------- Forwarded message ----------\nFrom: Ada Lovelace <ada@example.org>"));
@@ -433,20 +588,76 @@ mod tests {
     }
 
     #[test]
-    fn attaching_skips_folders_missing_and_repeated_files_and_counts_the_size() {
+    fn only_files_can_be_attached_and_the_same_file_twice_is_skipped() {
         let dir = std::env::temp_dir().join(format!("beavermail-attach-compose-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("a.txt"), b"12345").unwrap();
         std::fs::write(dir.join("b.txt"), b"123").unwrap();
+        let found = usable([dir.join("a.txt"), dir.join("sub"), dir.join("missing"), dir.join("b.txt")]);
+        assert_eq!(found.iter().map(|(_, n, s)| (n.as_str(), *s)).collect::<Vec<_>>(), [("a.txt", 5), ("b.txt", 3)]);
+
         let mut c = Compose::new(0);
         assert!(c.is_empty());
-        c.attach([dir.join("a.txt"), dir.join("a.txt"), dir.join("sub"), dir.join("missing"), dir.join("b.txt")]);
-        assert_eq!(c.files.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["a.txt", "b.txt"]);
-        assert_eq!(c.attached_size(), 8);
+        let jobs = c.add_pending("me@example.org", found.clone());
+        assert_eq!(jobs.len(), 2);
+        assert!(jobs[0].1.starts_with(drafts::files_dir("me@example.org", &c.id)), "{:?}", jobs[0].1);
+        assert!(c.add_pending("me@example.org", found).is_empty(), "already attached");
+        assert_eq!((c.pending(), c.attached_size()), (2, 8));
         assert!(!c.is_empty(), "files alone are something to lose");
+        c.file_done(&jobs[0].1, true);
+        c.file_done(&jobs[1].1, false);
+        assert_eq!((c.pending(), c.files.len()), (0, 1), "a failed copy leaves no placeholder");
         assert_eq!(c.file_list()[0].1, "a.txt");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_draft_is_saved_when_the_text_has_been_still_not_while_it_changes_and_never_untouched() {
+        let mut c = Compose::new(0);
+        let quiet = std::time::Duration::from_millis(40);
+        assert!(!c.autosave_due(quiet), "nothing written");
+        c.subject = "Lunch".into();
+        assert!(!c.autosave_due(quiet), "just changed");
+        std::thread::sleep(quiet * 2);
+        assert!(c.autosave_due(quiet), "still for long enough");
+        c.mark_saved();
+        assert!(!c.autosave_due(quiet), "nothing new since the save");
+        c.subject = "Lunch at noon".into();
+        assert!(!c.autosave_due(quiet), "changed again");
+        assert!(c.unsaved());
+    }
+
+    #[test]
+    fn a_draft_comes_back_as_it_was() {
+        let mut c = Compose::new(3);
+        c.to = "a@x.org".into();
+        c.subject = "Plan".into();
+        c.body = "Hello".into();
+        let jobs = c.add_pending("me", vec![("/tmp/plan.pdf".into(), "plan.pdf".into(), 9)]);
+        c.file_done(&jobs[0].1, true);
+        let draft = c.to_draft(1234);
+        assert_eq!((draft.updated, draft.files.len()), (1234, 1));
+        let back = Compose::from_draft(3, draft);
+        assert_eq!((back.id.as_str(), back.to.as_str(), back.subject.as_str(), back.body.as_str()), (c.id.as_str(), "a@x.org", "Plan", "Hello"));
+        assert_eq!(back.files[0].name, "plan.pdf");
+        assert!(back.files[0].ready && back.pending() == 0);
+        assert!(!back.unsaved(), "just opened, nothing to save");
+    }
+
+    #[test]
+    fn a_forward_reserves_its_attachments_to_be_copied_and_a_reply_does_not() {
+        let (summary, body) = message();
+        let originals = vec![
+            beavermail_core::Attachment { index: 0, name: "plan.pdf".into(), mime: "application/pdf".into(), size: 11 },
+            beavermail_core::Attachment { index: 2, name: "../notes.txt".into(), mime: "text/plain".into(), size: 8 },
+        ];
+        let f = Compose::forward(0, "me", &summary, &body, &originals);
+        assert_eq!(f.files.iter().map(|x| (x.name.as_str(), x.ready)).collect::<Vec<_>>(), [("plan.pdf", false), ("notes.txt", false)]);
+        assert_eq!(f.carry.iter().map(|(i, _)| *i).collect::<Vec<_>>(), [0, 2]);
+        assert_eq!(f.pending(), 2);
+        assert!(!f.unsaved(), "untouched, so no draft yet");
+        assert!(Compose::reply(0, "me@example.org", &summary, &body, false).files.is_empty());
     }
 
     #[test]

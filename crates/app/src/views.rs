@@ -369,6 +369,57 @@ pub fn attachment_chip(ui: &mut Ui, t: &Tokens, file: &Attachment, ticked: Optio
     chosen
 }
 
+/// What the user did to a draft row.
+pub enum DraftAction {
+    None,
+    Open,
+    Delete,
+}
+
+/// "just now", "3 min ago", "2 h ago", "5 d ago".
+pub fn ago(then: i64, now: i64) -> String {
+    let seconds = (now - then).max(0);
+    match seconds {
+        0..=59 => "just now".to_owned(),
+        60..=3599 => format!("{} min ago", seconds / 60),
+        3600..=86_399 => format!("{} h ago", seconds / 3600),
+        _ => format!("{} d ago", seconds / 86_400),
+    }
+}
+
+/// A draft kept on this computer: who it is for, the subject and the start of the text.
+pub fn draft_row(ui: &mut Ui, t: &Tokens, draft: &crate::drafts::DraftData) -> DraftAction {
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), MESSAGE_ROW_H), Sense::click());
+    let card = rect.shrink2(vec2(8.0, 2.0));
+    row_background(ui, card, &response, false, t);
+    let center = pos2(card.left() + 14.0 + AVATAR / 2.0, card.top() + 14.0 + AVATAR / 2.0);
+    ui.painter().circle_filled(center, AVATAR / 2.0, t.accent.gamma_multiply(0.18));
+    Icon::Pencil.image(icons::SIZE, t.accent).paint_at(ui, Rect::from_center_size(center, vec2(icons::SIZE, icons::SIZE)));
+    let left = card.left() + 14.0 + AVATAR + 12.0;
+    let width = card.right() - 14.0 - left;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    let when = ui.painter().layout_no_wrap(ago(draft.updated, now), FontId::proportional(13.0), t.text_dim);
+    let when_w = when.size().x;
+    ui.painter().galley(pos2(card.right() - 14.0 - when_w, card.top() + 13.0), when, t.text_dim);
+    let to = if draft.to.trim().is_empty() { "No recipient yet".to_owned() } else { draft.to.clone() };
+    let who = truncated(ui, &to, FontId::proportional(15.5), t.text, width - when_w - 12.0);
+    ui.painter().galley(pos2(left, card.top() + 11.0), who, t.text);
+    let subject = if draft.subject.trim().is_empty() { "(no subject)" } else { draft.subject.trim() };
+    let subject = truncated(ui, subject, FontId::proportional(14.5), t.text, width);
+    ui.painter().galley(pos2(left, card.top() + 33.0), subject, t.text);
+    let start = draft.body.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with('>')).unwrap_or("");
+    let start = truncated(ui, start, FontId::proportional(13.5), t.text_dim, width);
+    ui.painter().galley(pos2(left, card.top() + 56.0), start, t.text_dim);
+    let mut action = if response.clicked() { DraftAction::Open } else { DraftAction::None };
+    response.on_hover_cursor(egui::CursorIcon::PointingHand).context_menu(|ui| {
+        if ui.button("Delete draft").clicked() {
+            action = DraftAction::Delete;
+            ui.close();
+        }
+    });
+    action
+}
+
 /// 1240 as "1,240".
 pub fn thousands(n: u32) -> String {
     let digits = n.to_string();
@@ -385,6 +436,12 @@ pub fn thousands(n: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::thousands;
+
+    #[test]
+    fn ages_read_naturally() {
+        assert_eq!([(0, 30), (0, 120), (0, 7200), (0, 200_000)].map(|(a, b)| super::ago(a, b)), ["just now", "2 min ago", "2 h ago", "2 d ago"]);
+        assert_eq!(super::ago(500, 100), "just now", "a clock in the past is not negative");
+    }
 
     #[test]
     fn thousands_separators() {

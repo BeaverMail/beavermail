@@ -409,12 +409,25 @@ impl Vault {
         }
     }
 
+    /// The files directly inside `path` (not in folders below it), as paths relative to the vault.
+    pub fn list(&self, path: &Path) -> Result<Vec<PathBuf>, MailError> {
+        match &self.backing {
+            Backing::Disk(dir) => match std::fs::read_dir(dir.join(path)) {
+                Ok(entries) => Ok(entries.flatten().filter(|e| e.path().is_file()).map(|e| path.join(e.file_name())).collect()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+                Err(e) => Err(err(e)),
+            },
+            Backing::Memory(files) => Ok(files.lock().unwrap_or_else(std::sync::PoisonError::into_inner).keys().filter(|p| p.parent() == Some(path)).cloned().collect()),
+        }
+    }
+
     /// Every message file, as paths relative to the vault.
     fn all_files(&self) -> Vec<PathBuf> {
         match &self.backing {
             Backing::Disk(dir) => {
                 let mut found = Vec::new();
-                let mut pending = vec![dir.join("mail")];
+                // Everything the vault holds: downloaded mail and drafts with their attachments.
+                let mut pending = vec![dir.join("mail"), dir.join("drafts")];
                 while let Some(folder) = pending.pop() {
                     let Ok(entries) = std::fs::read_dir(&folder) else { continue };
                     for entry in entries.flatten() {
@@ -881,6 +894,37 @@ mod tests {
         let first = vault.get(path).unwrap();
         vault.write(path, b"same").unwrap();
         assert_ne!(first, vault.get(path).unwrap(), "a fresh nonce for every file");
+    }
+
+    #[test]
+    fn listing_shows_only_the_files_directly_inside_a_folder() {
+        for vault in [Vault::in_memory(), Vault::open(&temp_dir("list"), Box::new(MemoryStore::default())).unwrap()] {
+            vault.write(Path::new("drafts/a/one.json"), b"1").unwrap();
+            vault.write(Path::new("drafts/a/two.json"), b"2").unwrap();
+            vault.write(Path::new("drafts/a/one/attachment"), b"3").unwrap();
+            let mut listed = vault.list(Path::new("drafts/a")).unwrap();
+            listed.sort();
+            assert_eq!(listed, [PathBuf::from("drafts/a/one.json"), PathBuf::from("drafts/a/two.json")]);
+            assert!(vault.list(Path::new("drafts/none")).unwrap().is_empty());
+        }
+        let _ = std::fs::remove_dir_all(temp_dir("list"));
+    }
+
+    #[test]
+    fn drafts_follow_a_mode_change_like_downloaded_mail() {
+        let dir = temp_dir("draftsmode");
+        let vault = open(&dir, &Shared::default());
+        let (draft, attachment) = (Path::new("drafts/a/1.json"), Path::new("drafts/a/1/0-plan.pdf"));
+        vault.write(draft, b"{\"subject\":\"private\"}").unwrap();
+        vault.write(attachment, b"%PDF secret").unwrap();
+        assert!(!contains(&on_disk(&dir, draft), b"private"));
+        vault.set_mode(Mode::Off, None, NOP).unwrap();
+        assert_eq!(on_disk(&dir, draft), b"{\"subject\":\"private\"}", "plain after turning encryption off");
+        assert_eq!(on_disk(&dir, attachment), b"%PDF secret");
+        vault.set_mode(Mode::System, None, NOP).unwrap();
+        assert!(!contains(&on_disk(&dir, attachment), b"secret"), "encrypted again");
+        assert_eq!(vault.read(attachment).unwrap().as_deref(), Some(&b"%PDF secret"[..]));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -31,8 +31,11 @@ encrypted yet.
 Attachments are listed in the reader and can be opened, or saved one by one or several together
 through a file dialog (programs and macro documents ask before opening). Files can be attached to new
 messages with the Attach button or by dragging them in (drag and drop works on Windows, macOS and X11;
-on Wayland the toolkit does not support it yet, so start the app with `WAYLAND_DISPLAY=` to use X11); forwards do not carry the original
-attachments yet. No original HTML or end-to-end message encryption yet.
+on Wayland the toolkit does not support it yet, so start the app with `WAYLAND_DISPLAY=` to use X11). Forwards carry the original attachments.
+
+What you write is kept as a draft on this computer (saved a moment after you stop typing, inside the
+encrypted vault, with its attachments); open the Drafts folder to pick it up again. Drafts are not yet
+sent to the server's Drafts folder. No original HTML or end-to-end message encryption yet.
 
 ## Running
 

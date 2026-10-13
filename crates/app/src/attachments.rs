@@ -101,12 +101,12 @@ pub fn guess_mime(name: &str) -> String {
     .to_owned()
 }
 
-/// Reads the files to send. Run it off the UI thread: they can be large.
-pub fn read_files(files: &[(PathBuf, String)]) -> Result<Vec<beavermail_core::OutgoingFile>, String> {
+/// Reads the copies of the files to send from the vault. Run it off the UI thread: they can be large.
+pub fn read_files(vault: &beavermail_vault::Vault, files: &[(PathBuf, String)]) -> Result<Vec<beavermail_core::OutgoingFile>, String> {
     files
         .iter()
         .map(|(path, name)| {
-            let data = std::fs::read(path).map_err(|e| format!("{name}: {e}"))?;
+            let data = vault.read(path).map_err(|e| format!("{name}: {e}"))?.ok_or_else(|| format!("{name}: the copy kept for sending is missing"))?;
             Ok(beavermail_core::OutgoingFile { name: name.clone(), mime: guess_mime(name), data })
         })
         .collect()
@@ -171,16 +171,13 @@ mod tests {
     }
 
     #[test]
-    fn files_are_read_with_their_name_and_a_missing_one_is_reported_by_name() {
-        let dir = std::env::temp_dir().join(format!("beavermail-send-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a.txt"), b"hello").unwrap();
-        let read = read_files(&[(dir.join("a.txt"), "a.txt".into())]).unwrap();
+    fn files_are_read_from_the_vault_with_their_name_and_a_missing_one_is_reported_by_name() {
+        let vault = beavermail_vault::Vault::in_memory();
+        vault.write(Path::new("drafts/a/1/0-a.txt"), b"hello").unwrap();
+        let read = read_files(&vault, &[(PathBuf::from("drafts/a/1/0-a.txt"), "a.txt".into())]).unwrap();
         assert_eq!((read[0].name.as_str(), read[0].mime.as_str(), read[0].data.as_slice()), ("a.txt", "text/plain", &b"hello"[..]));
-        let error = read_files(&[(dir.join("gone.pdf"), "gone.pdf".into())]).unwrap_err();
+        let error = read_files(&vault, &[(PathBuf::from("drafts/a/1/1-gone.pdf"), "gone.pdf".into())]).unwrap_err();
         assert!(error.starts_with("gone.pdf:"), "{error}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

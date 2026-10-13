@@ -368,6 +368,8 @@ dependencies = [
  "opener",
  "rfd",
  "scraper",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

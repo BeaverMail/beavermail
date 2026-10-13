@@ -9,6 +9,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 
 mod attachments;
 mod compose;
+mod drafts;
 mod html;
 mod icons;
 mod security;
@@ -50,6 +51,8 @@ enum Event {
     Saved(Result<Option<String>, String>),
     /// Files chosen in the "attach" dialog.
     Picked(Vec<std::path::PathBuf>),
+    /// A copy of an attachment was made in the vault for a draft: (draft id, where in the vault, result).
+    FileStored(String, std::path::PathBuf, Result<(), String>),
 }
 
 enum VaultOutcome {
@@ -281,6 +284,8 @@ struct BeaverApp {
     query: String,
     focus_search: bool,
     compose: Option<compose::Compose>,
+    /// Drafts on this computer for the account being shown (filled while a Drafts folder is open).
+    drafts: Vec<drafts::DraftData>,
     /// A compose window with text in it is being closed; waiting for the user to confirm.
     confirm_discard: bool,
     /// Short confirmation ("Message sent") and when it was shown.
@@ -343,6 +348,7 @@ impl BeaverApp {
             query: String::new(),
             focus_search: false,
             compose: None,
+            drafts: Vec::new(),
             confirm_discard: false,
             notice: None,
             settings: Settings::default(),
@@ -423,6 +429,7 @@ impl BeaverApp {
         let (Some(source), Some(mailbox)) = (view.source.clone(), view.mailboxes.get(index)) else { return };
         let name = mailbox.name.clone();
         self.selected = Some((serial, index));
+        self.refresh_drafts();
         self.message = None;
         self.body = None;
         self.messages.clear();
@@ -573,7 +580,15 @@ impl BeaverApp {
         }
         let senders = self.senders();
         let from = self.selected.map(|(s, _)| s).filter(|s| senders.iter().any(|(x, _)| x == s)).or_else(|| senders.first().map(|(s, _)| *s));
-        self.compose = from.map(compose::Compose::new);
+        self.start_compose(from.map(compose::Compose::new));
+    }
+
+    /// Shows a compose window, remembering which account's drafts it belongs to.
+    fn start_compose(&mut self, compose: Option<compose::Compose>) {
+        self.compose = compose.map(|mut c| {
+            c.key = self.view(c.from).map(|v| v.account.key()).unwrap_or_default();
+            c
+        });
     }
 
     /// Files dropped onto the main window start a new message with them attached.
@@ -588,18 +603,31 @@ impl BeaverApp {
         let files = compose::dropped(ctx);
         if !files.is_empty() {
             self.new_message();
-            if let Some(compose) = &mut self.compose {
-                compose.attach(files);
-            }
+            self.attach_files(files);
         }
     }
 
     fn compose_window(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
         let Some(mut compose) = self.compose.take() else { return };
+        // Files dragged onto the window while composing.
+        let dropped = compose::dropped(ctx);
+        if !dropped.is_empty() {
+            self.compose = Some(compose);
+            self.attach_files(dropped);
+            let Some(back) = self.compose.take() else { return };
+            compose = back;
+        }
         let senders = self.senders();
         match compose::window(ctx, t, &mut compose, &senders) {
             compose::Outcome::Keep => {}
-            compose::Outcome::Discard if compose.is_empty() => return,
+            compose::Outcome::Close => {
+                self.save_draft(&mut compose);
+                return;
+            }
+            compose::Outcome::Discard if compose.is_empty() => {
+                self.delete_draft(&compose);
+                return;
+            }
             compose::Outcome::Discard => self.confirm_discard = true,
             compose::Outcome::Attach => {
                 self.spawn(async {
@@ -613,11 +641,12 @@ impl BeaverApp {
                     if let Some(sender) = sender {
                         let mut message = compose.outgoing(account.address());
                         let files = compose.file_list();
+                        let vault = self.vault.clone();
                         compose.sending = true;
                         compose.error = None;
                         self.spawn(async move {
-                            // The files are read now, off the window's thread, as they can be large.
-                            match tokio::task::spawn_blocking(move || attachments::read_files(&files)).await {
+                            // The copies are read now, off the window's thread, as they can be large.
+                            match tokio::task::spawn_blocking(move || attachments::read_files(&vault, &files)).await {
                                 Ok(Ok(read)) => message.attachments = read,
                                 Ok(Err(e)) => return Event::Sent(Err(MailError::Backend(e)), None),
                                 Err(e) => return Event::Sent(Err(MailError::Backend(e.to_string())), None),
@@ -631,6 +660,14 @@ impl BeaverApp {
                         });
                     }
                 }
+            }
+        }
+        // Keep a draft of what is being written, once the text has been still for a moment.
+        if !compose.sending {
+            if compose.autosave_due(std::time::Duration::from_secs(2)) {
+                self.save_draft(&mut compose);
+            } else if compose.unsaved() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(600));
             }
         }
         if self.confirm_discard {
@@ -648,6 +685,7 @@ impl BeaverApp {
             });
             if discard {
                 self.confirm_discard = false;
+                self.delete_draft(&compose);
                 return;
             }
             if keep || modal.should_close() {
@@ -926,12 +964,79 @@ impl BeaverApp {
         let body = &open.data;
         let Some(view) = self.view(serial).filter(|v| v.sender.is_some()) else { return };
         let own = view.account.address();
-        let compose = match action {
-            Action::Forward => compose::Compose::forward(serial, summary, body),
+        let key = view.account.key();
+        let mut compose = match action {
+            Action::Forward => compose::Compose::forward(serial, &key, summary, body, &body.attachments),
             _ => compose::Compose::reply(serial, own, summary, body, matches!(action, Action::ReplyAll)),
         };
+        let carry = std::mem::take(&mut compose.carry);
+        let source = view.source.clone();
+        let draft = compose.id.clone();
         if self.compose.is_none() {
-            self.compose = Some(compose);
+            self.start_compose(Some(compose));
+            // The attachments of a forwarded message are copied in the background.
+            if let Some(source) = source {
+                for (index, slot) in carry {
+                    let (vault, draft, source) = (self.vault.clone(), draft.clone(), source.clone());
+                    self.spawn(async move {
+                        let result = match source_attachment(&source, id, index).await {
+                            Ok((_, bytes)) => vault.write(&slot, &bytes).map_err(|e| e.to_string()),
+                            Err(e) => Err(e.to_string()),
+                        };
+                        Event::FileStored(draft, slot, result)
+                    });
+                }
+            }
+        }
+    }
+
+    /// Copies files into the open draft's folder in the vault, in the background.
+    fn attach_files(&mut self, paths: Vec<std::path::PathBuf>) {
+        let Some(compose) = self.compose.as_mut() else { return };
+        let (key, draft) = (compose.key.clone(), compose.id.clone());
+        for (source, slot) in compose.add_pending(&key, compose::usable(paths)) {
+            let (vault, tx, ctx, draft) = (self.vault.clone(), self.tx.clone(), self.ctx.clone(), draft.clone());
+            // Reading a big file must not hold up the window.
+            self.runtime.spawn_blocking(move || {
+                let result = std::fs::read(&source).map_err(|e| format!("{}: {e}", source.display())).and_then(|bytes| vault.write(&slot, &bytes).map_err(|e| e.to_string()));
+                let _ = tx.send(Event::FileStored(draft, slot, result));
+                ctx.request_repaint();
+            });
+        }
+    }
+
+    /// Saves the draft of a compose window (or removes it when nothing is written any more).
+    fn save_draft(&mut self, compose: &mut compose::Compose) {
+        if compose.is_empty() {
+            self.delete_draft(compose);
+        } else {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+            match drafts::save(&self.vault, &compose.key, &compose.to_draft(now)) {
+                Ok(()) => compose.mark_saved(),
+                Err(e) => self.error = Some(format!("Could not save the draft: {e}")),
+            }
+        }
+        self.refresh_drafts();
+    }
+
+    fn delete_draft(&mut self, compose: &compose::Compose) {
+        if let Err(e) = drafts::delete(&self.vault, &compose.key, &compose.id) {
+            self.error = Some(format!("Could not delete the draft: {e}"));
+        }
+        self.refresh_drafts();
+    }
+
+    /// Reads the drafts of the account whose Drafts folder is open.
+    fn refresh_drafts(&mut self) {
+        let key = self.selected.filter(|_| self.role() == Role::Drafts).and_then(|(s, _)| self.view(s)).map(|v| v.account.key());
+        self.drafts = key.map(|key| drafts::load_all(&self.vault, &key)).unwrap_or_default();
+    }
+
+    fn open_draft(&mut self, id: &str) {
+        let Some((serial, _)) = self.selected else { return };
+        let Some(draft) = self.drafts.iter().find(|d| d.id == id).cloned() else { return };
+        if self.compose.is_none() {
+            self.start_compose(Some(compose::Compose::from_draft(serial, draft)));
         }
     }
 
@@ -1157,9 +1262,13 @@ impl BeaverApp {
                 },
                 Err(e) => self.error = Some(format!("Could not get the attachment: {e}")),
             },
-            Event::Picked(paths) => {
-                if let Some(compose) = &mut self.compose {
-                    compose.attach(paths);
+            Event::Picked(paths) => self.attach_files(paths),
+            Event::FileStored(draft, slot, result) => {
+                if let Some(compose) = self.compose.as_mut().filter(|c| c.id == draft) {
+                    compose.file_done(&slot, result.is_ok());
+                    if let Err(e) = result {
+                        compose.error = Some(format!("Could not add the attachment: {e}"));
+                    }
                 }
             }
             Event::Saved(result) => match result {
@@ -1172,7 +1281,9 @@ impl BeaverApp {
             },
             Event::Sent(result, copy_error) => match result {
                 Ok(()) => {
-                    self.compose = None;
+                    if let Some(sent) = self.compose.take() {
+                        self.delete_draft(&sent);
+                    }
                     self.notice = Some(("Message sent".into(), std::time::Instant::now()));
                     if let Some(e) = copy_error {
                         self.error = Some(format!("The message was sent, but its copy could not be saved to Sent: {e}"));
@@ -1467,6 +1578,7 @@ impl BeaverApp {
     /// Search, refresh and the message list. Returns the message the user clicked and whether to add an account.
     fn message_list(&mut self, ui: &mut egui::Ui, t: &theme::Tokens) -> (Option<MessageId>, bool) {
         let (mut opened, mut add, mut refresh) = (None, false, false);
+        let (mut open_draft, mut delete_draft): (Option<String>, Option<String>) = (None, None);
         let frame = egui::Frame::new().fill(t.surface);
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
             if self.accounts.is_empty() {
@@ -1494,7 +1606,27 @@ impl BeaverApp {
                 });
             }
             ui.add_space(6.0);
+            if !self.drafts.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.add_space(16.0);
+                    ui.label(RichText::new(format!("Drafts on this computer ({})", self.drafts.len())).size(13.0).strong().color(t.text_dim));
+                });
+                egui::ScrollArea::vertical().id_salt("drafts").max_height(views::MESSAGE_ROW_H * 2.6).auto_shrink([false, true]).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    for draft in &self.drafts {
+                        match views::draft_row(ui, t, draft) {
+                            views::DraftAction::Open => open_draft = Some(draft.id.clone()),
+                            views::DraftAction::Delete => delete_draft = Some(draft.id.clone()),
+                            views::DraftAction::None => {}
+                        }
+                    }
+                });
+                ui.separator();
+            }
             if shown.is_empty() {
+                if !self.drafts.is_empty() {
+                    return;
+                }
                 let (title, hint) = if self.query.trim().is_empty() {
                     ("Nothing here", "This folder has no messages.")
                 } else {
@@ -1514,6 +1646,18 @@ impl BeaverApp {
         });
         if refresh {
             self.refresh();
+        }
+        if let Some(id) = open_draft {
+            self.open_draft(&id);
+        }
+        if let Some(id) = delete_draft
+            && let Some((serial, _)) = self.selected
+            && let Some(key) = self.view(serial).map(|v| v.account.key())
+        {
+            if let Err(e) = drafts::delete(&self.vault, &key, &id) {
+                self.error = Some(format!("Could not delete the draft: {e}"));
+            }
+            self.refresh_drafts();
         }
         (opened, add)
     }
@@ -1719,6 +1863,11 @@ impl eframe::App for BeaverApp {
             self.form = Some(NewAccount::default());
         }
     }
+}
+
+/// The bytes of an attachment, through the mail source (a function so tasks can call it without a method).
+async fn source_attachment(source: &ImapSource, id: MessageId, index: u32) -> Result<(String, Vec<u8>), MailError> {
+    source.attachment(id, index).await
 }
 
 fn main() -> eframe::Result {
