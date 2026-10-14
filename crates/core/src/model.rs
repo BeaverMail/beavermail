@@ -93,6 +93,30 @@ pub struct MessageBody {
     /// The `text/html` part, only when the message really has one. Untrusted: never run it.
     pub html: Option<String>,
     pub attachments: Vec<Attachment>,
+    /// The `Authentication-Results` headers (RFC 8601), topmost first. Who wrote each is untrusted until
+    /// its `server` is checked against the account's own server.
+    pub auth: Vec<AuthResult>,
+    /// A header says the server's spam filter flagged the message.
+    pub spam: bool,
+    /// The rules the server's spam filter reports as hit (SpamAssassin names, such as `SPF_FAIL`).
+    /// Anyone can write these headers, so they may only raise suspicion, never lower it.
+    pub spam_tests: Vec<String>,
+}
+
+/// One `Authentication-Results` header: the server that wrote it and the checks it reports.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AuthResult {
+    /// The `authserv-id`: the host that made the checks.
+    pub server: String,
+    pub checks: Vec<AuthCheck>,
+}
+
+/// "dkim=pass header.d=example.org": method and result in lower case, and the domain the check was about.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AuthCheck {
+    pub method: String,
+    pub result: String,
+    pub domain: String,
 }
 
 /// Transport security of a mail server connection.
@@ -253,6 +277,19 @@ pub struct Settings {
     /// Write messages in Markdown and send them as plain text plus HTML (PRD D10).
     #[serde(default = "yes")]
     pub rich_outgoing: bool,
+    /// Senders (lower-case addresses) whose messages may load remote images and styles in the original view.
+    #[serde(default)]
+    pub remote_senders: std::collections::BTreeSet<String>,
+    /// Hold suspicious mail from new senders apart from the Inbox.
+    #[serde(default = "yes")]
+    pub hold_suspicious: bool,
+    /// Senders the user marked: a lower-case address, or `@domain` for a whole organisation; `true` not
+    /// spam, `false` spam.
+    /// shortcut: the marks stay on this computer; the messages marked move to and from the server's Spam
+    /// folder, but a new message from a marked sender is only held here. A Sieve rule (or the server's
+    /// own filter learning from the Spam folder) would hold it on every device.
+    #[serde(default)]
+    pub marked: std::collections::BTreeMap<String, bool>,
 }
 
 fn yes() -> bool {
@@ -261,7 +298,7 @@ fn yes() -> bool {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { display: DisplayMode::default(), sender_display: Default::default(), rich_outgoing: true }
+        Self { display: DisplayMode::default(), sender_display: Default::default(), rich_outgoing: true, remote_senders: Default::default(), hold_suspicious: true, marked: Default::default() }
     }
 }
 
@@ -269,6 +306,42 @@ impl Settings {
     /// The display mode for a message from `address`.
     pub fn mode_for(&self, address: &str) -> DisplayMode {
         self.sender_display.get(&address.trim().to_lowercase()).copied().unwrap_or(self.display)
+    }
+
+    pub fn allows_remote(&self, address: &str) -> bool {
+        self.remote_senders.contains(&address.trim().to_lowercase())
+    }
+
+    /// Remembers that messages from `address` may (or may not any more) load remote content.
+    pub fn set_remote(&mut self, address: &str, allow: bool) {
+        let key = address.trim().to_lowercase();
+        if key.is_empty() {
+            return;
+        }
+        if allow {
+            self.remote_senders.insert(key);
+        } else {
+            self.remote_senders.remove(&key);
+        }
+    }
+
+    /// How the user marked `address` (or `@domain`): `Some(true)` not spam, `Some(false)` spam.
+    pub fn mark_of(&self, address: &str) -> Option<bool> {
+        self.marked.get(&address.trim().to_lowercase()).copied()
+    }
+
+    /// Marks `address` (or `@domain`) as not spam (`Some(true)`), spam (`Some(false)`), or forgets the mark.
+    pub fn set_mark(&mut self, address: &str, not_spam: Option<bool>) {
+        let key = address.trim().to_lowercase();
+        match not_spam {
+            _ if key.is_empty() => {}
+            Some(not_spam) => {
+                self.marked.insert(key, not_spam);
+            }
+            None => {
+                self.marked.remove(&key);
+            }
+        }
     }
 
     /// Remembers `mode` for `address`; a mode equal to the default clears the override.
@@ -298,5 +371,14 @@ mod tests {
         assert_eq!(settings.mode_for("b@x.org"), DisplayMode::Plain);
         settings.set_sender_mode("a@x.org", DisplayMode::Plain);
         assert!(settings.sender_display.is_empty());
+        assert!(!settings.allows_remote("a@x.org"));
+        settings.set_remote(" A@X.org ", true);
+        assert!(settings.allows_remote("a@x.org"));
+        settings.set_remote("a@x.org", false);
+        assert!(settings.remote_senders.is_empty());
+        settings.set_mark(" Spam@X.org", Some(false));
+        assert_eq!(settings.mark_of("spam@x.org"), Some(false));
+        settings.set_mark("spam@x.org", None);
+        assert_eq!(settings.mark_of("spam@x.org"), None);
     }
 }

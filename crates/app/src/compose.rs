@@ -677,6 +677,7 @@ mod tests {
             references: vec!["m1@host".into()],
             html: None,
             attachments: Vec::new(),
+            ..MessageBody::default()
         };
         (summary, body)
     }

@@ -11,8 +11,12 @@ mod attachments;
 mod compose;
 mod drafts;
 mod original;
+mod remote;
+mod screen;
+mod sender;
 mod html;
 mod icons;
+mod learn;
 mod security;
 mod theme;
 mod views;
@@ -43,6 +47,8 @@ enum Event {
     Synced(u64, usize, Result<SyncReport, MailError>),
     Messages(u64, usize, Result<Vec<MessageSummary>, MailError>),
     Body(u64, MessageId, Result<MessageBody, MailError>),
+    /// The checks' verdicts on the Inbox loaded as (account, folder index).
+    Screened(u64, usize, Result<std::collections::HashMap<MessageId, screen::Screened>, MailError>),
     /// A write (read flag, archive, trash) finished; the UI already showed its result.
     Done(u64, usize, Result<(), MailError>),
     /// The message in the compose window was sent, or the server refused it.
@@ -73,6 +79,10 @@ enum Action {
     Unread(bool),
     Archive,
     Trash,
+    /// To the server's Spam folder.
+    Spam,
+    /// From the Spam folder back to the Inbox.
+    NotSpam,
     Erase,
     Reply,
     ReplyAll,
@@ -82,13 +92,28 @@ enum Action {
 impl Action {
     /// Whether the message leaves the folder being shown.
     fn removes(self) -> bool {
-        matches!(self, Self::Archive | Self::Trash | Self::Erase)
+        matches!(self, Self::Archive | Self::Trash | Self::Spam | Self::NotSpam | Self::Erase)
     }
+}
+
+/// The one spam correction the reader offers for the open message.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Correction {
+    /// Held as suspicious: let the sender back into the Inbox.
+    NotSpam,
+    /// From a new sender and in the Inbox: move it, and the sender's other mail, to Spam.
+    Spam,
+    /// In the Spam folder: back to the Inbox, sender marked as not spam.
+    OutOfSpam,
 }
 
 /// What the user did in the sidebar this frame.
 struct SidebarOutcome {
     chosen: Option<(u64, usize)>,
+    /// The suspicious mail under this (account, Inbox index) was clicked.
+    suspicious: Option<(u64, usize)>,
+    /// "Check all mail for spam" was chosen in this (account, Inbox index)'s menu.
+    recheck: Option<(u64, usize)>,
     removed: Option<u64>,
     edit: Option<u64>,
     add: bool,
@@ -102,13 +127,20 @@ struct OpenBody {
     simplified: Option<Vec<html::Block>>,
     /// The HTML drawn as its sender styled it, made when first shown (and again for another width).
     original: Option<original::Page>,
+    /// The user agreed to load remote content for this message.
+    remote: bool,
+    /// The HTML links to images, styles or fonts on a server.
+    has_remote: bool,
+    /// What deserves a second look about the message, the most serious first.
+    findings: Vec<screen::Finding>,
 }
 
 impl OpenBody {
-    fn new(data: MessageBody) -> Self {
+    fn new(data: MessageBody, findings: Vec<screen::Finding>) -> Self {
         let plain = html::plain_blocks(&data.text);
         let simplified = data.html.as_deref().map(html::blocks);
-        Self { data, plain, simplified, original: None }
+        let has_remote = data.html.as_deref().is_some_and(html::has_remote);
+        Self { data, plain, simplified, original: None, remote: false, has_remote, findings }
     }
 }
 
@@ -125,6 +157,10 @@ struct ReaderOutcome {
     attachment: Option<(u32, views::ChipAction)>,
     /// "Save all" or "Save selected" was pressed.
     save_many: bool,
+    /// Remote content may always be loaded for the sender of this message.
+    allow_sender: Option<bool>,
+    /// The spam correction the user chose for the open message.
+    mark: Option<Correction>,
 }
 
 struct AccountView {
@@ -292,6 +328,8 @@ struct BeaverApp {
     form: Option<NewAccount>,
     /// A message waiting for the user to confirm erasing it for good.
     confirm_erase: Option<MessageId>,
+    /// "Move all to Spam" was pressed in the suspicious view; waiting for the user to confirm.
+    confirm_spam: bool,
     /// Text of the search box; filters the loaded messages by sender and subject.
     query: String,
     /// The query the results below belong to, which search they are, and what was found: (account, hit).
@@ -337,6 +375,12 @@ struct BeaverApp {
     unlocking: bool,
     /// Display mode chosen for the open message only; forgotten when another is opened.
     view_mode: Option<DisplayMode>,
+    /// Where the checks put each message of the Inbox being shown; empty until they have run.
+    screening: std::collections::HashMap<MessageId, screen::Screened>,
+    /// The selected account's suspicious mail is shown instead of its Inbox.
+    show_suspicious: bool,
+    /// The spam checks are running over the Inbox being shown.
+    checking: bool,
 }
 
 impl BeaverApp {
@@ -371,6 +415,7 @@ impl BeaverApp {
             error: None,
             form: None,
             confirm_erase: None,
+            confirm_spam: false,
             query: String::new(),
             searched: String::new(),
             search_seq: 0,
@@ -397,6 +442,9 @@ impl BeaverApp {
             unlock_skipped: false,
             unlocking: false,
             view_mode: None,
+            screening: std::collections::HashMap::new(),
+            show_suspicious: false,
+            checking: false,
         };
         app.error = archive_error.or(vault_error);
         let _ = std::fs::remove_dir_all(&app.open_dir); // copies of attachments from an earlier run
@@ -409,6 +457,16 @@ impl BeaverApp {
             Err(e) => app.error = Some(e),
         }
         app
+    }
+
+    /// The checks of [`screen::findings`] on an opened message; none when what they need cannot be read.
+    fn findings(&self, serial: u64, id: MessageId, body: &MessageBody) -> Vec<screen::Finding> {
+        let (Some(view), Some(message)) = (self.view(serial), self.messages.iter().find(|m| m.id == id)) else { return Vec::new() };
+        let own: Vec<String> = self.accounts.iter().map(|v| v.account.address().to_owned()).collect();
+        match screen::Known::load(&self.archive, &view.account, &own, &self.settings) {
+            Ok(known) => screen::findings(&known, &message.from, &message.address, body, &view.account.imap.host),
+            Err(_) => Vec::new(),
+        }
     }
 
     /// Runs one mail call in the background and wakes the UI with its result.
@@ -465,6 +523,8 @@ impl BeaverApp {
         self.message = None;
         self.body = None;
         self.messages.clear();
+        self.screening.clear();
+        self.checking = false;
         let local = source.clone();
         let folder = name.clone();
         self.spawn(async move { Event::Messages(serial, index, local.messages(&folder).await) });
@@ -556,7 +616,7 @@ impl BeaverApp {
                 self.messages[pos].unread = unread;
                 i32::from(unread) - i32::from(was_unread)
             }
-            Action::Archive | Action::Trash | Action::Erase => {
+            Action::Archive | Action::Trash | Action::Spam | Action::NotSpam | Action::Erase => {
                 self.messages.remove(pos);
                 -i32::from(was_unread)
             }
@@ -570,6 +630,8 @@ impl BeaverApp {
                 Action::Unread(unread) => source.set_unread(id, unread).await,
                 Action::Archive => source.archive(id).await,
                 Action::Trash => source.trash(id).await,
+                Action::Spam => source.move_to(id, Role::Junk).await,
+                Action::NotSpam => source.move_to(id, Role::Inbox).await,
                 Action::Erase => source.erase(id).await,
                 Action::Reply | Action::ReplyAll | Action::Forward => Ok(()),
             };
@@ -601,6 +663,16 @@ impl BeaverApp {
         if folder.stored > 0 && view.account.keep != Keep::Opened {
             parts.push(format!("{} stored offline", views::thousands(folder.stored)));
         }
+        let held = if folder.role == Role::Inbox { self.held() } else { 0 };
+        let checking = self.checking && folder.role == Role::Inbox;
+        if self.show_suspicious {
+            parts = vec![format!("{held} held as suspicious  ·  nothing moved on the server")];
+        } else if held > 0 {
+            parts.push(format!("{held} held as suspicious"));
+        }
+        if checking {
+            parts.push("checking for spam…".to_owned());
+        }
         if (self.messages.len() as u32) < total {
             parts.push(if self.syncing > 0 { "loading older mail".to_owned() } else { format!("newest {} loaded", views::thousands(self.messages.len() as u32)) });
         }
@@ -618,7 +690,132 @@ impl BeaverApp {
         } else {
             Vec::new()
         };
-        self.messages.iter().filter(|m| !ours.contains(&m.message_id)).collect()
+        // The Inbox leaves out what is held as suspicious, once the checks have run; until then it shows
+        // everything, and the suspicious view nothing.
+        // shortcut: a kept verdict does not see a sender become known (or a rule change) until the Inbox
+        // is checked in full from its menu; and new mail shows for a moment before its check, which
+        // checking at sync, in the background, would avoid.
+        let checked = self.holding() && !self.screening.is_empty();
+        let want = if self.show_suspicious { screen::Place::Spam } else { screen::Place::Inbox };
+        self.messages
+            .iter()
+            .filter(|m| !ours.contains(&m.message_id))
+            .filter(|m| if checked { self.screening.get(&m.id).is_some_and(|s| s.place == want) } else { !self.show_suspicious })
+            .collect()
+    }
+
+    /// The Inbox is shown and suspicious mail is held apart from it.
+    fn holding(&self) -> bool {
+        self.settings.hold_suspicious && self.role() == Role::Inbox
+    }
+
+    /// Checks, in the background, the messages of the Inbox just loaded that have no verdict yet. A
+    /// verdict is kept in the archive and stays until a mark changes it or a full check is asked for,
+    /// so only new mail is ever checked.
+    fn screen_inbox(&mut self, serial: u64, index: usize) {
+        if !self.holding() {
+            return;
+        }
+        let Some(view) = self.view(serial) else { return };
+        let (Some(source), account) = (view.source.clone(), view.account.clone()) else { return };
+        // The verdicts kept from before, read at once so held mail never shows in the Inbox.
+        if self.screening.is_empty()
+            && let Some(folder) = view.mailboxes.get(index).map(|f| f.name.clone())
+            && let Ok(kept) = self.archive.verdicts(&account.key(), &folder)
+        {
+            self.screening.extend(kept.into_iter().filter_map(|(id, json)| Some((id, serde_json::from_str(&json).ok()?))));
+        }
+        let fresh: Vec<MessageSummary> = self.messages.iter().filter(|m| !self.screening.contains_key(&m.id)).cloned().collect();
+        if fresh.is_empty() {
+            return;
+        }
+        // Mail already held is part of the campaigns the new mail is compared with.
+        let held: Vec<MessageSummary> = self.messages.iter().filter(|m| self.screening.get(&m.id).is_some_and(|s| s.place == screen::Place::Spam)).cloned().collect();
+        let own: Vec<String> = self.accounts.iter().map(|v| v.account.address().to_owned()).collect();
+        let (archive, settings) = (self.archive.clone(), self.settings.clone());
+        self.checking = true;
+        self.spawn(async move {
+            let verdicts = screen::Known::load(&archive, &account, &own, &settings).and_then(|known| {
+                let verdicts: std::collections::HashMap<MessageId, screen::Screened> = fresh.iter().map(|m| m.id).zip(screen::screen_all(&source, &known, &settings, &account.imap.host, &fresh, &held)).collect();
+                archive.set_verdicts(&kept(&verdicts))?;
+                Ok(verdicts)
+            });
+            Event::Screened(serial, index, verdicts)
+        });
+    }
+
+    /// Messages of the Inbox being shown that are held as suspicious.
+    fn held(&self) -> usize {
+        self.screening.values().filter(|s| s.place == screen::Place::Spam).count()
+    }
+
+    /// Checks the whole Inbox being shown again, after the setting or a mark was forgotten, or when
+    /// asked from its menu: the kept verdicts are dropped first.
+    fn rescreen(&mut self) {
+        if let Some((serial, index)) = self.selected
+            && let Some(view) = self.view(serial)
+            && let Some(folder) = view.mailboxes.get(index)
+            && let Err(e) = self.archive.clear_verdicts(&view.account.key(), &folder.name)
+        {
+            self.error = Some(format!("Could not reset the spam checks: {e}"));
+        }
+        self.screening.clear();
+        self.show_suspicious &= self.settings.hold_suspicious;
+        if let Some((serial, index)) = self.selected {
+            self.screen_inbox(serial, index);
+        }
+    }
+
+    /// The user marked the senders (or organisations) `keys` as not spam or spam: remembered, and applied
+    /// to the list at once.
+    fn mark_senders(&mut self, keys: &[String], not_spam: bool) {
+        let mut changed = std::collections::HashMap::new();
+        for key in keys {
+            self.settings.set_mark(key, Some(not_spam));
+            for (id, s) in self.screening.iter_mut().filter(|(_, s)| s.key == *key) {
+                s.mark(not_spam);
+                changed.insert(*id, s.clone());
+            }
+        }
+        self.save_settings();
+        if let Err(e) = self.archive.set_verdicts(&kept(&changed)) {
+            self.error = Some(format!("Could not keep the change to the spam checks: {e}"));
+        }
+    }
+
+    /// Keeps these messages as training examples of spam (or not), with the text they have now: they
+    /// count at once, and still after they move or the server empties its Spam folder.
+    fn learn(&mut self, ids: &[MessageId], spam: bool) {
+        let Some(account) = self.selected.and_then(|(serial, _)| self.view(serial)).map(|v| v.account.key()) else { return };
+        for m in self.messages.iter().filter(|m| ids.contains(&m.id)) {
+            // A message without a Message-ID is told apart by sender and subject.
+            let id = if m.message_id.is_empty() { format!("{}|{}", m.address, m.subject) } else { m.message_id.clone() };
+            let (text, domain) = screen::example(m);
+            if let Err(e) = self.archive.add_example(&account, &id, spam, &text, &domain) {
+                self.error = Some(format!("Could not keep this for the spam checks to learn: {e}"));
+            }
+        }
+    }
+
+    /// These Inbox messages are spam: their senders are marked, they are kept as examples, and they
+    /// move to the server's Spam folder, where other devices and the server's own filter learn it too.
+    fn move_to_spam(&mut self, ids: &[MessageId]) {
+        let mut keys: Vec<String> = self.messages.iter().filter(|m| ids.contains(&m.id)).map(|m| screen::sender_key(&m.address)).collect();
+        keys.sort();
+        keys.dedup();
+        self.mark_senders(&keys, false);
+        self.learn(ids, true);
+        for id in ids {
+            self.act(*id, Action::Spam);
+        }
+    }
+
+    /// A message of the Spam folder is not spam: its sender is marked so, and it goes back to the Inbox.
+    fn not_spam(&mut self, id: MessageId) {
+        let Some(key) = self.messages.iter().find(|m| m.id == id).map(|m| screen::sender_key(&m.address)) else { return };
+        self.mark_senders(&[key], true);
+        self.learn(&[id], false);
+        self.act(id, Action::NotSpam);
     }
 
     fn searching(&self) -> bool {
@@ -970,6 +1167,7 @@ impl BeaverApp {
             return;
         }
         let mut changed = false;
+        let mut rescreen = false;
         let mut vault_request = None;
         let mut unlock_again = false;
         let (mode, locked, job) = (self.vault.mode(), self.vault.is_locked(), self.vault_job.clone());
@@ -993,6 +1191,52 @@ impl BeaverApp {
                 }
                 ui.label(RichText::new(hint).size(13.0).color(t.text_dim));
                 ui.add_space(4.0);
+            }
+            if !self.settings.remote_senders.is_empty() {
+                ui.add_space(12.0);
+                ui.label(RichText::new("Senders that may load remote content").strong());
+                let mut forget = None;
+                for address in &self.settings.remote_senders {
+                    ui.horizontal(|ui| {
+                        ui.label(address);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.small_button("Remove").clicked() {
+                                forget = Some(address.clone());
+                            }
+                        });
+                    });
+                }
+                if let Some(address) = forget {
+                    self.settings.set_remote(&address, false);
+                    changed = true;
+                }
+            }
+            ui.add_space(12.0);
+            ui.label(RichText::new("Suspicious mail").strong());
+            if ui.checkbox(&mut self.settings.hold_suspicious, "Hold suspicious mail from new senders apart from the Inbox").changed() {
+                changed = true;
+                rescreen = true;
+            }
+            ui.label(RichText::new("Mail from people you know is never held. Nothing moves on the server.").size(13.0).color(t.text_dim));
+            if !self.settings.marked.is_empty() {
+                ui.add_space(6.0);
+                let mut forget = None;
+                for (key, not_spam) in &self.settings.marked {
+                    ui.horizontal(|ui| {
+                        let who = key.strip_prefix('@').map_or_else(|| key.clone(), |d| format!("everyone at {d}"));
+                        ui.label(format!("{who}  ·  {}", if *not_spam { "not spam" } else { "spam" }));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.small_button("Forget").on_hover_text("Let the checks decide again").clicked() {
+                                forget = Some(key.clone());
+                            }
+                        });
+                    });
+                }
+                if let Some(key) = forget {
+                    self.settings.set_mark(&key, None);
+                    changed = true;
+                    rescreen = true;
+                }
             }
             ui.add_space(12.0);
             ui.label(RichText::new("Writing").strong());
@@ -1040,6 +1284,9 @@ impl BeaverApp {
         }
         if changed {
             self.save_settings();
+        }
+        if rescreen {
+            self.rescreen();
         }
         if unlock_again {
             self.unlock_skipped = false;
@@ -1186,7 +1433,7 @@ impl BeaverApp {
 
     /// Up/Down move through the list, E archives, Delete trashes, U toggles unread.
     fn handle_keys(&mut self, ctx: &egui::Context) {
-        if self.form.is_some() || self.confirm_erase.is_some() || self.compose.is_some() || self.show_settings || self.locked() || ctx.egui_wants_keyboard_input() {
+        if self.form.is_some() || self.confirm_erase.is_some() || self.confirm_spam || self.compose.is_some() || self.show_settings || self.locked() || ctx.egui_wants_keyboard_input() {
             return;
         }
         let key = |k| ctx.input(|i| i.key_pressed(k));
@@ -1417,6 +1664,7 @@ impl BeaverApp {
                 Ok(messages) => {
                     self.messages = messages;
                     self.error = None;
+                    self.screen_inbox(serial, index);
                     if let Some(id) = self.pending_open
                         && self.messages.iter().any(|m| m.id == id)
                     {
@@ -1426,11 +1674,25 @@ impl BeaverApp {
                 }
                 Err(e) => self.error = Some(e.to_string()),
             },
+            Event::Screened(serial, index, result) if self.selected == Some((serial, index)) => {
+                self.checking = false;
+                match result {
+                    Ok(verdicts) => self.screening.extend(verdicts),
+                    Err(e) => {
+                        // Without verdicts the Inbox shows everything rather than hiding mail.
+                        self.screening.clear();
+                        self.error = Some(format!("The spam checks could not run, so the Inbox shows all mail: {e}"));
+                    }
+                }
+            }
             Event::Body(serial, id, result)
                 if self.selected.is_some_and(|(s, _)| s == serial) && self.message == Some(id) =>
             {
                 match result {
-                    Ok(body) => self.body = Some(OpenBody::new(body)),
+                    Ok(body) => {
+                        let findings = self.findings(serial, id, &body);
+                        self.body = Some(OpenBody::new(body, findings));
+                    }
                     Err(e) => self.error = Some(e.to_string()),
                 }
             }
@@ -1538,6 +1800,31 @@ impl BeaverApp {
         }
         if confirm || cancel || modal.should_close() {
             self.confirm_erase = None;
+        }
+    }
+
+    /// Confirms moving everything held as suspicious to the server's Spam folder.
+    fn spam_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
+        if !self.confirm_spam {
+            return;
+        }
+        let ids: Vec<MessageId> = self.visible().iter().map(|m| m.id).collect();
+        let (mut confirm, mut cancel) = (false, false);
+        let modal = egui::Modal::new(egui::Id::new("confirm_spam")).show(ctx, |ui| {
+            ui.set_width(FORM_WIDTH * 0.8);
+            ui.heading(format!("Move {} message{} to Spam?", ids.len(), if ids.len() == 1 { "" } else { "s" }));
+            ui.label(RichText::new("Their senders are marked as spam, so their mail goes there from now on. Any message can be brought back from the Spam folder with Not spam.").color(t.text_dim));
+            ui.add_space(12.0);
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
+                confirm = views::primary_button(ui, t, "Move to Spam", true).clicked();
+                cancel = ui.button("Cancel").clicked();
+            });
+        });
+        if confirm {
+            self.move_to_spam(&ids);
+        }
+        if confirm || cancel || modal.should_close() {
+            self.confirm_spam = false;
         }
     }
 
@@ -1733,7 +2020,10 @@ impl BeaverApp {
 
     /// Accounts and their folders. Returns (folder chosen, account to remove, account to edit, add-account clicked).
     fn sidebar(&mut self, ui: &mut egui::Ui, t: &theme::Tokens) -> SidebarOutcome {
-        let (mut chosen, mut removed, mut edit, mut add) = (None, None, None, false);
+        let (mut chosen, mut removed, mut edit, mut add, mut suspicious, mut recheck) = (None, None, None, false, None, None);
+        // shortcut: only the Inbox being shown has verdicts, so only its suspicious mail shows a count; check
+        // every account in the background (during sync) to count them all.
+        let held = self.held() as u32;
         let frame = egui::Frame::new().fill(t.bg).inner_margin(egui::Margin::same(12));
         egui::Panel::left("accounts").frame(frame).default_size(260.0).size_range(210.0..=340.0).show(ui, |ui| {
             let can_send = !self.senders().is_empty();
@@ -1768,10 +2058,21 @@ impl BeaverApp {
                                     for i in order {
                                         let mailbox = &view.mailboxes[i];
                                         let title = views::folder_title(&mailbox.name, mailbox.role);
-                                        let selected = self.selected == Some((view.serial, i));
+                                        let here = self.selected == Some((view.serial, i));
+                                        let holding = self.settings.hold_suspicious && mailbox.role == Role::Inbox;
                                         let tip = format!("{} message{}  ·  {} unread", views::thousands(mailbox.total), if mailbox.total == 1 { "" } else { "s" }, views::thousands(mailbox.unread));
-                                        if views::folder_row(ui, t, &title, mailbox.role, mailbox.unread, selected).on_hover_text(tip).clicked() {
+                                        let row = views::folder_row(ui, t, &title, mailbox.role, mailbox.unread, here && !(holding && self.show_suspicious)).on_hover_text(tip);
+                                        if row.clicked() {
                                             chosen = Some((view.serial, i));
+                                        }
+                                        row.context_menu(|ui| folder_menu(ui, mailbox.role, self.settings.hold_suspicious, &mut recheck, (view.serial, i)));
+                                        if holding {
+                                            let count = if here { held } else { 0 };
+                                            let row = views::suspicious_row(ui, t, count, here && self.show_suspicious).on_hover_text("Mail from new senders that failed a check, held apart from the Inbox");
+                                            if row.clicked() {
+                                                suspicious = Some((view.serial, i));
+                                            }
+                                            row.context_menu(|ui| folder_menu(ui, mailbox.role, true, &mut recheck, (view.serial, i)));
                                         }
                                     }
                                 });
@@ -1793,13 +2094,14 @@ impl BeaverApp {
                 });
             });
         });
-        SidebarOutcome { chosen, removed, edit, add }
+        SidebarOutcome { chosen, suspicious, recheck, removed, edit, add }
     }
 
     /// Search, refresh and the message list. Returns the message the user clicked and whether to add an account.
     fn message_list(&mut self, ui: &mut egui::Ui, t: &theme::Tokens) -> (Option<MessageId>, bool) {
         let (mut opened, mut add, mut refresh) = (None, false, false);
         let (mut open_draft, mut delete_draft): (Option<String>, Option<String>) = (None, None);
+        let mut ask_spam = false;
         let mut clicked_hit: Option<(u64, Hit)> = None;
         let frame = egui::Frame::new().fill(t.surface);
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
@@ -1821,11 +2123,18 @@ impl BeaverApp {
                 }
             });
             let shown = self.visible();
+            let can_move = self.show_suspicious && self.holding() && !shown.is_empty();
             if let Some(summary) = self.folder_summary() {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.add_space(16.0);
                     ui.label(RichText::new(summary).size(13.0).color(t.text_dim));
+                    if can_move {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.add_space(12.0);
+                            ask_spam = ui.button("Move all to Spam…").on_hover_text("Move every message held here to the server's Spam folder and mark their senders as spam").clicked();
+                        });
+                    }
                 });
             }
             ui.add_space(6.0);
@@ -1865,7 +2174,9 @@ impl BeaverApp {
                 if !self.drafts.is_empty() {
                     return;
                 }
-                let (title, hint) = if self.query.trim().is_empty() {
+                let (title, hint) = if self.show_suspicious && self.holding() {
+                    ("Nothing suspicious", "Mail from new senders that fails a check is held here, apart from the Inbox.")
+                } else if self.query.trim().is_empty() {
                     ("Nothing here", "This folder has no messages.")
                 } else {
                     ("No results", "No loaded message matches your search.")
@@ -1885,6 +2196,7 @@ impl BeaverApp {
         if refresh {
             self.refresh();
         }
+        self.confirm_spam |= ask_spam;
         if let Some((serial, hit)) = clicked_hit {
             self.open_hit(serial, &hit);
         }
@@ -1916,8 +2228,24 @@ impl BeaverApp {
         let mut remember = None;
         let mut attachment = None;
         let mut save_many = false;
+        let mut allow_sender = None;
+        let mut mark = None;
+        let mut suspicious = false;
+        // What the checks decided about this message, when they ran on it.
+        // The correction that makes sense: none for mail from known senders. The reasons are the warnings
+        // shown just above it.
+        let correction = self.message.and_then(|id| match self.role() {
+            Role::Junk => Some(Correction::OutOfSpam),
+            Role::Inbox if self.settings.hold_suspicious => self.screening.get(&id).and_then(|s| match s.place {
+                screen::Place::Spam => Some(Correction::NotSpam),
+                screen::Place::Inbox if s.new_sender => Some(Correction::Spam),
+                screen::Place::Inbox => None,
+            }),
+            _ => None,
+        });
         let (settings_mode, view_mode) = (self.settings.clone(), self.view_mode);
         let selected_files = self.attach_selected.clone();
+        let server_host = self.selected.and_then(|(serial, _)| self.view(serial)).map(|v| v.account.imap.host.clone()).unwrap_or_default();
         let role = self.role();
         let current = self.message.and_then(|id| self.messages.iter().find(|m| m.id == id)).cloned();
         let frame = egui::Frame::new().fill(t.surface);
@@ -1981,6 +2309,33 @@ impl BeaverApp {
                             let date = ui.painter().layout_no_wrap(detail, egui::FontId::proportional(13.0), t.text_dim);
                             ui.painter().galley(pos2(rect.left() + views::AVATAR + 12.0, rect.top() + 3.0), name, t.text);
                             ui.painter().galley(pos2(rect.left() + views::AVATAR + 12.0, rect.top() + 23.0), date, t.text_dim);
+                            let authenticity = sender::authenticity(&body.data.auth, &server_host, &message.address);
+                            for finding in &body.findings {
+                                let color = if finding.level == screen::Level::Danger { t.danger } else { t.text_dim };
+                                ui.add_space(6.0);
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.add(Icon::Spam.image(icons::SIZE, color));
+                                    ui.label(RichText::new(&finding.text).size(13.0).color(color));
+                                });
+                            }
+                            if body.findings.is_empty() && authenticity == sender::Authenticity::Verified {
+                                ui.add_space(6.0);
+                                ui.label(RichText::new(format!("Sender domain verified by your server: {}", sender::domain(&message.address))).size(13.0).color(t.text_dim));
+                            }
+                            suspicious = body.findings.iter().any(|f| f.level == screen::Level::Danger);
+                            if let Some(choice) = correction {
+                                let key = screen::sender_key(&message.address);
+                                let who = key.trim_start_matches('@');
+                                let (text, held, button, tip) = match choice {
+                                    Correction::NotSpam => ("Held apart from the Inbox as suspicious.".to_owned(), true, "Not spam", format!("Show mail from {who} in the Inbox from now on")),
+                                    Correction::Spam => (format!("First mail from {who}."), false, "Spam", format!("Move mail from {who} to the Spam folder, now and from now on")),
+                                    Correction::OutOfSpam => ("In the Spam folder.".to_owned(), true, "Not spam", format!("Move it back to the Inbox, and keep mail from {who} there from now on")),
+                                };
+                                ui.add_space(10.0);
+                                if views::mark_bar(ui, t, &text, held, button, &tip) {
+                                    mark = Some(choice);
+                                }
+                            }
                             if !body.data.to.is_empty() {
                                 ui.add_space(6.0);
                                 ui.add(egui::Label::new(RichText::new(format!("To: {}", body.data.to.join(", "))).size(13.0).color(t.text_dim)).truncate());
@@ -2027,11 +2382,23 @@ impl BeaverApp {
                             ui.add_space(16.0);
                             if let (Some(source), DisplayMode::Original) = (&body.data.html, mode) {
                                 let (width, scale) = (ui.available_width(), ui.ctx().pixels_per_point());
-                                if !body.original.as_ref().is_some_and(|p| p.fits(width, scale)) {
-                                    body.original = original::Page::new(ui.ctx(), source, width, scale);
+                                // A permission given to a sender never applies to a message that fails the server's checks.
+                                let remote = body.remote || (settings_mode.allows_remote(&message.address) && !suspicious);
+                                if !body.original.as_ref().is_some_and(|p| p.fits(width, scale, remote)) {
+                                    body.original = original::Page::new(ui.ctx(), source, width, scale, remote);
                                 }
-                                ui.label(RichText::new("Images, fonts and styles hosted on a server are not loaded.").size(13.0).color(t.text_dim));
-                                ui.add_space(6.0);
+                                if body.has_remote {
+                                    match views::remote_bar(ui, t, remote, if suspicious { "" } else { &message.address }) {
+                                        Some(views::Remote::Once) => body.remote = true,
+                                        Some(views::Remote::Always) => allow_sender = Some(true),
+                                        Some(views::Remote::Block) => {
+                                            body.remote = false;
+                                            allow_sender = Some(false);
+                                        }
+                                        None => {}
+                                    }
+                                    ui.add_space(8.0);
+                                }
                                 if let Some(page) = &mut body.original {
                                     url = page.show(ui);
                                 }
@@ -2048,7 +2415,7 @@ impl BeaverApp {
                 }
             }
         });
-        ReaderOutcome { action, url, mode: chosen_mode, remember, attachment, save_many }
+        ReaderOutcome { action, url, mode: chosen_mode, remember, attachment, save_many, allow_sender, mark }
     }
 }
 
@@ -2065,14 +2432,31 @@ impl eframe::App for BeaverApp {
         self.error_banner(ui, &t);
         self.status_bar(ui, &t);
 
-        let SidebarOutcome { chosen, removed, edit, mut add } = self.sidebar(ui, &t);
+        let SidebarOutcome { chosen, suspicious, recheck, removed, edit, mut add } = self.sidebar(ui, &t);
         if let Some(serial) = edit
             && let Some(view) = self.view(serial)
         {
             self.form = Some(NewAccount::editing(serial, &view.account));
         }
         if let Some((serial, index)) = chosen {
+            self.show_suspicious = false;
             self.select_mailbox(serial, index);
+        }
+        if let Some((serial, index)) = suspicious {
+            if self.selected != Some((serial, index)) {
+                self.select_mailbox(serial, index);
+            }
+            self.show_suspicious = true;
+        }
+        // A full check: every message again, with who is known worked out afresh. Opening another
+        // folder checks it all anyway, since its verdicts start empty.
+        if let Some((serial, index)) = recheck {
+            if self.selected == Some((serial, index)) {
+                self.rescreen();
+            } else {
+                self.show_suspicious = false;
+                self.select_mailbox(serial, index);
+            }
         }
         if let Some(serial) = removed {
             self.remove_account(serial);
@@ -2080,7 +2464,21 @@ impl eframe::App for BeaverApp {
         self.account_form(ui.ctx());
 
         self.handle_keys(ui.ctx());
-        let ReaderOutcome { action, url, mode, remember, attachment, save_many } = self.reader(ui, &t);
+        let ReaderOutcome { action, url, mode, remember, attachment, save_many, allow_sender, mark } = self.reader(ui, &t);
+        if let (Some(choice), Some(id)) = (mark, self.message) {
+            let key = self.messages.iter().find(|m| m.id == id).map(|m| screen::sender_key(&m.address)).unwrap_or_default();
+            match choice {
+                Correction::NotSpam => {
+                    self.mark_senders(&[key], true);
+                    self.learn(&[id], false);
+                }
+                Correction::Spam => {
+                    let ids: Vec<MessageId> = self.messages.iter().filter(|m| screen::sender_key(&m.address) == key).map(|m| m.id).collect();
+                    self.move_to_spam(&ids);
+                }
+                Correction::OutOfSpam => self.not_spam(id),
+            }
+        }
         if let Some((index, what)) = attachment {
             self.use_attachment(index, what);
         }
@@ -2092,6 +2490,10 @@ impl eframe::App for BeaverApp {
         }
         if mode.is_some() {
             self.view_mode = mode;
+        }
+        if let (Some(allow), Some(address)) = (allow_sender, self.current_address()) {
+            self.settings.set_remote(&address, allow);
+            self.save_settings();
         }
         if let (Some(mode), Some(address)) = (remember, self.current_address()) {
             self.settings.set_sender_mode(&address, mode);
@@ -2108,6 +2510,7 @@ impl eframe::App for BeaverApp {
             self.request(id, what);
         }
         self.erase_dialog(ui.ctx(), &t);
+        self.spam_dialog(ui.ctx(), &t);
         self.open_dialog(ui.ctx(), &t);
         self.settings_window(ui.ctx(), &t);
         if self.locked()
@@ -2126,12 +2529,43 @@ impl eframe::App for BeaverApp {
     }
 }
 
+/// Verdicts as the archive keeps them.
+fn kept(verdicts: &std::collections::HashMap<MessageId, screen::Screened>) -> Vec<(MessageId, String)> {
+    verdicts.iter().filter_map(|(id, v)| Some((*id, serde_json::to_string(v).ok()?))).collect()
+}
+
+/// The menu of a folder in the sidebar. Only the Inbox is checked for spam, so the check is offered
+/// there and explained elsewhere.
+fn folder_menu(ui: &mut egui::Ui, role: Role, holding: bool, recheck: &mut Option<(u64, usize)>, folder: (u64, usize)) {
+    let why = match (role, holding) {
+        (Role::Inbox, true) => None,
+        (Role::Inbox, false) => Some("Holding suspicious mail is turned off in Settings"),
+        _ => Some("Only the Inbox is checked for spam"),
+    };
+    let check = ui.add_enabled(why.is_none(), egui::Button::new("Check all mail for spam"));
+    let check = match why {
+        Some(why) => check.on_disabled_hover_text(why),
+        None => check.on_hover_text("Check every message again, not only new ones, and work out again who you know"),
+    };
+    if check.clicked() {
+        *recheck = Some(folder);
+        ui.close();
+    }
+}
+
 /// The bytes of an attachment, through the mail source (a function so tasks can call it without a method).
 async fn source_attachment(source: &ImapSource, id: MessageId, index: u32) -> Result<(String, Vec<u8>), MailError> {
     source.attachment(id, index).await
 }
 
 fn main() -> eframe::Result {
+    if std::env::args().any(|a| a == "--screen-dry-run") {
+        if let Err(e) = screen::dry_run() {
+            eprintln!("beavermail: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_title("BeaverMail").with_inner_size([1280.0, 800.0]),
         // With vsync, Mesa's Wayland swap blocks the UI thread until the compositor sends a frame

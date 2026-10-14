@@ -94,10 +94,18 @@ fn role_icon(role: Role) -> Icon {
 
 /// A folder in the sidebar: coloured icon, name, and the unread count in a pill.
 pub fn folder_row(ui: &mut Ui, t: &Tokens, title: &str, role: Role, unread: u32, selected: bool) -> Response {
+    nav_row(ui, t, title, role_icon(role), theme::role_color(role), unread, selected)
+}
+
+/// Under an Inbox: the mail held apart as suspicious, with how many messages in the pill.
+pub fn suspicious_row(ui: &mut Ui, t: &Tokens, held: u32, selected: bool) -> Response {
+    nav_row(ui, t, "Suspicious", Icon::Spam, t.danger, held, selected)
+}
+
+fn nav_row(ui: &mut Ui, t: &Tokens, title: &str, icon: Icon, color: Color32, unread: u32, selected: bool) -> Response {
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), FOLDER_ROW_H), Sense::click());
     row_background(ui, rect, &response, selected, t);
-    role_icon(role)
-        .image(icons::SIZE, theme::role_color(role))
+    icon.image(icons::SIZE, color)
         .paint_at(ui, Rect::from_center_size(pos2(rect.left() + 22.0, rect.center().y), vec2(icons::SIZE, icons::SIZE)));
     let mut right = 12.0;
     if unread > 0 {
@@ -136,11 +144,27 @@ pub fn message_row(ui: &mut Ui, t: &Tokens, message: &MessageSummary, selected: 
     }
     let primary = if message.unread { t.text } else { t.text_dim };
     let dot = if message.unread { 16.0 } else { 0.0 };
-    let sender = truncated(ui, &message.from, FontId::proportional(15.5), primary, width - date_w - 12.0 - dot - clip);
+    // The name is free text anyone can set, so the domain it really comes from is shown beside it.
+    let domain = crate::sender::domain(&message.address);
+    let flagged = crate::sender::warning(&message.from, &message.address).is_some();
+    let room = width - date_w - 12.0 - dot - clip;
+    let name_room = if domain.is_empty() { room } else { room * 0.6 };
+    let sender = truncated(ui, &message.from, FontId::proportional(15.5), primary, name_room);
     let sender_w = sender.size().x;
     ui.painter().galley(pos2(left, card.top() + 11.0), sender, primary);
+    let mut x = left + sender_w + 10.0;
     if message.unread {
-        ui.painter().circle_filled(pos2(left + sender_w + 10.0, card.top() + 21.0), 4.0, t.accent);
+        ui.painter().circle_filled(pos2(x, card.top() + 21.0), 4.0, t.accent);
+        x += 12.0;
+    }
+    if !domain.is_empty() && message.from != message.address {
+        let color = if flagged { t.danger } else { t.text_dim };
+        if flagged {
+            Icon::Spam.image(14.0, color).paint_at(ui, Rect::from_center_size(pos2(x + 7.0, card.top() + 21.0), vec2(14.0, 14.0)));
+            x += 18.0;
+        }
+        let shown = truncated(ui, &domain, FontId::proportional(13.0), color, (left + room - x).max(0.0));
+        ui.painter().galley(pos2(x, card.top() + 13.0), shown, color);
     }
     let subject = truncated(ui, &message.subject, FontId::proportional(14.5), primary, width);
     ui.painter().galley(pos2(left, card.top() + 33.0), subject, primary);
@@ -153,6 +177,22 @@ pub fn message_row(ui: &mut Ui, t: &Tokens, message: &MessageSummary, selected: 
         ui.painter().galley(pos2(card.right() - 14.0 - label.size().x, card.top() + 57.0), label, t.accent);
     }
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Above a message the checks have an opinion on: why, and the one correction that makes sense. True
+/// when the button is pressed.
+pub fn mark_bar(ui: &mut Ui, t: &Tokens, text: &str, held: bool, button: &str, tip: &str) -> bool {
+    let mut pressed = false;
+    egui::Frame::new().fill(t.input).stroke(egui::Stroke::new(1.0, t.border)).corner_radius(CornerRadius::same(CONTROL_RADIUS)).inner_margin(Margin::symmetric(12, 10)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal_wrapped(|ui| {
+            ui.add(Icon::Spam.image(icons::SIZE, if held { t.danger } else { t.text_dim }));
+            ui.label(egui::RichText::new(text).size(13.5).color(t.text));
+        });
+        ui.add_space(4.0);
+        pressed = ui.button(button).on_hover_text(tip).clicked();
+    });
+    pressed
 }
 
 /// A search field with a leading icon and a clear button. `focus` moves the caret into it.
@@ -200,6 +240,44 @@ pub fn empty_state(ui: &mut Ui, t: &Tokens, title: &str, hint: &str, action: Opt
         }
     });
     clicked
+}
+
+/// What the user chose in the remote-content bar.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Remote {
+    /// Load it for this message.
+    Once,
+    /// Load it for this message and every later one from the sender.
+    Always,
+    /// Stop loading it (and forget the sender's permission).
+    Block,
+}
+
+/// The bar above a message shown as designed: says what is blocked or loaded and offers the choice.
+pub fn remote_bar(ui: &mut Ui, t: &Tokens, loaded: bool, sender: &str) -> Option<Remote> {
+    let mut choice = None;
+    egui::Frame::new().fill(t.input).stroke(egui::Stroke::new(1.0, t.border)).corner_radius(egui::CornerRadius::same(crate::theme::CONTROL_RADIUS)).inner_margin(egui::Margin::symmetric(12, 10)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        if loaded {
+            ui.label(egui::RichText::new("Images and styles from the internet are loaded. The sender can see that you opened this message.").size(13.0).color(t.text_dim));
+            if ui.small_button("Block again").clicked() {
+                choice = Some(Remote::Block);
+            }
+        } else {
+            ui.label(egui::RichText::new("Images and styles from the internet are blocked.").size(13.5).color(t.text));
+            ui.label(egui::RichText::new("Loading them tells the sender you opened this message, and shows your network address.").size(13.0).color(t.text_dim));
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                if primary_button(ui, t, "Load for this message", true).clicked() {
+                    choice = Some(Remote::Once);
+                }
+                if !sender.is_empty() && ui.button(format!("Always for {sender}")).clicked() {
+                    choice = Some(Remote::Always);
+                }
+            });
+        }
+    });
+    choice
 }
 
 /// The one filled button of a group.

@@ -8,7 +8,7 @@
 pub mod model;
 pub mod sample;
 
-pub use model::{Account, Attachment, DisplayMode, Hit, Keep, Mailbox, MessageBody, MessageId, MessageSummary, Outgoing, OutgoingFile, Progress, Role, Server, Settings, SyncReport, Tls};
+pub use model::{Account, Attachment, AuthCheck, AuthResult, DisplayMode, Hit, Keep, Mailbox, MessageBody, MessageId, MessageSummary, Outgoing, OutgoingFile, Progress, Role, Server, Settings, SyncReport, Tls};
 
 use std::fmt;
 use std::future::Future;
@@ -92,6 +92,10 @@ pub trait MailSource {
 
     /// Moves a message to the account's archive folder.
     fn archive(&self, id: MessageId) -> impl Future<Output = Result<(), MailError>> + Send;
+
+    /// Moves a message to the account's folder with `role`: to Spam when the user says it is spam, back
+    /// to the Inbox when they say it is not.
+    fn move_to(&self, id: MessageId, role: Role) -> impl Future<Output = Result<(), MailError>> + Send;
 
     /// Moves a message to the account's trash folder.
     fn trash(&self, id: MessageId) -> impl Future<Output = Result<(), MailError>> + Send;

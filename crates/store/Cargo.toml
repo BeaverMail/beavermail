@@ -15,3 +15,5 @@ workspace = true
 [dependencies]
 beavermail-core.workspace = true
 rusqlite = { version = "0.40", features = ["bundled-sqlcipher-vendored-openssl"] }
+# Dates in this computer's time zone; already in the tree through async-imap, "clock" adds the zone lookup.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }

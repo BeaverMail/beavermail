@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use async_imap::types::{Fetch, Flag, NameAttribute};
 use async_imap::{Client, Session};
-use beavermail_core::{Account, Attachment, Hit, Keep, MailError, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Progress, Role, Server, SyncReport, Tls};
+use beavermail_core::{AuthCheck, AuthResult, Account, Attachment, Hit, Keep, MailError, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Progress, Role, Server, SyncReport, Tls};
 use beavermail_store::{Header, Location, Store};
 use beavermail_vault::{Vault, folder_path, message_path};
 use futures::TryStreamExt;
@@ -25,7 +25,7 @@ const BACKFILL_SPAN: u32 = 1000;
 /// Cached messages whose flags and existence are re-checked on every sync.
 const RECONCILE_WINDOW: u32 = 1000;
 /// Header fields the list and threading need; the rest of the header is not downloaded.
-const HEADER_FIELDS: &str = "BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES CONTENT-TYPE)]";
+const HEADER_FIELDS: &str = "BODY.PEEK[HEADER.FIELDS (FROM TO CC REPLY-TO SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES CONTENT-TYPE AUTHENTICATION-RESULTS X-SPAM-STATUS X-SPAM-FLAG X-SPAM-BAR X-SPAM-SCORE X-SPAM-REPORT)]";
 
 trait Conn: AsyncRead + AsyncWrite + Unpin + Send + fmt::Debug {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + fmt::Debug> Conn for T {}
@@ -42,6 +42,8 @@ enum Op {
     Seen(bool),
     Archive,
     Trash,
+    /// To the folder with this role (Spam, or back to the Inbox).
+    Move(Role),
     /// Permanent delete; allowed only inside the trash folder.
     Erase,
 }
@@ -66,6 +68,19 @@ struct Config {
 }
 
 impl ImapSource {
+    /// The message as stored on this computer, without going to the server; `None` when it is not stored.
+    pub fn stored_body(&self, id: MessageId) -> Result<Option<MessageBody>, MailError> {
+        let at = self.store.locate(id)?.ok_or(MailError::NotFound)?;
+        let path = self.file_of(&at.account, &at.folder, at.uid)?;
+        self.files.read(&path)?.map(|raw| parse_body(&raw)).transpose()
+    }
+
+    /// What the kept header fields say (sender, Reply-To, the server's checks), without text or
+    /// attachments; `None` when they were not read yet.
+    pub fn header_body(&self, id: MessageId) -> Result<Option<MessageBody>, MailError> {
+        self.store.headers(id)?.filter(|raw| !raw.is_empty()).map(|raw| parse_body(&raw)).transpose()
+    }
+
     /// Creates the source over the shared archive; the connection is opened on first use.
     pub fn new(account: &Account, password: String, store: Arc<Store>, files: Arc<Vault>) -> Self {
         let config = Config { server: account.imap.clone(), user: account.user.clone(), password };
@@ -233,6 +248,8 @@ fn header(fetch: &Fetch) -> Option<Header> {
         in_reply_to: ids(message.in_reply_to()).join(" "),
         references: ids(message.references()).join(" "),
         size: fetch.size.unwrap_or(0),
+        recipients: recipients(&message),
+        raw: raw.to_vec(),
         // The server's description of the message is exact; the Content-Type is a guess for servers
         // that do not send it.
         has_attachments: fetch.bodystructure().map_or_else(
@@ -240,6 +257,11 @@ fn header(fetch: &Fetch) -> Option<Header> {
             carries_file,
         ),
     })
+}
+
+/// The To and Cc addresses, lower case, separated by spaces.
+fn recipients(message: &mail_parser::Message<'_>) -> String {
+    [message.to(), message.cc()].into_iter().flatten().flat_map(|h| h.iter()).filter_map(|a| a.address()).map(str::to_lowercase).collect::<Vec<_>>().join(" ")
 }
 
 /// "Name <address>" or a bare address for each entry of an address header.
@@ -271,6 +293,7 @@ impl ImapSource {
             Op::Seen(_) | Op::Erase => None,
             Op::Archive => Some(self.folder_with_role(Role::Archive).await?.ok_or_else(|| backend("this account has no archive folder"))?),
             Op::Trash => Some(self.folder_with_role(Role::Trash).await?.ok_or_else(|| backend("this account has no trash folder"))?),
+            Op::Move(role) => Some(self.folder_with_role(role).await?.ok_or_else(|| backend(format!("this account has no {role:?} folder")))?),
         };
         if matches!(op, Op::Erase) && self.folder_with_role(Role::Trash).await?.as_deref() != Some(at.folder.as_str()) {
             return Err(backend("only messages in Trash can be erased"));
@@ -308,7 +331,7 @@ impl ImapSource {
         result.map_err(|e| state.failed(e))?;
         match op {
             Op::Seen(seen) => self.store.set_unread(id, !seen),
-            Op::Archive | Op::Trash | Op::Erase => {
+            Op::Archive | Op::Trash | Op::Move(_) | Op::Erase => {
                 self.drop_files(&at.folder, &[at.uid]);
                 self.store.remove(id)
             }
@@ -420,6 +443,39 @@ impl ImapSource {
             for uid in &unknown {
                 if !fetches.iter().any(|f| f.uid == Some(*uid)) {
                     store.set_attachments(account, folder, *uid, false)?;
+                }
+            }
+        }
+
+        // Sent rows from before recipients were kept: whom the user wrote to decides who is a known sender.
+        if store.folder_with_role(account, Role::Sent)?.as_deref() == Some(folder) {
+            for _ in 0..20 {
+                let unknown = store.unknown_recipients(account, folder, 300)?;
+                if unknown.is_empty() {
+                    break;
+                }
+                let set = unknown.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+                let fetches: Vec<Fetch> = session.uid_fetch(&set, "(UID BODY.PEEK[HEADER.FIELDS (TO CC)])").await?.try_collect().await?;
+                for uid in &unknown {
+                    // One the server no longer has is settled as "nobody".
+                    let found = fetches.iter().find(|f| f.uid == Some(*uid)).and_then(|f| f.header()).and_then(|raw| MessageParser::default().parse_headers(raw));
+                    store.set_recipients(account, folder, *uid, &found.map(|m| recipients(&m)).unwrap_or_default())?;
+                }
+            }
+        }
+
+        // Inbox rows from before header fields were kept: the screener checks them without the body.
+        if store.folder_with_role(account, Role::Inbox)?.as_deref() == Some(folder) {
+            for _ in 0..20 {
+                let unknown = store.unknown_headers(account, folder, 300)?;
+                if unknown.is_empty() {
+                    break;
+                }
+                let set = unknown.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+                let fetches: Vec<Fetch> = session.uid_fetch(&set, format!("(UID {HEADER_FIELDS})")).await?.try_collect().await?;
+                for uid in &unknown {
+                    let raw = fetches.iter().find(|f| f.uid == Some(*uid)).and_then(|f| f.header()).unwrap_or_default();
+                    store.set_headers(account, folder, *uid, raw)?;
                 }
             }
         }
@@ -546,7 +602,76 @@ fn parse_body(raw: &[u8]) -> Result<MessageBody, MailError> {
             _ => None,
         }),
         references: ids(message.references()),
+        auth: trace_headers(raw).iter().filter(|(n, _)| n == "authentication-results").map(|(_, v)| auth_result(v)).collect(),
+        spam: trace_headers(raw).iter().any(|(n, v)| spam_verdict(n, v)),
+        spam_tests: trace_headers(raw).iter().flat_map(|(n, v)| spam_tests(n, v)).collect(),
     })
+}
+
+/// The header lines of a message as (lower-case name, unfolded value), in order.
+fn trace_headers(raw: &[u8]) -> Vec<(String, String)> {
+    let text = String::from_utf8_lossy(raw);
+    let end = text.find("\r\n\r\n").or_else(|| text.find("\n\n")).unwrap_or(text.len());
+    let mut headers: Vec<(String, String)> = Vec::new();
+    for line in text[..end].lines() {
+        if line.starts_with([' ', '\t']) {
+            if let Some((_, value)) = headers.last_mut() {
+                value.push(' ');
+                value.push_str(line.trim());
+            }
+        } else if let Some((name, value)) = line.split_once(':') {
+            headers.push((name.trim().to_ascii_lowercase(), value.trim().to_owned()));
+        }
+    }
+    headers
+}
+
+/// A spam filter's header that says the message is spam: SpamAssassin's `X-Spam-Status: Yes` and
+/// `X-Spam-Flag: YES`, or Exim's `X-Spam-Bar` with five or more `+` (one per point, the usual threshold).
+fn spam_verdict(name: &str, value: &str) -> bool {
+    match name {
+        "x-spam-status" => value.trim_start().to_ascii_lowercase().starts_with("yes"),
+        "x-spam-flag" => value.trim().eq_ignore_ascii_case("yes"),
+        "x-spam-bar" => value.chars().filter(|c| *c == '+').count() >= 5,
+        _ => false,
+    }
+}
+
+/// The rule names a SpamAssassin header reports: `tests=A,B` in `X-Spam-Status`, or the "points
+/// RULE_NAME" lines of `X-Spam-Report`.
+fn spam_tests(name: &str, value: &str) -> Vec<String> {
+    let rule = |w: &str| w.len() >= 3 && w.contains('_') && w.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+    match name {
+        "x-spam-status" => value.split_once("tests=").map(|(_, t)| t.split_whitespace().next().unwrap_or("").split(',').filter(|w| rule(w)).map(str::to_owned).collect()).unwrap_or_default(),
+        "x-spam-report" => {
+            let words: Vec<&str> = value.split_whitespace().collect();
+            words.windows(2).filter(|w| w[0].parse::<f32>().is_ok() && rule(w[1])).map(|w| w[1].to_owned()).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// An `Authentication-Results` value: "server; spf=pass smtp.mailfrom=a@b; dkim=fail header.d=b".
+fn auth_result(value: &str) -> AuthResult {
+    let mut parts = value.split(';');
+    let server = parts.next().unwrap_or("").split_whitespace().next().unwrap_or("").trim_end_matches('.').to_lowercase();
+    let checks = parts
+        .filter_map(|part| {
+            let mut words = part.split_whitespace();
+            let (method, result) = words.next()?.split_once('=')?;
+            // The domain the check is about: the signer of a DKIM signature, the From domain of DMARC, the envelope sender of SPF.
+            let domain = words
+                .filter_map(|w| w.split_once('='))
+                .find_map(|(k, v)| match (k.to_ascii_lowercase().as_str(), method.to_ascii_lowercase().as_str()) {
+                    ("header.d", "dkim") | ("header.from", "dmarc") | ("smtp.mailfrom", "spf") | ("smtp.helo", "spf") => Some(v),
+                    _ => None,
+                })
+                .map(|v| v.trim_matches(['"', '<', '>']).rsplit('@').next().unwrap_or("").to_lowercase())
+                .unwrap_or_default();
+            Some(AuthCheck { method: method.to_lowercase(), result: result.trim_matches(['(', ')']).to_lowercase(), domain })
+        })
+        .collect();
+    AuthResult { server, checks }
 }
 
 impl ImapSource {
@@ -682,6 +807,11 @@ impl MailSource for ImapSource {
         // Searching the text needs it indexed, whatever is kept offline.
         self.index_stored().await?;
         let Some(since) = keep.since(now) else { return Ok(()) };
+        // The Spam folder's headers, not its bodies: what the server set aside teaches the spam checks.
+        if let Some(junk) = self.store.folder_with_role(&self.account, Role::Junk)? {
+            progress.set_activity(format!("Checking {junk}"));
+            self.sync_folder(&junk).await?;
+        }
         let mut folders: Vec<String> = self.store.folders(&self.account)?.into_iter().filter(|f| !matches!(f.role, Role::Junk | Role::Trash)).map(|f| f.name).collect();
         folders.sort_by_key(|n| n != "INBOX");
 
@@ -851,6 +981,10 @@ impl MailSource for ImapSource {
         self.write(id, Op::Trash).await
     }
 
+    async fn move_to(&self, id: MessageId, role: Role) -> Result<(), MailError> {
+        self.write(id, Op::Move(role)).await
+    }
+
     async fn erase(&self, id: MessageId) -> Result<(), MailError> {
         self.write(id, Op::Erase).await
     }
@@ -879,6 +1013,30 @@ mod tests {
 
     fn body_index(raw: &str, name: &str) -> u32 {
         parse_body(raw.as_bytes()).unwrap().attachments.into_iter().find(|a| a.name == name).unwrap().index
+    }
+
+    #[test]
+    fn the_servers_authentication_results_and_spam_verdict_are_read_in_order() {
+        let raw = "Authentication-Results: mail.example.org;\r\n\tdkim=pass header.d=Bank.com header.s=k1;\r\n\tspf=fail (reason) smtp.mailfrom=bounce@attacker.io;\r\n\tdmarc=pass (p=reject) header.from=bank.com\r\nAuthentication-Results: mx.attacker.io; dmarc=pass header.from=bank.com\r\nX-Spam-Status: Yes, score=9.1\r\nFrom: a@bank.com\r\nSubject: Authentication-Results: not a header\r\n\r\nAuthentication-Results: body text\r\n";
+        let body = parse_body(raw.as_bytes()).unwrap();
+        assert!(body.spam);
+        assert_eq!(body.auth.len(), 2, "only header lines count, not the body");
+        assert_eq!(body.auth[0].server, "mail.example.org");
+        let checks: Vec<_> = body.auth[0].checks.iter().map(|c| (c.method.as_str(), c.result.as_str(), c.domain.as_str())).collect();
+        assert_eq!(checks, [("dkim", "pass", "bank.com"), ("spf", "fail", "attacker.io"), ("dmarc", "pass", "bank.com")]);
+        assert_eq!(body.auth[1].server, "mx.attacker.io");
+        assert!(!parse_body(b"From: a@b.org\r\nX-Spam-Status: No, score=0\r\n\r\nhi").unwrap().spam);
+    }
+
+    #[test]
+    fn exims_spam_bar_and_spamassassins_rules_are_read() {
+        let raw = "From: a@b.org\r\nX-Spam-Score: -7\r\nX-Spam-Bar: /\r\nX-Spam-Report: Spam detection software\r\n Content analysis details:   (-0.8 points, 5.0 required)\r\n  pts rule name              description\r\n ---- ---------------------- ----\r\n -3.0 RCVD_IN_VALIDITY_CERTIFIED RBL: Sender in Validity\r\n  0.0 SPF_FAIL               SPF: sender does not match SPF record (fail)\r\n\r\nhi";
+        let body = parse_body(raw.as_bytes()).unwrap();
+        assert!(!body.spam);
+        assert_eq!(body.spam_tests, ["RCVD_IN_VALIDITY_CERTIFIED", "SPF_FAIL"]);
+        assert!(parse_body(b"From: a@b.org\r\nX-Spam-Bar: ++++++\r\n\r\nhi").unwrap().spam);
+        let status = parse_body(b"From: a@b.org\r\nX-Spam-Status: Yes, score=9.1 required=5.0 tests=BAYES_99,SPF_FAIL autolearn=no\r\n\r\nhi").unwrap();
+        assert_eq!(status.spam_tests, ["BAYES_99", "SPF_FAIL"]);
     }
 
     #[test]

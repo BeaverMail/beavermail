@@ -28,6 +28,7 @@ blitz-paint = "0.3.0-beta.3"
 blitz-traits = "0.3.0-beta.3"
 anyrender = "0.14"
 anyrender_vello_cpu = "0.18"
+ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier"] }
 scraper = { version = "0.27", default-features = false }
 
 [workspace.lints.rust]

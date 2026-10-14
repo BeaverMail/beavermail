@@ -111,6 +111,10 @@ pub struct Header {
     /// Size of the whole message in bytes; 0 when the server did not say.
     pub size: u32,
     pub has_attachments: bool,
+    /// The To and Cc addresses, lower case, separated by spaces.
+    pub recipients: String,
+    /// The header fields as fetched, for the checks that need no body (sender, Reply-To, the server's verdict).
+    pub raw: Vec<u8>,
 }
 
 /// A message whose file has not been downloaded yet.
@@ -177,15 +181,22 @@ fn role_from_int(n: i64) -> Role {
     }
 }
 
+/// The date as the reader expects it: in this computer's time zone, not the sender's.
+fn local_time(timestamp: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp(timestamp, 0).map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
+}
+
 fn summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageSummary> {
+    let timestamp: i64 = row.get(6)?;
     Ok(MessageSummary {
         id: MessageId(row.get::<_, i64>(0)? as u64),
         from: row.get(1)?,
         address: row.get(2)?,
         subject: row.get(3)?,
         preview: row.get(4)?,
-        received: row.get(5)?,
-        timestamp: row.get(6)?,
+        // The stored text is the sender's clock; it stays only for a message without a valid date.
+        received: if timestamp == 0 { row.get(5)? } else { local_time(timestamp).map_or_else(|| row.get(5), Ok)? },
+        timestamp,
         unread: row.get::<_, i64>(7)? != 0,
         has_attachments: row.get::<_, i64>(8)? != 0,
         message_id: row.get(9)?,
@@ -360,6 +371,38 @@ fn migrate(conn: &Connection) -> Result<(), MailError> {
             )
             .map_err(db)?;
         }
+        // Version 8: the To and Cc addresses, to know whom the user writes to. NULL: not read yet.
+        if version < 8 {
+            conn.execute_batch("ALTER TABLE messages ADD COLUMN recipients TEXT; PRAGMA user_version = 8;").map_err(db)?;
+        }
+        // Version 9: the fetched header fields, to check a message before its body is downloaded. NULL: not read yet.
+        if version < 9 {
+            conn.execute_batch("ALTER TABLE messages ADD COLUMN headers BLOB; PRAGMA user_version = 9;").map_err(db)?;
+        }
+        // Version 10: the header fields kept include the spam filter's report; read them again.
+        if version < 10 {
+            conn.execute_batch("UPDATE messages SET headers = NULL; PRAGMA user_version = 10;").map_err(db)?;
+        }
+        // Version 11: the spam checks' verdict on each message, so only new mail is checked.
+        if version < 11 {
+            conn.execute_batch("ALTER TABLE messages ADD COLUMN verdict TEXT; PRAGMA user_version = 11;").map_err(db)?;
+        }
+        // Version 12: messages the user called spam or not spam, kept as training examples after the
+        // messages themselves move or the server empties its Spam folder.
+        if version < 12 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS examples (
+                     account TEXT NOT NULL,
+                     message_id TEXT NOT NULL,
+                     spam INTEGER NOT NULL,
+                     text TEXT NOT NULL,
+                     domain TEXT NOT NULL,
+                     PRIMARY KEY (account, message_id)
+                 );
+                 PRAGMA user_version = 12;",
+            )
+            .map_err(db)?;
+        }
     Ok(())
 }
 
@@ -481,6 +524,7 @@ impl Store {
         let tx = conn.transaction().map_err(db)?;
         tx.execute("DELETE FROM messages WHERE account = ?1", [account]).map_err(db)?;
         tx.execute("DELETE FROM folders WHERE account = ?1", [account]).map_err(db)?;
+        tx.execute("DELETE FROM examples WHERE account = ?1", [account]).map_err(db)?;
         tx.commit().map_err(db)
     }
 
@@ -549,14 +593,14 @@ impl Store {
             let mut stmt = tx
                 .prepare(
                     "INSERT OR IGNORE INTO messages
-                     (account, folder, uid, from_name, from_addr, subject, received, timestamp, unread, message_id, in_reply_to, refs, size, attach, attach_known)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 1)",
+                     (account, folder, uid, from_name, from_addr, subject, received, timestamp, unread, message_id, in_reply_to, refs, size, attach, attach_known, recipients, headers)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 1, ?15, ?16)",
                 )
                 .map_err(db)?;
             for h in headers {
                 stmt.execute(params![
                     account, folder, i64::from(h.uid), h.from_name, h.from_addr, h.subject, h.received, h.timestamp, i64::from(h.unread),
-                    h.message_id, h.in_reply_to, h.references, i64::from(h.size), i64::from(h.has_attachments)
+                    h.message_id, h.in_reply_to, h.references, i64::from(h.size), i64::from(h.has_attachments), h.recipients, h.raw
                 ])
                 .map_err(db)?;
             }
@@ -631,6 +675,126 @@ impl Store {
             )
             .map(|_| ())
             .map_err(db)
+    }
+
+    /// UIDs of a folder whose recipients were never read (rows from before they were kept).
+    pub fn unknown_recipients(&self, account: &str, folder: &str, limit: usize) -> Result<Vec<u32>, MailError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT uid FROM messages WHERE account = ?1 AND folder = ?2 AND recipients IS NULL ORDER BY timestamp DESC LIMIT ?3").map_err(db)?;
+        let rows = stmt.query_map(params![account, folder, limit as i64], |r| r.get::<_, i64>(0).map(|u| u as u32)).map_err(db)?;
+        rows.collect::<Result<_, _>>().map_err(db)
+    }
+
+    /// Records the To and Cc addresses of a message (lower case, separated by spaces).
+    pub fn set_recipients(&self, account: &str, folder: &str, uid: u32, recipients: &str) -> Result<(), MailError> {
+        self.conn()
+            .execute("UPDATE messages SET recipients = ?4 WHERE account = ?1 AND folder = ?2 AND uid = ?3", params![account, folder, i64::from(uid), recipients])
+            .map(|_| ())
+            .map_err(db)
+    }
+
+    /// UIDs of a folder whose header fields were never kept (rows from before they were).
+    pub fn unknown_headers(&self, account: &str, folder: &str, limit: usize) -> Result<Vec<u32>, MailError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT uid FROM messages WHERE account = ?1 AND folder = ?2 AND headers IS NULL ORDER BY timestamp DESC LIMIT ?3").map_err(db)?;
+        let rows = stmt.query_map(params![account, folder, limit as i64], |r| r.get::<_, i64>(0).map(|u| u as u32)).map_err(db)?;
+        rows.collect::<Result<_, _>>().map_err(db)
+    }
+
+    pub fn set_headers(&self, account: &str, folder: &str, uid: u32, raw: &[u8]) -> Result<(), MailError> {
+        self.conn()
+            .execute("UPDATE messages SET headers = ?4 WHERE account = ?1 AND folder = ?2 AND uid = ?3", params![account, folder, i64::from(uid), raw])
+            .map(|_| ())
+            .map_err(db)
+    }
+
+    /// The header fields kept for a message; `None` when they were not read yet.
+    pub fn headers(&self, id: MessageId) -> Result<Option<Vec<u8>>, MailError> {
+        self.conn().query_row("SELECT headers FROM messages WHERE id = ?1", [id.0 as i64], |r| r.get(0)).optional().map(Option::flatten).map_err(db)
+    }
+
+    /// The spam checks' verdicts kept for the messages of a folder. The archive does not read them.
+    pub fn verdicts(&self, account: &str, folder: &str) -> Result<Vec<(MessageId, String)>, MailError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT id, verdict FROM messages WHERE account = ?1 AND folder = ?2 AND verdict IS NOT NULL").map_err(db)?;
+        let rows = stmt.query_map(params![account, folder], |r| Ok((MessageId(r.get::<_, i64>(0)? as u64), r.get(1)?))).map_err(db)?;
+        rows.collect::<Result<_, _>>().map_err(db)
+    }
+
+    pub fn set_verdicts(&self, verdicts: &[(MessageId, String)]) -> Result<(), MailError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(db)?;
+        {
+            let mut stmt = tx.prepare("UPDATE messages SET verdict = ?2 WHERE id = ?1").map_err(db)?;
+            for (id, verdict) in verdicts {
+                stmt.execute(params![id.0 as i64, verdict]).map_err(db)?;
+            }
+        }
+        tx.commit().map_err(db)
+    }
+
+    /// Forgets a folder's verdicts, so every message is checked again.
+    pub fn clear_verdicts(&self, account: &str, folder: &str) -> Result<(), MailError> {
+        self.conn().execute("UPDATE messages SET verdict = NULL WHERE account = ?1 AND folder = ?2", params![account, folder]).map(|_| ()).map_err(db)
+    }
+
+    /// Keeps a message the user called spam (or not spam) as a training example; a later call on the
+    /// same message replaces it, so changing one's mind does not count twice.
+    pub fn add_example(&self, account: &str, message_id: &str, spam: bool, text: &str, domain: &str) -> Result<(), MailError> {
+        self.conn()
+            .execute("INSERT OR REPLACE INTO examples (account, message_id, spam, text, domain) VALUES (?1, ?2, ?3, ?4, ?5)", params![account, message_id, i64::from(spam), text, domain])
+            .map(|_| ())
+            .map_err(db)
+    }
+
+    /// The training examples of an account: (message id, spam, text, sender domain).
+    pub fn examples(&self, account: &str) -> Result<Vec<(String, bool, String, String)>, MailError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT message_id, spam, text, domain FROM examples WHERE account = ?1").map_err(db)?;
+        let rows = stmt.query_map([account], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0, r.get(2)?, r.get(3)?))).map_err(db)?;
+        rows.collect::<Result<_, _>>().map_err(db)
+    }
+
+    /// Everyone the user has written to from this account: the recipients of its Sent folder, lower case.
+    pub fn correspondents(&self, account: &str) -> Result<std::collections::HashSet<String>, MailError> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT m.recipients FROM messages m JOIN folders f ON f.account = m.account AND f.name = m.folder WHERE m.account = ?1 AND f.role = ?2 AND m.recipients IS NOT NULL")
+            .map_err(db)?;
+        let rows = stmt.query_map(params![account, role_to_int(Role::Sent)], |r| r.get::<_, String>(0)).map_err(db)?;
+        let mut out = std::collections::HashSet::new();
+        for row in rows {
+            out.extend(row.map_err(db)?.split_whitespace().map(str::to_owned));
+        }
+        Ok(out)
+    }
+
+    /// Messages of `folder` that answer one the user sent: their In-Reply-To or References name a
+    /// message of the Sent folder.
+    pub fn replies_to_sent(&self, account: &str, folder: &str) -> Result<std::collections::HashSet<MessageId>, MailError> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT m.message_id FROM messages m JOIN folders f ON f.account = m.account AND f.name = m.folder WHERE m.account = ?1 AND f.role = ?2 AND m.message_id != ''")
+            .map_err(db)?;
+        let sent: std::collections::HashSet<String> = stmt.query_map(params![account, role_to_int(Role::Sent)], |r| r.get(0)).map_err(db)?.collect::<Result<_, _>>().map_err(db)?;
+        let mut stmt = conn.prepare("SELECT id, in_reply_to, refs FROM messages WHERE account = ?1 AND folder = ?2").map_err(db)?;
+        let rows = stmt.query_map(params![account, folder], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))).map_err(db)?;
+        let mut out = std::collections::HashSet::new();
+        for row in rows {
+            let (id, in_reply_to, refs) = row.map_err(db)?;
+            if in_reply_to.split_whitespace().chain(refs.split_whitespace()).any(|r| sent.contains(r)) {
+                out.insert(MessageId(id as u64));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every (display name, lower-case address) the account has received mail from, once each.
+    pub fn senders(&self, account: &str) -> Result<Vec<(String, String)>, MailError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT DISTINCT from_name, lower(from_addr) FROM messages WHERE account = ?1 AND from_addr != ''").map_err(db)?;
+        let rows = stmt.query_map([account], |r| Ok((r.get(0)?, r.get(1)?))).map_err(db)?;
+        rows.collect::<Result<_, _>>().map_err(db)
     }
 
     /// Messages dated `since` or later whose file is not stored, newest first.
@@ -1150,10 +1314,59 @@ mod tests {
     }
 
     #[test]
+    fn dates_are_shown_in_local_time_from_the_timestamp() {
+        let store = store();
+        // Two messages written in different zones: the sender's clock text is not what is shown.
+        store.add_headers("me", "INBOX", &[Header { received: "2026-10-14 16:41".into(), ..header(1, "a", 1_760_446_860, false) }, header(2, "b", 0, false)]).unwrap();
+        let list = store.messages("me", "INBOX").unwrap();
+        assert_eq!(list[0].received, local_time(1_760_446_860).unwrap());
+        assert_eq!(list[1].received, "2026-10-13 12:00", "no date: the stored text");
+    }
+
+    #[test]
     fn other_accounts_do_not_see_each_others_mail() {
         let store = store();
         store.add_headers("me", "INBOX", &[header(1, "mine", 1, false)]).unwrap();
         assert!(store.messages("you", "INBOX").unwrap().is_empty());
         assert!(store.search("you", "mine", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn correspondents_are_the_recipients_of_sent_mail() {
+        let store = store();
+        store.set_folders("me", &[("INBOX".into(), Role::Inbox), ("Sent".into(), Role::Sent)]).unwrap();
+        let sent = |uid, to: &str| Header { recipients: to.into(), ..header(uid, "s", 1, false) };
+        store.add_headers("me", "Sent", &[sent(1, "bob@x.org carol@y.org"), sent(2, "")]).unwrap();
+        store.add_headers("me", "INBOX", &[sent(1, "me@z.org")]).unwrap();
+        let known = store.correspondents("me").unwrap();
+        assert_eq!(known.len(), 2);
+        assert!(known.contains("bob@x.org") && known.contains("carol@y.org") && !known.contains("me@z.org"));
+        // A row from before recipients were kept is read later, then counts.
+        store.conn().execute("UPDATE messages SET recipients = NULL WHERE folder = 'Sent' AND uid = 2", []).unwrap();
+        assert_eq!(store.unknown_recipients("me", "Sent", 10).unwrap(), [2]);
+        store.set_recipients("me", "Sent", 2, "dan@x.org").unwrap();
+        assert!(store.correspondents("me").unwrap().contains("dan@x.org"));
+        assert_eq!(store.senders("me").unwrap(), [("Ada Lovelace".to_owned(), "ada@example.org".to_owned())]);
+        let id = store.id_of("me", "INBOX", 1).unwrap().unwrap();
+        assert_eq!(store.headers(id).unwrap(), Some(Vec::new()));
+        let mine = Header { message_id: "a@me".into(), ..header(3, "s", 1, false) };
+        let answer = Header { in_reply_to: "a@me".into(), ..header(4, "re", 2, false) };
+        let deeper = Header { references: "x@y a@me".into(), ..header(5, "re", 3, false) };
+        store.add_headers("me", "Sent", &[mine]).unwrap();
+        store.add_headers("me", "INBOX", &[answer, deeper]).unwrap();
+        store.set_verdicts(&[(id, "held".into())]).unwrap();
+        assert_eq!(store.verdicts("me", "INBOX").unwrap(), [(id, "held".to_owned())]);
+        store.clear_verdicts("me", "INBOX").unwrap();
+        assert!(store.verdicts("me", "INBOX").unwrap().is_empty());
+        store.add_example("me", "a@x", true, "korean gelatin", "spam.io").unwrap();
+        store.add_example("me", "a@x", false, "korean gelatin", "spam.io").unwrap();
+        assert_eq!(store.examples("me").unwrap(), [("a@x".to_owned(), false, "korean gelatin".to_owned(), "spam.io".to_owned())], "a changed mind replaces");
+        let replies = store.replies_to_sent("me", "INBOX").unwrap();
+        assert_eq!(replies.len(), 2);
+        assert!(!replies.contains(&id));
+        store.conn().execute("UPDATE messages SET headers = NULL WHERE id = ?1", [id.0 as i64]).unwrap();
+        assert_eq!((store.headers(id).unwrap(), store.unknown_headers("me", "INBOX", 10).unwrap()), (None, vec![1]));
+        store.set_headers("me", "INBOX", 1, b"From: a@b").unwrap();
+        assert_eq!(store.headers(id).unwrap().as_deref(), Some(&b"From: a@b"[..]));
     }
 }

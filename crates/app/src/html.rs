@@ -58,6 +58,50 @@ struct Walker {
     pre: bool,
 }
 
+/// Whether showing the message as designed would fetch anything: an image, style or font on a server.
+pub fn has_remote(html: &str) -> bool {
+    let remote = |v: &str| {
+        let v = v.trim_start().to_ascii_lowercase();
+        v.starts_with("http://") || v.starts_with("https://") || v.starts_with("//")
+    };
+    let mut end = html.len().min(MAX_INPUT);
+    while !html.is_char_boundary(end) {
+        end -= 1;
+    }
+    let document = Html::parse_document(&html[..end]);
+    document.tree.nodes().any(|n| match n.value() {
+        Node::Element(e) => ["src", "srcset", "background", "poster"].iter().any(|a| e.attr(a).is_some_and(remote)) || (e.name() == "link" && e.attr("href").is_some_and(remote)) || e.attr("style").is_some_and(|s| s.to_ascii_lowercase().contains("url(")),
+        Node::Text(t) => t.text.to_ascii_lowercase().contains("url(") || t.text.contains("@import"),
+        _ => false,
+    })
+}
+
+/// How many letters and digits the HTML hides from the reader (`display: none`, zero size and the
+/// like). A short hidden preheader is normal in newsletters; a long one is meant for spam filters.
+pub fn hidden_text(html: &str) -> usize {
+    /// `hidden`: nothing below can be seen. `tiny`: font size zero, which a descendant can set back,
+    /// as layout templates do (zero on the container removes the gaps between inline blocks).
+    fn walk(el: ElementRef<'_>, hidden: bool, tiny: bool) -> usize {
+        let style: String = el.value().attr("style").unwrap_or("").to_ascii_lowercase().chars().filter(|c| !c.is_whitespace()).collect();
+        // The number in front of the unit ("0", "0px", "16px"), if the property is set.
+        let number = |prop: &str| style.split(';').filter_map(|d| d.strip_prefix(prop)).next_back().and_then(|v| v.split(|c: char| !(c.is_ascii_digit() || c == '.')).next()?.parse::<f32>().ok());
+        let hidden = hidden || el.value().attr("hidden").is_some() || style.contains("display:none") || style.contains("visibility:hidden") || number("opacity:") == Some(0.0);
+        let tiny = number("font-size:").map_or(tiny, |size| size == 0.0);
+        el.children()
+            .map(|child| match child.value() {
+                Node::Text(t) if hidden || tiny => t.chars().filter(|c| c.is_alphanumeric()).count(),
+                Node::Element(_) => ElementRef::wrap(child).map_or(0, |c| walk(c, hidden, tiny)),
+                _ => 0,
+            })
+            .sum()
+    }
+    let mut end = html.len().min(MAX_INPUT);
+    while !html.is_char_boundary(end) {
+        end -= 1;
+    }
+    walk(Html::parse_document(&html[..end]).root_element(), false, false)
+}
+
 /// The HTML reduced to blocks.
 pub fn blocks(html: &str) -> Vec<Block> {
     let mut end = html.len().min(MAX_INPUT);
@@ -288,7 +332,7 @@ pub fn host(url: &str) -> String {
 pub fn looks_misleading(text: &str, url: &str) -> bool {
     let text = text.trim();
     let named = text.starts_with("http://") || text.starts_with("https://") || (text.contains('.') && !text.contains(' ') && !text.contains('@'));
-    named && !url.to_ascii_lowercase().starts_with("mailto:") && host(text) != host(url)
+    named && !url.to_ascii_lowercase().starts_with("mailto:") && !crate::sender::same_site(&host(text), &host(url))
 }
 
 /// The link without known tracking parameters.
@@ -389,11 +433,30 @@ mod tests {
         assert!(looks_misleading("https://bank.com/a", "https://evil.example/"));
         assert!(!looks_misleading("https://www.bank.com/a", "https://bank.com/b"));
         assert!(!looks_misleading("Click here", "https://evil.example/"));
+        assert!(!looks_misleading("www.scaleway.com", "https://links.scaleway.com/c/1"), "a subdomain of the site named");
+    }
+
+    #[test]
+    fn hidden_text_is_measured_once() {
+        let html = r#"<p>shown</p><div style="display: none">abc <span style="font-size:16px">de</span></div><span style="FONT-SIZE: 0px">fg</span><i hidden>h</i><b style="font-size:0.9em">shown</b><b style="opacity:0.5">shown</b><div style="opacity:0">i&zwnj; &zwnj;</div>"#;
+        assert_eq!(hidden_text(html), 3 + 2 + 2 + 1 + 1, "only letters and digits count");
+        let layout = r#"<td style="font-size:0px"><div style="font-size:16px">Hello Ada, your invoice</div></td>"#;
+        assert_eq!(hidden_text(layout), 0, "a zero-size container whose text sets its own size back is visible");
     }
 
     #[test]
     fn huge_input_is_cut_instead_of_freezing() {
         let html = format!("<p>{}</p>", "x ".repeat(MAX_INPUT));
         assert!(blocks(&html).len() <= MAX_BLOCKS);
+    }
+
+    #[test]
+    fn remote_content_is_detected_but_links_and_inline_images_are_not() {
+        assert!(has_remote(r#"<img src="https://t.example/p.gif">"#));
+        assert!(has_remote(r#"<body background="//cdn.example/bg.png">hi"#));
+        assert!(has_remote(r#"<p style="background:url('http://x.example/a.png')">hi</p>"#));
+        assert!(has_remote(r#"<link rel="stylesheet" href="https://x.example/a.css">"#));
+        assert!(has_remote("<style>@import url(https://x.example/a.css);</style>"));
+        assert!(!has_remote(r#"<p>hi <a href="https://x.example">link</a></p><img src="data:image/png;base64,AAAA"><img src="cid:logo">"#));
     }
 }
