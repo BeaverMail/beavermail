@@ -71,6 +71,13 @@ pub struct Attachment {
     pub size: u64,
 }
 
+/// A message found by a search, with the folder it is in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hit {
+    pub message: MessageSummary,
+    pub folder: String,
+}
+
 /// What opening a message needs beyond its summary: text, recipients and threading headers.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MessageBody {

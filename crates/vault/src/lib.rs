@@ -295,6 +295,19 @@ impl Vault {
         Ok(())
     }
 
+    /// A key for another use (the search index), derived from the data key so it never has to be
+    /// stored. `None` when the vault is off or locked, which means "not encrypted" to the caller.
+    pub fn derived_key(&self, purpose: &str) -> Option<Zeroizing<[u8; 32]>> {
+        let state = self.read_state();
+        let key = state.key.as_deref()?;
+        // The data key is already uniformly random; Argon2 at its minimum cost is just a keyed hash here.
+        let params = Params::new(8, 1, 1, Some(32)).ok()?;
+        let mut out = Zeroizing::new([0u8; 32]);
+        let salt = [b"beavermail-derive:".as_slice(), purpose.as_bytes()].concat();
+        Argon2::new(Algorithm::Argon2id, Version::V0x13, params).hash_password_into(key, &salt, &mut *out).ok()?;
+        Some(out)
+    }
+
     fn unwrap_with_passphrase(&self, slot: &Slot, passphrase: &str) -> Result<Zeroizing<[u8; 32]>, MailError> {
         let slot_key = derive(passphrase, &from_hex(&slot.salt)?, slot.kdf.unwrap_or(KDF))?;
         unwrap_key(&slot_key, &slot.wrapped).map_err(|_| MailError::Auth("wrong passphrase".into()))
@@ -723,6 +736,14 @@ mod tests {
         std::fs::write(dir.join(&a), b"From: forged\r\n\r\nhi").unwrap();
         assert!(vault.read(&a).is_err(), "a plain file planted in an encrypted vault");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn derived_keys_are_stable_and_per_purpose() {
+        let vault = Vault::in_memory();
+        let (a, b, c) = (vault.derived_key("index").unwrap(), vault.derived_key("index").unwrap(), vault.derived_key("other").unwrap());
+        assert_eq!(*a, *b);
+        assert_ne!(*a, *c);
     }
 
     #[test]

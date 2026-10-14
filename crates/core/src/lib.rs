@@ -8,7 +8,7 @@
 pub mod model;
 pub mod sample;
 
-pub use model::{Account, Attachment, DisplayMode, Keep, Mailbox, MessageBody, MessageId, MessageSummary, Outgoing, OutgoingFile, Progress, Role, Server, Settings, SyncReport, Tls};
+pub use model::{Account, Attachment, DisplayMode, Hit, Keep, Mailbox, MessageBody, MessageId, MessageSummary, Outgoing, OutgoingFile, Progress, Role, Server, Settings, SyncReport, Tls};
 
 use std::fmt;
 use std::future::Future;
@@ -43,6 +43,10 @@ impl std::error::Error for MailError {}
 pub trait MailSource {
     /// Mailboxes (folders) as the local archive knows them, without touching the network.
     fn cached_mailboxes(&self) -> impl Future<Output = Result<Vec<Mailbox>, MailError>> + Send;
+
+    /// Searches the local archive of the account: words (in sender, subject, preview and message text),
+    /// `from:`, `subject:`, `in:<folder>`, `is:unread`, `has:attachment`. Newest first.
+    fn search(&self, query: &str, limit: usize) -> impl Future<Output = Result<Vec<Hit>, MailError>> + Send;
 
     /// Asks the server for the mailboxes, remembers them locally and returns them.
     fn mailboxes(&self) -> impl Future<Output = Result<Vec<Mailbox>, MailError>> + Send;

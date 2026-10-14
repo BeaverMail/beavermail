@@ -9,10 +9,10 @@
 //! shortcut: the database file is not encrypted yet; PRD 7.3 asks for a key held in the system
 //! keychain (SQLCipher or file-level encryption), to be added before any release.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use beavermail_core::{MailError, MessageId, MessageSummary, Role};
+use beavermail_core::{Hit, MailError, MessageId, MessageSummary, Role};
 use rusqlite::{Connection, OptionalExtension, params};
 
 const SCHEMA: &str = "
@@ -67,7 +67,31 @@ END;
 ";
 
 pub struct Store {
-    conn: Mutex<Connection>,
+    inner: Mutex<Inner>,
+}
+
+/// The open database and what is known about how it is kept on disk.
+struct Inner {
+    conn: Connection,
+    /// The database file; `None` for one in memory.
+    path: Option<PathBuf>,
+    /// The key the file is encrypted with; `None` when it is plain.
+    key: Option<[u8; 32]>,
+    /// A stand-in until the key is available (a passphrase not entered yet): empty, and in memory.
+    locked: bool,
+}
+
+impl std::ops::Deref for Inner {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.conn
+    }
+}
+
+impl std::ops::DerefMut for Inner {
+    fn deref_mut(&mut self) -> &mut Connection {
+        &mut self.conn
+    }
 }
 
 /// A message header as the sync reads it from the server.
@@ -168,23 +192,132 @@ fn summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageSummary> {
     })
 }
 
+/// A search as the user typed it, split into what it asks for.
+#[derive(Default, Debug, PartialEq, Eq)]
+struct Query {
+    words: Vec<String>,
+    from: Vec<String>,
+    subject: Vec<String>,
+    folders: Vec<String>,
+    unread: bool,
+    attachment: bool,
+}
+
+impl Query {
+    fn parse(text: &str) -> Self {
+        let mut query = Self::default();
+        for token in tokens(text) {
+            match token.split_once(':') {
+                Some(("from", v)) if !v.is_empty() => query.from.push(v.to_owned()),
+                Some(("subject", v)) if !v.is_empty() => query.subject.push(v.to_owned()),
+                Some(("in", v)) if !v.is_empty() => query.folders.push(v.to_owned()),
+                Some(("is", v)) if v.eq_ignore_ascii_case("unread") => query.unread = true,
+                Some(("has", v)) if v.eq_ignore_ascii_case("attachment") => query.attachment = true,
+                _ => query.words.push(token),
+            }
+        }
+        query
+    }
+
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Splits on spaces; a double-quoted run stays one token (without its quotes).
+fn tokens(text: &str) -> Vec<String> {
+    let (mut out, mut current, mut quoted) = (Vec::new(), String::new(), false);
+    for c in text.chars() {
+        match c {
+            '"' => quoted = !quoted,
+            c if c.is_whitespace() && !quoted => {
+                if !current.is_empty() {
+                    out.push(std::mem::take(&mut current));
+                }
+            }
+            c => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+/// One search term as an FTS5 phrase, quoted so that it cannot be taken for syntax. A single word also
+/// matches as a prefix ("budg" finds "budget").
+fn fts_term(word: &str) -> String {
+    let clean = word.replace('"', " ");
+    let clean = clean.trim();
+    if clean.contains(char::is_whitespace) { format!("\"{clean}\"") } else { format!("\"{clean}\"*") }
+}
+
 const SUMMARY_COLUMNS: &str = "id, CASE WHEN from_name = '' THEN from_addr ELSE from_name END, from_addr, subject, preview, received, timestamp, unread, attach, message_id";
 
-impl Store {
-    /// Opens (and creates) the archive at `path`.
-    pub fn open(path: &Path) -> Result<Self, MailError> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(db)?;
+/// The key as SQLCipher takes a raw one: `x'<hex>'`.
+fn raw_key(key: &[u8; 32]) -> String {
+    format!("x'{}'", key.iter().map(|b| format!("{b:02x}")).collect::<String>())
+}
+
+/// Opens the database file with `key` (or plain). Reading something proves the key is right.
+fn open_file(path: &Path, key: Option<&[u8; 32]>) -> Result<Connection, MailError> {
+    let attempt = |key: Option<&[u8; 32]>| -> Result<Connection, rusqlite::Error> {
+        let conn = Connection::open(path)?;
+        if let Some(key) = key {
+            conn.execute_batch(&format!("PRAGMA key = \"{}\";", raw_key(key)))?;
         }
-        Self::with(Connection::open(path).map_err(db)?)
+        conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0))?;
+        Ok(conn)
+    };
+    if !path.exists() {
+        return attempt(key).map_err(db);
     }
-
-    /// A throwaway archive in memory, for tests.
-    pub fn in_memory() -> Result<Self, MailError> {
-        Self::with(Connection::open_in_memory().map_err(db)?)
+    match attempt(key) {
+        Ok(conn) => Ok(conn),
+        // A file written before the index was encrypted: encrypt it now.
+        Err(_) if key.is_some() && attempt(None).is_ok() => {
+            export_file(path, None, key)?;
+            attempt(key).map_err(db)
+        }
+        Err(_) if key.is_none() => Err(MailError::Auth("the archive is encrypted".into())),
+        Err(e) => Err(MailError::Auth(format!("the archive cannot be opened with this key: {e}"))),
     }
+}
 
-    fn with(conn: Connection) -> Result<Self, MailError> {
+/// Rewrites the database file from `from` to `to` (a key, or plain) through SQLCipher's export, then
+/// replaces the old file with the new one.
+fn export_file(path: &Path, from: Option<&[u8; 32]>, to: Option<&[u8; 32]>) -> Result<(), MailError> {
+    let tmp = path.with_extension("rewrite");
+    let _ = std::fs::remove_file(&tmp);
+    {
+        let conn = Connection::open(path).map_err(db)?;
+        if let Some(key) = from {
+            conn.execute_batch(&format!("PRAGMA key = \"{}\";", raw_key(key))).map_err(db)?;
+        }
+        let _: i64 = conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0)).map_err(db)?;
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        let target = to.map_or_else(String::new, raw_key);
+        conn.execute("ATTACH DATABASE ?1 AS rewritten KEY ?2", params![tmp.to_string_lossy(), target]).map_err(db)?;
+        conn.query_row("SELECT sqlcipher_export('rewritten')", [], |_| Ok(())).map_err(db)?;
+        // The export copies tables and rows, not the schema version the migrations rely on.
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).map_err(db)?;
+        conn.execute_batch(&format!("PRAGMA rewritten.user_version = {version}; DETACH DATABASE rewritten;")).map_err(db)?;
+    }
+    remove_database(path);
+    std::fs::rename(&tmp, path).map_err(db)
+}
+
+/// Deletes the database file and the files SQLite keeps next to it.
+fn remove_database(path: &Path) {
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        let _ = std::fs::remove_file(PathBuf::from(name));
+    }
+}
+
+/// Brings the tables up to the current version.
+fn migrate(conn: &Connection) -> Result<(), MailError> {
         conn.execute_batch(SCHEMA).map_err(db)?;
         // Version 2: message bodies moved out of the database into encrypted files (PRD D11).
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).map_err(db)?;
@@ -214,12 +347,106 @@ impl Store {
         if version < 6 {
             conn.execute_batch("ALTER TABLE messages ADD COLUMN attach_known INTEGER NOT NULL DEFAULT 0; PRAGMA user_version = 6;").map_err(db)?;
         }
-        Ok(Self { conn: Mutex::new(conn) })
+        // Version 7: the text of messages is searchable. `body_fts` keeps only the words, not the text
+        // (contentless), and `indexed` says which messages are in it.
+        if version < 7 {
+            conn.execute_batch(
+                "ALTER TABLE messages ADD COLUMN indexed INTEGER NOT NULL DEFAULT 0;
+                 CREATE VIRTUAL TABLE IF NOT EXISTS body_fts USING fts5 (body, content = '', contentless_delete = 1, tokenize = 'unicode61 remove_diacritics 2');
+                 CREATE TRIGGER IF NOT EXISTS messages_body_ad AFTER DELETE ON messages BEGIN
+                     DELETE FROM body_fts WHERE rowid = old.id;
+                 END;
+                 PRAGMA user_version = 7;",
+            )
+            .map_err(db)?;
+        }
+    Ok(())
+}
+
+impl Store {
+    /// Opens (and creates) the archive at `path`, encrypted with `key` (SQLCipher) or plain when `key`
+    /// is `None`. A plain file opened with a key is encrypted in place; an encrypted file opened without
+    /// one is [`MailError::Auth`], because it cannot be read.
+    pub fn open(path: &Path, key: Option<&[u8; 32]>) -> Result<Self, MailError> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(db)?;
+        }
+        let conn = open_file(path, key)?;
+        Self::with(conn, Some(path.to_path_buf()), key.copied())
     }
 
-    fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+    /// An empty stand-in for the archive at `path`, for as long as its key is not known. Call
+    /// [`Store::unlock`] when it is.
+    pub fn locked(path: &Path) -> Result<Self, MailError> {
+        let store = Self::with(Connection::open_in_memory().map_err(db)?, Some(path.to_path_buf()), None)?;
+        store.conn().locked = true;
+        Ok(store)
+    }
+
+    /// A throwaway archive in memory, for tests.
+    pub fn in_memory() -> Result<Self, MailError> {
+        Self::with(Connection::open_in_memory().map_err(db)?, None, None)
+    }
+
+    fn with(conn: Connection, path: Option<PathBuf>, key: Option<[u8; 32]>) -> Result<Self, MailError> {
+        migrate(&conn)?;
+        Ok(Self { inner: Mutex::new(Inner { conn, path, key, locked: false }) })
+    }
+
+    /// Whether this is still the empty stand-in made by [`Store::locked`].
+    pub fn is_locked(&self) -> bool {
+        self.conn().locked
+    }
+
+    /// Opens the real archive of a [`Store::locked`] one, with its key.
+    pub fn unlock(&self, key: Option<&[u8; 32]>) -> Result<(), MailError> {
+        let mut inner = self.conn();
+        let Some(path) = inner.path.clone() else { return Ok(()) };
+        let conn = open_file(&path, key)?;
+        migrate(&conn)?;
+        *inner = Inner { conn, path: Some(path), key: key.copied(), locked: false };
+        Ok(())
+    }
+
+    /// Changes how the file is kept: plain to encrypted, encrypted to plain, or under another key. A
+    /// no-op for a database in memory and when nothing changes.
+    pub fn rekey(&self, key: Option<&[u8; 32]>) -> Result<(), MailError> {
+        let mut inner = self.conn();
+        let Some(path) = inner.path.clone() else { return Ok(()) };
+        if inner.key.as_ref() == key {
+            return Ok(());
+        }
+        match (inner.key, key) {
+            (Some(_), Some(new)) => {
+                inner.conn.execute_batch(&format!("PRAGMA rekey = \"{}\";", raw_key(new))).map_err(db)?;
+            }
+            (current, new) => {
+                // Close the file, rewrite it through an export, and open the result.
+                inner.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").map_err(db)?;
+                inner.conn = Connection::open_in_memory().map_err(db)?;
+                export_file(&path, current.as_ref(), new)?;
+                inner.conn = open_file(&path, new)?;
+            }
+        }
+        inner.key = key.copied();
+        Ok(())
+    }
+
+    /// Throws the archive away and starts an empty one (the key was lost: the mail is downloaded again).
+    pub fn reset(&self, key: Option<&[u8; 32]>) -> Result<(), MailError> {
+        let mut inner = self.conn();
+        let Some(path) = inner.path.clone() else { return Ok(()) };
+        inner.conn = Connection::open_in_memory().map_err(db)?;
+        remove_database(&path);
+        let conn = open_file(&path, key)?;
+        migrate(&conn)?;
+        *inner = Inner { conn, path: Some(path), key: key.copied(), locked: false };
+        Ok(())
+    }
+
+    fn conn(&self) -> std::sync::MutexGuard<'_, Inner> {
         // A panic while the lock was held leaves consistent data (every write is a transaction).
-        self.conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Records the folders the server lists and forgets those that no longer exist.
@@ -478,20 +705,82 @@ impl Store {
         self.conn().execute("UPDATE messages SET preview = ?2 WHERE id = ?1", params![id.0 as i64, preview]).map(|_| ()).map_err(db)
     }
 
-    /// Messages of one account whose sender, subject or preview contain every word of `query`.
-    pub fn search(&self, account: &str, query: &str, limit: usize) -> Result<Vec<MessageSummary>, MailError> {
-        // Each word becomes a quoted prefix term, so user input can never be FTS syntax.
-        let terms: Vec<String> = query.split_whitespace().map(|w| format!("\"{}\"*", w.replace('"', ""))).collect();
-        if terms.is_empty() {
+    /// Keeps the words of a message's text for searching (at most the first 200 000 characters).
+    pub fn index_body(&self, id: MessageId, text: &str) -> Result<(), MailError> {
+        let text: String = text.chars().take(200_000).collect();
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(db)?;
+        tx.execute("DELETE FROM body_fts WHERE rowid = ?1", [id.0 as i64]).map_err(db)?;
+        tx.execute("INSERT INTO body_fts (rowid, body) VALUES (?1, ?2)", params![id.0 as i64, text]).map_err(db)?;
+        tx.execute("UPDATE messages SET indexed = 1 WHERE id = ?1", [id.0 as i64]).map_err(db)?;
+        tx.commit().map_err(db)
+    }
+
+    /// Messages whose file is stored but whose text is not searchable yet: (id, folder, uid).
+    pub fn unindexed(&self, account: &str, limit: usize) -> Result<Vec<(MessageId, String, u32)>, MailError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT id, folder, uid FROM messages WHERE account = ?1 AND stored = 1 AND indexed = 0 LIMIT ?2").map_err(db)?;
+        let rows = stmt.query_map(params![account, limit as i64], |r| Ok((MessageId(r.get::<_, i64>(0)? as u64), r.get(1)?, r.get::<_, i64>(2)? as u32))).map_err(db)?;
+        rows.collect::<Result<_, _>>().map_err(db)
+    }
+
+    /// Empties the text index, as if the messages had been stored before searching existed. For tests.
+    #[doc(hidden)]
+    pub fn forget_index_for_tests(&self) {
+        let conn = self.conn();
+        conn.execute_batch("INSERT INTO body_fts (body_fts) VALUES ('delete-all'); UPDATE messages SET indexed = 0, preview = '';").expect("the index can be emptied");
+    }
+
+    /// The file of a message turned out to be missing: it is not stored after all, and not indexed.
+    pub fn clear_stored(&self, id: MessageId) -> Result<(), MailError> {
+        self.conn().execute("UPDATE messages SET stored = 0, indexed = 0 WHERE id = ?1", [id.0 as i64]).map(|_| ()).map_err(db)
+    }
+
+    /// Marks a stored message as searched, when it has no text to add.
+    pub fn mark_indexed(&self, id: MessageId) -> Result<(), MailError> {
+        self.conn().execute("UPDATE messages SET indexed = 1 WHERE id = ?1", [id.0 as i64]).map(|_| ()).map_err(db)
+    }
+
+    /// Messages of one account that match `query`, newest first. Words must all appear, in the sender,
+    /// subject, preview or text of the message. `from:`, `subject:`, `in:<folder>`, `is:unread` and
+    /// `has:attachment` narrow it down; a `"quoted phrase"` stays together. User input is never FTS syntax.
+    pub fn search(&self, account: &str, query: &str, limit: usize) -> Result<Vec<Hit>, MailError> {
+        let query = Query::parse(query);
+        if query.is_empty() {
             return Ok(Vec::new());
         }
+        let mut conditions = vec!["account = ?1".to_owned()];
+        let mut args: Vec<String> = vec![account.to_owned()];
+        let arg = |value: String, args: &mut Vec<String>| {
+            args.push(value);
+            format!("?{}", args.len())
+        };
+        for word in &query.words {
+            let p = arg(fts_term(word), &mut args);
+            conditions.push(format!("(id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH {p}) OR id IN (SELECT rowid FROM body_fts WHERE body_fts MATCH {p}))"));
+        }
+        for who in &query.from {
+            let p = arg(format!("{{from_name from_addr}} : {}", fts_term(who)), &mut args);
+            conditions.push(format!("id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH {p})"));
+        }
+        for what in &query.subject {
+            let p = arg(format!("subject : {}", fts_term(what)), &mut args);
+            conditions.push(format!("id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH {p})"));
+        }
+        for folder in &query.folders {
+            let p = arg(folder.to_lowercase(), &mut args);
+            conditions.push(format!("LOWER(folder) = {p}"));
+        }
+        if query.unread {
+            conditions.push("unread = 1".to_owned());
+        }
+        if query.attachment {
+            conditions.push("attach = 1".to_owned());
+        }
+        let sql = format!("SELECT {SUMMARY_COLUMNS}, folder FROM messages WHERE {} ORDER BY timestamp DESC LIMIT {}", conditions.join(" AND "), limit.min(1000));
         let conn = self.conn();
-        let sql = format!(
-            "SELECT {SUMMARY_COLUMNS} FROM messages WHERE account = ?1 AND id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?2)
-             ORDER BY timestamp DESC LIMIT ?3"
-        );
         let mut stmt = conn.prepare(&sql).map_err(db)?;
-        let rows = stmt.query_map(params![account, terms.join(" "), limit as i64], summary).map_err(db)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |r| Ok(Hit { message: summary(r)?, folder: r.get(10)? })).map_err(db)?;
         rows.collect::<Result<_, _>>().map_err(db)
     }
 
@@ -607,7 +896,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA).unwrap();
         conn.execute_batch("PRAGMA user_version = 2;").unwrap();
-        let store = Store::with(conn).unwrap();
+        let store = Store::with(conn, None, None).unwrap();
         store.add_headers("me", "INBOX", &[header(1, "a", 1, false)]).unwrap();
         assert_eq!(store.count_pending("me", "INBOX", 0).unwrap(), 1);
     }
@@ -650,7 +939,7 @@ mod tests {
     fn an_old_database_loses_its_bodies_table() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE bodies (id INTEGER PRIMARY KEY, data TEXT); PRAGMA user_version = 1;").unwrap();
-        let store = Store::with(conn).unwrap();
+        let store = Store::with(conn, None, None).unwrap();
         let tables: i64 = store.conn().query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = 'bodies'", [], |r| r.get(0)).unwrap();
         assert_eq!(tables, 0);
     }
@@ -696,6 +985,168 @@ mod tests {
         // PRD section 5: search over 50k messages in 500 ms. Generous bounds so a slow CI box does not flake.
         assert!(search < std::time::Duration::from_millis(500), "search took {search:?}");
         assert!(list < std::time::Duration::from_secs(2), "list took {list:?}");
+    }
+
+    fn found(store: &Store, query: &str) -> Vec<String> {
+        store.search("me", query, 50).unwrap().into_iter().map(|h| h.message.subject).collect()
+    }
+
+    #[test]
+    fn the_text_of_a_message_is_searchable_once_indexed_and_leaves_with_the_message() {
+        let store = store();
+        store.add_headers("me", "INBOX", &[header(1, "Plan", 1, false), header(2, "Lunch", 2, false)]).unwrap();
+        let id = store.id_of("me", "INBOX", 1).unwrap().unwrap();
+        assert!(found(&store, "gazpacho").is_empty());
+        store.index_body(id, "We will serve gazpacho on Friday").unwrap();
+        assert_eq!(found(&store, "gazpacho"), ["Plan"]);
+        assert_eq!(found(&store, "gazp plan"), ["Plan"], "words from the text and the subject together");
+        assert!(found(&store, "gazpacho lunch").is_empty(), "every word has to match");
+        // Indexing again replaces, it does not add.
+        store.index_body(id, "Now it is paella").unwrap();
+        assert!(found(&store, "gazpacho").is_empty());
+        assert_eq!(found(&store, "paella"), ["Plan"]);
+        store.remove_uids("me", "INBOX", &[1]).unwrap();
+        assert!(found(&store, "paella").is_empty(), "gone from the index with the message");
+    }
+
+    #[test]
+    fn stored_messages_not_yet_in_the_index_are_listed_until_indexed() {
+        let store = store();
+        store.add_headers("me", "INBOX", &[header(1, "a", 1, false), header(2, "b", 2, false)]).unwrap();
+        assert!(store.unindexed("me", 10).unwrap().is_empty(), "no file yet, nothing to index");
+        store.mark_stored("me", "INBOX", 1).unwrap();
+        store.mark_stored("me", "INBOX", 2).unwrap();
+        let waiting = store.unindexed("me", 10).unwrap();
+        assert_eq!(waiting.iter().map(|(_, f, u)| (f.as_str(), *u)).collect::<Vec<_>>().len(), 2);
+        store.index_body(waiting[0].0, "text").unwrap();
+        store.mark_indexed(waiting[1].0).unwrap();
+        assert!(store.unindexed("me", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn operators_narrow_a_search() {
+        let store = store();
+        let mut ada = header(1, "Budget review", 3, true);
+        ada.has_attachments = true;
+        let mut grace = header(2, "Budget notes", 2, false);
+        grace.from_name = "Grace Hopper".into();
+        grace.from_addr = "grace@navy.example".into();
+        store.add_headers("me", "INBOX", &[ada, grace]).unwrap();
+        store.add_headers("me", "Archive", &[header(3, "Old budget", 1, false)]).unwrap();
+        assert_eq!(found(&store, "budget"), ["Budget review", "Budget notes", "Old budget"], "newest first");
+        assert_eq!(found(&store, "from:grace"), ["Budget notes"]);
+        assert_eq!(found(&store, "from:navy.example budget"), ["Budget notes"]);
+        assert_eq!(found(&store, "subject:review"), ["Budget review"]);
+        assert_eq!(found(&store, "is:unread"), ["Budget review"]);
+        assert_eq!(found(&store, "has:attachment budget"), ["Budget review"]);
+        assert_eq!(found(&store, "in:archive budget"), ["Old budget"]);
+        assert_eq!(found(&store, "\"budget notes\""), ["Budget notes"], "a phrase stays together");
+        assert!(found(&store, "from:").len() <= 3, "an empty operator is just text");
+        let hits = store.search("me", "in:archive", 10).unwrap();
+        assert_eq!(hits[0].folder, "Archive");
+    }
+
+    #[test]
+    fn search_text_is_never_syntax() {
+        let store = store();
+        store.add_headers("me", "INBOX", &[header(1, "Plain", 1, false)]).unwrap();
+        for hostile in ["\"", "NEAR(", "a AND OR b", "* *", "subject:\"", "(((", "from:{x}", "'; DROP TABLE messages; --"] {
+            assert!(store.search("me", hostile, 10).is_ok(), "{hostile}");
+        }
+        assert_eq!(found(&store, "plain"), ["Plain"], "and the table is still there");
+    }
+
+    fn temp_file(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("beavermail-store-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir.join("mail.sqlite3")
+    }
+
+    /// Everything the files next to the database hold, as one byte string.
+    fn raw_bytes(path: &Path) -> Vec<u8> {
+        ["", "-wal", "-shm"].iter().flat_map(|suffix| {
+            let mut name = path.as_os_str().to_owned();
+            name.push(suffix);
+            std::fs::read(PathBuf::from(name)).unwrap_or_default()
+        }).collect()
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    fn fill(store: &Store) {
+        store.set_folders("me", &[("INBOX".into(), Role::Inbox)]).unwrap();
+        store.add_headers("me", "INBOX", &[header(1, "Quarterly zeppelin budget", 5, true)]).unwrap();
+        let id = store.id_of("me", "INBOX", 1).unwrap().unwrap();
+        store.index_body(id, "the quokka said hello").unwrap();
+    }
+
+    #[test]
+    fn an_encrypted_index_is_unreadable_without_its_key_and_still_searchable_with_it() {
+        let path = temp_file("encrypted");
+        let key = [7u8; 32];
+        fill(&Store::open(&path, Some(&key)).unwrap());
+        let raw = raw_bytes(&path);
+        assert!(!contains(&raw, b"zeppelin") && !contains(&raw, b"quokka") && !contains(&raw, b"ada@example.org"), "no plain text on disk");
+        assert!(matches!(Store::open(&path, None), Err(MailError::Auth(_))), "no key");
+        assert!(matches!(Store::open(&path, Some(&[8u8; 32])), Err(MailError::Auth(_))), "the wrong key");
+        let again = Store::open(&path, Some(&key)).unwrap();
+        assert_eq!(found(&again, "zeppelin").len(), 1, "the subject index");
+        assert_eq!(found(&again, "quokka").len(), 1, "the text index");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_plain_index_is_encrypted_when_opened_with_a_key_and_loses_nothing() {
+        let path = temp_file("convert");
+        fill(&Store::open(&path, None).unwrap());
+        assert!(contains(&raw_bytes(&path), b"zeppelin"), "plain to begin with");
+        let key = [9u8; 32];
+        let store = Store::open(&path, Some(&key)).unwrap();
+        assert!(!contains(&raw_bytes(&path), b"zeppelin"), "encrypted now");
+        assert_eq!(found(&store, "zeppelin").len(), 1);
+        assert_eq!(found(&store, "quokka").len(), 1);
+        assert_eq!(store.folders("me").unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn rekeying_changes_the_key_and_can_remove_the_encryption() {
+        let path = temp_file("rekey");
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+        let store = Store::open(&path, Some(&a)).unwrap();
+        fill(&store);
+        store.rekey(Some(&b)).unwrap();
+        assert!(matches!(Store::open(&path, Some(&a)), Err(MailError::Auth(_))), "the old key is dead");
+        assert_eq!(found(&Store::open(&path, Some(&b)).unwrap(), "quokka").len(), 1);
+        store.rekey(None).unwrap();
+        assert!(contains(&raw_bytes(&path), b"zeppelin"), "plain again");
+        assert_eq!(found(&store, "quokka").len(), 1, "the open store keeps working through the change");
+        store.rekey(Some(&a)).unwrap();
+        assert!(!contains(&raw_bytes(&path), b"zeppelin"));
+        assert_eq!(found(&Store::open(&path, Some(&a)).unwrap(), "zeppelin").len(), 1);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_locked_stand_in_is_empty_until_unlocked_and_a_reset_starts_over() {
+        let path = temp_file("locked");
+        let key = [3u8; 32];
+        fill(&Store::open(&path, Some(&key)).unwrap());
+        let store = Store::locked(&path).unwrap();
+        assert!(store.is_locked() && store.folders("me").unwrap().is_empty());
+        assert!(store.unlock(Some(&[4u8; 32])).is_err(), "the wrong key leaves it locked");
+        assert!(store.is_locked());
+        store.unlock(Some(&key)).unwrap();
+        assert!(!store.is_locked());
+        assert_eq!(found(&store, "zeppelin").len(), 1);
+        // The key is lost: start over with a new one, and the old content is gone for good.
+        store.reset(Some(&[5u8; 32])).unwrap();
+        assert!(store.folders("me").unwrap().is_empty());
+        assert!(!contains(&raw_bytes(&path), b"zeppelin"));
+        assert!(Store::open(&path, Some(&[5u8; 32])).is_ok());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]

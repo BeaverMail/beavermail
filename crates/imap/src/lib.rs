@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use async_imap::types::{Fetch, Flag, NameAttribute};
 use async_imap::{Client, Session};
-use beavermail_core::{Account, Attachment, Keep, MailError, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Progress, Role, Server, SyncReport, Tls};
+use beavermail_core::{Account, Attachment, Hit, Keep, MailError, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Progress, Role, Server, SyncReport, Tls};
 use beavermail_store::{Header, Location, Store};
 use beavermail_vault::{Vault, folder_path, message_path};
 use futures::TryStreamExt;
@@ -330,6 +330,35 @@ impl ImapSource {
     const BATCH_MESSAGES: usize = 25;
     const BATCH_BYTES: u64 = 4 * 1024 * 1024;
 
+    /// Makes the text of messages that were stored before searching existed (or whose download did not
+    /// get to it) searchable. A message whose file turns out to be missing is marked as not stored, so
+    /// the next download fetches it again.
+    async fn index_stored(&self) -> Result<(), MailError> {
+        loop {
+            let batch = self.store.unindexed(&self.account, 200)?;
+            if batch.is_empty() {
+                return Ok(());
+            }
+            for (id, folder, uid) in batch {
+                let path = self.file_of(&self.account, &folder, uid)?;
+                match self.files.read(&path) {
+                    Ok(Some(raw)) => match parse_body(&raw) {
+                        Ok(body) => {
+                            self.store.set_preview(id, &body.text)?;
+                            self.store.set_attachments(&self.account, &folder, uid, !body.attachments.is_empty())?;
+                            self.store.index_body(id, &body.text)?;
+                        }
+                        Err(_) => self.store.mark_indexed(id)?, // not a message: do not look again
+                    },
+                    Ok(None) => self.store.clear_stored(id)?,
+                    Err(MailError::Auth(why)) => return Err(MailError::Auth(why)), // locked: try again after unlocking
+                    Err(_) => self.store.mark_indexed(id)?,
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// The synchronisation itself; see [`MailSource::sync`].
     async fn sync_folder(&self, folder: &str) -> Result<SyncReport, MailError> {
         let mut state = self.state.lock().await;
@@ -450,6 +479,7 @@ impl ImapSource {
             {
                 self.store.set_preview(id, &body.text)?;
                 self.store.set_attachments(&self.account, folder, uid, !body.attachments.is_empty())?;
+                self.store.index_body(id, &body.text)?;
             }
             self.store.mark_stored(&self.account, folder, uid)?;
         }
@@ -538,6 +568,10 @@ impl ImapSource {
 impl MailSource for ImapSource {
     async fn cached_mailboxes(&self) -> Result<Vec<Mailbox>, MailError> {
         Ok(self.store.folders(&self.account)?.into_iter().map(|f| Mailbox { name: f.name, unread: f.unread, role: f.role, total: f.total, stored: f.stored }).collect())
+    }
+
+    async fn search(&self, query: &str, limit: usize) -> Result<Vec<Hit>, MailError> {
+        self.store.search(&self.account, query, limit)
     }
 
     async fn mailboxes(&self) -> Result<Vec<Mailbox>, MailError> {
@@ -645,6 +679,8 @@ impl MailSource for ImapSource {
     async fn download(&self, keep: Keep, progress: &Progress) -> Result<(), MailError> {
         use std::sync::atomic::Ordering::Relaxed;
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+        // Searching the text needs it indexed, whatever is kept offline.
+        self.index_stored().await?;
         let Some(since) = keep.since(now) else { return Ok(()) };
         let mut folders: Vec<String> = self.store.folders(&self.account)?.into_iter().filter(|f| !matches!(f.role, Role::Junk | Role::Trash)).map(|f| f.name).collect();
         folders.sort_by_key(|n| n != "INBOX");
@@ -722,6 +758,7 @@ impl MailSource for ImapSource {
             self.store.set_preview(id, &body.text)?;
             self.store.mark_stored(&at.account, &at.folder, at.uid)?;
             self.store.set_attachments(&at.account, &at.folder, at.uid, !body.attachments.is_empty())?;
+            self.store.index_body(id, &body.text)?;
         }
         Ok(body)
     }

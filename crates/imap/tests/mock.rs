@@ -497,3 +497,28 @@ async fn without_idle_the_server_is_polled() {
     assert!(!commands.iter().any(|c| c == "IDLE"), "{commands:?}");
     assert!(commands.iter().any(|c| c == "NOOP"), "{commands:?}");
 }
+
+#[tokio::test]
+async fn the_text_of_downloaded_messages_is_searchable_and_so_are_the_headers() {
+    let mock = start(true).await;
+    mock.source.mailboxes().await.unwrap();
+    mock.source.sync("INBOX").await.unwrap();
+    assert!(mock.source.search("hi there", 10).await.unwrap().is_empty(), "the text is not downloaded yet");
+    assert_eq!(mock.source.search("hello from:ada", 10).await.unwrap().len(), 1, "sender and subject are");
+    mock.source.download(Keep::All, &Progress::default()).await.unwrap();
+    let hits = mock.source.search("there", 10).await.unwrap();
+    assert!(hits.iter().any(|h| h.folder == "INBOX"), "{hits:?}");
+}
+
+#[tokio::test]
+async fn messages_stored_before_indexing_existed_get_indexed_by_the_next_run() {
+    let mock = start(true).await;
+    let id = message_in(&mock, "INBOX").await;
+    mock.source.body(id).await.unwrap(); // stores the file and indexes the text
+    assert_eq!(mock.source.search("there", 10).await.unwrap().len(), 1);
+    // Forget the index, as a database from an earlier version would not have it.
+    mock.store.forget_index_for_tests();
+    assert!(mock.source.search("there", 10).await.unwrap().is_empty());
+    mock.source.download(Keep::Opened, &Progress::default()).await.unwrap();
+    assert_eq!(mock.source.search("there", 10).await.unwrap().len(), 1, "the stored file was read again");
+}

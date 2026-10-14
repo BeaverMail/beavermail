@@ -26,8 +26,9 @@ kept by the system, a passphrase, or no encryption.
 New mail shows up by itself: the Inbox is watched with IDLE (or polled every few minutes on servers without it),
 and mail, flags, deletions and older history sync in the background, and the messages themselves
 download in the background (per account: everything, last 12 months, last 30 days, or only opened
-messages), with progress and a pause button in the status bar. The index itself is not
-encrypted yet.
+messages), with progress and a pause button in the status bar. The index (SQLCipher) follows
+the same setting and is encrypted with a key derived from the message key. The search box looks in senders,
+subjects and message text (`from:`, `subject:`, `is:unread`, `has:attachment` narrow it).
 
 Attachments are listed in the reader and can be opened, or saved one by one or several together
 through a file dialog (programs and macro documents ask before opening). Files can be attached to new

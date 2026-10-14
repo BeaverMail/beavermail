@@ -17,7 +17,7 @@ mod theme;
 mod views;
 
 use beavermail_accounts as store;
-use beavermail_core::{Account, DisplayMode, Keep, MailError, MailSender, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Progress, Role, Server, Settings, SyncReport, Tls};
+use beavermail_core::{Account, DisplayMode, Hit, Keep, MailError, MailSender, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Progress, Role, Server, Settings, SyncReport, Tls};
 use beavermail_imap::ImapSource;
 use beavermail_smtp::{SmtpSender, render_draft};
 use beavermail_store::Store;
@@ -36,6 +36,8 @@ enum Event {
     Downloaded(u64, Result<(), MailError>),
     /// The server says something changed in the Inbox of an account.
     Changed(u64),
+    /// Search results from one account: (search number, account, hits).
+    Found(u64, u64, Result<Vec<Hit>, MailError>),
     /// One sync of the selected folder finished; more history may remain.
     Synced(u64, usize, Result<SyncReport, MailError>),
     Messages(u64, usize, Result<Vec<MessageSummary>, MailError>),
@@ -289,6 +291,13 @@ struct BeaverApp {
     confirm_erase: Option<MessageId>,
     /// Text of the search box; filters the loaded messages by sender and subject.
     query: String,
+    /// The query the results below belong to, which search they are, and what was found: (account, hit).
+    searched: String,
+    search_seq: u64,
+    hits_seq: u64,
+    hits: Vec<(u64, Hit)>,
+    /// A message to open once its folder has loaded (after clicking a search result).
+    pending_open: Option<MessageId>,
     focus_search: bool,
     compose: Option<compose::Compose>,
     /// Drafts on this computer for the account being shown (filled while a Drafts folder is open).
@@ -330,15 +339,20 @@ struct BeaverApp {
 impl BeaverApp {
     fn new(ctx: egui::Context) -> Self {
         let (tx, rx) = channel();
-        let (archive, archive_error) = match store::archive_path().and_then(|path| Store::open(&path).map_err(|e| e.to_string())) {
-            Ok(archive) => (archive, None),
-            // Without a usable file the app still works, but nothing is kept between runs.
-            Err(e) => (Store::in_memory().expect("in-memory archive"), Some(format!("The local mail archive is unavailable: {e}"))),
-        };
         let (vault, vault_error) = match store::data_dir().and_then(|dir| Vault::open(&dir, Box::new(SystemStore)).map_err(|e| e.to_string())) {
             Ok(vault) => (vault, None),
             // Never a plain-text fallback: without the key, messages are kept in memory only.
             Err(e) => (Vault::in_memory(), Some(format!("Downloaded messages cannot be stored safely: {e}"))),
+        };
+        // The index is encrypted with a key derived from the vault's, so it follows the same setting.
+        let opened = store::archive_path().and_then(|path| {
+            let store = if vault.is_locked() { Store::locked(&path) } else { Store::open(&path, vault.derived_key("index").as_deref()) };
+            store.map_err(|e| e.to_string())
+        });
+        let (archive, archive_error) = match opened {
+            Ok(archive) => (archive, None),
+            // Without a usable file the app still works, but nothing is kept between runs.
+            Err(e) => (Store::in_memory().expect("in-memory archive"), Some(format!("The local mail archive is unavailable: {e}"))),
         };
         let mut app = Self {
             runtime: Runtime::new().expect("tokio runtime"),
@@ -355,6 +369,11 @@ impl BeaverApp {
             form: None,
             confirm_erase: None,
             query: String::new(),
+            searched: String::new(),
+            search_seq: 0,
+            hits_seq: 0,
+            hits: Vec::new(),
+            pending_open: None,
             focus_search: false,
             compose: None,
             drafts: Vec::new(),
@@ -564,12 +583,12 @@ impl BeaverApp {
     }
 
     /// "1,240 messages · 3 unread · 980 stored offline" for the folder being shown.
-    fn folder_summary(&self, shown: usize) -> Option<String> {
+    fn folder_summary(&self) -> Option<String> {
         let (serial, index) = self.selected?;
         let view = self.view(serial)?;
         let folder = view.mailboxes.get(index)?;
-        if !self.query.trim().is_empty() {
-            return Some(format!("{} results", views::thousands(shown as u32)));
+        if self.searching() {
+            return Some(format!("{} result{}", views::thousands(self.hits.len() as u32), if self.hits.len() == 1 { "" } else { "s" }));
         }
         let total = folder.total.max(self.messages.len() as u32);
         let mut parts = vec![format!("{} message{}", views::thousands(total), if total == 1 { "" } else { "s" })];
@@ -585,17 +604,48 @@ impl BeaverApp {
         Some(parts.join("  ·  "))
     }
 
-    /// The loaded messages that match the search box, in list order.
+    /// The messages of the folder being shown, in list order (none while a search is showing).
     fn visible(&self) -> Vec<&MessageSummary> {
-        let query = self.query.trim().to_lowercase();
-        let matches = |m: &MessageSummary| m.from.to_lowercase().contains(&query) || m.subject.to_lowercase().contains(&query);
+        if self.searching() {
+            return Vec::new();
+        }
         // In the Drafts folder, the copy of a draft that is also kept here is shown once, from here.
         let ours: Vec<String> = if self.role() == Role::Drafts {
             self.drafts.iter().map(|d| d.id.clone()).chain(self.compose.iter().map(|c| c.id.clone())).map(|id| beavermail_smtp::draft_message_id(&id)).collect()
         } else {
             Vec::new()
         };
-        self.messages.iter().filter(|m| !ours.contains(&m.message_id)).filter(|m| query.is_empty() || matches(m)).collect()
+        self.messages.iter().filter(|m| !ours.contains(&m.message_id)).collect()
+    }
+
+    fn searching(&self) -> bool {
+        !self.query.trim().is_empty()
+    }
+
+    /// Asks every account's archive for the query typed in the search box.
+    fn run_search(&mut self) {
+        self.searched.clone_from(&self.query);
+        self.search_seq += 1;
+        let (seq, query) = (self.search_seq, self.query.trim().to_owned());
+        if query.is_empty() {
+            self.hits.clear();
+            return;
+        }
+        let sources: Vec<(u64, Arc<ImapSource>)> = self.accounts.iter().filter_map(|v| Some((v.serial, v.source.clone()?))).collect();
+        for (serial, source) in sources {
+            let query = query.clone();
+            self.spawn(async move { Event::Found(seq, serial, source.search(&query, 200).await) });
+        }
+    }
+
+    /// A search result was clicked: show its folder with the message open.
+    fn open_hit(&mut self, serial: u64, hit: &Hit) {
+        let Some(index) = self.view(serial).and_then(|v| v.mailboxes.iter().position(|m| m.name == hit.folder)) else { return };
+        self.query.clear();
+        self.searched.clear();
+        self.hits.clear();
+        self.pending_open = Some(hit.message.id);
+        self.select_mailbox(serial, index);
     }
 
     /// Asks the server again for the selected folder and its account's folder list.
@@ -847,7 +897,7 @@ impl BeaverApp {
 
     /// Starts a change to how stored mail is protected, on a worker thread.
     fn run_vault(&mut self, request: security::Request, ctx: &egui::Context) {
-        let (vault, tx, ctx) = (self.vault.clone(), self.tx.clone(), ctx.clone());
+        let (vault, archive, tx, ctx) = (self.vault.clone(), self.archive.clone(), self.tx.clone(), ctx.clone());
         match request {
             security::Request::Skip => self.unlock_skipped = true,
             security::Request::Apply(mode, passphrase) => {
@@ -859,7 +909,7 @@ impl BeaverApp {
                         job.total.store(total, std::sync::atomic::Ordering::Relaxed);
                         ctx.request_repaint();
                     };
-                    let result = vault.set_mode(mode, passphrase.as_deref(), &progress);
+                    let result = vault.set_mode(mode, passphrase.as_deref(), &progress).and_then(|()| archive.rekey(vault.derived_key("index").as_deref()));
                     let _ = tx.send(Event::Vault(VaultOutcome::Applied(mode, result)));
                     ctx.request_repaint();
                 });
@@ -867,14 +917,14 @@ impl BeaverApp {
             security::Request::Unlock(passphrase) => {
                 self.unlocking = true;
                 self.runtime.spawn_blocking(move || {
-                    let _ = tx.send(Event::Vault(VaultOutcome::Unlocked(vault.unlock(&passphrase))));
+                    let _ = tx.send(Event::Vault(VaultOutcome::Unlocked(vault.unlock(&passphrase).and_then(|()| archive.unlock(vault.derived_key("index").as_deref())))));
                     ctx.request_repaint();
                 });
             }
             security::Request::Reset => {
                 self.unlocking = true;
                 self.runtime.spawn_blocking(move || {
-                    let _ = tx.send(Event::Vault(VaultOutcome::Reset(vault.reset())));
+                    let _ = tx.send(Event::Vault(VaultOutcome::Reset(vault.reset().and_then(|()| archive.reset(vault.derived_key("index").as_deref())))));
                     ctx.request_repaint();
                 });
             }
@@ -1290,6 +1340,23 @@ impl BeaverApp {
                     self.start_watch(serial);
                 }
             }
+            Event::Found(seq, serial, result) => {
+                if seq != self.search_seq {
+                    return; // an answer to a query that has been changed since
+                }
+                if self.hits_seq != seq {
+                    self.hits.clear();
+                    self.hits_seq = seq;
+                }
+                match result {
+                    Ok(found) => {
+                        self.hits.extend(found.into_iter().map(|h| (serial, h)));
+                        self.hits.sort_by_key(|(_, h)| std::cmp::Reverse(h.message.timestamp));
+                        self.hits.truncate(300);
+                    }
+                    Err(e) => self.error = Some(format!("Search failed: {e}")),
+                }
+            }
             Event::Changed(serial) => {
                 // Bring the Inbox up to date and refresh the counts; the list reloads if the Inbox is open.
                 if let Some(view) = self.view(serial)
@@ -1342,6 +1409,12 @@ impl BeaverApp {
                 Ok(messages) => {
                     self.messages = messages;
                     self.error = None;
+                    if let Some(id) = self.pending_open
+                        && self.messages.iter().any(|m| m.id == id)
+                    {
+                        self.pending_open = None;
+                        self.select_message(id);
+                    }
                 }
                 Err(e) => self.error = Some(e.to_string()),
             },
@@ -1719,6 +1792,7 @@ impl BeaverApp {
     fn message_list(&mut self, ui: &mut egui::Ui, t: &theme::Tokens) -> (Option<MessageId>, bool) {
         let (mut opened, mut add, mut refresh) = (None, false, false);
         let (mut open_draft, mut delete_draft): (Option<String>, Option<String>) = (None, None);
+        let mut clicked_hit: Option<(u64, Hit)> = None;
         let frame = egui::Frame::new().fill(t.surface);
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
             if self.accounts.is_empty() {
@@ -1730,7 +1804,8 @@ impl BeaverApp {
                 ui.add_space(12.0);
                 let width = ui.available_width() - theme::CONTROL_H - 20.0;
                 let focus = std::mem::take(&mut self.focus_search);
-                views::search_box(ui, t, &mut self.query, "Search mail  ( / )", width, focus);
+                views::search_box(ui, t, &mut self.query, "Search mail  ( / )", width, focus)
+                    .on_hover_text("Search everything stored on this computer.\nWords, \"a phrase\", from:ada, subject:invoice, in:inbox, is:unread, has:attachment");
                 if self.syncing > 0 {
                     ui.add_sized([theme::CONTROL_H - 4.0, theme::CONTROL_H - 4.0], egui::Spinner::new().size(16.0)).on_hover_text("Syncing…");
                 } else {
@@ -1738,7 +1813,7 @@ impl BeaverApp {
                 }
             });
             let shown = self.visible();
-            if let Some(summary) = self.folder_summary(shown.len()) {
+            if let Some(summary) = self.folder_summary() {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.add_space(16.0);
@@ -1746,6 +1821,21 @@ impl BeaverApp {
                 });
             }
             ui.add_space(6.0);
+            if self.searching() {
+                if self.hits.is_empty() {
+                    views::empty_state(ui, t, "No results", "Nothing stored on this computer matches. Try fewer words.", None);
+                    return;
+                }
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, views::MESSAGE_ROW_H, self.hits.len(), |ui, range| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    for (serial, hit) in &self.hits[range] {
+                        if views::message_row(ui, t, &hit.message, self.message == Some(hit.message.id), Some(&hit.folder)).clicked() {
+                            clicked_hit = Some((*serial, hit.clone()));
+                        }
+                    }
+                });
+                return;
+            }
             if !self.drafts.is_empty() {
                 ui.horizontal(|ui| {
                     ui.add_space(16.0);
@@ -1778,7 +1868,7 @@ impl BeaverApp {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, views::MESSAGE_ROW_H, shown.len(), |ui, range| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 for message in &shown[range] {
-                    if views::message_row(ui, t, message, self.message == Some(message.id)).clicked() {
+                    if views::message_row(ui, t, message, self.message == Some(message.id), None).clicked() {
                         opened = Some(message.id);
                     }
                 }
@@ -1786,6 +1876,9 @@ impl BeaverApp {
         });
         if refresh {
             self.refresh();
+        }
+        if let Some((serial, hit)) = clicked_hit {
+            self.open_hit(serial, &hit);
         }
         if let Some(id) = open_draft {
             self.open_draft(&id);
@@ -2001,6 +2094,9 @@ impl eframe::App for BeaverApp {
             && let Some(request) = security::unlock_prompt(ui.ctx(), &t, &mut self.security, self.unlocking)
         {
             self.run_vault(request, ui.ctx());
+        }
+        if self.query != self.searched {
+            self.run_search();
         }
         self.drop_files_on_the_app(ui.ctx(), &t);
         self.compose_window(ui.ctx(), &t);
