@@ -21,6 +21,12 @@ serde_json = "1"
 opener = { version = "0.8", default-features = false }
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 scraper.workspace = true
+blitz-dom.workspace = true
+blitz-html.workspace = true
+blitz-paint.workspace = true
+blitz-traits.workspace = true
+anyrender.workspace = true
+anyrender_vello_cpu.workspace = true
 beavermail-accounts.workspace = true
 beavermail-imap.workspace = true
 beavermail-smtp.workspace = true

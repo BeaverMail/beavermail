@@ -38,7 +38,7 @@ on Wayland the toolkit does not support it yet, so start the app with `WAYLAND_D
 What you write is kept as a draft on this computer (saved a moment after you stop typing, inside the
 encrypted vault, with its attachments); open the Drafts folder to pick it up again. A copy of the draft is also
 kept in the server's Drafts folder (after a longer pause, and when you close the window), so other devices see it;
-opening a draft made elsewhere is not supported yet. No original HTML or end-to-end message encryption yet.
+opening a draft made elsewhere is not supported yet. Messages are written in Markdown (a small toolbar and a preview; Settings turns it off) and sent as plain text plus a simple HTML version, with no images or tracking. Besides plain text and simplified HTML, a message can be read as "Original HTML": layout and colours as the sender designed them, drawn by Blitz (no browser, no scripts); nothing is fetched from a server, so images and styles hosted remotely are not shown and nothing can track you. No end-to-end message encryption yet.
 
 ## Running
 

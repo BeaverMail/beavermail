@@ -189,10 +189,6 @@ impl Progress {
     }
 }
 
-fn yes() -> bool {
-    true
-}
-
 impl Account {
     /// The address to send from: the configured one, else the login name.
     pub fn address(&self) -> &str {
@@ -228,9 +224,11 @@ pub struct Outgoing {
     /// Message-IDs of the thread so far, oldest first, without angle brackets.
     pub references: Vec<String>,
     pub attachments: Vec<OutgoingFile>,
+    /// `body` is Markdown: it is sent as is for the plain-text part, plus a rendered HTML part.
+    pub rich: bool,
 }
 
-/// How an incoming message is shown (PRD D9). Original HTML is not implemented yet.
+/// How an incoming message is shown (PRD D9).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DisplayMode {
@@ -239,10 +237,12 @@ pub enum DisplayMode {
     Plain,
     /// A cleaned-up subset of the HTML: text structure and links, no images, styles or remote content.
     Simplified,
+    /// The HTML as designed, drawn by a layout engine; nothing is loaded from a server.
+    Original,
 }
 
 /// User preferences, stored apart from the accounts.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
     /// How messages are shown unless a sender has its own setting.
     #[serde(default)]
@@ -250,6 +250,19 @@ pub struct Settings {
     /// Per-sender overrides, by lower-case address.
     #[serde(default)]
     pub sender_display: std::collections::BTreeMap<String, DisplayMode>,
+    /// Write messages in Markdown and send them as plain text plus HTML (PRD D10).
+    #[serde(default = "yes")]
+    pub rich_outgoing: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self { display: DisplayMode::default(), sender_display: Default::default(), rich_outgoing: true }
+    }
 }
 
 impl Settings {

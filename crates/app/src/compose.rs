@@ -45,6 +45,8 @@ pub struct Compose {
     pub pushing: bool,
     /// A draft of this message exists (or may exist) on the server: it was saved, pushed, or reopened.
     touched: bool,
+    /// Show the message as the recipient will read it instead of the text being edited.
+    pub preview: bool,
 }
 
 pub enum Outcome {
@@ -96,6 +98,7 @@ impl Compose {
             server_saved: 0,
             pushing: false,
             touched: false,
+            preview: false,
         }
         .settled()
     }
@@ -300,7 +303,7 @@ impl Compose {
         self.files.iter().map(|f| (f.vault.clone(), f.name.clone())).collect()
     }
 
-    pub fn outgoing(&self, from_address: &str) -> Outgoing {
+    pub fn outgoing(&self, from_address: &str, rich: bool) -> Outgoing {
         Outgoing {
             from: from_address.to_owned(),
             to: addresses(&self.to),
@@ -310,6 +313,7 @@ impl Compose {
             in_reply_to: self.in_reply_to.clone(),
             references: self.references.clone(),
             attachments: Vec::new(), // read from `files` when the message is sent
+            rich,
         }
     }
 }
@@ -414,8 +418,83 @@ fn row(ui: &mut Ui, t: &Tokens, name: &str, text: &mut String, hint: &str) -> eg
     response
 }
 
+/// A Markdown edit made by a toolbar button.
+#[derive(Clone, Copy)]
+enum Format {
+    /// Wrap the selection (or the cursor) in these marks.
+    Wrap(&'static str),
+    /// Start every selected line with this prefix.
+    Lines(&'static str),
+    Link,
+}
+
+/// Applies `format` to the characters `from..to` of `text`; returns the selection to restore.
+fn format_text(text: &mut String, from: usize, to: usize, format: Format) -> (usize, usize) {
+    let byte = |text: &str, n: usize| text.char_indices().nth(n).map_or(text.len(), |(i, _)| i);
+    let (from, to) = (from.min(to), from.max(to));
+    let (a, b) = (byte(text, from), byte(text, to));
+    match format {
+        Format::Wrap(mark) => {
+            text.insert_str(b, mark);
+            text.insert_str(a, mark);
+            let n = mark.chars().count();
+            (from + n, to + n)
+        }
+        Format::Link => {
+            let label = if a == b { "text" } else { &text[a..b] }.to_owned();
+            let url = "https://";
+            text.replace_range(a..b, &format!("[{label}]({url})"));
+            // Leave the address selected: that is what is left to write.
+            let start = from + label.chars().count() + 3;
+            (start, start + url.chars().count())
+        }
+        Format::Lines(prefix) => {
+            let start = text[..a].rfind('\n').map_or(0, |i| i + 1);
+            let selected = text[start..b].to_owned();
+            let prefixed: String = selected.split('\n').map(|l| format!("{prefix}{l}")).collect::<Vec<_>>().join("\n");
+            let added = prefixed.chars().count() - selected.chars().count();
+            text.replace_range(start..b, &prefixed);
+            (from + prefix.chars().count(), to + added)
+        }
+    }
+}
+
+/// Formatting buttons above the text, and the switch between writing and the recipient's view.
+fn toolbar(ui: &mut Ui, ctx: &egui::Context, t: &Tokens, compose: &mut Compose, id: egui::Id) {
+    ui.horizontal(|ui| {
+        let tools = [
+            ("B", "Bold", Format::Wrap("**")),
+            ("I", "Italic", Format::Wrap("*")),
+            ("Link", "Link", Format::Link),
+            ("• List", "Bulleted list", Format::Lines("- ")),
+            ("❝ Quote", "Quote", Format::Lines("> ")),
+        ];
+        for (label, tip, format) in tools {
+            let text = match label {
+                "B" => RichText::new(label).strong(),
+                "I" => RichText::new(label).italics(),
+                _ => RichText::new(label),
+            };
+            if ui.add_enabled(!compose.preview, egui::Button::new(text).frame(false)).on_hover_text(tip).clicked()
+                && let Some(mut state) = TextEdit::load_state(ctx, id)
+            {
+                let range = state.cursor.char_range().map_or((0, 0), |r| (r.primary.index.into(), r.secondary.index.into()));
+                let (from, to) = format_text(&mut compose.body, range.0, range.1, format);
+                state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(from), egui::text::CCursor::new(to))));
+                state.store(ctx, id);
+                ctx.memory_mut(|m| m.request_focus(id));
+            }
+        }
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.selectable_value(&mut compose.preview, true, "Preview");
+            ui.selectable_value(&mut compose.preview, false, "Write");
+        });
+    });
+    ui.label(RichText::new("Markdown: sent as plain text with a simple HTML version. No images or tracking.").size(12.5).color(t.text_dim));
+}
+
 /// Shows the window. `senders` lists the accounts that can send, as (serial, address).
-pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &[(u64, String)]) -> Outcome {
+pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &[(u64, String)], rich: bool) -> Outcome {
     let mut outcome = Outcome::Keep;
     let waiting_for_files = compose.pending() > 0;
     let ready = !compose.sending && !compose.to.trim().is_empty() && !waiting_for_files;
@@ -445,8 +524,16 @@ pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &
                 row(ui, t, "Subject", &mut compose.subject, "");
                 // Leave room for the header rows and buttons so the window never outgrows a small screen.
                 let body_h = (ctx.content_rect().height() - 360.0).clamp(120.0, 420.0);
+                let id = egui::Id::new("compose_body");
+                if rich {
+                    toolbar(ui, ctx, t, compose, id);
+                }
                 egui::ScrollArea::vertical().max_height(body_h).auto_shrink([false, true]).show(ui, |ui| {
-                    let id = egui::Id::new("compose_body");
+                    if rich && compose.preview {
+                        let blocks = crate::html::blocks(&beavermail_smtp::markdown_html(&compose.body));
+                        crate::views::body(ui, t, &blocks);
+                        return;
+                    }
                     let mut output = TextEdit::multiline(&mut compose.body)
                         .id(id)
                         .frame(Frame::NONE)
@@ -546,6 +633,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn toolbar_edits_wrap_prefix_and_link() {
+        let mut s = "héllo wörld".to_owned();
+        assert_eq!(format_text(&mut s, 6, 11, Format::Wrap("**")), (8, 13));
+        assert_eq!(s, "héllo **wörld**");
+        let mut s = "one\ntwo\nthree".to_owned();
+        format_text(&mut s, 5, 9, Format::Lines("- "));
+        assert_eq!(s, "one\n- two\n- three");
+        let mut s = "see docs".to_owned();
+        let (a, b) = format_text(&mut s, 4, 8, Format::Link);
+        assert_eq!(s, "see [docs](https://)");
+        assert_eq!(s.chars().skip(a).take(b - a).collect::<String>(), "https://");
+        let mut s = String::new();
+        format_text(&mut s, 0, 0, Format::Wrap("*"));
+        assert_eq!(s, "**");
+    }
+
+    #[test]
     fn recipient_fields_split_on_separators() {
         assert_eq!(addresses("a@x.org, b@x.org;\n c@x.org ,,"), ["a@x.org", "b@x.org", "c@x.org"]);
         assert!(addresses("  ").is_empty());
@@ -585,7 +689,7 @@ mod tests {
         assert!(c.cc.is_empty());
         assert_eq!(c.subject, "Re: Lunch");
         assert!(c.body.starts_with("\n\nOn 2026-10-13 12:00, Ada Lovelace <ada@example.org> wrote:\n> See you at noon.\n>\n> Bring the notes."), "{}", c.body);
-        let out = c.outgoing("me@example.org");
+        let out = c.outgoing("me@example.org", false);
         assert_eq!(out.in_reply_to.as_deref(), Some("m2@host"));
         assert_eq!(out.references, ["m1@host", "m2@host"]);
     }
@@ -616,7 +720,7 @@ mod tests {
         assert!(c.to.is_empty());
         assert!(c.body.contains("---------- Forwarded message ----------\nFrom: Ada Lovelace <ada@example.org>"));
         assert!(c.body.ends_with("Bring the notes."));
-        assert!(c.outgoing("me@example.org").in_reply_to.is_none());
+        assert!(c.outgoing("me@example.org", false).in_reply_to.is_none());
     }
 
     #[test]

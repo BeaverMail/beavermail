@@ -60,15 +60,41 @@ fn build(message: &Outgoing) -> Result<Message, MailError> {
         builder = builder.references(refs.join(" "));
     }
     let builder = builder.date_now().message_id(None);
+    with_content(builder, message)
+}
+
+/// Sets the body: plain text, or Markdown plus its HTML, with the attachments after it.
+fn with_content(builder: lettre::message::MessageBuilder, message: &Outgoing) -> Result<Message, MailError> {
+    let text = || MultiPart::alternative_plain_html(message.body.clone(), markdown_html(&message.body));
     if message.attachments.is_empty() {
-        return builder.body(message.body.clone()).map_err(backend);
+        return if message.rich { builder.multipart(text()) } else { builder.body(message.body.clone()) }.map_err(backend);
     }
-    let mut parts = MultiPart::mixed().singlepart(SinglePart::plain(message.body.clone()));
+    let mut parts = if message.rich { MultiPart::mixed().multipart(text()) } else { MultiPart::mixed().singlepart(SinglePart::plain(message.body.clone())) };
     for file in &message.attachments {
         let kind = ContentType::parse(&file.mime).unwrap_or_else(|_| ContentType::parse("application/octet-stream").expect("a valid type"));
         parts = parts.singlepart(Attachment::new(file.name.clone()).body(file.data.clone(), kind));
     }
     builder.multipart(parts).map_err(backend)
+}
+
+/// The HTML for a Markdown message. Raw HTML in the text is shown as text, images are not sent
+/// (their description is), and only web and mail links stay links: nothing remote, nothing active.
+pub fn markdown_html(markdown: &str) -> String {
+    use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+    let mut dropped_link = false;
+    let events = Parser::new_ext(markdown, Options::ENABLE_STRIKETHROUGH).filter_map(|event| match event {
+        Event::Html(text) | Event::InlineHtml(text) => Some(Event::Text(text)),
+        Event::Start(Tag::Image { .. }) | Event::End(TagEnd::Image) => None,
+        Event::Start(Tag::Link { ref dest_url, .. }) if !["http://", "https://", "mailto:"].iter().any(|s| dest_url.to_ascii_lowercase().starts_with(s)) => {
+            dropped_link = true;
+            None
+        }
+        Event::End(TagEnd::Link) if std::mem::take(&mut dropped_link) => None,
+        other => Some(other),
+    });
+    let mut html = String::new();
+    pulldown_cmark::html::push_html(&mut html, events);
+    html
 }
 
 /// Marks the copy of a draft kept on the server, so that a later save can find and replace it.
@@ -118,17 +144,7 @@ pub fn render_draft(message: &Outgoing, id: &str) -> Result<Vec<u8>, MailError> 
         builder = builder.references(refs.join(" "));
     }
     let builder = builder.date_now().message_id(Some(bracketed(&draft_message_id(id))));
-    let email = if message.attachments.is_empty() {
-        builder.body(message.body.clone())
-    } else {
-        let mut parts = MultiPart::mixed().singlepart(SinglePart::plain(message.body.clone()));
-        for file in &message.attachments {
-            let kind = ContentType::parse(&file.mime).unwrap_or_else(|_| ContentType::parse("application/octet-stream").expect("a valid type"));
-            parts = parts.singlepart(Attachment::new(file.name.clone()).body(file.data.clone(), kind));
-        }
-        builder.multipart(parts)
-    };
-    let raw = email.map(|m| m.formatted()).map_err(backend)?;
+    let raw = with_content(builder, message)?.formatted();
     Ok(if none_yet { without_header(&raw, "To") } else { raw })
 }
 
@@ -234,6 +250,21 @@ mod tests {
         assert!(text.contains("filename=\"plan.pdf\""), "{text}");
         assert!(text.contains("Content-Transfer-Encoding: base64"), "binary data is base64: {text}");
         assert!(text.contains("application/octet-stream"), "an unknown type falls back to plain bytes: {text}");
+    }
+
+    #[test]
+    fn markdown_is_sent_as_text_and_safe_html() {
+        let mut rich = outgoing();
+        rich.rich = true;
+        rich.body = "# Hi\n\n**bold** <script>x</script> ![pic](http://t.example/p.png) [ok](https://a.example) [bad](javascript:alert(1))".into();
+        let text = String::from_utf8(build(&rich).unwrap().formatted()).unwrap();
+        assert!(text.contains("multipart/alternative") && text.contains("text/plain") && text.contains("text/html"), "{text}");
+        let html = markdown_html(&rich.body);
+        assert!(html.contains("<h1>Hi</h1>") && html.contains("<strong>bold</strong>") && html.contains("href=\"https://a.example\""), "{html}");
+        assert!(!html.contains("<script") && !html.contains("<img") && !html.contains("javascript:") && !html.contains("t.example"), "{html}");
+        rich.attachments = vec![beavermail_core::OutgoingFile { name: "a.txt".into(), mime: "text/plain".into(), data: b"x".to_vec() }];
+        let mixed = String::from_utf8(render_draft(&rich, "d").unwrap()).unwrap();
+        assert!(mixed.find("multipart/mixed").unwrap() < mixed.find("multipart/alternative").unwrap(), "{mixed}");
     }
 
     #[test]

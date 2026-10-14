@@ -21,6 +21,13 @@ beavermail-store = { path = "crates/store" }
 beavermail-vault = { path = "crates/vault" }
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
 egui_extras = { version = "0.36", default-features = false, features = ["svg"] }
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+blitz-dom = "0.3.0-beta.3"
+blitz-html = "0.3.0-beta.3"
+blitz-paint = "0.3.0-beta.3"
+blitz-traits = "0.3.0-beta.3"
+anyrender = "0.14"
+anyrender_vello_cpu = "0.18"
 scraper = { version = "0.27", default-features = false }
 
 [workspace.lints.rust]

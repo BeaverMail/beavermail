@@ -10,6 +10,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 mod attachments;
 mod compose;
 mod drafts;
+mod original;
 mod html;
 mod icons;
 mod security;
@@ -99,13 +100,15 @@ struct OpenBody {
     plain: Vec<html::Block>,
     /// `None` when the message has no HTML part.
     simplified: Option<Vec<html::Block>>,
+    /// The HTML drawn as its sender styled it, made when first shown (and again for another width).
+    original: Option<original::Page>,
 }
 
 impl OpenBody {
     fn new(data: MessageBody) -> Self {
         let plain = html::plain_blocks(&data.text);
         let simplified = data.html.as_deref().map(html::blocks);
-        Self { data, plain, simplified }
+        Self { data, plain, simplified, original: None }
     }
 }
 
@@ -710,7 +713,7 @@ impl BeaverApp {
             compose = back;
         }
         let senders = self.senders();
-        match compose::window(ctx, t, &mut compose, &senders) {
+        match compose::window(ctx, t, &mut compose, &senders, self.settings.rich_outgoing) {
             compose::Outcome::Keep => {}
             compose::Outcome::Close => {
                 self.save_draft(&mut compose);
@@ -734,7 +737,7 @@ impl BeaverApp {
                 if let Some(view) = self.view(compose.from) {
                     let (account, sender, source) = (view.account.clone(), view.sender.clone(), view.source.clone());
                     if let Some(sender) = sender {
-                        let mut message = compose.outgoing(account.address());
+                        let mut message = compose.outgoing(account.address(), self.settings.rich_outgoing);
                         let files = compose.file_list();
                         let vault = self.vault.clone();
                         compose.sending = true;
@@ -981,6 +984,7 @@ impl BeaverApp {
             let modes = [
                 (DisplayMode::Plain, "Plain text", "The safest view. Links stay clickable; images and styling are dropped."),
                 (DisplayMode::Simplified, "Simplified HTML", "Keeps headings, lists, quotes and links. Never loads images, fonts or trackers."),
+                (DisplayMode::Original, "Original HTML", "Layout and colours as the sender designed them. Nothing is loaded from a server, so no tracking."),
             ];
             for (mode, title, hint) in modes {
                 if ui.radio(self.settings.display == mode, title).clicked() && self.settings.display != mode {
@@ -990,15 +994,19 @@ impl BeaverApp {
                 ui.label(RichText::new(hint).size(13.0).color(t.text_dim));
                 ui.add_space(4.0);
             }
-            ui.add_enabled(false, egui::RadioButton::new(false, "Original HTML")).on_disabled_hover_text("Not available yet");
-            ui.label(RichText::new("Needs a full renderer. Not available yet.").size(13.0).color(t.text_dim));
+            ui.add_space(12.0);
+            ui.label(RichText::new("Writing").strong());
+            if ui.checkbox(&mut self.settings.rich_outgoing, "Write in Markdown and send an HTML version too").changed() {
+                changed = true;
+            }
+            ui.label(RichText::new("Bold, lists, links and quotes. The plain-text part is always sent, readable as written. Off: plain text only.").size(13.0).color(t.text_dim));
             if !self.settings.sender_display.is_empty() {
                 ui.add_space(12.0);
                 ui.label(RichText::new("Senders with their own setting").strong());
                 let mut forget = None;
                 for (address, mode) in &self.settings.sender_display {
                     ui.horizontal(|ui| {
-                        let label = if *mode == DisplayMode::Simplified { "Simplified HTML" } else { "Plain text" };
+                        let label = match mode { DisplayMode::Original => "Original HTML", DisplayMode::Simplified => "Simplified HTML", DisplayMode::Plain => "Plain text" };
                         ui.label(format!("{address}  ·  {label}"));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if ui.small_button("Remove").clicked() {
@@ -1141,7 +1149,7 @@ impl BeaverApp {
     fn push_draft(&mut self, compose: &mut compose::Compose) {
         let Some(view) = self.view(compose.from) else { return };
         let Some(source) = view.source.clone() else { return };
-        let message = compose.outgoing(view.account.address());
+        let message = compose.outgoing(view.account.address(), self.settings.rich_outgoing);
         let (files, vault, id, snapshot, serial) = (compose.file_list(), self.vault.clone(), compose.id.clone(), compose.snapshot(), compose.from);
         compose.pushing = true;
         self.spawn(async move {
@@ -1953,7 +1961,7 @@ impl BeaverApp {
             });
             ui.add_space(6.0);
             ui.separator();
-            match &self.body {
+            match &mut self.body {
                 None => {
                     ui.centered_and_justified(|ui| ui.spinner());
                 }
@@ -2004,7 +2012,7 @@ impl BeaverApp {
                                 ui.add_space(10.0);
                                 ui.horizontal(|ui| {
                                     ui.label(RichText::new("Show as").size(13.0).color(t.text_dim));
-                                    for (label, value) in [("Text", DisplayMode::Plain), ("Simplified", DisplayMode::Simplified)] {
+                                    for (label, value) in [("Text", DisplayMode::Plain), ("Simplified", DisplayMode::Simplified), ("Original", DisplayMode::Original)] {
                                         if ui.selectable_label(mode == value, label).clicked() {
                                             chosen_mode = Some(value);
                                         }
@@ -2017,11 +2025,23 @@ impl BeaverApp {
                             ui.add_space(16.0);
                             ui.separator();
                             ui.add_space(16.0);
-                            let blocks = match (&body.simplified, mode) {
-                                (Some(simplified), DisplayMode::Simplified) => simplified,
-                                _ => &body.plain,
-                            };
-                            url = views::body(ui, t, blocks);
+                            if let (Some(source), DisplayMode::Original) = (&body.data.html, mode) {
+                                let (width, scale) = (ui.available_width(), ui.ctx().pixels_per_point());
+                                if !body.original.as_ref().is_some_and(|p| p.fits(width, scale)) {
+                                    body.original = original::Page::new(ui.ctx(), source, width, scale);
+                                }
+                                ui.label(RichText::new("Images, fonts and styles hosted on a server are not loaded.").size(13.0).color(t.text_dim));
+                                ui.add_space(6.0);
+                                if let Some(page) = &mut body.original {
+                                    url = page.show(ui);
+                                }
+                            } else {
+                                let blocks = match (&body.simplified, mode) {
+                                    (Some(simplified), DisplayMode::Simplified) => simplified,
+                                    _ => &body.plain,
+                                };
+                                url = views::body(ui, t, blocks);
+                            }
                             ui.add_space(28.0);
                         });
                     });
