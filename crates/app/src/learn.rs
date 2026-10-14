@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! A spam classifier learnt from the user's own mail: a logistic regression trained online with
-//! FTRL-Proximal over hashed word features, the method Stalwart's filter uses, and among the best
-//! non-neural ones in the TREC spam track. It is trained again from the archive each time new mail is
+//! FTRL-Proximal over hashed word features. It is trained again from the archive each time new mail is
 //! checked: the messages the user called spam or not spam (kept as examples, so they outlive the
 //! server emptying its Spam folder), the Spam folder itself, and the mail of known senders. Only the
 //! examples are kept, never the weights, so what it knows is always what the archive says.
@@ -13,7 +12,7 @@ use std::hash::{Hash, Hasher};
 /// Fewer examples of either kind than this and the model says nothing: rules decide alone until then.
 pub const MIN_EXAMPLES: usize = 20;
 const EPOCHS: usize = 5;
-// FTRL-Proximal settings (McMahan et al. 2013): learning rate, its smoothing, L1 and L2.
+// FTRL-Proximal settings: learning rate, its smoothing, L1 and L2.
 const ALPHA: f32 = 0.3;
 const BETA: f32 = 1.0;
 const L1: f32 = 1.0;
@@ -27,8 +26,8 @@ pub struct Model {
     names: HashMap<u64, String>,
 }
 
-/// The features of a text: each word, each pair of words up to four apart (the orthogonal sparse
-/// bigrams of OSBF and rspamd: "pink gelatin" and "pink _ ritual" both count), and the sender's domain.
+/// The features of a text: each word, each pair of words up to four apart (orthogonal sparse
+/// bigrams: "pink gelatin" and "pink _ ritual" both count), and the sender's domain.
 fn features(text: &str, domain: &str) -> Vec<(u64, String)> {
     let words: Vec<String> = text.split(|c: char| !c.is_alphanumeric()).filter(|w| w.chars().count() >= 2).map(str::to_lowercase).take(300).collect();
     let mut out: Vec<String> = words.clone();

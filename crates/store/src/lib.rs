@@ -5,9 +5,6 @@
 //! Everything the UI shows comes from here first, so the window opens instantly and works
 //! offline; the protocol backends only keep it up to date. Rows are keyed by account, folder and
 //! IMAP UID, and a [`MessageId`] is the row id, which stays valid across sessions.
-//!
-//! shortcut: the database file is not encrypted yet; PRD 7.3 asks for a key held in the system
-//! keychain (SQLCipher or file-level encryption), to be added before any release.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -330,7 +327,7 @@ fn remove_database(path: &Path) {
 /// Brings the tables up to the current version.
 fn migrate(conn: &Connection) -> Result<(), MailError> {
         conn.execute_batch(SCHEMA).map_err(db)?;
-        // Version 2: message bodies moved out of the database into encrypted files (PRD D11).
+        // Version 2: message bodies moved out of the database into encrypted files.
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).map_err(db)?;
         if version < 2 {
             conn.execute_batch("DROP TABLE IF EXISTS bodies; PRAGMA user_version = 2;").map_err(db)?;
@@ -1146,7 +1143,7 @@ mod tests {
         assert_eq!(store.search("me", "report 4999", 50).unwrap().len(), 11, "4999 and the ten numbers that start with it");
         let search = started.elapsed();
         eprintln!("list of 50k: {list:?}, search: {search:?}");
-        // PRD section 5: search over 50k messages in 500 ms. Generous bounds so a slow CI box does not flake.
+        // Search over 50k messages in 500 ms. Generous bounds so a slow CI box does not flake.
         assert!(search < std::time::Duration::from_millis(500), "search took {search:?}");
         assert!(list < std::time::Duration::from_secs(2), "list took {list:?}");
     }

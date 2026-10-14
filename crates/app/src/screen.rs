@@ -230,7 +230,7 @@ pub fn screen_all(source: &ImapSource, known: &Known, settings: &Settings, serve
 /// Inbox, where a missed spam costs a glance and a held message could cost a reply.
 const HOLD_PROBABILITY: f32 = 0.9;
 
-/// A min-hash of a text's three-word phrases (as rspamd's fuzzy check does): texts that share most of
+/// A min-hash of a text's three-word phrases: texts that share most of
 /// their phrases share most of the values, whatever was changed around them.
 type Print = [u64; 32];
 

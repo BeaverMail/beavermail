@@ -125,7 +125,9 @@ fn nav_row(ui: &mut Ui, t: &Tokens, title: &str, icon: Icon, color: Color32, unr
 }
 
 /// A message in the list: avatar, sender with unread dot, date, subject and a one-line preview.
-pub fn message_row(ui: &mut Ui, t: &Tokens, message: &MessageSummary, selected: bool, folder: Option<&str>) -> Response {
+/// `warning`, the spam check that failed, takes the preview's place (the preview is the sender's
+/// text), so spam is judged without opening it.
+pub fn message_row(ui: &mut Ui, t: &Tokens, message: &MessageSummary, selected: bool, folder: Option<&str>, warning: Option<&str>) -> Response {
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), MESSAGE_ROW_H), Sense::click());
     let card = rect.shrink2(vec2(8.0, 2.0));
     row_background(ui, card, &response, selected, t);
@@ -171,8 +173,17 @@ pub fn message_row(ui: &mut Ui, t: &Tokens, message: &MessageSummary, selected: 
     // In search results: which folder the message is in, so identical subjects can be told apart.
     let label = folder.map(|f| ui.painter().layout_no_wrap(folder_title(f, Role::Other), FontId::proportional(12.5), t.accent));
     let label_w = label.as_ref().map_or(0.0, |l| l.size().x + 12.0);
-    let preview = truncated(ui, &message.preview, FontId::proportional(13.5), t.text_dim, width - label_w);
-    ui.painter().galley(pos2(left, card.top() + 56.0), preview, t.text_dim);
+    match warning {
+        Some(text) => {
+            Icon::Spam.image(14.0, t.danger).paint_at(ui, Rect::from_center_size(pos2(left + 7.0, card.top() + 64.0), vec2(14.0, 14.0)));
+            let line = truncated(ui, text, FontId::proportional(13.5), t.danger, width - label_w - 20.0);
+            ui.painter().galley(pos2(left + 20.0, card.top() + 56.0), line, t.danger);
+        }
+        None => {
+            let preview = truncated(ui, &message.preview, FontId::proportional(13.5), t.text_dim, width - label_w);
+            ui.painter().galley(pos2(left, card.top() + 56.0), preview, t.text_dim);
+        }
+    }
     if let Some(label) = label {
         ui.painter().galley(pos2(card.right() - 14.0 - label.size().x, card.top() + 57.0), label, t.accent);
     }

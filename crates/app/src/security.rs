@@ -1,4 +1,4 @@
-//! Settings and prompts for how stored mail is protected (PRD 7.5): off, a key kept by the system,
+//! Settings and prompts for how stored mail is protected: off, a key kept by the system,
 //! or a passphrase.
 
 use std::sync::atomic::{AtomicUsize, Ordering};

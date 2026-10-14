@@ -252,7 +252,7 @@ pub struct Outgoing {
     pub rich: bool,
 }
 
-/// How an incoming message is shown (PRD D9).
+/// How an incoming message is shown.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DisplayMode {
@@ -274,7 +274,7 @@ pub struct Settings {
     /// Per-sender overrides, by lower-case address.
     #[serde(default)]
     pub sender_display: std::collections::BTreeMap<String, DisplayMode>,
-    /// Write messages in Markdown and send them as plain text plus HTML (PRD D10).
+    /// Write messages in Markdown and send them as plain text plus HTML.
     #[serde(default = "yes")]
     pub rich_outgoing: bool,
     /// Senders (lower-case addresses) whose messages may load remote images and styles in the original view.

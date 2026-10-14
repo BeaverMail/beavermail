@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! Message files at rest: one file per message under a data directory, optionally encrypted,
-//! with the key held in key slots (PRD 7.5, D12).
+//! with the key held in key slots.
 //!
 //! Three modes, chosen by the user:
 //! - [`Mode::Off`]: files are plain RFC 822, readable by any tool.
