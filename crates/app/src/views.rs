@@ -16,6 +16,7 @@ pub const MESSAGE_ROW_H: f32 = 84.0;
 const FOLDER_ROW_H: f32 = 38.0;
 const THREAD_ROW_H: f32 = 38.0;
 const SWITCH: egui::Vec2 = vec2(40.0, 22.0);
+pub const PALETTE_ROW_H: f32 = 36.0;
 pub const AVATAR: f32 = 40.0;
 
 fn tint(t: &Tokens) -> Color32 {
@@ -137,6 +138,26 @@ fn nav_row(ui: &mut Ui, t: &Tokens, title: &str, icon: Option<(Icon, Color32)>, 
     let galley = truncated(ui, title, FontId::proportional(15.0), color, rect.width() - 46.0 - right);
     ui.painter().galley(pos2(rect.left() + 42.0, rect.center().y - galley.size().y / 2.0), galley, color);
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A line of the command palette: what it does on the left, its keys on the right; `enabled` false
+/// dims it (the caller says why on hover).
+pub fn palette_row(ui: &mut Ui, t: &Tokens, label: &str, keys: &str, chosen: bool, enabled: bool) -> Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), PALETTE_ROW_H), Sense::click());
+    row_background(ui, rect, &response, chosen, t);
+    let color = if enabled { t.text } else { t.text_dim.gamma_multiply(0.7) };
+    let mut right = rect.right() - 12.0;
+    if !keys.is_empty() {
+        let galley = ui.painter().layout_no_wrap(keys.to_owned(), FontId::proportional(12.5), t.text_dim);
+        let cap = Rect::from_min_size(pos2(right - galley.size().x - 12.0, rect.center().y - 11.0), vec2(galley.size().x + 12.0, 22.0));
+        ui.painter().rect_stroke(cap, CornerRadius::same(5), egui::Stroke::new(1.0, t.border_strong), egui::StrokeKind::Inside);
+        ui.painter().galley(cap.center() - galley.size() / 2.0, galley, t.text_dim);
+        right = cap.left() - 12.0;
+    }
+    let text = truncated(ui, label, FontId::proportional(14.5), color, right - rect.left() - 12.0);
+    ui.painter().galley(pos2(rect.left() + 12.0, rect.center().y - text.size().y / 2.0), text, color);
+    response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, chosen, label));
+    if enabled { response.on_hover_cursor(egui::CursorIcon::PointingHand) } else { response }
 }
 
 /// An on/off setting: its name and a line saying what it does on the left, a switch on the right.

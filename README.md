@@ -25,7 +25,7 @@ Licensed under AGPL-3.0-only (see [LICENSE](LICENSE)).
 - Conversations: one row per thread (References, In-Reply-To, "Re:" subjects) with your replies from Sent; can be turned off.
 - Messages open in tabs (double click).
 
-Keys: Up/Down, Page Up/Down, Home/End, F6 (list or reader; in the reader the same keys and Space scroll), Enter, E, Delete, U, `!` (spam), C or Ctrl+N (new), R, A, F, `/`, Ctrl+W, Ctrl+Tab; in a new message Esc or Ctrl+Shift+D discards.
+Keys (Ctrl+K lists every command with its key, and goes to any folder): Up/Down, Page Up/Down, Home/End, F6 (list or reader; in the reader the same keys and Space scroll), Enter, E, Delete, U, `!` (spam), C or Ctrl+N (new), R, A, F, `/`, Ctrl+W, Ctrl+Tab; in a new message Esc or Ctrl+Shift+D discards.
 
 `cargo run -p beavermail -- --screen-dry-run` prints what the spam checks would do to each Inbox, without moving anything.
 

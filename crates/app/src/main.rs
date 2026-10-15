@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 mod attachments;
+mod commands;
 mod compose;
 mod drafts;
 mod original;
@@ -32,6 +33,7 @@ use beavermail_store::Store;
 use beavermail_vault::{Mode, SystemStore, Vault};
 use eframe::egui::{self, Align, Layout, RichText, pos2, vec2};
 
+use crate::commands::Command;
 use crate::icons::Icon;
 use tokio::runtime::Runtime;
 
@@ -101,6 +103,22 @@ impl Action {
     fn removes(self) -> bool {
         matches!(self, Self::Archive | Self::Trash | Self::Spam | Self::NotSpam | Self::Erase)
     }
+}
+
+/// The command palette (Ctrl+K): what is typed and which line is chosen.
+#[derive(Default)]
+struct Palette {
+    query: String,
+    at: usize,
+    /// The user moved with the arrows; until then the first line that can run is chosen.
+    moved: bool,
+}
+
+/// A line of the palette: a command, or a folder to go to as (account, folder index).
+#[derive(Clone)]
+enum Entry {
+    Run(Command),
+    Folder(u64, usize),
 }
 
 /// Which pane the keys act on: the list (arrows move through it) or the reader (arrows scroll it).
@@ -394,6 +412,8 @@ impl SettingsPage {
 
 const FORM_WIDTH: f32 = 460.0;
 const SETTINGS_WIDTH: f32 = 780.0;
+const PALETTE_WIDTH: f32 = 560.0;
+const PALETTE_LIST_H: f32 = 360.0;
 /// The settings sidebar, page list and accounts.
 const SETTINGS_NAV: f32 = 220.0;
 /// Text field width in the account form: the form minus its label column and spacing.
@@ -605,6 +625,8 @@ struct BeaverApp {
     confirm_unsubscribe: Option<(String, unsubscribe::Method)>,
     /// Block sender was pressed on this message, until the user confirms.
     confirm_block: Option<MessageId>,
+    /// The command palette, while open.
+    palette: Option<Palette>,
     /// The pane F6 moved the keys to; `None` until then, and again after a click in the list.
     pane: Option<Pane>,
     /// A scroll of the reader asked for from the keyboard, done when it is next drawn.
@@ -717,6 +739,7 @@ impl BeaverApp {
             confirm_remove: None,
             confirm_unsubscribe: None,
             confirm_block: None,
+            palette: None,
             pane: None,
             reader_scroll: None,
             list_reveal: None,
@@ -2134,6 +2157,96 @@ impl BeaverApp {
         }
     }
 
+    /// The command palette: every command and folder, found by typing, run with Enter.
+    fn palette_window(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
+        let Some(mut palette) = self.palette.take() else { return };
+        let mut entries: Vec<(Entry, String, String)> = Command::ALL.into_iter().filter(|c| *c != Command::Palette).map(|c| (Entry::Run(c), c.label().to_owned(), c.keys(ctx))).collect();
+        for view in &self.accounts {
+            let mut order: Vec<usize> = (0..view.mailboxes.len()).collect();
+            order.sort_by_key(|&i| (views::folder_rank(view.mailboxes[i].role), view.mailboxes[i].name.clone()));
+            for i in order {
+                let mailbox = &view.mailboxes[i];
+                entries.push((Entry::Folder(view.serial, i), format!("Go to {} › {}", view.account.name, views::folder_title(&mailbox.name, mailbox.role)), String::new()));
+            }
+        }
+        entries.retain(|(_, label, _)| Command::matches(label, &palette.query));
+        let why = |entry: &Entry| match entry {
+            Entry::Run(c) => self.can(*c).err(),
+            Entry::Folder(..) => None,
+        };
+        let last = entries.len().saturating_sub(1);
+        if !palette.moved {
+            palette.at = entries.iter().position(|(e, ..)| why(e).is_none()).unwrap_or(0);
+        }
+        // Only the arrows bring the chosen line into view, so scrolling with the wheel stays put.
+        let mut follow = false;
+        if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+            palette.at = (palette.at + 1).min(last);
+            (palette.moved, follow) = (true, true);
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+            palette.at = palette.at.saturating_sub(1);
+            (palette.moved, follow) = (true, true);
+        }
+        // A page is the lines the list shows at once.
+        let page = (PALETTE_LIST_H / (views::PALETTE_ROW_H + 2.0)).floor() as usize;
+        if ctx.input(|i| i.key_pressed(egui::Key::PageDown)) {
+            palette.at = (palette.at + page).min(last);
+            (palette.moved, follow) = (true, true);
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::PageUp)) {
+            palette.at = palette.at.saturating_sub(page);
+            (palette.moved, follow) = (true, true);
+        }
+        palette.at = palette.at.min(last);
+        let mut chosen = ctx.input(|i| i.key_pressed(egui::Key::Enter)).then_some(palette.at).filter(|at| entries.get(*at).is_some_and(|(e, ..)| why(e).is_none()));
+        let id = egui::Id::new("palette");
+        let area = egui::Modal::default_area(id).anchor(egui::Align2::CENTER_TOP, vec2(0.0, 90.0));
+        let modal = egui::Modal::new(id).area(area).show(ctx, |ui| {
+            ui.set_width(PALETTE_WIDTH);
+            let before = palette.query.clone();
+            // A row of fixed height: the box centres itself in whatever height it is given.
+            ui.allocate_ui_with_layout(vec2(PALETTE_WIDTH, theme::CONTROL_H), Layout::left_to_right(Align::Center), |ui| {
+                views::search_box(ui, t, &mut palette.query, "Type a command or a folder", PALETTE_WIDTH, true);
+            });
+            if palette.query != before {
+                palette.moved = false;
+            }
+            ui.add_space(8.0);
+            if entries.is_empty() {
+                ui.label(RichText::new("No command or folder matches.").color(t.text_dim));
+            }
+            egui::ScrollArea::vertical().max_height(PALETTE_LIST_H).show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                for (i, (entry, label, keys)) in entries.iter().enumerate() {
+                    let reason = why(entry);
+                    let row = views::palette_row(ui, t, label, keys, i == palette.at, reason.is_none());
+                    if follow && i == palette.at {
+                        row.scroll_to_me(None);
+                    }
+                    match reason {
+                        Some(reason) => drop(row.on_hover_text(reason)),
+                        None if row.clicked() => chosen = Some(i),
+                        None => {}
+                    }
+                }
+            });
+            ui.add_space(6.0);
+            ui.label(RichText::new("↑ ↓ and Page Up/Down to choose  ·  Enter to run  ·  Esc to close").size(12.5).color(t.text_dim));
+        });
+        if let Some((entry, ..)) = chosen.and_then(|at| entries.get(at)) {
+            match *entry {
+                Entry::Run(command) => self.run(command),
+                Entry::Folder(serial, index) => {
+                    self.show_suspicious = false;
+                    self.select_mailbox(serial, index);
+                }
+            }
+        } else if !modal.should_close() {
+            self.palette = Some(palette);
+        }
+    }
+
     /// Confirms leaving a mailing list, naming where the request goes.
     fn unsubscribe_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
         let Some((who, way)) = self.confirm_unsubscribe.clone() else { return };
@@ -2447,43 +2560,30 @@ impl BeaverApp {
 
     /// Up/Down move through the list, E archives, Delete trashes, U toggles unread.
     fn handle_keys(&mut self, ctx: &egui::Context) {
-        if self.form.is_some() || !self.confirm_erase.is_empty() || self.confirm_spam || self.confirm_empty.is_some() || self.confirm_remove.is_some() || self.confirm_unsubscribe.is_some() || self.confirm_block.is_some() || self.compose.is_some() || self.show_settings || self.locked() {
+        if self.form.is_some() || !self.confirm_erase.is_empty() || self.confirm_spam || self.confirm_empty.is_some() || self.confirm_remove.is_some() || self.confirm_unsubscribe.is_some() || self.confirm_block.is_some() || self.compose.is_some() || self.show_settings || self.palette.is_some() || self.locked() {
             return;
         }
-        // Unlike the plain keys, this one also works while the search box has the keyboard.
-        if ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::N))) {
-            self.new_message();
+        // Ctrl+N and Ctrl+K work while the search box has the keyboard; the other keys do not.
+        let typing = ctx.egui_wants_keyboard_input();
+        if let Some(command) = Command::ALL.into_iter().find(|c| c.pressed(ctx, typing)) {
+            if self.can(command).is_ok() {
+                self.run(command);
+            }
             return;
         }
-        if ctx.egui_wants_keyboard_input() {
+        if typing {
             return;
         }
         let key = |k| ctx.input(|i| i.key_pressed(k));
-        if key(egui::Key::C) {
-            self.new_message();
-            return;
-        }
-        if key(egui::Key::Slash) {
-            self.focus_search = true;
-            return;
-        }
         // In a message tab the list is not on screen: no moving through it.
         let ids: Vec<MessageId> = if self.in_tab { Vec::new() } else { self.listed() };
         let pos = self.message.and_then(|id| ids.iter().position(|i| self.conversations.same(*i, id) && (self.threaded() || *i == id)));
-        if key(egui::Key::F6) && !self.in_tab {
-            self.pane = Some(if self.pane == Some(Pane::Reader) || self.message.is_none() { Pane::List } else { Pane::Reader });
-            return;
-        }
         let reading = self.in_tab || self.pane == Some(Pane::Reader);
         if key(egui::Key::Escape) {
             self.picked.clear();
             if reading && !self.in_tab {
                 self.pane = Some(Pane::List);
             }
-        }
-        if !self.in_tab && ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::A))) {
-            self.picked = ids.clone();
-            return;
         }
         let shift = ctx.input(|i| i.modifiers.shift);
         if reading {
@@ -2516,52 +2616,100 @@ impl BeaverApp {
                 }
             }
         }
-        let shortcut = |modifiers, key| ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(modifiers, key)));
-        if shortcut(egui::Modifiers::COMMAND, egui::Key::W) {
-            if let Some(at) = self.active().filter(|_| self.in_tab) {
-                self.close_tab(at);
+    }
+
+    /// Whether `command` can run now, and if not, why (shown in the palette).
+    fn can(&self, command: Command) -> Result<(), &'static str> {
+        let many = self.picked.len() >= 2;
+        let one = || match self.message {
+            _ if many => Err("Several messages are picked"),
+            None => Err("Open a message first"),
+            Some(id) => Ok(id),
+        };
+        let some = || if many || self.message.is_some() { Ok(()) } else { Err("Open or pick a message first") };
+        match command {
+            Command::Palette | Command::Search | Command::Settings => Ok(()),
+            Command::NewMessage if self.senders().is_empty() => Err("Add an account to send mail"),
+            Command::NewMessage => Ok(()),
+            Command::Reply | Command::ReplyAll | Command::Forward => one().and(if self.body.is_some() { Ok(()) } else { Err("The message is still loading") }),
+            Command::Archive | Command::Trash | Command::ToggleRead => some(),
+            Command::Spam => {
+                some()?;
+                let role = if many { self.picked_role() } else { self.message.map_or(Role::Other, |id| self.role_of(id)) };
+                if role == Role::Inbox { Ok(()) } else { Err("Only for mail in the Inbox") }
             }
-            return;
-        }
-        let back = shortcut(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Tab);
-        if back || shortcut(egui::Modifiers::COMMAND, egui::Key::Tab) {
-            self.cycle_tabs(back);
-            return;
-        }
-        if self.picked.len() >= 2 {
-            let ids = self.targets();
-            let spam = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Text(t) if t == "!")));
-            if key(egui::Key::E) {
-                self.request_all(ids, Action::Archive);
-            } else if key(egui::Key::Delete) {
-                self.request_all(ids, Action::Trash);
-            } else if key(egui::Key::U) {
-                let unread = ids.iter().any(|id| self.summary_of(*id).is_some_and(|m| m.unread));
-                self.request_all(ids, Action::Unread(!unread));
-            } else if spam && self.picked_role() == Role::Inbox {
-                self.request_all(ids, Action::Spam);
+            Command::BlockSender => {
+                let id = one()?;
+                match self.role_of(id) {
+                    Role::Junk => Err("Already in Spam"),
+                    Role::Sent | Role::Drafts => Err("Your own mail"),
+                    _ if self.summary_of(id).is_none_or(|m| m.address.is_empty()) => Err("The message has no sender address"),
+                    _ => Ok(()),
+                }
             }
-            return;
+            Command::OpenInTab => one().and(if self.in_tab { Err("Already in a tab") } else { Ok(()) }),
+            Command::CloseTab => if self.in_tab { Ok(()) } else { Err("No message tab is shown") },
+            Command::PreviousTab | Command::NextTab => if self.tabs.iter().any(|t| t.pinned) { Ok(()) } else { Err("No message is open in a tab") },
+            Command::SelectAll => if self.in_tab || self.listed().is_empty() { Err("No list is shown") } else { Ok(()) },
+            Command::Refresh => if self.shown().is_empty() { Err("No folder is shown") } else { Ok(()) },
+            Command::SwitchPane => if self.in_tab { Err("A message tab has no list") } else { Ok(()) },
+            Command::AllInboxes => if self.accounts.len() >= 2 { Ok(()) } else { Err("Needs two accounts or more") },
         }
-        let Some(id) = self.message else { return };
-        if key(egui::Key::Enter) && pos.is_some() {
-            self.open_message(id, true);
-        } else if key(egui::Key::R) {
-            self.request(id, Action::Reply);
-        } else if key(egui::Key::A) {
-            self.request(id, Action::ReplyAll);
-        } else if key(egui::Key::F) {
-            self.request(id, Action::Forward);
-        } else if key(egui::Key::E) {
-            self.request(id, Action::Archive);
-        } else if key(egui::Key::Delete) {
-            self.request(id, Action::Trash);
-        } else if key(egui::Key::U) {
-            let unread = self.summary_of(id).is_some_and(|m| m.unread);
-            self.request(id, Action::Unread(!unread));
-        } else if ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Text(t) if t == "!"))) && self.role_of(id) == Role::Inbox {
-            // "!" as typed, whatever the keyboard layout puts it on: spam.
-            self.correct(id, Correction::Spam);
+    }
+
+    /// Runs `command`, from its key or the palette; [`Self::can`] said yes.
+    fn run(&mut self, command: Command) {
+        let targets = self.targets();
+        let answer = |c| match c {
+            Command::Reply => Action::Reply,
+            Command::ReplyAll => Action::ReplyAll,
+            _ => Action::Forward,
+        };
+        match command {
+            Command::Palette => self.palette = Some(Palette::default()),
+            Command::NewMessage => self.new_message(),
+            Command::Reply | Command::ReplyAll | Command::Forward => {
+                if let Some(id) = self.message {
+                    self.request(id, answer(command));
+                }
+            }
+            Command::Archive => self.request_all(targets, Action::Archive),
+            Command::Trash => self.request_all(targets, Action::Trash),
+            Command::ToggleRead => {
+                let unread = targets.iter().any(|id| self.summary_of(*id).is_some_and(|m| m.unread));
+                self.request_all(targets, Action::Unread(!unread));
+            }
+            Command::Spam if self.picked.len() >= 2 => self.request_all(targets, Action::Spam),
+            Command::Spam => {
+                if let Some(id) = self.message {
+                    self.correct(id, Correction::Spam);
+                }
+            }
+            Command::BlockSender => self.confirm_block = self.message,
+            Command::OpenInTab => {
+                if let Some(id) = self.message {
+                    self.open_message(id, true);
+                }
+            }
+            Command::CloseTab => {
+                if let Some(at) = self.active().filter(|_| self.in_tab) {
+                    self.close_tab(at);
+                }
+            }
+            Command::PreviousTab => self.cycle_tabs(true),
+            Command::NextTab => self.cycle_tabs(false),
+            Command::SelectAll => self.picked = self.listed(),
+            Command::Search => self.focus_search = true,
+            Command::Refresh => self.refresh(),
+            Command::SwitchPane => self.pane = Some(if self.pane == Some(Pane::Reader) || self.message.is_none() { Pane::List } else { Pane::Reader }),
+            Command::AllInboxes => {
+                self.show_suspicious = false;
+                self.show_all_inboxes();
+            }
+            Command::Settings => {
+                self.show_settings = true;
+                self.security.mode = None;
+            }
         }
     }
 
@@ -3188,7 +3336,7 @@ impl BeaverApp {
         egui::Panel::left("accounts").frame(frame).default_size(260.0).size_range(210.0..=340.0).show(ui, |ui| {
             let can_send = !self.senders().is_empty();
             let why = if can_send { None } else { Some("Add an account to send mail") };
-            if views::primary_wide(ui, t, Icon::Pencil, "New email", why).on_hover_text("New message (C or Ctrl+N)").clicked() && can_send {
+            if views::primary_wide(ui, t, Icon::Pencil, "New email", why).on_hover_text(Command::NewMessage.tip(ui.ctx())).clicked() && can_send {
                 self.new_message();
             }
             ui.add_space(8.0);
@@ -3298,7 +3446,7 @@ impl BeaverApp {
                 let width = ui.available_width() - theme::CONTROL_H - 20.0;
                 let focus = std::mem::take(&mut self.focus_search);
                 views::search_box(ui, t, &mut self.query, "Search mail  ( / )", width, focus)
-                    .on_hover_text("Search everything stored on this computer.\nWords, \"a phrase\", from:ada, subject:invoice, in:inbox, is:unread, has:attachment");
+                    .on_hover_text(format!("Search everything stored on this computer.\nWords, \"a phrase\", from:ada, subject:invoice, in:inbox, is:unread, has:attachment\n\nAll commands and their keys: {}", Command::Palette.keys(ui.ctx())));
                 if self.syncing > 0 {
                     ui.add_sized([theme::CONTROL_H - 4.0, theme::CONTROL_H - 4.0], egui::Spinner::new().size(16.0)).on_hover_text("Syncing…");
                 } else {
@@ -3498,29 +3646,31 @@ impl BeaverApp {
                 ui.add_space(12.0);
                 let archived = role == Role::Archive;
                 let loaded = self.body.is_some();
+                let ctx = ui.ctx().clone();
                 let answers = [
-                    (Icon::Reply, "Reply (R)", Action::Reply),
-                    (Icon::ReplyAll, "Reply all (A)", Action::ReplyAll),
-                    (Icon::Forward, "Forward (F)", Action::Forward),
+                    (Icon::Reply, Command::Reply, Action::Reply),
+                    (Icon::ReplyAll, Command::ReplyAll, Action::ReplyAll),
+                    (Icon::Forward, Command::Forward, Action::Forward),
                 ];
-                for (icon, tip, what) in answers {
-                    if icons::button(ui, t, icon, tip, loaded, false).clicked() {
+                for (icon, command, what) in answers {
+                    if icons::button(ui, t, icon, &command.tip(&ctx), loaded, false).clicked() {
                         action = Some((message.id, what));
                     }
                 }
                 ui.add_space(8.0);
+                let key = |c: Command| c.keys(&ctx);
                 let tools = [
-                    (Icon::Archive, "Archive (E)", Action::Archive, !archived),
+                    (Icon::Archive, Command::Archive.tip(&ctx), Action::Archive, !archived),
                     (
                         if message.unread { Icon::MailOpen } else { Icon::Mail },
-                        if message.unread { "Mark as read (U)" } else { "Mark as unread (U)" },
+                        format!("{} ({})", if message.unread { "Mark as read" } else { "Mark as unread" }, key(Command::ToggleRead)),
                         Action::Unread(!message.unread),
                         true,
                     ),
-                    (Icon::Trash, if role == Role::Trash { "Delete permanently (Delete)" } else { "Move to Trash (Delete)" }, Action::Trash, true),
+                    (Icon::Trash, if role == Role::Trash { format!("Delete permanently ({})", key(Command::Trash)) } else { Command::Trash.tip(&ctx) }, Action::Trash, true),
                 ];
                 for (icon, tip, what, enabled) in tools {
-                    let tip = if !enabled { "Already in the archive" } else { tip };
+                    let tip = if !enabled { "Already in the archive" } else { tip.as_str() };
                     if icons::button(ui, t, icon, tip, enabled, false).clicked() {
                         action = Some((message.id, what));
                     }
@@ -3860,6 +4010,7 @@ impl eframe::App for BeaverApp {
         self.account_form(ui.ctx());
         self.remove_dialog(ui.ctx(), &t);
         self.unsubscribe_dialog(ui.ctx(), &t);
+        self.palette_window(ui.ctx(), &t);
         self.block_dialog(ui.ctx(), &t);
         if self.locked()
             && let Some(request) = security::unlock_prompt(ui.ctx(), &t, &mut self.security, self.unlocking)
