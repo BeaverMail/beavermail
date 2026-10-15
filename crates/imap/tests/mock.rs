@@ -302,7 +302,7 @@ async fn the_archive_works_without_the_server() {
     assert_eq!(offline.cached_mailboxes().await.unwrap().len(), 5);
     assert_eq!(offline.messages("INBOX").await.unwrap().len(), 1);
     assert_eq!(offline.body(id).await.unwrap(), body, "an opened message is readable offline");
-    assert!(offline.sync("INBOX").await.is_err());
+    assert!(matches!(offline.sync("INBOX").await, Err(MailError::Offline(_))), "an unreachable server is told apart from other failures");
     assert_eq!(offline.messages("INBOX").await.unwrap().len(), 1, "a failed sync loses nothing");
 }
 

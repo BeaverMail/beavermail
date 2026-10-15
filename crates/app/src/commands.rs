@@ -15,6 +15,7 @@ pub enum Command {
     Forward,
     Archive,
     Trash,
+    Undo,
     ToggleRead,
     Spam,
     BlockSender,
@@ -45,7 +46,7 @@ const CTRL_SHIFT: Modifiers = Modifiers::COMMAND.plus(Modifiers::SHIFT);
 
 impl Command {
     /// In the order the keys are tried (Ctrl+Shift+Tab before Ctrl+Tab) and the palette lists them.
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 21] = [
         Self::Palette,
         Self::NewMessage,
         Self::Reply,
@@ -53,6 +54,7 @@ impl Command {
         Self::Forward,
         Self::Archive,
         Self::Trash,
+        Self::Undo,
         Self::ToggleRead,
         Self::Spam,
         Self::BlockSender,
@@ -77,6 +79,7 @@ impl Command {
             Self::Forward => "Forward",
             Self::Archive => "Archive",
             Self::Trash => "Move to Trash",
+            Self::Undo => "Undo archive or move to Trash",
             Self::ToggleRead => "Mark as read or unread",
             Self::Spam => "Spam",
             Self::BlockSender => "Block sender",
@@ -103,6 +106,7 @@ impl Command {
             Self::Forward => &[Trigger::Key(Key::F)],
             Self::Archive => &[Trigger::Key(Key::E)],
             Self::Trash => &[Trigger::Key(Key::Delete)],
+            Self::Undo => &[Trigger::Shortcut(CTRL, Key::Z, false)],
             Self::ToggleRead => &[Trigger::Key(Key::U)],
             Self::Spam => &[Trigger::Text("!")],
             Self::OpenInTab => &[Trigger::Key(Key::Enter)],

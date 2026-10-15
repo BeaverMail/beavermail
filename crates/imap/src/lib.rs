@@ -129,7 +129,7 @@ async fn tls(tcp: TcpStream, host: &str) -> Result<Stream, MailError> {
 
 async fn connect(c: &Config) -> Result<Session<Stream>, MailError> {
     let Server { host, port, tls: mode } = &c.server;
-    let tcp = TcpStream::connect((host.as_str(), *port)).await.map_err(backend)?;
+    let tcp = TcpStream::connect((host.as_str(), *port)).await.map_err(|e| MailError::Offline(e.to_string()))?;
     let client = match mode {
         Tls::None => Client::new(Box::new(tcp) as Stream),
         Tls::Tls => Client::new(tls(tcp, host).await?),

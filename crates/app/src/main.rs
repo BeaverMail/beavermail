@@ -105,6 +105,31 @@ impl Action {
     }
 }
 
+/// How long an Archive or Move to Trash waits before going to the server, so Undo can take it back.
+const UNDO_SECS: u64 = 10;
+
+/// Archive or Move to Trash, shown at once but sent to the server only after [`UNDO_SECS`].
+struct Pending {
+    /// For the bar: "Archived 3 messages".
+    text: String,
+    until: std::time::Instant,
+    /// Each message: (account, folder index shown, the action, the message as listed, its place in the list).
+    items: Vec<(u64, usize, Action, MessageSummary, usize)>,
+}
+
+/// Runs `action` on message `id` on the server.
+async fn perform(source: Arc<ImapSource>, id: MessageId, action: Action) -> Result<(), MailError> {
+    match action {
+        Action::Unread(unread) => source.set_unread(id, unread).await,
+        Action::Archive => source.archive(id).await,
+        Action::Trash => source.trash(id).await,
+        Action::Spam => source.move_to(id, Role::Junk).await,
+        Action::NotSpam => source.move_to(id, Role::Inbox).await,
+        Action::Erase => source.erase(id).await,
+        Action::Reply | Action::ReplyAll | Action::Forward => Ok(()),
+    }
+}
+
 /// The command palette (Ctrl+K): what is typed and which line is chosen.
 #[derive(Default)]
 struct Palette {
@@ -250,6 +275,8 @@ struct AccountView {
     sender: Option<Arc<SmtpSender>>,
     mailboxes: Vec<Mailbox>,
     error: Option<String>,
+    /// The server could not be reached the last time it was asked; the archive is shown.
+    offline: bool,
     /// The background download, shared with the status bar.
     progress: Arc<Progress>,
     /// Set to stop the Inbox watcher; `watching` says whether one is running.
@@ -413,6 +440,8 @@ impl SettingsPage {
 const FORM_WIDTH: f32 = 460.0;
 const SETTINGS_WIDTH: f32 = 780.0;
 const PALETTE_WIDTH: f32 = 560.0;
+/// How far the toast sits above the window's bottom edge: clear of the status bar.
+const TOAST_LIFT: f32 = 44.0;
 const PALETTE_LIST_H: f32 = 360.0;
 /// The settings sidebar, page list and accounts.
 const SETTINGS_NAV: f32 = 220.0;
@@ -627,6 +656,8 @@ struct BeaverApp {
     confirm_block: Option<MessageId>,
     /// The command palette, while open.
     palette: Option<Palette>,
+    /// The last Archive or Move to Trash, until it goes to the server.
+    pending: Option<Pending>,
     /// The pane F6 moved the keys to; `None` until then, and again after a click in the list.
     pane: Option<Pane>,
     /// A scroll of the reader asked for from the keyboard, done when it is next drawn.
@@ -740,6 +771,7 @@ impl BeaverApp {
             confirm_unsubscribe: None,
             confirm_block: None,
             palette: None,
+            pending: None,
             pane: None,
             reader_scroll: None,
             list_reveal: None,
@@ -816,7 +848,7 @@ impl BeaverApp {
         }
         let progress = Arc::new(Progress::default());
         progress.paused.store(self.downloads_paused, std::sync::atomic::Ordering::Relaxed);
-        let view = AccountView { serial, account, source, sender, mailboxes: Vec::new(), error, progress, watch_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)), watching: false };
+        let view = AccountView { serial, account, source, sender, mailboxes: Vec::new(), error, offline: false, progress, watch_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)), watching: false };
         match position {
             Some(at) => self.accounts.insert(at.min(self.accounts.len()), view),
             None => self.accounts.push(view),
@@ -833,6 +865,7 @@ impl BeaverApp {
         if view.source.is_none() || view.mailboxes.get(index).is_none() {
             return;
         }
+        self.send_pending(); // Undo puts mail back in the list it left
         self.selected = Some((serial, index));
         self.unified = false;
         self.refresh_drafts();
@@ -852,6 +885,7 @@ impl BeaverApp {
 
     /// Shows the Inbox of every account together, newest first.
     fn show_all_inboxes(&mut self) {
+        self.send_pending();
         self.selected = None;
         self.unified = true;
         self.drafts.clear();
@@ -1165,6 +1199,9 @@ impl BeaverApp {
         let index = self.shown().into_iter().find(|(s, _)| *s == serial).map_or(usize::MAX, |(_, i)| i);
         let Some(source) = self.view(serial).and_then(|v| v.source.clone()) else { return };
         let pos = self.messages.iter().position(|m| m.id == id);
+        // Archive and Move to Trash of a listed message wait, so Undo can put it back.
+        let undoable = matches!(action, Action::Archive | Action::Trash) && self.role_of(id) != Role::Trash;
+        let kept = pos.filter(|_| undoable).map(|p| (p, self.messages[p].clone()));
         if let Some(pos) = pos {
             let was_unread = self.messages[pos].unread;
             let unread_change = match action {
@@ -1185,18 +1222,17 @@ impl BeaverApp {
             self.tabs.iter_mut().filter(|t| t.message.id == id).for_each(|t| t.message.unread = unread);
             self.hits.iter_mut().filter(|(_, h)| h.message.id == id).for_each(|(_, h)| h.message.unread = unread);
         }
-        self.spawn(async move {
-            let result = match action {
-                Action::Unread(unread) => source.set_unread(id, unread).await,
-                Action::Archive => source.archive(id).await,
-                Action::Trash => source.trash(id).await,
-                Action::Spam => source.move_to(id, Role::Junk).await,
-                Action::NotSpam => source.move_to(id, Role::Inbox).await,
-                Action::Erase => source.erase(id).await,
-                Action::Reply | Action::ReplyAll | Action::Forward => Ok(()),
-            };
-            Event::Done(serial, index, result)
-        });
+        match kept {
+            Some((pos, message)) => {
+                let pending = self.pending.get_or_insert_with(|| Pending { text: String::new(), until: std::time::Instant::now(), items: Vec::new() });
+                pending.items.push((serial, index, action, message, pos));
+                pending.until = std::time::Instant::now() + std::time::Duration::from_secs(UNDO_SECS);
+                let n = pending.items.len();
+                let done = if matches!(action, Action::Archive) { "Archived" } else { "Moved to Trash" };
+                pending.text = format!("{done} {n} message{}", if n == 1 { "" } else { "s" });
+            }
+            None => self.spawn(async move { Event::Done(serial, index, perform(source, id, action).await) }),
+        }
         if action.removes() {
             // The message left its folder: its tab goes, and triage goes on with the one that took
             // its place in the list.
@@ -1216,6 +1252,42 @@ impl BeaverApp {
                     self.select_message(next);
                 }
             }
+        }
+    }
+
+    /// The server of account `serial` could not be reached: shown as a state, not an error.
+    fn went_offline(&mut self, serial: u64) {
+        if let Some(view) = self.accounts.iter_mut().find(|v| v.serial == serial) {
+            view.offline = true;
+        }
+    }
+
+    /// Sends the Archive or Move to Trash that was waiting for Undo.
+    fn send_pending(&mut self) {
+        let Some(pending) = self.pending.take() else { return };
+        for (serial, index, action, message, _) in pending.items {
+            if let Some(source) = self.view(serial).and_then(|v| v.source.clone()) {
+                self.spawn(async move { Event::Done(serial, index, perform(source, message.id, action).await) });
+            }
+        }
+    }
+
+    /// Takes back the last Archive or Move to Trash: nothing reached the server, so the messages only
+    /// return to the list, where they were, and the first of them opens again.
+    fn undo(&mut self) {
+        let Some(pending) = self.pending.take() else { return };
+        let first = pending.items.first().map(|(_, _, _, m, _)| m.id);
+        for (serial, index, _, message, pos) in pending.items.into_iter().rev() {
+            if message.unread
+                && let Some(mailbox) = self.accounts.iter_mut().find(|v| v.serial == serial).and_then(|v| v.mailboxes.get_mut(index))
+            {
+                mailbox.unread += 1;
+            }
+            let at = pos.min(self.messages.len());
+            self.messages.insert(at, message);
+        }
+        if let Some(id) = first {
+            self.select_message(id);
         }
     }
 
@@ -2355,6 +2427,8 @@ impl BeaverApp {
 
     /// Runs a user action; trashing from the trash asks first, because that erases for good.
     fn request(&mut self, id: MessageId, action: Action) {
+        // A new command: what waited for Undo goes to the server now.
+        self.send_pending();
         let whole = self.conversation(id);
         if matches!(action, Action::Reply | Action::ReplyAll | Action::Forward) {
             self.answer(id, action);
@@ -2383,6 +2457,7 @@ impl BeaverApp {
     /// Runs `action` on several messages at once, as [`Self::request`] does on one. Spam and Not spam
     /// mark the senders and keep the messages as examples, as one at a time.
     fn request_all(&mut self, ids: Vec<MessageId>, action: Action) {
+        self.send_pending();
         let mut ids: Vec<MessageId> = ids.into_iter().flat_map(|id| self.conversation(id)).collect();
         let mut seen = std::collections::HashSet::new();
         ids.retain(|id| seen.insert(*id));
@@ -2633,6 +2708,7 @@ impl BeaverApp {
             Command::NewMessage => Ok(()),
             Command::Reply | Command::ReplyAll | Command::Forward => one().and(if self.body.is_some() { Ok(()) } else { Err("The message is still loading") }),
             Command::Archive | Command::Trash | Command::ToggleRead => some(),
+            Command::Undo => if self.pending.is_some() { Ok(()) } else { Err("Nothing to undo") },
             Command::Spam => {
                 some()?;
                 let role = if many { self.picked_role() } else { self.message.map_or(Role::Other, |id| self.role_of(id)) };
@@ -2675,6 +2751,7 @@ impl BeaverApp {
             }
             Command::Archive => self.request_all(targets, Action::Archive),
             Command::Trash => self.request_all(targets, Action::Trash),
+            Command::Undo => self.undo(),
             Command::ToggleRead => {
                 let unread = targets.iter().any(|id| self.summary_of(*id).is_some_and(|m| m.unread));
                 self.request_all(targets, Action::Unread(!unread));
@@ -2843,6 +2920,7 @@ impl BeaverApp {
                         mailboxes.sort_by_key(|m| (views::folder_rank(m.role), m.name.clone()));
                         view.mailboxes = mailboxes;
                         view.error = None;
+                        view.offline &= !fresh; // the server answered
                         let inbox = view.mailboxes.iter().position(|m| m.role == Role::Inbox).unwrap_or(0);
                         let moved = selected_name.and_then(|name| view.mailboxes.iter().position(|m| m.name == name));
                         let has_inbox = view.mailboxes.iter().any(|m| m.role == Role::Inbox);
@@ -2857,6 +2935,7 @@ impl BeaverApp {
                             if self.accounts.len() >= 2 { self.show_all_inboxes() } else { self.select_mailbox(serial, inbox) }
                         }
                     }
+                    Err(MailError::Offline(_)) => view.offline = true,
                     Err(e) => view.error = Some(e.to_string()),
                 }
                 if download {
@@ -2897,6 +2976,7 @@ impl BeaverApp {
                     Ok(()) => {}
                     // The status bar already says the stored mail is locked.
                     Err(MailError::Auth(_)) if self.vault.is_locked() => {}
+                    Err(MailError::Offline(_)) => self.went_offline(serial),
                     Err(e) => self.error = Some(format!("Downloading mail stopped: {e}")),
                 }
                 // Previews arrive with the files.
@@ -2916,6 +2996,9 @@ impl BeaverApp {
                 }
                 match result {
                     Ok(report) => {
+                        if let Some(view) = self.accounts.iter_mut().find(|v| v.serial == serial) {
+                            view.offline = false; // the server answered
+                        }
                         let Some(view) = self.view(serial) else { return };
                         let (Some(source), Some(name)) = (view.source.clone(), view.mailboxes.get(index).map(|m| m.name.clone())) else { return };
                         let (local, folder) = (source.clone(), name.clone());
@@ -2926,6 +3009,7 @@ impl BeaverApp {
                             self.start_sync(serial, index, source, name);
                         }
                     }
+                    Err(MailError::Offline(_)) => self.went_offline(serial),
                     Err(e) => self.error = Some(e.to_string()),
                 }
             }
@@ -2935,7 +3019,9 @@ impl BeaverApp {
                     let origin = &self.origin;
                     self.messages.retain(|m| origin.get(&m.id).is_some_and(|s| *s != serial));
                     self.origin.extend(messages.iter().map(|m| (m.id, serial)));
-                    self.messages.extend(messages);
+                    // Mail waiting for Undo is still in the folder on the server and in the archive.
+                    let waiting: Vec<MessageId> = self.pending.iter().flat_map(|p| p.items.iter().map(|(_, _, _, m, _)| m.id)).collect();
+                    self.messages.extend(messages.into_iter().filter(|m| !waiting.contains(&m.id)));
                     if self.unified {
                         self.messages.sort_by_key(|m| std::cmp::Reverse(m.timestamp));
                     }
@@ -2967,11 +3053,18 @@ impl BeaverApp {
             {
                 match result {
                     Ok(prepared) => self.body = Some(OpenBody::new(*prepared)),
+                    Err(MailError::Offline(_)) => {
+                        self.went_offline(serial);
+                        self.error = Some("This message is not stored on this computer. It opens once the server can be reached.".into());
+                    }
                     Err(e) => self.error = Some(e.to_string()),
                 }
             }
             Event::Done(serial, index, Err(e)) => {
-                self.error = Some(e.to_string());
+                self.error = Some(match e {
+                    MailError::Offline(_) => "The server cannot be reached, so the change was not made. Try again when you are online.".into(),
+                    e => e.to_string(),
+                });
                 // Show what the server really has.
                 if self.unified && self.shows(serial, index) {
                     self.show_all_inboxes();
@@ -3264,6 +3357,10 @@ impl BeaverApp {
                 } else if running || self.syncing > 0 {
                     ui.add(egui::Spinner::new().size(12.0));
                     ui.label(dim(if activity.is_empty() { "Syncing…".to_owned() } else { format!("{activity}…") }));
+                } else if self.accounts.iter().any(|v| v.offline) {
+                    let names: Vec<&str> = self.accounts.iter().filter(|v| v.offline).map(|v| v.account.name.as_str()).collect();
+                    let who = if names.len() == self.accounts.len() { String::new() } else { format!(" ({})", names.join(", ")) };
+                    ui.label(dim(format!("Offline{who}: showing mail stored on this computer")));
                 } else if let Some(why) = &self.draft_error {
                     ui.label(RichText::new(format!("Draft not saved on the server: {why}")).size(13.0).color(t.danger));
                 } else {
@@ -3291,20 +3388,53 @@ impl BeaverApp {
         }
     }
 
-    fn error_banner(&mut self, ui: &mut egui::Ui, t: &theme::Tokens) {
+    /// The short-lived message at the bottom centre, over the content so nothing moves: Undo while an
+    /// action waits for the server, else a notice ("Message sent").
+    fn toast(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
         const NOTICE_SECS: f32 = 4.0;
+        let mut undo = false;
+        let show = |ctx: &egui::Context, add: &mut dyn FnMut(&mut egui::Ui)| {
+            egui::Area::new(egui::Id::new("toast"))
+                .order(egui::Order::Foreground)
+                .anchor(egui::Align2::CENTER_BOTTOM, vec2(0.0, -TOAST_LIFT))
+                .interactable(true)
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style()).inner_margin(egui::Margin::symmetric(16, 8)).show(ui, |ui| ui.horizontal(|ui| add(ui)));
+                });
+        };
+        if let Some(pending) = &self.pending {
+            let left = pending.until.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                self.send_pending();
+            } else {
+                ctx.request_repaint_after(left);
+                let (text, keys) = (pending.text.clone(), Command::Undo.keys(ctx));
+                show(ctx, &mut |ui| {
+                    ui.label(RichText::new(&text).color(t.text));
+                    ui.add_space(8.0);
+                    undo = ui.button("Undo").clicked();
+                    ui.label(RichText::new(&keys).size(12.5).color(t.text_dim));
+                });
+                if undo {
+                    self.undo();
+                }
+                return; // the notice waits: one at a time
+            }
+        }
         if let Some((text, since)) = self.notice.clone() {
             let left = NOTICE_SECS - since.elapsed().as_secs_f32();
             if left <= 0.0 {
                 self.notice = None;
             } else {
-                ui.ctx().request_repaint_after(std::time::Duration::from_secs_f32(left));
-                let banner = egui::Frame::new().fill(t.accent.gamma_multiply(0.16)).inner_margin(egui::Margin::symmetric(16, 10));
-                egui::Panel::top("notice").frame(banner).show(ui, |ui| {
-                    ui.label(RichText::new(text).color(t.accent));
+                ctx.request_repaint_after(std::time::Duration::from_secs_f32(left));
+                show(ctx, &mut |ui| {
+                    ui.label(RichText::new(&text).color(t.text));
                 });
             }
         }
+    }
+
+    fn error_banner(&mut self, ui: &mut egui::Ui, t: &theme::Tokens) {
         let Some(error) = self.error.clone() else { return };
         let banner = egui::Frame::new().fill(t.danger.gamma_multiply(0.14)).inner_margin(egui::Margin::symmetric(16, 10));
         egui::Panel::top("error").frame(banner).show(ui, |ui| {
@@ -3877,6 +4007,18 @@ impl BeaverApp {
 
 impl eframe::App for BeaverApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // What waited for Undo is done now, or the mail would come back at the next start.
+        if let Some(pending) = self.pending.take() {
+            let jobs: Vec<_> = pending.items.into_iter().filter_map(|(serial, _, action, m, _)| Some((self.view(serial)?.source.clone()?, m.id, action))).collect();
+            self.runtime.block_on(async {
+                let all = async {
+                    for (source, id, action) in jobs {
+                        let _ = perform(source, id, action).await;
+                    }
+                };
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(10), all).await;
+            });
+        }
         let _ = std::fs::remove_dir_all(&self.open_dir); // the decrypted copies made to open attachments
     }
 
@@ -4011,6 +4153,7 @@ impl eframe::App for BeaverApp {
         self.remove_dialog(ui.ctx(), &t);
         self.unsubscribe_dialog(ui.ctx(), &t);
         self.palette_window(ui.ctx(), &t);
+        self.toast(ui.ctx(), &t);
         self.block_dialog(ui.ctx(), &t);
         if self.locked()
             && let Some(request) = security::unlock_prompt(ui.ctx(), &t, &mut self.security, self.unlocking)

@@ -22,6 +22,8 @@ pub enum MailError {
     Auth(String),
     /// Network, protocol or storage failure.
     Backend(String),
+    /// The server could not be reached (no network, or it is down): the archive still answers.
+    Offline(String),
 }
 
 impl fmt::Display for MailError {
@@ -30,6 +32,7 @@ impl fmt::Display for MailError {
             Self::NotFound => f.write_str("not found"),
             Self::Auth(why) => write!(f, "authentication failed: {why}"),
             Self::Backend(why) => write!(f, "mail backend error: {why}"),
+            Self::Offline(why) => write!(f, "cannot reach the server: {why}"),
         }
     }
 }
