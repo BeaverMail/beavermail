@@ -3171,6 +3171,7 @@ impl BeaverApp {
     fn sidebar(&mut self, ui: &mut egui::Ui, t: &theme::Tokens) -> SidebarOutcome {
         let (mut chosen, mut removed, mut edit, mut add, mut suspicious, mut recheck, mut empty) = (None, None, None, false, None, None, None);
         let mut all = false;
+        let mut fold = None;
         // shortcut: only the Inboxes being shown have verdicts, so only their suspicious mail shows a count;
         // check every account in the background (during sync) to count them all.
         let mut held_of: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
@@ -3214,7 +3215,7 @@ impl BeaverApp {
                             title.append(&view.account.name, 0.0, egui::TextFormat::simple(egui::FontId::proportional(15.0), t.text));
                             let header = egui::CollapsingHeader::new(title)
                                 .id_salt(view.serial)
-                                .default_open(true)
+                                .default_open(!self.settings.folded.contains(&view.account.key()))
                                 .show(ui, |ui| {
                                     if let Some(error) = &view.error {
                                         ui.colored_label(t.danger, error);
@@ -3242,6 +3243,9 @@ impl BeaverApp {
                                         }
                                     }
                                 });
+                            if header.header_response.clicked() {
+                                fold = Some(view.account.key());
+                            }
                             header.header_response.context_menu(|ui| {
                                 if ui.button("Account settings…").clicked() {
                                     edit = Some(view.serial);
@@ -3260,6 +3264,13 @@ impl BeaverApp {
                 });
             });
         });
+        // Remembered for the next start; within a session egui keeps the state itself.
+        if let Some(key) = fold {
+            if !self.settings.folded.remove(&key) {
+                self.settings.folded.insert(key);
+            }
+            self.save_settings();
+        }
         SidebarOutcome { chosen, suspicious, recheck, empty, removed, edit, add, all }
     }
 
