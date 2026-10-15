@@ -790,13 +790,14 @@ impl Store {
         rows.collect::<Result<_, _>>().map_err(db)
     }
 
-    /// Everyone the user has written to from this account: the recipients of its Sent folder, lower case.
-    pub fn correspondents(&self, account: &str) -> Result<std::collections::HashSet<String>, MailError> {
+    /// Everyone the user has written to, from any of their accounts: the recipients of every Sent
+    /// folder, lower case. Someone written to from work is not a stranger at home.
+    pub fn correspondents(&self) -> Result<std::collections::HashSet<String>, MailError> {
         let conn = self.conn();
         let mut stmt = conn
-            .prepare("SELECT m.recipients FROM messages m JOIN folders f ON f.account = m.account AND f.name = m.folder WHERE m.account = ?1 AND f.role = ?2 AND m.recipients IS NOT NULL")
+            .prepare("SELECT m.recipients FROM messages m JOIN folders f ON f.account = m.account AND f.name = m.folder WHERE f.role = ?1 AND m.recipients IS NOT NULL")
             .map_err(db)?;
-        let rows = stmt.query_map(params![account, role_to_int(Role::Sent)], |r| r.get::<_, String>(0)).map_err(db)?;
+        let rows = stmt.query_map(params![role_to_int(Role::Sent)], |r| r.get::<_, String>(0)).map_err(db)?;
         let mut out = std::collections::HashSet::new();
         for row in rows {
             out.extend(row.map_err(db)?.split_whitespace().map(str::to_owned));
@@ -1405,14 +1406,18 @@ mod tests {
         let sent = |uid, to: &str| Header { recipients: to.into(), ..header(uid, "s", 1, false) };
         store.add_headers("me", "Sent", &[sent(1, "bob@x.org carol@y.org"), sent(2, "")]).unwrap();
         store.add_headers("me", "INBOX", &[sent(1, "me@z.org")]).unwrap();
-        let known = store.correspondents("me").unwrap();
+        let known = store.correspondents().unwrap();
         assert_eq!(known.len(), 2);
         assert!(known.contains("bob@x.org") && known.contains("carol@y.org") && !known.contains("me@z.org"));
+        // Written to from another account counts too.
+        store.set_folders("work", &[("Sent".into(), Role::Sent)]).unwrap();
+        store.add_headers("work", "Sent", &[sent(1, "erin@w.org")]).unwrap();
+        assert!(store.correspondents().unwrap().contains("erin@w.org"));
         // A row from before recipients were kept is read later, then counts.
         store.conn().execute("UPDATE messages SET recipients = NULL WHERE folder = 'Sent' AND uid = 2", []).unwrap();
         assert_eq!(store.unknown_recipients("me", "Sent", 10).unwrap(), [2]);
         store.set_recipients("me", "Sent", 2, "dan@x.org").unwrap();
-        assert!(store.correspondents("me").unwrap().contains("dan@x.org"));
+        assert!(store.correspondents().unwrap().contains("dan@x.org"));
         assert_eq!(store.senders("me").unwrap(), [("Ada Lovelace".to_owned(), "ada@example.org".to_owned())]);
         let id = store.id_of("me", "INBOX", 1).unwrap().unwrap();
         assert_eq!(store.headers(id).unwrap(), Some(Vec::new()));

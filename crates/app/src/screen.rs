@@ -71,7 +71,7 @@ impl Known {
     /// `own` is every address the user sends from, on any account.
     pub fn load(store: &Store, account: &Account, own: &[String], settings: &Settings) -> Result<Self, MailError> {
         let key = account.key();
-        let mut known = Self::new(store.correspondents(&key)?, own, &store.senders(&key)?, settings);
+        let mut known = Self::new(store.correspondents()?, own, &store.senders(&key)?, settings);
         // What the user has already judged: messages they called spam or not spam (kept, so they count
         // after moving or after the server empties its Spam folder), the Spam folder, mail from senders
         // marked as spam, and the mail of known senders, which reaches the Inbox whatever its content.

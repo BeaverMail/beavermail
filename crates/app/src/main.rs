@@ -268,6 +268,8 @@ struct ReaderOutcome {
     expand: bool,
     /// Back to the list, from a message shown in its place.
     back: bool,
+    /// Trust was pressed for this message's sender.
+    trust: Option<MessageId>,
 }
 
 struct AccountView {
@@ -551,6 +553,18 @@ fn account_page(ui: &mut egui::Ui, t: &theme::Tokens, form: &mut NewAccount) -> 
     pressed
 }
 
+/// The mark for what was typed in "Add a trusted sender": an address, or `@domain` for its whole
+/// organisation (`@mail.shop.example` trusts `@shop.example`, as marks from messages do); `None` if it
+/// is neither.
+fn trusted_key(text: &str) -> Option<String> {
+    let text = text.trim().to_lowercase();
+    let (user, domain) = text.split_once('@')?;
+    if !domain.contains('.') || domain.starts_with('.') || domain.ends_with('.') || domain.contains(char::is_whitespace) || user.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(if user.is_empty() { format!("@{}", sender::registrable(domain)) } else { text })
+}
+
 /// User and password, as rows of the caller's form grid.
 fn login_rows(ui: &mut egui::Ui, form: &mut NewAccount) {
     ui.label("User");
@@ -697,6 +711,8 @@ struct BeaverApp {
     list_view: (f32, f32),
     /// Asking whether to forget the senders and messages marked as spam or not spam.
     confirm_forget_marks: bool,
+    /// What is typed in "Add a trusted sender".
+    trust_input: String,
     /// The compose field last typed in: Esc takes the focus away, and Keep editing gives it back.
     compose_focus: Option<egui::Id>,
     refocus: u8,
@@ -805,6 +821,7 @@ impl BeaverApp {
             whole_conversation: false,
             list_view: (0.0, 0.0),
             confirm_forget_marks: false,
+            trust_input: String::new(),
             compose_focus: None,
             refocus: 0,
             downloads_paused: false,
@@ -1619,6 +1636,15 @@ impl BeaverApp {
         }
     }
 
+    /// Trusts the sender (or organisation) of message `id`: its mail reaches the Inbox from now on, unless
+    /// the server says it is forged, and this message counts as an example of wanted mail.
+    fn trust(&mut self, id: MessageId) {
+        let Some(key) = self.summary_of(id).map(|m| screen::sender_key(&m.address)) else { return };
+        self.mark_senders(std::slice::from_ref(&key), true);
+        self.learn(&[id], false);
+        self.notice = Some((format!("Trusted {}", key.trim_start_matches('@')), std::time::Instant::now()));
+    }
+
     /// A message of the Spam folder is not spam: its sender is marked so, and it goes back to the Inbox.
     fn not_spam(&mut self, id: MessageId) {
         let Some(key) = self.summary_of(id).map(|m| screen::sender_key(&m.address)) else { return };
@@ -2249,17 +2275,55 @@ impl BeaverApp {
                                     changed = true;
                                     rescreen = true;
                                 }
-                                ui.add_space(12.0);
-                                let marked = self.settings.marked.len();
-                                if marked == 0 {
-                                    hint(ui, "Nothing learned from your choices yet. Mark a message as spam, or as not spam, and the filter learns from it.");
-                                } else if !self.confirm_forget_marks {
-                                    ui.label(format!("{marked} sender{} marked by you.", if marked == 1 { "" } else { "s" }));
-                                    hint(ui, "To change one, open its message and choose Not spam (or Spam). Mail in your Spam folder keeps counting.");
-                                    if ui.button("Forget what I marked…").clicked() {
+                                section_title(ui, "Trusted senders");
+                                hint(ui, "Their mail always reaches the Inbox, unless your server says it is forged.");
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    let field = ui.add(sized_field(&mut self.trust_input, FIELD_WIDTH).hint_text("name@example.com or @example.com"));
+                                    let key = trusted_key(&self.trust_input);
+                                    let add = ui.add_enabled(key.is_some(), egui::Button::new("Add")).on_disabled_hover_text("An address, or @ and a domain");
+                                    let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                    if let Some(key) = key.filter(|_| add.clicked() || enter) {
+                                        self.settings.set_mark(&key, Some(true));
+                                        self.trust_input.clear();
+                                        (changed, rescreen) = (true, true);
+                                    }
+                                });
+                                for (title, trusted, empty) in [
+                                    ("", true, "None yet. Choose Trust on a message from a new sender, or add one here."),
+                                    ("Marked as spam", false, "None. Spam or Block sender on a message puts its sender here."),
+                                ] {
+                                    if !title.is_empty() {
+                                        section_title(ui, title);
+                                    }
+                                    let keys: Vec<String> = self.settings.marked.iter().filter(|(_, v)| **v == trusted).map(|(k, _)| k.clone()).collect();
+                                    if keys.is_empty() {
+                                        hint(ui, empty);
+                                    }
+                                    for key in keys {
+                                        ui.horizontal(|ui| {
+                                            let shown = match key.strip_prefix('@') {
+                                                Some(domain) => format!("Everyone at {domain}"),
+                                                None => key.clone(),
+                                            };
+                                            ui.label(shown);
+                                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                if ui.small_button("Remove").clicked() {
+                                                    self.settings.set_mark(&key, None);
+                                                    (changed, rescreen) = (true, true);
+                                                }
+                                            });
+                                        });
+                                    }
+                                }
+                                ui.add_space(16.0);
+                                let any = !self.settings.marked.is_empty();
+                                if any && !self.confirm_forget_marks {
+                                    hint(ui, "Mail in your Spam folder keeps counting as spam whatever is listed here.");
+                                    if ui.button("Forget every mark and example…").clicked() {
                                         self.confirm_forget_marks = true;
                                     }
-                                } else {
+                                } else if any {
                                     ui.label("Forget every sender and message you marked?");
                                     hint(ui, "The filter goes back to its own checks and the Spam folder. Nothing moves on the server.");
                                     ui.horizontal(|ui| {
@@ -2869,6 +2933,17 @@ impl BeaverApp {
                 let role = if many { self.picked_role() } else { self.message.map_or(Role::Other, |id| self.role_of(id)) };
                 if role == Role::Inbox { Ok(()) } else { Err("Only for mail in the Inbox") }
             }
+            Command::TrustSender => {
+                let id = one()?;
+                let key = self.summary_of(id).map(|m| screen::sender_key(&m.address)).unwrap_or_default();
+                match self.role_of(id) {
+                    Role::Junk => Err("Use Not spam for mail in Spam"),
+                    Role::Sent | Role::Drafts => Err("Your own mail"),
+                    _ if key.is_empty() => Err("The message has no sender address"),
+                    _ if self.settings.mark_of(&key) == Some(true) => Err("Already trusted"),
+                    _ => Ok(()),
+                }
+            }
             Command::BlockSender => {
                 let id = one()?;
                 match self.role_of(id) {
@@ -2919,6 +2994,11 @@ impl BeaverApp {
             Command::Spam => {
                 if let Some(id) = self.message {
                     self.correct(id, Correction::Spam);
+                }
+            }
+            Command::TrustSender => {
+                if let Some(id) = self.message {
+                    self.trust(id);
                 }
             }
             Command::BlockSender => self.confirm_block = self.message,
@@ -3947,7 +4027,7 @@ impl BeaverApp {
         let mut allow_sender = None;
         let mut mark = None;
         let mut suspicious = false;
-        let (mut leave, mut block) = (None, None);
+        let (mut leave, mut block, mut trust) = (None, None, None);
         let scroll = self.reader_scroll.take();
         let (mut switch, mut expand) = (None, false);
         // The open message's conversation, oldest first, when the list shows conversations.
@@ -4125,8 +4205,13 @@ impl BeaverApp {
                                     Correction::OutOfSpam => ("In the Spam folder.".to_owned(), true, "Not spam", format!("Move it back to the Inbox, and keep mail from {who} there from now on")),
                                 };
                                 ui.add_space(10.0);
-                                if views::mark_bar(ui, t, &text, held, button, &tip) {
-                                    mark = Some(choice);
+                                // A new sender in the Inbox can be trusted from here, before anything goes wrong.
+                                let trust_tip = format!("Mail from {who} always reaches the Inbox, unless your server says it is forged");
+                                let offer = (choice == Correction::Spam).then_some(trust_tip.as_str());
+                                match views::mark_bar(ui, t, &text, held, button, &tip, offer) {
+                                    Some(views::Mark::Correct) => mark = Some(choice),
+                                    Some(views::Mark::Trust) => trust = Some(message.id),
+                                    None => {}
                                 }
                             }
                             if !body.data.to.is_empty() {
@@ -4219,7 +4304,7 @@ impl BeaverApp {
                 pane_ring(ui, t, reader.response.rect);
             }
         }
-        ReaderOutcome { action, url, mode: chosen_mode, remember, attachment, save_many, allow_sender, mark, bulk, unsubscribe: leave, block, switch, expand, back }
+        ReaderOutcome { action, url, mode: chosen_mode, remember, attachment, save_many, allow_sender, mark, bulk, unsubscribe: leave, block, switch, expand, back, trust }
     }
 }
 
@@ -4308,9 +4393,12 @@ impl eframe::App for BeaverApp {
         }
         // Without the reading pane and with no message in its place, there is no reader to draw.
         let shows_reader = self.in_tab || self.full_preview || self.settings.reading_pane;
-        let ReaderOutcome { action, url, mode, remember, attachment, save_many, allow_sender, mark, bulk, unsubscribe, block, switch, expand, back } =
+        let ReaderOutcome { action, url, mode, remember, attachment, save_many, allow_sender, mark, bulk, unsubscribe, block, switch, expand, back, trust } =
             if shows_reader { self.reader(ui, &t) } else { ReaderOutcome::default() };
         self.full_preview &= !back;
+        if let Some(id) = trust {
+            self.trust(id);
+        }
         self.whole_conversation |= expand;
         // Another message of the conversation takes the place of the one shown, in the pane or its tab.
         if let Some(id) = switch
@@ -4530,6 +4618,15 @@ mod tests {
         assert_eq!(reveal_offset(2, 0.0, 5.0 * h), None, "already in view");
         assert_eq!(reveal_offset(9, 0.0, 5.0 * h), Some(5.0 * h), "below: the row ends at the bottom edge");
         assert_eq!(reveal_offset(1, 4.0 * h, 5.0 * h), Some(h), "above: the row starts at the top edge");
+    }
+
+    #[test]
+    fn a_trusted_sender_typed_by_hand_is_an_address_or_an_organisation() {
+        assert_eq!(trusted_key(" Bob@Shop.Example "), Some("bob@shop.example".into()));
+        assert_eq!(trusted_key("@mail.shop.example"), Some("@shop.example".into()), "the organisation, as a mark from a message");
+        for bad in ["bob", "bob@", "@", "@localhost", "a b@x.org", "bob@.org"] {
+            assert_eq!(trusted_key(bad), None, "{bad}");
+        }
     }
 
     #[test]

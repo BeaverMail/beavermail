@@ -297,8 +297,16 @@ pub fn message_row(ui: &mut Ui, t: &Tokens, message: &MessageSummary, selected: 
 
 /// Above a message the checks have an opinion on: why, and the one correction that makes sense. True
 /// when the button is pressed.
-pub fn mark_bar(ui: &mut Ui, t: &Tokens, text: &str, held: bool, button: &str, tip: &str) -> bool {
-    let mut pressed = false;
+/// Which button of [`mark_bar`] was pressed.
+pub enum Mark {
+    /// The bar's own correction (Spam, Not spam).
+    Correct,
+    Trust,
+}
+
+/// `trust`: the tooltip of a Trust button beside the correction, for a new sender.
+pub fn mark_bar(ui: &mut Ui, t: &Tokens, text: &str, held: bool, button: &str, tip: &str, trust: Option<&str>) -> Option<Mark> {
+    let mut pressed = None;
     egui::Frame::new().fill(t.input).stroke(egui::Stroke::new(1.0, t.border)).corner_radius(CornerRadius::same(CONTROL_RADIUS)).inner_margin(Margin::symmetric(12, 10)).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal_wrapped(|ui| {
@@ -306,7 +314,16 @@ pub fn mark_bar(ui: &mut Ui, t: &Tokens, text: &str, held: bool, button: &str, t
             ui.label(egui::RichText::new(text).size(13.5).color(t.text));
         });
         ui.add_space(4.0);
-        pressed = ui.button(button).on_hover_text(tip).clicked();
+        ui.horizontal(|ui| {
+            if let Some(trust_tip) = trust
+                && ui.button("Trust").on_hover_text(trust_tip).clicked()
+            {
+                pressed = Some(Mark::Trust);
+            }
+            if ui.button(button).on_hover_text(tip).clicked() {
+                pressed = Some(Mark::Correct);
+            }
+        });
     });
     pressed
 }

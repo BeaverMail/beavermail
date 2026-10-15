@@ -18,6 +18,7 @@ pub enum Command {
     Undo,
     ToggleRead,
     Spam,
+    TrustSender,
     BlockSender,
     OpenInTab,
     CloseTab,
@@ -48,7 +49,7 @@ const CTRL_SHIFT: Modifiers = Modifiers::COMMAND.plus(Modifiers::SHIFT);
 
 impl Command {
     /// In the order the keys are tried (Ctrl+Shift+Tab before Ctrl+Tab) and the palette lists them.
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 24] = [
         Self::Palette,
         Self::NewMessage,
         Self::Reply,
@@ -59,6 +60,7 @@ impl Command {
         Self::Undo,
         Self::ToggleRead,
         Self::Spam,
+        Self::TrustSender,
         Self::BlockSender,
         Self::OpenInTab,
         Self::CloseTab,
@@ -86,6 +88,7 @@ impl Command {
             Self::Undo => "Undo archive or move to Trash",
             Self::ToggleRead => "Mark as read or unread",
             Self::Spam => "Spam",
+            Self::TrustSender => "Trust sender",
             Self::BlockSender => "Block sender",
             Self::OpenInTab => "Open in a tab",
             Self::CloseTab => "Close tab",
@@ -122,7 +125,7 @@ impl Command {
             Self::SelectAll => &[Trigger::Shortcut(CTRL, Key::A, false)],
             Self::Search => &[Trigger::Text("/")],
             Self::SwitchPane => &[Trigger::Key(Key::F6)],
-            Self::BlockSender | Self::Refresh | Self::AllInboxes | Self::WorkOffline | Self::WorkOnline | Self::Settings => &[],
+            Self::TrustSender | Self::BlockSender | Self::Refresh | Self::AllInboxes | Self::WorkOffline | Self::WorkOnline | Self::Settings => &[],
         }
     }
 
