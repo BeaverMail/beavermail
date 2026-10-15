@@ -197,6 +197,12 @@ fn summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageSummary> {
         unread: row.get::<_, i64>(7)? != 0,
         has_attachments: row.get::<_, i64>(8)? != 0,
         message_id: row.get(9)?,
+        parents: {
+            let (in_reply_to, refs): (String, String) = (row.get(10)?, row.get(11)?);
+            let mut parents: Vec<String> = refs.split_whitespace().chain(in_reply_to.split_whitespace()).map(str::to_owned).collect();
+            parents.dedup();
+            parents
+        },
     })
 }
 
@@ -263,7 +269,7 @@ fn fts_term(word: &str) -> String {
 /// How much of a message's text the preview keeps.
 const PREVIEW_CHARS: usize = 1500;
 
-const SUMMARY_COLUMNS: &str = "id, CASE WHEN from_name = '' THEN from_addr ELSE from_name END, from_addr, subject, preview, received, timestamp, unread, attach, message_id";
+const SUMMARY_COLUMNS: &str = "id, CASE WHEN from_name = '' THEN from_addr ELSE from_name END, from_addr, subject, preview, received, timestamp, unread, attach, message_id, in_reply_to, refs";
 
 /// The key as SQLCipher takes a raw one: `x'<hex>'`.
 fn raw_key(key: &[u8; 32]) -> String {
@@ -954,7 +960,7 @@ impl Store {
         let sql = format!("SELECT {SUMMARY_COLUMNS}, folder FROM messages WHERE {} ORDER BY timestamp DESC LIMIT {}", conditions.join(" AND "), limit.min(1000));
         let conn = self.conn();
         let mut stmt = conn.prepare(&sql).map_err(db)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |r| Ok(Hit { message: summary(r)?, folder: r.get(10)? })).map_err(db)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |r| Ok(Hit { message: summary(r)?, folder: r.get(12)? })).map_err(db)?;
         rows.collect::<Result<_, _>>().map_err(db)
     }
 

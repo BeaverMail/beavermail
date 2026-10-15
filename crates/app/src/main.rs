@@ -20,6 +20,7 @@ mod icons;
 mod learn;
 mod security;
 mod theme;
+mod threads;
 mod unsubscribe;
 mod views;
 
@@ -48,6 +49,8 @@ enum Event {
     /// One sync of the selected folder finished; more history may remain.
     Synced(u64, usize, Result<SyncReport, MailError>),
     Messages(u64, usize, Result<Vec<MessageSummary>, MailError>),
+    /// The Sent folder of the account shown, for the user's replies in its conversations: (account, folder index shown, messages).
+    SentList(u64, usize, Result<Vec<MessageSummary>, MailError>),
     Body(u64, MessageId, Result<Box<Prepared>, MailError>),
     /// The checks' verdicts on the Inbox loaded as (account, folder index).
     Screened(u64, usize, Result<std::collections::HashMap<MessageId, screen::Screened>, MailError>),
@@ -208,6 +211,10 @@ struct ReaderOutcome {
     unsubscribe: Option<(String, unsubscribe::Method)>,
     /// Block sender was pressed on this message.
     block: Option<MessageId>,
+    /// Another message of the conversation was chosen in the reader.
+    switch: Option<MessageId>,
+    /// "Show earlier" was pressed in the conversation.
+    expand: bool,
 }
 
 struct AccountView {
@@ -468,9 +475,7 @@ fn account_page(ui: &mut egui::Ui, t: &theme::Tokens, form: &mut NewAccount) -> 
         });
         ui.end_row();
     });
-    ui.add_space(4.0);
-    ui.checkbox(&mut form.save_sent, "Keep a copy of sent messages in Sent");
-    hint(ui, "Turn off for providers that already do it, such as Gmail and Microsoft 365.");
+    views::switch_row(ui, t, &mut form.save_sent, "Keep a copy of sent messages in Sent", "Turn off for providers that already do it, such as Gmail and Microsoft 365.");
 
     section_title(ui, "Connection");
     hint(ui, "Saving a change here reconnects the account. A different user or server downloads its mail again.");
@@ -598,6 +603,12 @@ struct BeaverApp {
     pane: Option<Pane>,
     /// A scroll of the reader asked for from the keyboard, done when it is next drawn.
     reader_scroll: Option<Scroll>,
+    /// The Sent folder of the account shown (empty when Sent itself is shown).
+    sent: Vec<MessageSummary>,
+    /// The conversations of the folder shown, worked out again when it changes.
+    conversations: threads::Conversations,
+    /// The reader shows every message of the open conversation, not only the latest few.
+    whole_conversation: bool,
     /// The message last asked for in the reader, so a load it no longer wants stops early.
     wanted: Arc<std::sync::atomic::AtomicU64>,
     /// A list row to bring into view after the keyboard moved to it.
@@ -700,6 +711,9 @@ impl BeaverApp {
             reader_scroll: None,
             list_reveal: None,
             wanted: Arc::default(),
+            sent: Vec::new(),
+            conversations: threads::Conversations::default(),
+            whole_conversation: false,
             list_view: (0.0, 0.0),
             confirm_forget_marks: false,
             compose_focus: None,
@@ -783,6 +797,7 @@ impl BeaverApp {
         let Some(view) = self.view(serial) else { return };
         let (Some(source), Some(mailbox)) = (view.source.clone(), view.mailboxes.get(index)) else { return };
         let name = mailbox.name.clone();
+        let sent_folder = view.mailboxes.iter().find(|m| m.role == Role::Sent && m.name != name).map(|m| m.name.clone());
         self.selected = Some((serial, index));
         self.refresh_drafts();
         // The reading pane belonged to the list being left; tabs stay.
@@ -797,6 +812,11 @@ impl BeaverApp {
         let local = source.clone();
         let folder = name.clone();
         self.spawn(async move { Event::Messages(serial, index, local.messages(&folder).await) });
+        self.sent.clear();
+        if let Some(sent) = sent_folder {
+            let local = source.clone();
+            self.spawn(async move { Event::SentList(serial, index, local.messages(&sent).await) });
+        }
         self.start_sync(serial, index, source, name);
     }
 
@@ -895,8 +915,13 @@ impl BeaverApp {
         if self.active() != Some(at) {
             self.activate(at);
         }
+        // Reading a conversation reads all of it, as its row shows it unread while any message is.
+        let unread_here: Vec<MessageId> = self.conversation(id).into_iter().filter(|m| *m != id && self.summary_of(*m).is_some_and(|s| s.unread)).collect();
         if !judging && unread {
             self.act(id, Action::Unread(false));
+        }
+        if !judging {
+            unread_here.into_iter().for_each(|m| self.act(m, Action::Unread(false)));
         }
     }
 
@@ -911,6 +936,7 @@ impl BeaverApp {
         let own: Vec<String> = self.accounts.iter().map(|v| v.account.address().to_owned()).collect();
         let (archive, settings, wanted) = (self.archive.clone(), self.settings.clone(), self.wanted.clone());
         self.in_tab = tab.pinned;
+        self.whole_conversation &= self.message.is_some_and(|m| self.conversations.same(m, id));
         self.message = Some(id);
         self.body = None;
         self.view_mode = None;
@@ -996,6 +1022,23 @@ impl BeaverApp {
             .find(|m| m.id == id)
             .or_else(|| self.tabs.iter().find(|t| t.message.id == id).map(|t| &t.message))
             .or_else(|| self.hits.iter().find(|(_, h)| h.message.id == id).map(|(_, h)| &h.message))
+            .or_else(|| self.sent.iter().find(|m| m.id == id))
+    }
+
+    /// The list shows conversations: on in Settings, and not in search results, the suspicious mail,
+    /// Drafts or Spam, where each message is judged or edited alone.
+    fn threaded(&self) -> bool {
+        self.settings.threads && !self.searching() && !self.show_suspicious && !matches!(self.role(), Role::Drafts | Role::Junk)
+    }
+
+    /// The messages of the folder shown that a command on `id` applies to: its whole conversation
+    /// there when the list shows conversations, else `id` alone.
+    fn conversation(&self, id: MessageId) -> Vec<MessageId> {
+        if !self.threaded() || !self.messages.iter().any(|m| m.id == id) {
+            return vec![id];
+        }
+        let ids: Vec<MessageId> = self.conversations.members(id).iter().copied().filter(|m| self.messages.iter().any(|x| x.id == *m)).collect();
+        if ids.is_empty() { vec![id] } else { ids }
     }
 
     /// The account of message `id`: its tab's or search result's, which may not be the folder shown's.
@@ -1146,10 +1189,14 @@ impl BeaverApp {
         // checking at sync, in the background, would avoid.
         let checked = self.holding() && !self.screening.is_empty();
         let want = if self.show_suspicious { screen::Place::Spam } else { screen::Place::Inbox };
+        let threaded = self.threaded();
+        let mut shown = std::collections::HashSet::new();
         self.messages
             .iter()
             .filter(|m| !ours.contains(&m.message_id))
             .filter(|m| if checked { self.screening.get(&m.id).is_some_and(|s| s.place == want) } else { !self.show_suspicious })
+            // Newest first, so a conversation's row is its latest message here.
+            .filter(|m| !threaded || self.conversations.number(m.id).is_none_or(|n| shown.insert(n)))
             .collect()
     }
 
@@ -1814,6 +1861,9 @@ impl BeaverApp {
                 ui.add_space(4.0);
             }
                                 ui.add_space(12.0);
+                                let about = "One row per conversation, with your replies from Sent. Archive, Delete and Mark as read act on all of it.";
+                                changed |= views::switch_row(ui, t, &mut self.settings.threads, "Group messages into conversations", about).changed();
+                                ui.add_space(12.0);
             if !self.settings.remote_senders.is_empty() {
                 ui.label(RichText::new("Senders that may load remote content").strong());
                 let mut forget = None;
@@ -1853,10 +1903,8 @@ impl BeaverApp {
             }
                             }
                             SettingsPage::Writing => {
-            if ui.checkbox(&mut self.settings.rich_outgoing, "Write in Markdown and send an HTML version too").changed() {
-                changed = true;
-            }
-            ui.label(RichText::new("Bold, lists, links and quotes. The plain-text part is always sent, readable as written. Off: plain text only.").size(13.0).color(t.text_dim));
+                                let about = "Bold, lists, links and quotes. The plain-text part is always sent, readable as written. Off: plain text only.";
+                                changed |= views::switch_row(ui, t, &mut self.settings.rich_outgoing, "Write in Markdown and send an HTML version too", about).changed();
                                 ui.add_space(12.0);
                                 ui.label("Undo send");
                                 let secs = &mut self.settings.undo_send_secs;
@@ -1868,10 +1916,11 @@ impl BeaverApp {
                                 hint(ui, "After Send the message waits here, so you can take it back. Off sends it at once.");
                             }
                             SettingsPage::Spam => {
-            if ui.checkbox(&mut self.settings.hold_suspicious, "Hold suspicious mail from new senders apart from the Inbox").changed() {
-                changed = true;
-                rescreen = true;
-            }
+                                let about = "Mail from a new sender that fails a check waits under Suspicious, beside the Inbox.";
+                                if views::switch_row(ui, t, &mut self.settings.hold_suspicious, "Hold suspicious mail from new senders apart from the Inbox", about).changed() {
+                                    changed = true;
+                                    rescreen = true;
+                                }
                                 ui.add_space(12.0);
                                 let marked = self.settings.marked.len();
                                 if marked == 0 {
@@ -2108,8 +2157,19 @@ impl BeaverApp {
 
     /// Runs a user action; trashing from the trash asks first, because that erases for good.
     fn request(&mut self, id: MessageId, action: Action) {
+        let whole = self.conversation(id);
         if matches!(action, Action::Reply | Action::ReplyAll | Action::Forward) {
             self.answer(id, action);
+        } else if whole.len() > 1 {
+            // Triage goes on with the conversation that takes this one's row, as for a single message.
+            let row = self.listed().iter().position(|i| self.conversations.same(*i, id));
+            let open = self.message.is_some_and(|m| whole.contains(&m));
+            self.request_all(whole, action);
+            if action.removes() && open && self.confirm_erase.is_empty()
+                && let Some(next) = row.and_then(|r| self.listed().get(r).copied())
+            {
+                self.show_listed(next);
+            }
         } else if matches!(action, Action::Trash) && self.role_of(id) == Role::Trash {
             self.confirm_erase = vec![id];
         } else {
@@ -2125,6 +2185,9 @@ impl BeaverApp {
     /// Runs `action` on several messages at once, as [`Self::request`] does on one. Spam and Not spam
     /// mark the senders and keep the messages as examples, as one at a time.
     fn request_all(&mut self, ids: Vec<MessageId>, action: Action) {
+        let mut ids: Vec<MessageId> = ids.into_iter().flat_map(|id| self.conversation(id)).collect();
+        let mut seen = std::collections::HashSet::new();
+        ids.retain(|id| seen.insert(*id));
         let Some(&first) = ids.first() else { return };
         if ids.len() == 1 && !matches!(action, Action::Spam | Action::NotSpam) {
             return self.request(first, action);
@@ -2321,7 +2384,7 @@ impl BeaverApp {
         }
         // In a message tab the list is not on screen: no moving through it.
         let ids: Vec<MessageId> = if self.in_tab { Vec::new() } else { self.listed() };
-        let pos = self.message.and_then(|id| ids.iter().position(|i| *i == id));
+        let pos = self.message.and_then(|id| ids.iter().position(|i| self.conversations.same(*i, id) && (self.threaded() || *i == id)));
         if key(egui::Key::F6) && !self.in_tab {
             self.pane = Some(if self.pane == Some(Pane::Reader) || self.message.is_none() { Pane::List } else { Pane::Reader });
             return;
@@ -2363,7 +2426,7 @@ impl BeaverApp {
             };
             if let Some(next) = next.map(|n| n.min(last)) {
                 self.list_reveal = Some(next);
-                if Some(ids[next]) != self.message {
+                if pos != Some(next) {
                     self.show_listed(ids[next]);
                 }
             }
@@ -2629,6 +2692,10 @@ impl BeaverApp {
                 }
                 Err(e) => self.error = Some(e.to_string()),
             },
+            Event::SentList(serial, index, result) if self.selected == Some((serial, index)) => {
+                // Without it a conversation shows only the folder's side; not worth an error.
+                self.sent = result.unwrap_or_default();
+            }
             Event::Screened(serial, index, result) if self.selected == Some((serial, index)) => {
                 self.checking = false;
                 match result {
@@ -3126,7 +3193,7 @@ impl BeaverApp {
                     for (serial, hit) in &self.hits[range] {
                         let id = hit.message.id;
                         let selected = if self.picked.len() >= 2 { self.picked.contains(&id) } else { self.message == Some(id) };
-                        let row = views::message_row(ui, t, &hit.message, selected, Some(&hit.folder), None);
+                        let row = views::message_row(ui, t, &hit.message, selected, Some(&hit.folder), None, 1);
                         let (ctrl, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
                         let keep = row.double_clicked() || row.triple_clicked() || row.middle_clicked();
                         if row.clicked() && !keep && ctrl {
@@ -3174,11 +3241,16 @@ impl BeaverApp {
             }
             ui.spacing_mut().item_spacing.y = 0.0; // rows touch, so row `i` starts at `i` times the row height
             let area = list_area(reveal, view);
+            let threaded = self.threaded();
             let shown_rows = area.show_rows(ui, views::MESSAGE_ROW_H, shown.len(), |ui, range| {
                 for message in &shown[range] {
                     let warning = self.correction(message.id).and_then(|(_, warning)| warning);
-                    let selected = if self.picked.len() >= 2 { self.picked.contains(&message.id) } else { self.message == Some(message.id) };
-                    let row = views::message_row(ui, t, message, selected, None, warning);
+                    // A conversation's row: its latest message here, bold while any of it is unread.
+                    let (count, unread) = if threaded { (self.conversations.members(message.id).len(), self.conversations.unread(message.id)) } else { (1, message.unread) };
+                    let open = self.message.is_some_and(|id| if threaded { self.conversations.same(id, message.id) } else { id == message.id });
+                    let selected = if self.picked.len() >= 2 { self.picked.contains(&message.id) } else { open };
+                    let summary = MessageSummary { unread, ..(*message).clone() };
+                    let row = views::message_row(ui, t, &summary, selected, None, warning, count);
                     let (ctrl, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
                     // A click just before the double click makes egui count three: that opens the tab too.
                     if row.double_clicked() || row.triple_clicked() || row.middle_clicked() {
@@ -3250,6 +3322,13 @@ impl BeaverApp {
         let mut suspicious = false;
         let (mut leave, mut block) = (None, None);
         let scroll = self.reader_scroll.take();
+        let (mut switch, mut expand) = (None, false);
+        // The open message's conversation, oldest first, when the list shows conversations.
+        let conversation: Vec<MessageSummary> = match self.message.filter(|_| self.threaded()) {
+            Some(id) => self.conversations.members(id).iter().filter_map(|m| self.summary_of(*m).cloned()).collect(),
+            None => Vec::new(),
+        };
+        let whole = self.whole_conversation;
         // The correction that makes sense; the reasons are the warnings shown just above it.
         let correction = self.message.and_then(|id| self.correction(id)).map(|(choice, _)| choice);
         let (settings_mode, view_mode) = (self.settings.clone(), self.view_mode);
@@ -3341,6 +3420,25 @@ impl BeaverApp {
                             ui.add_space(20.0);
                             ui.heading(&message.subject);
                             ui.add_space(12.0);
+                            if conversation.len() > 1 {
+                                // The latest few, so a long conversation does not push the message out of sight.
+                                let hidden = if whole || conversation.len() <= 6 { 0 } else { conversation.len() - 5 };
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(format!("{} messages in this conversation", conversation.len())).size(13.0).color(t.text_dim));
+                                    if hidden > 0 && ui.small_button(format!("Show {hidden} earlier")).clicked() {
+                                        expand = true;
+                                    }
+                                });
+                                ui.add_space(2.0);
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                for m in conversation.iter().skip(hidden) {
+                                    if views::thread_row(ui, t, m, m.id == message.id).clicked() && m.id != message.id {
+                                        switch = Some(m.id);
+                                    }
+                                }
+                                ui.spacing_mut().item_spacing.y = 8.0;
+                                ui.add_space(14.0);
+                            }
                             let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), views::AVATAR), egui::Sense::hover());
                             views::avatar(ui, t, &message.from, rect.left_center() + vec2(views::AVATAR / 2.0, 0.0), views::AVATAR);
                             let authenticity = sender::authenticity(&body.data.auth, &server_host, &message.address);
@@ -3483,7 +3581,7 @@ impl BeaverApp {
                 pane_ring(ui, t, reader.response.rect);
             }
         }
-        ReaderOutcome { action, url, mode: chosen_mode, remember, attachment, save_many, allow_sender, mark, bulk, unsubscribe: leave, block }
+        ReaderOutcome { action, url, mode: chosen_mode, remember, attachment, save_many, allow_sender, mark, bulk, unsubscribe: leave, block, switch, expand }
     }
 }
 
@@ -3495,6 +3593,9 @@ impl eframe::App for BeaverApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         while let Ok(event) = self.rx.try_recv() {
             self.apply(event);
+        }
+        if self.settings.threads {
+            self.conversations.update(&self.messages, &self.sent);
         }
         let t = theme::Tokens::get(ui.ctx());
         self.error_banner(ui, &t);
@@ -3548,7 +3649,18 @@ impl eframe::App for BeaverApp {
         self.confirm_remove = removed.or(self.confirm_remove);
 
         self.handle_keys(ui.ctx());
-        let ReaderOutcome { action, url, mode, remember, attachment, save_many, allow_sender, mark, bulk, unsubscribe, block } = self.reader(ui, &t);
+        let ReaderOutcome { action, url, mode, remember, attachment, save_many, allow_sender, mark, bulk, unsubscribe, block, switch, expand } = self.reader(ui, &t);
+        self.whole_conversation |= expand;
+        // Another message of the conversation takes the place of the one shown, in the pane or its tab.
+        if let Some(id) = switch
+            && let Some(at) = self.active()
+            && let Some(message) = self.summary_of(id).cloned()
+        {
+            let role = if self.sent.iter().any(|m| m.id == id) { Role::Sent } else { self.role() };
+            let (serial, pinned) = (self.tabs[at].serial, self.tabs[at].pinned);
+            self.tabs[at] = tabs::Tab { serial, message, role, pinned };
+            self.activate(at);
+        }
         match unsubscribe {
             // The compose window is the question: nothing goes out until Send.
             Some((_, unsubscribe::Method::Mail(to, subject, text))) => {

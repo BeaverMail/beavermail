@@ -756,6 +756,7 @@ mod tests {
             timestamp: 0,
             has_attachments: false,
             message_id: String::new(),
+            parents: Vec::new(),
             unread: false,
         };
         let body = MessageBody {

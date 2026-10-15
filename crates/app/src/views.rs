@@ -14,6 +14,8 @@ use crate::theme::{self, CONTROL_H, CONTROL_RADIUS, Tokens};
 /// Fixed row height, so the list can be virtualised with `show_rows`.
 pub const MESSAGE_ROW_H: f32 = 84.0;
 const FOLDER_ROW_H: f32 = 38.0;
+const THREAD_ROW_H: f32 = 38.0;
+const SWITCH: egui::Vec2 = vec2(40.0, 22.0);
 pub const AVATAR: f32 = 40.0;
 
 fn tint(t: &Tokens) -> Color32 {
@@ -137,10 +139,65 @@ fn nav_row(ui: &mut Ui, t: &Tokens, title: &str, icon: Option<(Icon, Color32)>, 
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+/// An on/off setting: its name and a line saying what it does on the left, a switch on the right.
+/// The whole row flips it; the response is `changed` when it did.
+pub fn switch_row(ui: &mut Ui, t: &Tokens, on: &mut bool, label: &str, hint: &str) -> Response {
+    let width = ui.available_width();
+    let text_w = (width - SWITCH.x - 24.0).max(80.0);
+    let title = ui.painter().layout(label.to_owned(), FontId::proportional(15.0), t.text, text_w);
+    let about = (!hint.is_empty()).then(|| ui.painter().layout(hint.to_owned(), FontId::proportional(13.0), t.text_dim, text_w));
+    let text_h = title.size().y + about.as_ref().map_or(0.0, |a| a.size().y + 3.0);
+    let (rect, mut response) = ui.allocate_exact_size(vec2(width, text_h.max(SWITCH.y) + 12.0), Sense::click());
+    if response.clicked() {
+        *on = !*on;
+        response.mark_changed();
+    }
+    let top = rect.top() + 6.0;
+    ui.painter().galley(pos2(rect.left(), top), title, t.text);
+    if let Some(about) = about {
+        ui.painter().galley(pos2(rect.left(), rect.bottom() - 6.0 - about.size().y), about, t.text_dim);
+    }
+    // The switch lines up with the name, where the eye reads what it turns on.
+    let track = Rect::from_min_size(pos2(rect.right() - SWITCH.x, top + 10.0 - SWITCH.y / 2.0), SWITCH);
+    let k = ui.ctx().animate_bool_responsive(response.id, *on);
+    let off = if t.dark { t.border_strong } else { t.text_dim };
+    let fill = if *on { t.accent } else { off };
+    let fill = if response.hovered() { fill.gamma_multiply(0.85) } else { fill };
+    ui.painter().rect_filled(track, CornerRadius::same((SWITCH.y / 2.0) as u8), fill);
+    let knob = if *on || !t.dark { t.on_accent } else { t.text };
+    let r = SWITCH.y / 2.0 - 3.0;
+    ui.painter().circle_filled(pos2(track.left() + 3.0 + r + k * (SWITCH.x - 6.0 - 2.0 * r), track.center().y), r, knob);
+    if response.has_focus() {
+        ui.painter().rect_stroke(track.expand(3.0), CornerRadius::same((SWITCH.y / 2.0 + 3.0) as u8), egui::Stroke::new(2.0, t.accent), egui::StrokeKind::Outside);
+    }
+    response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *on, label));
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// One message of the open conversation in the reader: who, a line of it, and when; `current` is the one shown.
+pub fn thread_row(ui: &mut Ui, t: &Tokens, message: &MessageSummary, current: bool) -> Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), THREAD_ROW_H), Sense::click());
+    row_background(ui, rect, &response, current, t);
+    avatar(ui, t, &message.from, pos2(rect.left() + 20.0, rect.center().y), 24.0);
+    let date = ui.painter().layout_no_wrap(message.received.clone(), FontId::proportional(13.0), t.text_dim);
+    let date_w = date.size().x;
+    ui.painter().galley(pos2(rect.right() - 10.0 - date_w, rect.center().y - date.size().y / 2.0), date, t.text_dim);
+    let left = rect.left() + 42.0;
+    let room = rect.right() - 20.0 - date_w - left;
+    let color = if message.unread || current { t.text } else { t.text_dim };
+    let name = truncated(ui, &message.from, FontId::proportional(14.0), color, room * 0.4);
+    let name_w = name.size().x;
+    ui.painter().galley(pos2(left, rect.center().y - name.size().y / 2.0), name, color);
+    let line = truncated(ui, &message.preview, FontId::proportional(13.0), t.text_dim, room - name_w - 10.0);
+    ui.painter().galley(pos2(left + name_w + 10.0, rect.center().y - line.size().y / 2.0), line, t.text_dim);
+    response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, current, &message.from));
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 /// A message in the list: avatar, sender with unread dot, date, subject and a one-line preview.
 /// `warning`, the spam check that failed, takes the preview's place (the preview is the sender's
-/// text), so spam is judged without opening it.
-pub fn message_row(ui: &mut Ui, t: &Tokens, message: &MessageSummary, selected: bool, folder: Option<&str>, warning: Option<&str>) -> Response {
+/// text), so spam is judged without opening it. `count`: messages in its conversation, shown from two.
+pub fn message_row(ui: &mut Ui, t: &Tokens, message: &MessageSummary, selected: bool, folder: Option<&str>, warning: Option<&str>, count: usize) -> Response {
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), MESSAGE_ROW_H), Sense::click());
     let card = rect.shrink2(vec2(8.0, 2.0));
     row_background(ui, card, &response, selected, t);
@@ -156,6 +213,15 @@ pub fn message_row(ui: &mut Ui, t: &Tokens, message: &MessageSummary, selected: 
     let clip = if message.has_attachments { 20.0 } else { 0.0 };
     if message.has_attachments {
         Icon::Paperclip.image(15.0, t.text_dim).paint_at(ui, Rect::from_center_size(pos2(card.right() - 14.0 - date_w - 17.0, card.top() + 21.0), vec2(15.0, 15.0)));
+    }
+    let mut clip = clip;
+    if count > 1 {
+        let text = ui.painter().layout_no_wrap(count.to_string(), FontId::proportional(12.5), t.text_dim);
+        let pill = Rect::from_center_size(pos2(0.0, card.top() + 21.0), vec2((text.size().x + 14.0).max(24.0), 20.0));
+        let pill = pill.translate(vec2(card.right() - 14.0 - date_w - clip - 8.0 - pill.width() / 2.0, 0.0));
+        ui.painter().rect_filled(pill, CornerRadius::same(10), if selected { t.accent.gamma_multiply(0.22) } else { t.hover });
+        ui.painter().galley(pill.center() - text.size() / 2.0, text, t.text_dim);
+        clip += pill.width() + 8.0;
     }
     let primary = if message.unread { t.text } else { t.text_dim };
     let dot = if message.unread { 16.0 } else { 0.0 };

@@ -142,6 +142,7 @@ mod tests {
             unread: false,
             has_attachments: false,
             message_id: String::new(),
+            parents: Vec::new(),
         }
     }
 

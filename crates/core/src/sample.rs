@@ -41,6 +41,7 @@ impl SampleSource {
                     timestamp: 0,
                     has_attachments: false,
                     message_id: String::new(),
+                    parents: Vec::new(),
                     unread: next() % 3 == 0,
                 };
                 (folder, summary, body)

@@ -51,6 +51,9 @@ pub struct MessageSummary {
     pub has_attachments: bool,
     /// The `Message-ID` header without angle brackets; empty when the message has none.
     pub message_id: String,
+    /// The messages it answers, from `In-Reply-To` and `References`, without angle brackets: what
+    /// groups it into a conversation.
+    pub parents: Vec<String>,
 }
 
 /// What one synchronisation of a folder did.
@@ -301,6 +304,9 @@ pub struct Settings {
     /// own filter learning from the Spam folder) would hold it on every device.
     #[serde(default)]
     pub marked: std::collections::BTreeMap<String, bool>,
+    /// Show a conversation as one row in the list, its messages together in the reader.
+    #[serde(default = "yes")]
+    pub threads: bool,
 }
 
 fn yes() -> bool {
@@ -313,7 +319,7 @@ fn undo_secs() -> u32 {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { display: DisplayMode::default(), sender_display: Default::default(), rich_outgoing: true, undo_send_secs: undo_secs(), remote_senders: Default::default(), hold_suspicious: true, marked: Default::default() }
+        Self { display: DisplayMode::default(), sender_display: Default::default(), rich_outgoing: true, undo_send_secs: undo_secs(), remote_senders: Default::default(), hold_suspicious: true, marked: Default::default(), threads: true }
     }
 }
 
