@@ -162,6 +162,10 @@ impl MailSource for SampleSource {
     async fn erase(&self, _: MessageId) -> Result<(), MailError> {
         Err(read_only())
     }
+
+    async fn empty(&self, _: Role) -> Result<usize, MailError> {
+        Err(read_only())
+    }
 }
 
 #[cfg(test)]

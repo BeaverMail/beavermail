@@ -988,6 +988,34 @@ impl MailSource for ImapSource {
     async fn erase(&self, id: MessageId) -> Result<(), MailError> {
         self.write(id, Op::Erase).await
     }
+
+    async fn empty(&self, role: Role) -> Result<usize, MailError> {
+        if !matches!(role, Role::Trash | Role::Junk) {
+            return Err(backend("only Trash and Spam can be emptied"));
+        }
+        let folder = self.folder_with_role(role).await?.ok_or_else(|| backend(format!("this account has no {role:?} folder")))?;
+        // Only what the user has seen listed: what arrived meanwhile is not erased unseen.
+        let uids: Vec<u32> = self.store.flags_since(&self.account, &folder, 0)?.into_iter().map(|(uid, _)| uid).collect();
+        if uids.is_empty() {
+            return Ok(0);
+        }
+        let mut state = self.state.lock().await;
+        let session = state.session(&self.config).await?;
+        let result = async {
+            session.select(&folder).await?;
+            for chunk in uids.chunks(500) {
+                let set = chunk.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+                session.uid_store(&set, "+FLAGS.SILENT (\\Deleted)").await?.try_collect::<Vec<_>>().await?;
+                session.uid_expunge(&set).await?.try_collect::<Vec<_>>().await?;
+            }
+            Ok::<(), async_imap::error::Error>(())
+        }
+        .await;
+        result.map_err(|e| state.failed(e))?;
+        self.drop_files(&folder, &uids);
+        self.store.remove_uids(&self.account, &folder, &uids)?;
+        Ok(uids.len())
+    }
 }
 
 #[cfg(test)]

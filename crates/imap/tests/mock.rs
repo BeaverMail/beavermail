@@ -238,6 +238,16 @@ async fn erase_in_the_trash_deletes_for_good() {
 }
 
 #[tokio::test]
+async fn emptying_erases_the_known_messages_of_that_folder_only() {
+    let mock = start(true).await;
+    message_in(&mock, "Trash").await;
+    assert!(mock.source.empty(Role::Inbox).await.is_err(), "only Trash and Spam");
+    assert_eq!(mock.source.empty(Role::Trash).await.unwrap(), 1);
+    assert_eq!(mock.writes(), ["UID STORE 5 +FLAGS.SILENT (\\Deleted)", "UID EXPUNGE 5"]);
+    assert!(mock.source.messages("Trash").await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn moving_within_the_target_folder_is_refused() {
     let mock = start(true).await;
     let id = message_in(&mock, "Trash").await;

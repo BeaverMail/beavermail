@@ -102,6 +102,10 @@ pub trait MailSource {
 
     /// Erases a message for good. Only messages already in the trash folder may be erased.
     fn erase(&self, id: MessageId) -> impl Future<Output = Result<(), MailError>> + Send;
+
+    /// Erases for good every message known here in the Trash or Spam folder (`role`); mail that
+    /// arrived since the last sync stays. Returns how many were erased.
+    fn empty(&self, role: Role) -> impl Future<Output = Result<usize, MailError>> + Send;
 }
 
 /// Sends mail for one account. Kept apart from [`MailSource`]: sending and reading use different servers.
