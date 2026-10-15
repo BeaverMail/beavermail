@@ -57,10 +57,11 @@ enum Event {
     /// The checks' verdicts on the Inbox loaded as (account, folder index).
     Screened(u64, usize, Result<std::collections::HashMap<MessageId, screen::Screened>, MailError>),
     /// A write (read flag, archive, trash) finished; the UI already showed its result.
-    Done(u64, usize, Result<(), MailError>),
-    /// The message in the compose window was sent, or the server refused it.
-    /// Second field: why the copy in Sent could not be saved, when the message itself went out.
-    Sent(Result<(), MailError>, Option<String>),
+    /// The third field is the message and action, for a change that can wait for the connection.
+    Done(u64, usize, Option<(MessageId, Action)>, Result<(), MailError>),
+    /// A message was sent, or the server refused it: (draft id, result, why the copy in Sent could not
+    /// be saved when the message itself went out). The draft is the compose window's or one in the Outbox.
+    Sent(String, Result<(), MailError>, Option<String>),
     /// A change to how stored mail is protected finished.
     Vault(VaultOutcome),
     /// The bytes of an attachment, to open with another program.
@@ -658,6 +659,17 @@ struct BeaverApp {
     palette: Option<Palette>,
     /// The last Archive or Move to Trash, until it goes to the server.
     pending: Option<Pending>,
+    /// Outbox messages being sent now: (account, the draft).
+    outbox_sending: std::collections::HashMap<String, (u64, drafts::DraftData)>,
+    /// Messages waiting in the Outbox, every account together.
+    outbox: usize,
+    /// The user chose to work offline: nothing goes to the network until they go online again. Not
+    /// remembered, so a restart is online and the app is never offline without the user knowing.
+    work_offline: bool,
+    /// Changes made while the server could not be reached, made when it answers: (account, folder
+    /// index, message, action). shortcut: kept in memory only, so closing the app drops them; keep
+    /// them in the vault, as the Outbox does, if that turns out to matter.
+    offline_changes: Vec<(u64, usize, MessageId, Action)>,
     /// The pane F6 moved the keys to; `None` until then, and again after a click in the list.
     pane: Option<Pane>,
     /// A scroll of the reader asked for from the keyboard, done when it is next drawn.
@@ -772,6 +784,10 @@ impl BeaverApp {
             confirm_block: None,
             palette: None,
             pending: None,
+            outbox_sending: std::collections::HashMap::new(),
+            outbox: 0,
+            offline_changes: Vec::new(),
+            work_offline: false,
             pane: None,
             reader_scroll: None,
             list_reveal: None,
@@ -812,6 +828,7 @@ impl BeaverApp {
             }),
             Err(e) => app.error = Some(e),
         }
+        app.count_outbox(); // what waited from the last session shows at once
         app
     }
 
@@ -840,6 +857,10 @@ impl BeaverApp {
             }
             Err(e) => (None, None, Some(e)),
         };
+        if let (Some(source), Some(sender)) = (&source, &sender) {
+            source.set_offline(self.work_offline);
+            sender.set_offline(self.work_offline);
+        }
         if let Some(source) = source.clone() {
             // The archive answers at once; the server's list follows and replaces it.
             let cached = source.clone();
@@ -1231,7 +1252,7 @@ impl BeaverApp {
                 let done = if matches!(action, Action::Archive) { "Archived" } else { "Moved to Trash" };
                 pending.text = format!("{done} {n} message{}", if n == 1 { "" } else { "s" });
             }
-            None => self.spawn(async move { Event::Done(serial, index, perform(source, id, action).await) }),
+            None => self.spawn(async move { Event::Done(serial, index, Some((id, action)), perform(source, id, action).await) }),
         }
         if action.removes() {
             // The message left its folder: its tab goes, and triage goes on with the one that took
@@ -1255,6 +1276,63 @@ impl BeaverApp {
         }
     }
 
+    /// The answer for a message sent from the Outbox: gone from it once sent, left in it while there is no
+    /// connection, and back among the drafts, with the reason, when the server refused it.
+    fn sent_from_outbox(&mut self, serial: u64, draft: drafts::DraftData, result: Result<(), MailError>) {
+        let Some(view) = self.view(serial) else { return };
+        let (key, source) = (view.account.key(), view.source.clone());
+        let subject = if draft.subject.trim().is_empty() { "(no subject)".to_owned() } else { draft.subject.trim().to_owned() };
+        match result {
+            Ok(()) => {
+                if let Err(e) = drafts::delete(&self.vault, &key, &draft.id) {
+                    self.error = Some(format!("“{subject}” was sent, but it could not be taken out of the Outbox: {e}"));
+                }
+                // A copy may have been kept in the server's Drafts folder before it was sent.
+                if let Some(source) = source {
+                    let id = draft.id.clone();
+                    self.spawn(async move { Event::DraftPushed(serial, id.clone(), 0, source.delete_draft(&id).await) });
+                }
+                self.notice = Some((format!("Sent “{subject}” from the Outbox"), std::time::Instant::now()));
+            }
+            Err(MailError::Offline(_)) => {}
+            Err(e) => {
+                let _ = drafts::save(&self.vault, &key, &drafts::DraftData { queued: false, ..draft });
+                self.error = Some(format!("Could not send “{subject}”: {e}. It is back in Drafts."));
+            }
+        }
+        self.count_outbox();
+        self.refresh_drafts();
+    }
+
+    /// Works offline, or online again. Offline, the backends answer "offline" at once, so syncing,
+    /// downloads and the Inbox watch stop, and sending and changes wait in their queues. Online, every
+    /// account asks its server again, which also sends what waited.
+    fn set_work_offline(&mut self, offline: bool) {
+        self.work_offline = offline;
+        for view in &mut self.accounts {
+            if let (Some(source), Some(sender)) = (&view.source, &view.sender) {
+                source.set_offline(offline);
+                sender.set_offline(offline);
+            }
+            if offline {
+                view.watch_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                view.watch_stop = Arc::new(std::sync::atomic::AtomicBool::new(false)); // for the next watch
+                view.watching = false;
+                view.progress.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                view.offline = false;
+                view.progress.cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        if !offline {
+            // The server's answer starts downloads, the watch and the Outbox (see `Event::Mailboxes`).
+            for (serial, source) in self.accounts.iter().filter_map(|v| Some((v.serial, v.source.clone()?))).collect::<Vec<_>>() {
+                self.spawn(async move { Event::Mailboxes(serial, source.mailboxes().await, true) });
+            }
+            self.refresh();
+        }
+    }
+
     /// The server of account `serial` could not be reached: shown as a state, not an error.
     fn went_offline(&mut self, serial: u64) {
         if let Some(view) = self.accounts.iter_mut().find(|v| v.serial == serial) {
@@ -1267,7 +1345,7 @@ impl BeaverApp {
         let Some(pending) = self.pending.take() else { return };
         for (serial, index, action, message, _) in pending.items {
             if let Some(source) = self.view(serial).and_then(|v| v.source.clone()) {
-                self.spawn(async move { Event::Done(serial, index, perform(source, message.id, action).await) });
+                self.spawn(async move { Event::Done(serial, index, Some((message.id, action)), perform(source, message.id, action).await) });
             }
         }
     }
@@ -1615,28 +1693,81 @@ impl BeaverApp {
 
     /// Hands the message to the server in the background; the answer comes back as `Event::Sent`.
     fn dispatch_send(&mut self, compose: &mut compose::Compose) {
-        let Some(view) = self.view(compose.from) else { return };
+        if self.send_message(compose) {
+            compose.sending = true;
+            compose.error = None;
+        }
+    }
+
+    /// Sends `compose`'s message from its account in the background; false when the account cannot send.
+    fn send_message(&self, compose: &compose::Compose) -> bool {
+        let Some(view) = self.view(compose.from) else { return false };
         let (account, sender, source) = (view.account.clone(), view.sender.clone(), view.source.clone());
-        let Some(sender) = sender else { return };
+        let Some(sender) = sender else { return false };
         let mut message = compose.outgoing(account.address(), self.settings.rich_outgoing);
-        let files = compose.file_list();
-        let vault = self.vault.clone();
-        compose.sending = true;
-        compose.error = None;
+        let (files, vault, id) = (compose.file_list(), self.vault.clone(), compose.id.clone());
         self.spawn(async move {
             // The copies are read now, off the window's thread, as they can be large.
             match tokio::task::spawn_blocking(move || attachments::read_files(&vault, &files)).await {
                 Ok(Ok(read)) => message.attachments = read,
-                Ok(Err(e)) => return Event::Sent(Err(MailError::Backend(e)), None),
-                Err(e) => return Event::Sent(Err(MailError::Backend(e.to_string())), None),
+                Ok(Err(e)) => return Event::Sent(id, Err(MailError::Backend(e)), None),
+                Err(e) => return Event::Sent(id, Err(MailError::Backend(e.to_string())), None),
             }
             let result = sender.send(message).await;
             let copy_error = match (&result, source) {
                 (Ok(raw), Some(source)) if account.save_sent => source.save_sent(raw.clone()).await.err().map(|e| e.to_string()),
                 _ => None,
             };
-            Event::Sent(result.map(|_| ()), copy_error)
+            Event::Sent(id, result.map(|_| ()), copy_error)
         });
+        true
+    }
+
+    /// Puts the compose window's message in the Outbox: kept as a draft marked to send, the window closes.
+    fn queue(&mut self, compose: compose::Compose) {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+        let draft = drafts::DraftData { queued: true, ..compose.to_draft(now) };
+        match drafts::save(&self.vault, &compose.key, &draft) {
+            Ok(()) => self.notice = Some(("Saved to the Outbox: it is sent when the server can be reached".into(), std::time::Instant::now())),
+            Err(e) => {
+                self.error = Some(format!("Could not keep the message to send later: {e}"));
+                self.compose = Some(compose); // nothing is lost: the window stays
+                return;
+            }
+        }
+        self.count_outbox();
+        self.refresh_drafts();
+    }
+
+    /// Sends what waits in account `serial`'s Outbox; its server just answered.
+    fn send_outbox(&mut self, serial: u64) {
+        let Some(key) = self.view(serial).map(|v| v.account.key()) else { return };
+        // Changes made offline go first, in the order they were made.
+        if let Some(source) = self.view(serial).and_then(|v| v.source.clone()) {
+            let (now, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.offline_changes).into_iter().partition(|c| c.0 == serial);
+            self.offline_changes = later;
+            for (serial, index, id, action) in now {
+                let source = source.clone();
+                self.spawn(async move { Event::Done(serial, index, Some((id, action)), perform(source, id, action).await) });
+            }
+        }
+        let open = self.compose.as_ref().map(|c| c.id.clone());
+        for draft in drafts::load_all(&self.vault, &key).into_iter().filter(|d| d.queued) {
+            // One being edited, or already on its way, is left alone.
+            if open.as_ref() == Some(&draft.id) || self.outbox_sending.contains_key(&draft.id) {
+                continue;
+            }
+            let mut compose = compose::Compose::from_draft(serial, draft.clone());
+            compose.key = key.clone();
+            if self.send_message(&compose) {
+                self.outbox_sending.insert(draft.id.clone(), (serial, draft));
+            }
+        }
+    }
+
+    /// Counts the messages in every account's Outbox, for the status bar.
+    fn count_outbox(&mut self) {
+        self.outbox = self.accounts.iter().map(|v| drafts::load_all(&self.vault, &v.account.key()).iter().filter(|d| d.queued).count()).sum();
     }
 
     fn compose_window(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
@@ -2727,9 +2858,12 @@ impl BeaverApp {
             Command::CloseTab => if self.in_tab { Ok(()) } else { Err("No message tab is shown") },
             Command::PreviousTab | Command::NextTab => if self.tabs.iter().any(|t| t.pinned) { Ok(()) } else { Err("No message is open in a tab") },
             Command::SelectAll => if self.in_tab || self.listed().is_empty() { Err("No list is shown") } else { Ok(()) },
+            Command::Refresh if self.work_offline => Err("Working offline"),
             Command::Refresh => if self.shown().is_empty() { Err("No folder is shown") } else { Ok(()) },
             Command::SwitchPane => if self.in_tab { Err("A message tab has no list") } else { Ok(()) },
             Command::AllInboxes => if self.accounts.len() >= 2 { Ok(()) } else { Err("Needs two accounts or more") },
+            Command::WorkOffline => if self.work_offline { Err("Already working offline") } else { Ok(()) },
+            Command::WorkOnline => if self.work_offline { Ok(()) } else { Err("Already online") },
         }
     }
 
@@ -2787,6 +2921,8 @@ impl BeaverApp {
                 self.show_settings = true;
                 self.security.mode = None;
             }
+            Command::WorkOffline => self.set_work_offline(true),
+            Command::WorkOnline => self.set_work_offline(false),
         }
     }
 
@@ -2941,6 +3077,7 @@ impl BeaverApp {
                 if download {
                     self.start_download(serial);
                     self.start_watch(serial);
+                    self.send_outbox(serial);
                 }
             }
             Event::Found(seq, serial, result) => {
@@ -3020,7 +3157,8 @@ impl BeaverApp {
                     self.messages.retain(|m| origin.get(&m.id).is_some_and(|s| *s != serial));
                     self.origin.extend(messages.iter().map(|m| (m.id, serial)));
                     // Mail waiting for Undo is still in the folder on the server and in the archive.
-                    let waiting: Vec<MessageId> = self.pending.iter().flat_map(|p| p.items.iter().map(|(_, _, _, m, _)| m.id)).collect();
+                    let offline_moves = self.offline_changes.iter().filter(|c| c.3.removes()).map(|c| c.2);
+                    let waiting: Vec<MessageId> = self.pending.iter().flat_map(|p| p.items.iter().map(|(_, _, _, m, _)| m.id)).chain(offline_moves).collect();
                     self.messages.extend(messages.into_iter().filter(|m| !waiting.contains(&m.id)));
                     if self.unified {
                         self.messages.sort_by_key(|m| std::cmp::Reverse(m.timestamp));
@@ -3060,11 +3198,13 @@ impl BeaverApp {
                     Err(e) => self.error = Some(e.to_string()),
                 }
             }
-            Event::Done(serial, index, Err(e)) => {
-                self.error = Some(match e {
-                    MailError::Offline(_) => "The server cannot be reached, so the change was not made. Try again when you are online.".into(),
-                    e => e.to_string(),
-                });
+            // No connection: the change waits and is made when the server answers again.
+            Event::Done(serial, index, Some(change), Err(MailError::Offline(_))) => {
+                self.went_offline(serial);
+                self.offline_changes.push((serial, index, change.0, change.1));
+            }
+            Event::Done(serial, index, _, Err(e)) => {
+                self.error = Some(e.to_string());
                 // Show what the server really has.
                 if self.unified && self.shows(serial, index) {
                     self.show_all_inboxes();
@@ -3134,23 +3274,36 @@ impl BeaverApp {
                 Ok(None) => {}
                 Err(e) => self.error = Some(e),
             },
-            Event::Sent(result, copy_error) => match result {
-                Ok(()) => {
-                    if let Some(sent) = self.compose.take() {
-                        self.delete_draft(&sent);
-                    }
-                    self.notice = Some(("Message sent".into(), std::time::Instant::now()));
-                    if let Some(e) = copy_error {
-                        self.error = Some(format!("The message was sent, but its copy could not be saved to Sent: {e}"));
+            Event::Sent(id, result, copy_error) => {
+                if let Some(e) = copy_error.as_ref().filter(|_| result.is_ok()) {
+                    self.error = Some(format!("The message was sent, but its copy could not be saved to Sent: {e}"));
+                }
+                if let Some((serial, draft)) = self.outbox_sending.remove(&id) {
+                    self.sent_from_outbox(serial, draft, result);
+                } else if self.compose.as_ref().is_some_and(|c| c.id == id) {
+                    match result {
+                        Ok(()) => {
+                            if let Some(sent) = self.compose.take() {
+                                self.delete_draft(&sent);
+                            }
+                            self.notice = Some(("Message sent".into(), std::time::Instant::now()));
+                        }
+                        // No connection: the message waits in the Outbox instead of failing.
+                        Err(MailError::Offline(_)) => {
+                            if let Some(mut compose) = self.compose.take() {
+                                compose.sending = false;
+                                self.queue(compose);
+                            }
+                        }
+                        Err(e) => {
+                            if let Some(compose) = &mut self.compose {
+                                compose.sending = false;
+                                compose.error = Some(e.to_string());
+                            }
+                        }
                     }
                 }
-                Err(e) => {
-                    if let Some(compose) = &mut self.compose {
-                        compose.sending = false;
-                        compose.error = Some(e.to_string());
-                    }
-                }
-            },
+            }
             _ => {} // answer for a folder or message that is no longer selected
         }
     }
@@ -3209,7 +3362,7 @@ impl BeaverApp {
             mailbox.total = 0;
             mailbox.unread = 0;
         }
-        self.spawn(async move { Event::Done(serial, index, source.empty(Role::Junk).await.map(drop)) });
+        self.spawn(async move { Event::Done(serial, index, None, source.empty(Role::Junk).await.map(drop)) });
     }
 
     /// Confirms emptying a Spam folder: nothing in it can be brought back afterwards.
@@ -3337,10 +3490,22 @@ impl BeaverApp {
         let mode = self.vault.mode();
         let dim = |text: String| RichText::new(text).size(13.0).color(t.text_dim);
         let mut toggle_pause = false;
+        let (mut go_online, mut go_offline) = (false, false);
         let frame = egui::Frame::new().fill(t.bg).inner_margin(egui::Margin::symmetric(14, 5));
         egui::Panel::bottom("status").frame(frame).show(ui, |ui| {
             ui.horizontal(|ui| {
-                if locked {
+                if self.work_offline {
+                    let mut waiting = String::new();
+                    if self.outbox > 0 {
+                        waiting += &format!("  ·  {} waiting to be sent", views::thousands(self.outbox as u32));
+                    }
+                    if !self.offline_changes.is_empty() {
+                        let n = self.offline_changes.len();
+                        waiting += &format!("  ·  {n} change{} waiting", if n == 1 { "" } else { "s" });
+                    }
+                    ui.label(RichText::new(format!("Working offline{waiting}")).size(13.0).color(t.text));
+                    go_online = ui.small_button("Go online").clicked();
+                } else if locked {
                     ui.label(RichText::new("Stored mail is locked. Downloads wait for the passphrase.").size(13.0).color(t.danger));
                 } else if running && total > 0 && done < total {
                     ui.label(dim("Downloading mail".to_owned()));
@@ -3360,7 +3525,17 @@ impl BeaverApp {
                 } else if self.accounts.iter().any(|v| v.offline) {
                     let names: Vec<&str> = self.accounts.iter().filter(|v| v.offline).map(|v| v.account.name.as_str()).collect();
                     let who = if names.len() == self.accounts.len() { String::new() } else { format!(" ({})", names.join(", ")) };
-                    ui.label(dim(format!("Offline{who}: showing mail stored on this computer")));
+                    let mut waiting = String::new();
+                    if self.outbox > 0 {
+                        waiting += &format!("  ·  {} waiting to be sent", views::thousands(self.outbox as u32));
+                    }
+                    if !self.offline_changes.is_empty() {
+                        let n = self.offline_changes.len();
+                        waiting += &format!("  ·  {n} change{} waiting", if n == 1 { "" } else { "s" });
+                    }
+                    ui.label(dim(format!("Offline{who}: showing mail stored on this computer{waiting}")));
+                } else if self.outbox > 0 {
+                    ui.label(dim(format!("{} message{} in the Outbox", views::thousands(self.outbox as u32), if self.outbox == 1 { "" } else { "s" })));
                 } else if let Some(why) = &self.draft_error {
                     ui.label(RichText::new(format!("Draft not saved on the server: {why}")).size(13.0).color(t.danger));
                 } else {
@@ -3374,9 +3549,17 @@ impl BeaverApp {
                         (_, Mode::Passphrase) => "Mail on this computer is encrypted with your passphrase",
                     };
                     ui.label(dim(protection.to_owned()));
+                    if !self.work_offline {
+                        ui.add_space(12.0);
+                        let link = egui::Button::new(dim("Work offline".to_owned())).frame(false);
+                        go_offline = ui.add(link).on_hover_text("Stop using the network: sending and changes wait until you go online").clicked();
+                    }
                 });
             });
         });
+        if go_online || go_offline {
+            self.set_work_offline(go_offline);
+        }
         if toggle_pause {
             self.downloads_paused = !self.downloads_paused;
             for view in &self.accounts {
@@ -3576,7 +3759,7 @@ impl BeaverApp {
                 let width = ui.available_width() - theme::CONTROL_H - 20.0;
                 let focus = std::mem::take(&mut self.focus_search);
                 views::search_box(ui, t, &mut self.query, "Search mail  ( / )", width, focus)
-                    .on_hover_text(format!("Search everything stored on this computer.\nWords, \"a phrase\", from:ada, subject:invoice, in:inbox, is:unread, has:attachment\n\nAll commands and their keys: {}", Command::Palette.keys(ui.ctx())));
+                    .on_hover_text(format!("Search everything stored on this computer.\nWords, \"a phrase\", from:ada, to:bob, subject:invoice, in:inbox, is:unread, has:attachment, after:2026-09-01, before:2026-10\n\nAll commands and their keys: {}", Command::Palette.keys(ui.ctx())));
                 if self.syncing > 0 {
                     ui.add_sized([theme::CONTROL_H - 4.0, theme::CONTROL_H - 4.0], egui::Spinner::new().size(16.0)).on_hover_text("Syncing…");
                 } else {
@@ -3747,6 +3930,7 @@ impl BeaverApp {
             None => Vec::new(),
         };
         let whole = self.whole_conversation;
+        let work_offline = self.work_offline;
         // The correction that makes sense; the reasons are the warnings shown just above it.
         let correction = self.message.and_then(|id| self.correction(id)).map(|(choice, _)| choice);
         let (settings_mode, view_mode) = (self.settings.clone(), self.view_mode);
@@ -3865,7 +4049,7 @@ impl BeaverApp {
                             suspicious = body.findings.iter().any(|f| f.level == screen::Level::Danger);
                             // Never for spam: leaving a list it sends only tells the spammer the address is read.
                             let way = unsubscribe::method(&body.data.unsubscribe, body.data.one_click, authenticity == sender::Authenticity::Verified)
-                                .filter(|_| role != Role::Junk && !suspicious);
+                                .filter(|_| role != Role::Junk && !suspicious && !work_offline);
                             let mut text_right = rect.right();
                             if let Some(way) = way {
                                 ui.scope_builder(egui::UiBuilder::new().max_rect(rect).layout(Layout::right_to_left(Align::Center)), |ui| {
@@ -3960,7 +4144,8 @@ impl BeaverApp {
                             if let (Some(source), DisplayMode::Original) = (&body.data.html, mode) {
                                 let (width, scale) = (ui.available_width(), ui.ctx().pixels_per_point());
                                 // A permission given to a sender never applies to a message that fails the server's checks.
-                                let remote = body.remote || (settings_mode.allows_remote(&message.address) && !suspicious);
+                                // Working offline nothing is fetched, whatever was allowed.
+                                let remote = !work_offline && (body.remote || (settings_mode.allows_remote(&message.address) && !suspicious));
                                 if !body.original.as_ref().is_some_and(|p| p.fits(width, scale, remote)) {
                                     body.original = original::Page::new(ui.ctx(), source, width, scale, remote, &body.trackers);
                                 }

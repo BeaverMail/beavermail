@@ -23,6 +23,9 @@ pub struct DraftData {
     pub files: Vec<DraftFile>,
     /// Seconds since the Unix epoch.
     pub updated: i64,
+    /// In the Outbox: Send was pressed without a connection; it goes when the server can be reached.
+    #[serde(default)]
+    pub queued: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

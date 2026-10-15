@@ -291,6 +291,17 @@ async fn syncing_twice_does_not_duplicate_and_reports_no_more_history() {
 }
 
 #[tokio::test]
+async fn working_offline_keeps_off_the_server_until_online_again() {
+    let mock = start(true).await;
+    mock.source.sync("INBOX").await.unwrap(); // a session is open now
+    mock.source.set_offline(true);
+    assert!(matches!(mock.source.sync("INBOX").await, Err(MailError::Offline(_))), "the open session is not used");
+    assert!(mock.source.messages("INBOX").await.is_ok(), "the archive still answers");
+    mock.source.set_offline(false);
+    mock.source.sync("INBOX").await.unwrap();
+}
+
+#[tokio::test]
 async fn the_archive_works_without_the_server() {
     let mock = start(true).await;
     let id = message_in(&mock, "INBOX").await;

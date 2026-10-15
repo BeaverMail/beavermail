@@ -211,7 +211,12 @@ fn summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageSummary> {
 struct Query {
     words: Vec<String>,
     from: Vec<String>,
+    /// Parts of a To or Cc address.
+    to: Vec<String>,
     subject: Vec<String>,
+    /// Received on or after this time, and before this one (seconds), from `after:` and `before:`.
+    after: Option<i64>,
+    before: Option<i64>,
     folders: Vec<String>,
     unread: bool,
     attachment: bool,
@@ -223,6 +228,9 @@ impl Query {
         for token in tokens(text) {
             match token.split_once(':') {
                 Some(("from", v)) if !v.is_empty() => query.from.push(v.to_owned()),
+                Some(("to", v)) if !v.is_empty() => query.to.push(v.to_lowercase()),
+                Some(("after", v)) if day_start(v).is_some() => query.after = day_start(v),
+                Some(("before", v)) if day_start(v).is_some() => query.before = day_start(v),
                 Some(("subject", v)) if !v.is_empty() => query.subject.push(v.to_owned()),
                 Some(("in", v)) if !v.is_empty() => query.folders.push(v.to_owned()),
                 Some(("is", v)) if v.eq_ignore_ascii_case("unread") => query.unread = true,
@@ -236,6 +244,17 @@ impl Query {
     fn is_empty(&self) -> bool {
         *self == Self::default()
     }
+}
+
+/// The first moment, on this computer's clock, of a day ("2026-10-01"), a month ("2026-10") or a year.
+fn day_start(text: &str) -> Option<i64> {
+    let full = match text.matches('-').count() {
+        0 => format!("{text}-01-01"),
+        1 => format!("{text}-01"),
+        _ => text.to_owned(),
+    };
+    let day = chrono::NaiveDate::parse_from_str(&full, "%Y-%m-%d").ok()?;
+    Some(day.and_hms_opt(0, 0, 0)?.and_local_timezone(chrono::Local).earliest()?.timestamp())
 }
 
 /// Splits on spaces; a double-quoted run stays one token (without its quotes).
@@ -943,6 +962,19 @@ impl Store {
             let p = arg(format!("{{from_name from_addr}} : {}", fts_term(who)), &mut args);
             conditions.push(format!("id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH {p})"));
         }
+        for who in &query.to {
+            // The address list is plain text: % and _ are taken literally.
+            let p = arg(format!("%{}%", who.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")), &mut args);
+            conditions.push(format!("recipients LIKE {p} ESCAPE '\\'"));
+        }
+        if let Some(after) = query.after {
+            let p = arg(after.to_string(), &mut args);
+            conditions.push(format!("timestamp >= CAST({p} AS INTEGER)"));
+        }
+        if let Some(before) = query.before {
+            let p = arg(before.to_string(), &mut args);
+            conditions.push(format!("timestamp < CAST({p} AS INTEGER)"));
+        }
         for what in &query.subject {
             let p = arg(format!("subject : {}", fts_term(what)), &mut args);
             conditions.push(format!("id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH {p})"));
@@ -1171,6 +1203,23 @@ mod tests {
 
     fn found(store: &Store, query: &str) -> Vec<String> {
         store.search("me", query, 50).unwrap().into_iter().map(|h| h.message.subject).collect()
+    }
+
+    #[test]
+    fn to_before_and_after_narrow_the_results() {
+        let store = store();
+        let day = |d: &str| day_start(d).unwrap();
+        let sent = |uid, subject: &str, to: &str, at| Header { recipients: to.into(), ..header(uid, subject, at, false) };
+        store
+            .add_headers("me", "INBOX", &[sent(1, "September note", "grace@navy.example", day("2026-09-15") + 3600), sent(2, "October note", "ada@example.org bob@x_y.example", day("2026-10-02") + 60)])
+            .unwrap();
+        assert_eq!(found(&store, "to:grace"), ["September note"]);
+        assert_eq!(found(&store, "to:x_y"), ["October note"], "_ is a letter here, not a wildcard");
+        assert!(found(&store, "to:x%y").is_empty());
+        assert_eq!(found(&store, "after:2026-10-01"), ["October note"]);
+        assert_eq!(found(&store, "before:2026-10 note"), ["September note"], "a month starts on its first day");
+        assert_eq!(found(&store, "after:2026-09-15 before:2026-09-16"), ["September note"], "after: includes its day, before: does not");
+        assert!(found(&store, "after:yesterday").is_empty(), "not a date: an ordinary word");
     }
 
     #[test]

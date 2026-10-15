@@ -681,9 +681,10 @@ pub fn draft_row(ui: &mut Ui, t: &Tokens, draft: &crate::drafts::DraftData) -> D
     let left = card.left() + 14.0 + AVATAR + 12.0;
     let width = card.right() - 14.0 - left;
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
-    let when = ui.painter().layout_no_wrap(ago(draft.updated, now), FontId::proportional(13.0), t.text_dim);
+    let (when, color) = if draft.queued { ("Waiting to send".to_owned(), t.accent) } else { (ago(draft.updated, now), t.text_dim) };
+    let when = ui.painter().layout_no_wrap(when, FontId::proportional(13.0), color);
     let when_w = when.size().x;
-    ui.painter().galley(pos2(card.right() - 14.0 - when_w, card.top() + 13.0), when, t.text_dim);
+    ui.painter().galley(pos2(card.right() - 14.0 - when_w, card.top() + 13.0), when, color);
     let to = if draft.to.trim().is_empty() { "No recipient yet".to_owned() } else { draft.to.clone() };
     let who = truncated(ui, &to, FontId::proportional(15.5), t.text, width - when_w - 12.0);
     ui.painter().galley(pos2(left, card.top() + 11.0), who, t.text);

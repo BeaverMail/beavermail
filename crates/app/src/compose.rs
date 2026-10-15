@@ -187,6 +187,7 @@ impl Compose {
             references: self.references.clone(),
             files: self.files.iter().filter(|f| f.ready).map(|f| DraftFile { name: f.name.clone(), size: f.size, path: f.vault.clone() }).collect(),
             updated,
+            queued: false,
         }
     }
 

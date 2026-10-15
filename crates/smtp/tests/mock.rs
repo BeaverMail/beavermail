@@ -118,6 +118,23 @@ async fn a_wrong_password_is_an_auth_error() {
 }
 
 #[tokio::test]
+async fn an_unreachable_server_is_offline_so_the_message_can_wait() {
+    // Nothing listens on port 1.
+    let server = Server { host: "127.0.0.1".into(), port: 1, tls: Tls::None };
+    let account = Account { name: "mock".into(), user: "me@example.com".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true, keep: beavermail_core::Keep::default(), signature: String::new() };
+    let error = SmtpSender::new(&account, "secret".into()).send(message()).await.unwrap_err();
+    assert!(matches!(error, MailError::Offline(_)), "{error:?}");
+}
+
+#[tokio::test]
+async fn working_offline_sends_nothing() {
+    let (sender, transcript) = start("secret", "secret").await;
+    sender.set_offline(true);
+    assert!(matches!(sender.send(message()).await.unwrap_err(), MailError::Offline(_)));
+    assert!(transcript.lock().unwrap().commands.is_empty(), "the server heard nothing");
+}
+
+#[tokio::test]
 async fn invalid_addresses_never_reach_the_server() {
     let (sender, transcript) = start("secret", "secret").await;
     let mut bad = message();

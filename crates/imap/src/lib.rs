@@ -65,9 +65,17 @@ struct Config {
     server: Server,
     user: String,
     password: String,
+    /// The user chose to work offline: no connection is opened, and an open one is dropped.
+    offline: std::sync::atomic::AtomicBool,
 }
 
 impl ImapSource {
+    /// Working offline: every call that needs the server answers [`MailError::Offline`] at once, and
+    /// the archive keeps answering the rest.
+    pub fn set_offline(&self, offline: bool) {
+        self.config.offline.store(offline, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// The message as stored on this computer, without going to the server; `None` when it is not stored.
     pub fn stored_body(&self, id: MessageId) -> Result<Option<MessageBody>, MailError> {
         let at = self.store.locate(id)?.ok_or(MailError::NotFound)?;
@@ -83,7 +91,7 @@ impl ImapSource {
 
     /// Creates the source over the shared archive; the connection is opened on first use.
     pub fn new(account: &Account, password: String, store: Arc<Store>, files: Arc<Vault>) -> Self {
-        let config = Config { server: account.imap.clone(), user: account.user.clone(), password };
+        let config = Config { server: account.imap.clone(), user: account.user.clone(), password, offline: Default::default() };
         Self { config, poll_interval: std::time::Duration::from_secs(180), account: account.key(), store, files, state: Mutex::new(State::default()) }
     }
 
@@ -128,6 +136,9 @@ async fn tls(tcp: TcpStream, host: &str) -> Result<Stream, MailError> {
 }
 
 async fn connect(c: &Config) -> Result<Session<Stream>, MailError> {
+    if c.offline.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(MailError::Offline("working offline".into()));
+    }
     let Server { host, port, tls: mode } = &c.server;
     let tcp = TcpStream::connect((host.as_str(), *port)).await.map_err(|e| MailError::Offline(e.to_string()))?;
     let client = match mode {
@@ -146,6 +157,10 @@ async fn connect(c: &Config) -> Result<Session<Stream>, MailError> {
 impl State {
     /// The open session, connecting first if needed.
     async fn session(&mut self, config: &Config) -> Result<&mut Session<Stream>, MailError> {
+        if config.offline.load(std::sync::atomic::Ordering::Relaxed) {
+            self.session = None; // closed, so nothing more goes over it
+            return Err(MailError::Offline("working offline".into()));
+        }
         if self.session.is_none() {
             self.session = Some(connect(config).await?);
         }

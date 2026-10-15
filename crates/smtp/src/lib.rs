@@ -12,12 +12,14 @@ pub struct SmtpSender {
     server: Server,
     user: String,
     password: String,
+    /// The user chose to work offline: sending answers [`MailError::Offline`], so the message waits.
+    offline: std::sync::atomic::AtomicBool,
 }
 
 impl SmtpSender {
     /// Creates the sender; the connection is opened for each message.
     pub fn new(account: &Account, password: String) -> Self {
-        Self { server: account.smtp.clone(), user: account.user.clone(), password }
+        Self { server: account.smtp.clone(), user: account.user.clone(), password, offline: Default::default() }
     }
 
     fn transport(&self) -> Result<AsyncSmtpTransport<Tokio1Executor>, MailError> {
@@ -176,13 +178,24 @@ fn bracketed(id: &str) -> String {
     format!("<{id}>")
 }
 
+impl SmtpSender {
+    pub fn set_offline(&self, offline: bool) {
+        self.offline.store(offline, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 impl MailSender for SmtpSender {
     async fn send(&self, message: Outgoing) -> Result<Vec<u8>, MailError> {
+        if self.offline.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(MailError::Offline("working offline".into()));
+        }
         let email = build(&message)?;
         let raw = email.formatted();
         match self.transport()?.send(email).await {
             Ok(_) => Ok(raw),
             Err(e) if e.status().is_some_and(|code| code.to_string() == "535") => Err(MailError::Auth(e.to_string())),
+            // What is left once the server's answers, TLS and the message itself are ruled out: no connection.
+            Err(e) if !(e.is_response() || e.is_client() || e.is_transient() || e.is_permanent() || e.is_tls()) => Err(MailError::Offline(e.to_string())),
             Err(e) => Err(backend(e)),
         }
     }
