@@ -7,6 +7,7 @@ use crate::theme::{CONTROL_RADIUS, Tokens};
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Icon {
     Archive,
+    ArrowLeft,
     Ban,
     Drafts,
     Folder,
@@ -34,6 +35,7 @@ impl Icon {
     fn source(self) -> egui::ImageSource<'static> {
         match self {
             Self::Archive => egui::include_image!("../assets/icons/archive.svg"),
+            Self::ArrowLeft => egui::include_image!("../assets/icons/arrow-left.svg"),
             Self::Ban => egui::include_image!("../assets/icons/ban.svg"),
             Self::Drafts => egui::include_image!("../assets/icons/file-pen-line.svg"),
             Self::Folder => egui::include_image!("../assets/icons/folder.svg"),

@@ -239,6 +239,7 @@ impl Prepared {
 }
 
 /// What the user did in the reader this frame.
+#[derive(Default)]
 struct ReaderOutcome {
     action: Option<(MessageId, Action)>,
     /// A link that was clicked, cleaned of tracking parameters.
@@ -265,6 +266,8 @@ struct ReaderOutcome {
     switch: Option<MessageId>,
     /// "Show earlier" was pressed in the conversation.
     expand: bool,
+    /// Back to the list, from a message shown in its place.
+    back: bool,
 }
 
 struct AccountView {
@@ -663,6 +666,8 @@ struct BeaverApp {
     outbox_sending: std::collections::HashMap<String, (u64, drafts::DraftData)>,
     /// Messages waiting in the Outbox, every account together.
     outbox: usize,
+    /// Without the reading pane, the open message is shown in the list's place.
+    full_preview: bool,
     /// The user chose to work offline: nothing goes to the network until they go online again. Not
     /// remembered, so a restart is online and the app is never offline without the user knowing.
     work_offline: bool,
@@ -788,6 +793,7 @@ impl BeaverApp {
             outbox: 0,
             offline_changes: Vec::new(),
             work_offline: false,
+            full_preview: false,
             pane: None,
             reader_scroll: None,
             list_reveal: None,
@@ -1033,7 +1039,7 @@ impl BeaverApp {
     /// Shows `tab`'s message, from any folder: in the reading pane, or when pinned, in its tab.
     fn open(&mut self, tab: tabs::Tab) {
         self.picked.clear();
-        let (id, unread) = (tab.message.id, tab.message.unread);
+        let (id, unread, pinned) = (tab.message.id, tab.message.unread, tab.pinned);
         // Suspicious mail and spam are opened to judge them, not to read them.
         let judging = self.show_suspicious || tab.role == Role::Junk;
         let at = match tabs::slot(&self.tabs, id, tab.pinned) {
@@ -1050,6 +1056,8 @@ impl BeaverApp {
         if self.active() != Some(at) {
             self.activate(at);
         }
+        // Without the reading pane, a message opens in the list's place.
+        self.full_preview = !pinned && !self.settings.reading_pane;
         // Reading a conversation reads all of it, as its row shows it unread while any message is.
         let unread_here: Vec<MessageId> = self.conversation(id).into_iter().filter(|m| *m != id && self.summary_of(*m).is_some_and(|s| s.unread)).collect();
         if !judging && unread {
@@ -1195,6 +1203,16 @@ impl BeaverApp {
         if self.searching() { self.hits.iter().map(|(_, h)| h.message.id).collect() } else { self.visible().iter().map(|m| m.id).collect() }
     }
 
+    /// Moves the selection to listed message `id`: shown in the reading pane, or without the pane only
+    /// selected, unless a message is already shown in the list's place.
+    fn move_to(&mut self, id: MessageId) {
+        if self.settings.reading_pane || self.full_preview {
+            self.show_listed(id);
+        } else {
+            self.message = Some(id);
+        }
+    }
+
     /// Shows a listed message in the reading pane: a search result where it is, or one of the folder.
     fn show_listed(&mut self, id: MessageId) {
         match self.hits.iter().find(|(_, h)| h.message.id == id).cloned().filter(|_| self.searching()) {
@@ -1270,7 +1288,7 @@ impl BeaverApp {
                 self.message = None;
                 self.body = None;
                 if let Some(next) = pos.and_then(|p| self.messages.get(p).or(self.messages.last())).map(|m| m.id) {
-                    self.select_message(next);
+                    self.move_to(next);
                 }
             }
         }
@@ -2171,6 +2189,8 @@ impl BeaverApp {
                                 ui.add_space(12.0);
                                 let about = "One row per conversation, with your replies from Sent. Archive, Delete and Mark as read act on all of it.";
                                 changed |= views::switch_row(ui, t, &mut self.settings.threads, "Group messages into conversations", about).changed();
+                                let about = "Off: the list takes the whole width and a message opens in its place; Esc or the arrow goes back.";
+                                changed |= views::switch_row(ui, t, &mut self.settings.reading_pane, "Show the message beside the list", about).changed();
                                 ui.add_space(12.0);
             if !self.settings.remote_senders.is_empty() {
                 ui.label(RichText::new("Senders that may load remote content").strong());
@@ -2784,9 +2804,13 @@ impl BeaverApp {
         // In a message tab the list is not on screen: no moving through it.
         let ids: Vec<MessageId> = if self.in_tab { Vec::new() } else { self.listed() };
         let pos = self.message.and_then(|id| ids.iter().position(|i| self.conversations.same(*i, id) && (self.threaded() || *i == id)));
-        let reading = self.in_tab || self.pane == Some(Pane::Reader);
+        let reading = self.in_tab || self.full_preview || self.pane == Some(Pane::Reader);
         if key(egui::Key::Escape) {
             self.picked.clear();
+            if self.full_preview {
+                self.full_preview = false; // back to the list
+                return;
+            }
             if reading && !self.in_tab {
                 self.pane = Some(Pane::List);
             }
@@ -2818,7 +2842,7 @@ impl BeaverApp {
             if let Some(next) = next.map(|n| n.min(last)) {
                 self.list_reveal = Some(next);
                 if pos != Some(next) {
-                    self.show_listed(ids[next]);
+                    self.move_to(ids[next]);
                 }
             }
         }
@@ -2860,6 +2884,7 @@ impl BeaverApp {
             Command::SelectAll => if self.in_tab || self.listed().is_empty() { Err("No list is shown") } else { Ok(()) },
             Command::Refresh if self.work_offline => Err("Working offline"),
             Command::Refresh => if self.shown().is_empty() { Err("No folder is shown") } else { Ok(()) },
+            Command::SwitchPane if !self.settings.reading_pane => Err("The message is not shown beside the list"),
             Command::SwitchPane => if self.in_tab { Err("A message tab has no list") } else { Ok(()) },
             Command::AllInboxes => if self.accounts.len() >= 2 { Ok(()) } else { Err("Needs two accounts or more") },
             Command::WorkOffline => if self.work_offline { Err("Already working offline") } else { Ok(()) },
@@ -2898,8 +2923,9 @@ impl BeaverApp {
             }
             Command::BlockSender => self.confirm_block = self.message,
             Command::OpenInTab => {
+                // Without the reading pane, Enter on a selected message opens it in the list's place.
                 if let Some(id) = self.message {
-                    self.open_message(id, true);
+                    if self.settings.reading_pane || self.full_preview { self.open_message(id, true) } else { self.show_listed(id) }
                 }
             }
             Command::CloseTab => {
@@ -3942,6 +3968,8 @@ impl BeaverApp {
         let current = open.map(|(message, ..)| message);
         let frame = egui::Frame::new().fill(t.surface);
         let in_tab = self.in_tab;
+        let full_preview = self.full_preview && !in_tab;
+        let mut back = false;
         let picked = if in_tab { 0 } else { self.picked.len() };
         let picked_unread = self.picked.iter().any(|id| self.summary_of(*id).is_some_and(|m| m.unread));
         let folder_role = self.picked_role();
@@ -3958,6 +3986,10 @@ impl BeaverApp {
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 ui.add_space(12.0);
+                if full_preview {
+                    back = icons::button(ui, t, Icon::ArrowLeft, "Back to the list (Esc)", true, false).clicked();
+                    ui.add_space(8.0);
+                }
                 let archived = role == Role::Archive;
                 let loaded = self.body.is_some();
                 let ctx = ui.ctx().clone();
@@ -4177,8 +4209,9 @@ impl BeaverApp {
                 }
             }
         };
-        // A message tab has the window to itself; otherwise the reader is the pane on the right.
-        if in_tab {
+        // A message tab has the window to itself, a message without the reading pane the list's place;
+        // otherwise the reader is the pane on the right.
+        if in_tab || full_preview {
             egui::CentralPanel::default().frame(frame).show(ui, draw);
         } else {
             let reader = egui::Panel::right("reader").frame(frame).default_size(470.0).size_range(360.0..=900.0).show(ui, draw);
@@ -4186,7 +4219,7 @@ impl BeaverApp {
                 pane_ring(ui, t, reader.response.rect);
             }
         }
-        ReaderOutcome { action, url, mode: chosen_mode, remember, attachment, save_many, allow_sender, mark, bulk, unsubscribe: leave, block, switch, expand }
+        ReaderOutcome { action, url, mode: chosen_mode, remember, attachment, save_many, allow_sender, mark, bulk, unsubscribe: leave, block, switch, expand, back }
     }
 }
 
@@ -4270,7 +4303,14 @@ impl eframe::App for BeaverApp {
         self.confirm_remove = removed.or(self.confirm_remove);
 
         self.handle_keys(ui.ctx());
-        let ReaderOutcome { action, url, mode, remember, attachment, save_many, allow_sender, mark, bulk, unsubscribe, block, switch, expand } = self.reader(ui, &t);
+        if self.full_preview && (self.message.is_none() || self.settings.reading_pane) {
+            self.full_preview = false;
+        }
+        // Without the reading pane and with no message in its place, there is no reader to draw.
+        let shows_reader = self.in_tab || self.full_preview || self.settings.reading_pane;
+        let ReaderOutcome { action, url, mode, remember, attachment, save_many, allow_sender, mark, bulk, unsubscribe, block, switch, expand, back } =
+            if shows_reader { self.reader(ui, &t) } else { ReaderOutcome::default() };
+        self.full_preview &= !back;
         self.whole_conversation |= expand;
         // Another message of the conversation takes the place of the one shown, in the pane or its tab.
         if let Some(id) = switch
@@ -4319,7 +4359,7 @@ impl eframe::App for BeaverApp {
             self.view_mode = None;
             self.save_settings();
         }
-        let (opened, add_from_list) = if self.in_tab { (None, false) } else { self.message_list(ui, &t) };
+        let (opened, add_from_list) = if self.in_tab || self.full_preview { (None, false) } else { self.message_list(ui, &t) };
         add |= add_from_list;
 
         if let Some(id) = opened {

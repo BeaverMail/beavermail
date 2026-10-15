@@ -307,6 +307,9 @@ pub struct Settings {
     /// Show a conversation as one row in the list, its messages together in the reader.
     #[serde(default = "yes")]
     pub threads: bool,
+    /// The message shows beside the list; off, it opens in the list's place.
+    #[serde(default = "yes")]
+    pub reading_pane: bool,
     /// Accounts (by [`Account::key`]) folded in the sidebar, so they stay folded at the next start.
     #[serde(default)]
     pub folded: std::collections::BTreeSet<String>,
@@ -322,7 +325,7 @@ fn undo_secs() -> u32 {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { display: DisplayMode::default(), sender_display: Default::default(), rich_outgoing: true, undo_send_secs: undo_secs(), remote_senders: Default::default(), hold_suspicious: true, marked: Default::default(), threads: true, folded: Default::default() }
+        Self { display: DisplayMode::default(), sender_display: Default::default(), rich_outgoing: true, undo_send_secs: undo_secs(), remote_senders: Default::default(), hold_suspicious: true, marked: Default::default(), threads: true, reading_pane: true, folded: Default::default() }
     }
 }
 
