@@ -161,6 +161,12 @@ pub fn role_color(role: Role) -> Color32 {
     }
 }
 
+/// The colour marking an account's mail in All inboxes and beside its name, by its place in the list.
+pub fn account_color(at: usize) -> Color32 {
+    const HUES: [u32; 6] = [0x3B82F6, 0xF59E0B, 0x22A06B, 0xEC4899, 0x8B5CF6, 0x06B6D4];
+    rgb(HUES[at % HUES.len()])
+}
+
 /// Background and initials colour of a person's avatar, stable for a given name.
 pub fn avatar_colors(name: &str, dark: bool) -> (Color32, Color32) {
     const HUES: [u32; 6] = [0x3B82F6, 0x8B5CF6, 0xEC4899, 0xF59E0B, 0x22A06B, 0x06B6D4];

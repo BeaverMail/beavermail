@@ -15,7 +15,7 @@ Licensed under AGPL-3.0-only (see [LICENSE](LICENSE)).
 
 ## Status
 
-- Several IMAP accounts; send, reply, forward over SMTP with a copy in Sent.
+- Several IMAP accounts, with All inboxes (each account's mail marked by its colour); send, reply, forward over SMTP with a copy in Sent.
 - Local archive: SQLCipher index plus encrypted message files; background sync, IDLE, full-text search.
 - Reader: plain text, simplified HTML or original HTML (Blitz); nothing remote loads unless allowed.
 - Sender checks (server authentication results, look-alike names and domains, misleading links, risky attachments).

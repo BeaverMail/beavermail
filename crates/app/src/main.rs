@@ -145,6 +145,8 @@ struct SidebarOutcome {
     removed: Option<u64>,
     edit: Option<u64>,
     add: bool,
+    /// "All inboxes" was clicked.
+    all: bool,
 }
 
 /// The open message's body, already reduced to blocks for both display modes.
@@ -603,7 +605,11 @@ struct BeaverApp {
     pane: Option<Pane>,
     /// A scroll of the reader asked for from the keyboard, done when it is next drawn.
     reader_scroll: Option<Scroll>,
-    /// The Sent folder of the account shown (empty when Sent itself is shown).
+    /// The Inbox of every account is shown together; `selected` is then `None`.
+    unified: bool,
+    /// The account each listed message (and each Sent one) comes from.
+    origin: std::collections::HashMap<MessageId, u64>,
+    /// The Sent folder of the account shown, or of every account (empty when Sent itself is shown).
     sent: Vec<MessageSummary>,
     /// The conversations of the folder shown, worked out again when it changes.
     conversations: threads::Conversations,
@@ -711,6 +717,8 @@ impl BeaverApp {
             reader_scroll: None,
             list_reveal: None,
             wanted: Arc::default(),
+            unified: false,
+            origin: std::collections::HashMap::new(),
             sent: Vec::new(),
             conversations: threads::Conversations::default(),
             whole_conversation: false,
@@ -795,10 +803,11 @@ impl BeaverApp {
 
     fn select_mailbox(&mut self, serial: u64, index: usize) {
         let Some(view) = self.view(serial) else { return };
-        let (Some(source), Some(mailbox)) = (view.source.clone(), view.mailboxes.get(index)) else { return };
-        let name = mailbox.name.clone();
-        let sent_folder = view.mailboxes.iter().find(|m| m.role == Role::Sent && m.name != name).map(|m| m.name.clone());
+        if view.source.is_none() || view.mailboxes.get(index).is_none() {
+            return;
+        }
         self.selected = Some((serial, index));
+        self.unified = false;
         self.refresh_drafts();
         // The reading pane belonged to the list being left; tabs stay.
         self.tabs.retain(|t| t.pinned);
@@ -807,17 +816,61 @@ impl BeaverApp {
         self.message = None;
         self.body = None;
         self.messages.clear();
+        self.origin.clear();
+        self.sent.clear();
         self.screening.clear();
         self.checking = false;
+        self.load_folder(serial, index);
+    }
+
+    /// Shows the Inbox of every account together, newest first.
+    fn show_all_inboxes(&mut self) {
+        self.selected = None;
+        self.unified = true;
+        self.drafts.clear();
+        self.tabs.retain(|t| t.pinned);
+        self.in_tab = false;
+        self.picked.clear();
+        self.message = None;
+        self.body = None;
+        self.messages.clear();
+        self.origin.clear();
+        self.sent.clear();
+        self.screening.clear();
+        self.checking = false;
+        for (serial, index) in self.shown() {
+            self.load_folder(serial, index);
+        }
+    }
+
+    /// Reads folder `index` of account `serial` from the archive, its Sent folder for conversations,
+    /// and brings it up to date from the server.
+    fn load_folder(&mut self, serial: u64, index: usize) {
+        let Some(view) = self.view(serial) else { return };
+        let (Some(source), Some(mailbox)) = (view.source.clone(), view.mailboxes.get(index)) else { return };
+        let name = mailbox.name.clone();
+        let sent_folder = view.mailboxes.iter().find(|m| m.role == Role::Sent && m.name != name).map(|m| m.name.clone());
         let local = source.clone();
         let folder = name.clone();
         self.spawn(async move { Event::Messages(serial, index, local.messages(&folder).await) });
-        self.sent.clear();
         if let Some(sent) = sent_folder {
             let local = source.clone();
             self.spawn(async move { Event::SentList(serial, index, local.messages(&sent).await) });
         }
         self.start_sync(serial, index, source, name);
+    }
+
+    /// The folders whose messages the list shows, as (account, folder index): the one selected, or
+    /// every account's Inbox.
+    fn shown(&self) -> Vec<(u64, usize)> {
+        if !self.unified {
+            return self.selected.into_iter().collect();
+        }
+        self.accounts.iter().filter_map(|v| Some((v.serial, v.mailboxes.iter().position(|m| m.role == Role::Inbox)?))).collect()
+    }
+
+    fn shows(&self, serial: u64, index: usize) -> bool {
+        self.shown().contains(&(serial, index))
     }
 
     /// Starts watching an account's Inbox (IDLE, or polling) so new mail shows up by itself.
@@ -888,7 +941,7 @@ impl BeaverApp {
 
     /// Shows message `id`: in the reading pane, or `pin`, in its tab (opened if need be).
     fn open_message(&mut self, id: MessageId, pin: bool) {
-        let listed = self.selected.zip(self.messages.iter().find(|m| m.id == id)).map(|((serial, _), m)| tabs::Tab { serial, message: m.clone(), role: self.role(), pinned: pin });
+        let listed = self.messages.iter().find(|m| m.id == id).and_then(|m| Some(tabs::Tab { serial: self.serial_of(id)?, message: m.clone(), role: self.role(), pinned: pin }));
         let tabbed = || self.tabs.iter().find(|t| t.message.id == id).map(|t| tabs::Tab { serial: t.serial, message: t.message.clone(), role: t.role, pinned: pin });
         if let Some(tab) = listed.or_else(tabbed) {
             self.open(tab);
@@ -1045,7 +1098,7 @@ impl BeaverApp {
     fn serial_of(&self, id: MessageId) -> Option<u64> {
         let tab = self.tabs.iter().find(|t| t.message.id == id).map(|t| t.serial);
         let hit = || self.hits.iter().find(|(_, h)| h.message.id == id).map(|(s, _)| *s);
-        tab.or_else(hit).or(self.selected.map(|(s, _)| s))
+        tab.or_else(hit).or_else(|| self.origin.get(&id).copied()).or(self.selected.map(|(s, _)| s))
     }
 
     /// What the folder of message `id` is for: its tab's, its search result's, or the folder shown.
@@ -1082,7 +1135,7 @@ impl BeaverApp {
         }
         // The message's account: its tab's, which may not be the folder shown, or the folder's.
         let Some(serial) = self.serial_of(id) else { return };
-        let index = self.selected.filter(|(s, _)| *s == serial).map_or(usize::MAX, |(_, i)| i);
+        let index = self.shown().into_iter().find(|(s, _)| *s == serial).map_or(usize::MAX, |(_, i)| i);
         let Some(source) = self.view(serial).and_then(|v| v.source.clone()) else { return };
         let pos = self.messages.iter().position(|m| m.id == id);
         if let Some(pos) = pos {
@@ -1141,6 +1194,23 @@ impl BeaverApp {
 
     /// "1,240 messages · 3 unread · 980 stored offline" for the folder being shown.
     fn folder_summary(&self) -> Option<String> {
+        if self.unified && !self.searching() {
+            let inboxes: Vec<&Mailbox> = self.shown().iter().filter_map(|(s, i)| self.view(*s)?.mailboxes.get(*i)).collect();
+            let total = inboxes.iter().map(|m| m.total).sum::<u32>().max(self.messages.len() as u32);
+            let unread: u32 = inboxes.iter().map(|m| m.unread).sum();
+            let held = self.held();
+            let mut parts = vec!["All inboxes".to_owned(), format!("{} message{}", views::thousands(total), if total == 1 { "" } else { "s" })];
+            if unread > 0 {
+                parts.push(format!("{} unread", views::thousands(unread)));
+            }
+            if held > 0 {
+                parts.push(format!("{held} held as suspicious"));
+            }
+            if self.checking {
+                parts.push("checking for spam…".to_owned());
+            }
+            return Some(parts.join("  ·  "));
+        }
         let (serial, index) = self.selected?;
         let view = self.view(serial)?;
         let folder = view.mailboxes.get(index)?;
@@ -1187,14 +1257,16 @@ impl BeaverApp {
         // shortcut: a kept verdict does not see a sender become known (or a rule change) until the Inbox
         // is checked in full from its menu; and new mail shows for a moment before its check, which
         // checking at sync, in the background, would avoid.
-        let checked = self.holding() && !self.screening.is_empty();
+        // Per account: in All inboxes one Inbox may be checked before another.
+        let screened: std::collections::HashSet<u64> = if self.holding() { self.screening.keys().filter_map(|id| self.origin.get(id).copied()).collect() } else { Default::default() };
+        let checked = |m: &MessageSummary| self.origin.get(&m.id).is_some_and(|s| screened.contains(s));
         let want = if self.show_suspicious { screen::Place::Spam } else { screen::Place::Inbox };
         let threaded = self.threaded();
         let mut shown = std::collections::HashSet::new();
         self.messages
             .iter()
             .filter(|m| !ours.contains(&m.message_id))
-            .filter(|m| if checked { self.screening.get(&m.id).is_some_and(|s| s.place == want) } else { !self.show_suspicious })
+            .filter(|m| if checked(m) { self.screening.get(&m.id).is_some_and(|s| s.place == want) } else { !self.show_suspicious })
             // Newest first, so a conversation's row is its latest message here.
             .filter(|m| !threaded || self.conversations.number(m.id).is_none_or(|n| shown.insert(n)))
             .collect()
@@ -1214,19 +1286,21 @@ impl BeaverApp {
         }
         let Some(view) = self.view(serial) else { return };
         let (Some(source), account) = (view.source.clone(), view.account.clone()) else { return };
+        let mine = |id: &MessageId| self.origin.get(id) == Some(&serial);
         // The verdicts kept from before, read at once so held mail never shows in the Inbox.
-        if self.screening.is_empty()
+        if !self.screening.keys().any(mine)
             && let Some(folder) = view.mailboxes.get(index).map(|f| f.name.clone())
             && let Ok(kept) = self.archive.verdicts(&account.key(), &folder)
         {
             self.screening.extend(kept.into_iter().filter_map(|(id, json)| Some((id, serde_json::from_str(&json).ok()?))));
         }
-        let fresh: Vec<MessageSummary> = self.messages.iter().filter(|m| !self.screening.contains_key(&m.id)).cloned().collect();
+        let mine = |id: &MessageId| self.origin.get(id) == Some(&serial);
+        let fresh: Vec<MessageSummary> = self.messages.iter().filter(|m| mine(&m.id) && !self.screening.contains_key(&m.id)).cloned().collect();
         if fresh.is_empty() {
             return;
         }
         // Mail already held is part of the campaigns the new mail is compared with.
-        let held: Vec<MessageSummary> = self.messages.iter().filter(|m| self.screening.get(&m.id).is_some_and(|s| s.place == screen::Place::Spam)).cloned().collect();
+        let held: Vec<MessageSummary> = self.messages.iter().filter(|m| mine(&m.id) && self.screening.get(&m.id).is_some_and(|s| s.place == screen::Place::Spam)).cloned().collect();
         let own: Vec<String> = self.accounts.iter().map(|v| v.account.address().to_owned()).collect();
         let (archive, settings) = (self.archive.clone(), self.settings.clone());
         self.checking = true;
@@ -1248,16 +1322,17 @@ impl BeaverApp {
     /// Checks the whole Inbox being shown again, after the setting or a mark was forgotten, or when
     /// asked from its menu: the kept verdicts are dropped first.
     fn rescreen(&mut self) {
-        if let Some((serial, index)) = self.selected
-            && let Some(view) = self.view(serial)
-            && let Some(folder) = view.mailboxes.get(index)
-            && let Err(e) = self.archive.clear_verdicts(&view.account.key(), &folder.name)
-        {
-            self.error = Some(format!("Could not reset the spam checks: {e}"));
+        for (serial, index) in self.shown() {
+            if let Some(view) = self.view(serial)
+                && let Some(folder) = view.mailboxes.get(index)
+                && let Err(e) = self.archive.clear_verdicts(&view.account.key(), &folder.name)
+            {
+                self.error = Some(format!("Could not reset the spam checks: {e}"));
+            }
         }
         self.screening.clear();
         self.show_suspicious &= self.settings.hold_suspicious;
-        if let Some((serial, index)) = self.selected {
+        for (serial, index) in self.shown() {
             self.screen_inbox(serial, index);
         }
     }
@@ -1386,14 +1461,15 @@ impl BeaverApp {
 
     /// Asks the server again for the selected folder and its account's folder list.
     fn refresh(&mut self) {
-        let Some((serial, index)) = self.selected else { return };
-        let Some(view) = self.view(serial) else { return };
-        let (Some(source), Some(mailbox)) = (view.source.clone(), view.mailboxes.get(index)) else { return };
-        let name = mailbox.name.clone();
-        let folders = source.clone();
-        self.spawn(async move { Event::Mailboxes(serial, folders.mailboxes().await, true) });
-        self.start_sync(serial, index, source, name);
-        self.start_download(serial);
+        for (serial, index) in self.shown() {
+            let Some(view) = self.view(serial) else { continue };
+            let (Some(source), Some(mailbox)) = (view.source.clone(), view.mailboxes.get(index)) else { continue };
+            let name = mailbox.name.clone();
+            let folders = source.clone();
+            self.spawn(async move { Event::Mailboxes(serial, folders.mailboxes().await, true) });
+            self.start_sync(serial, index, source, name);
+            self.start_download(serial);
+        }
     }
 
     /// Accounts that can send, as (serial, address).
@@ -1407,7 +1483,9 @@ impl BeaverApp {
             return;
         }
         let senders = self.senders();
-        let from = self.selected.map(|(s, _)| s).filter(|s| senders.iter().any(|(x, _)| x == s)).or_else(|| senders.first().map(|(s, _)| *s));
+        // The account of the folder shown, or in All inboxes the open message's.
+        let shown = self.selected.map(|(s, _)| s).or_else(|| self.message.and_then(|id| self.serial_of(id)));
+        let from = shown.filter(|s| senders.iter().any(|(x, _)| x == s)).or_else(|| senders.first().map(|(s, _)| *s));
         let signature = from.and_then(|f| self.view(f)).map(|v| v.account.signature.clone()).unwrap_or_default();
         self.start_compose(from.map(|f| compose::Compose::new(f).with_signature(&signature)));
     }
@@ -2151,6 +2229,9 @@ impl BeaverApp {
 
     /// Role of the folder being shown.
     fn role(&self) -> Role {
+        if self.unified {
+            return Role::Inbox;
+        }
         let (serial, index) = self.selected.unzip();
         serial.zip(index).and_then(|(s, i)| self.view(s)?.mailboxes.get(i)).map_or(Role::Other, |m| m.role)
     }
@@ -2534,6 +2615,9 @@ impl BeaverApp {
             self.message = None;
             self.body = None;
         }
+        if self.unified {
+            self.show_all_inboxes(); // its mail under the new connection
+        }
         if let Some(compose) = &mut self.compose
             && compose.from == old.serial
         {
@@ -2572,6 +2656,9 @@ impl BeaverApp {
             self.message = None;
             self.body = None;
         }
+        if self.unified {
+            self.show_all_inboxes(); // without the account's mail
+        }
     }
 
     fn apply(&mut self, event: Event) {
@@ -2606,10 +2693,16 @@ impl BeaverApp {
                         view.error = None;
                         let inbox = view.mailboxes.iter().position(|m| m.role == Role::Inbox).unwrap_or(0);
                         let moved = selected_name.and_then(|name| view.mailboxes.iter().position(|m| m.name == name));
+                        let has_inbox = view.mailboxes.iter().any(|m| m.role == Role::Inbox);
                         if self.selected.is_some_and(|(s, _)| s == serial) {
                             self.selected = moved.map(|i| (serial, i));
+                        } else if self.unified {
+                            // An account whose folders arrive after All inboxes was opened joins it now.
+                            if has_inbox && !self.origin.values().any(|s| *s == serial) {
+                                self.load_folder(serial, inbox);
+                            }
                         } else if self.selected.is_none() && !view.mailboxes.is_empty() {
-                            self.select_mailbox(serial, inbox);
+                            if self.accounts.len() >= 2 { self.show_all_inboxes() } else { self.select_mailbox(serial, inbox) }
                         }
                     }
                     Err(e) => view.error = Some(e.to_string()),
@@ -2655,7 +2748,7 @@ impl BeaverApp {
                     Err(e) => self.error = Some(format!("Downloading mail stopped: {e}")),
                 }
                 // Previews arrive with the files.
-                if let Some((s, index)) = self.selected.filter(|(s, _)| *s == serial)
+                if let Some((s, index)) = self.shown().into_iter().find(|(s, _)| *s == serial)
                     && let Some(view) = self.view(s)
                     && let (Some(source), Some(name)) = (view.source.clone(), view.mailboxes.get(index).map(|m| m.name.clone()))
                 {
@@ -2666,7 +2759,7 @@ impl BeaverApp {
             }
             Event::Synced(serial, index, result) => {
                 self.syncing = self.syncing.saturating_sub(1);
-                if self.selected != Some((serial, index)) {
+                if !self.shows(serial, index) {
                     return;
                 }
                 match result {
@@ -2684,19 +2777,30 @@ impl BeaverApp {
                     Err(e) => self.error = Some(e.to_string()),
                 }
             }
-            Event::Messages(serial, index, result) if self.selected == Some((serial, index)) => match result {
+            Event::Messages(serial, index, result) if self.shows(serial, index) => match result {
                 Ok(messages) => {
-                    self.messages = messages;
+                    // This account's part of the list is replaced; the others' stay (All inboxes).
+                    let origin = &self.origin;
+                    self.messages.retain(|m| origin.get(&m.id).is_some_and(|s| *s != serial));
+                    self.origin.extend(messages.iter().map(|m| (m.id, serial)));
+                    self.messages.extend(messages);
+                    if self.unified {
+                        self.messages.sort_by_key(|m| std::cmp::Reverse(m.timestamp));
+                    }
                     self.error = None;
                     self.screen_inbox(serial, index);
                 }
                 Err(e) => self.error = Some(e.to_string()),
             },
-            Event::SentList(serial, index, result) if self.selected == Some((serial, index)) => {
+            Event::SentList(serial, index, result) if self.shows(serial, index) => {
                 // Without it a conversation shows only the folder's side; not worth an error.
-                self.sent = result.unwrap_or_default();
+                let origin = &self.origin;
+                self.sent.retain(|m| origin.get(&m.id).is_some_and(|s| *s != serial));
+                let sent = result.unwrap_or_default();
+                self.origin.extend(sent.iter().map(|m| (m.id, serial)));
+                self.sent.extend(sent);
             }
-            Event::Screened(serial, index, result) if self.selected == Some((serial, index)) => {
+            Event::Screened(serial, index, result) if self.shows(serial, index) => {
                 self.checking = false;
                 match result {
                     Ok(verdicts) => self.screening.extend(verdicts),
@@ -2716,8 +2820,11 @@ impl BeaverApp {
             }
             Event::Done(serial, index, Err(e)) => {
                 self.error = Some(e.to_string());
-                if self.selected == Some((serial, index)) {
-                    self.select_mailbox(serial, index); // show what the server really has
+                // Show what the server really has.
+                if self.unified && self.shows(serial, index) {
+                    self.show_all_inboxes();
+                } else if self.selected == Some((serial, index)) {
+                    self.select_mailbox(serial, index);
                 }
             }
             Event::Done(..) => {}
@@ -3063,9 +3170,15 @@ impl BeaverApp {
     /// Accounts and their folders. Returns (folder chosen, account to remove, account to edit, add-account clicked).
     fn sidebar(&mut self, ui: &mut egui::Ui, t: &theme::Tokens) -> SidebarOutcome {
         let (mut chosen, mut removed, mut edit, mut add, mut suspicious, mut recheck, mut empty) = (None, None, None, false, None, None, None);
-        // shortcut: only the Inbox being shown has verdicts, so only its suspicious mail shows a count; check
-        // every account in the background (during sync) to count them all.
-        let held = self.held() as u32;
+        let mut all = false;
+        // shortcut: only the Inboxes being shown have verdicts, so only their suspicious mail shows a count;
+        // check every account in the background (during sync) to count them all.
+        let mut held_of: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+        for (id, _) in self.screening.iter().filter(|(_, s)| s.place == screen::Place::Spam) {
+            if let Some(serial) = self.origin.get(id) {
+                *held_of.entry(*serial).or_default() += 1;
+            }
+        }
         let frame = egui::Frame::new().fill(t.bg).inner_margin(egui::Margin::same(12));
         egui::Panel::left("accounts").frame(frame).default_size(260.0).size_range(210.0..=340.0).show(ui, |ui| {
             let can_send = !self.senders().is_empty();
@@ -3086,9 +3199,20 @@ impl BeaverApp {
                 ui.add_space(4.0);
                 ui.with_layout(Layout::top_down(Align::Min), |ui| {
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        if self.accounts.len() >= 2 {
+                            let unread = self.accounts.iter().filter_map(|v| v.mailboxes.iter().find(|m| m.role == Role::Inbox)).map(|m| m.unread).sum();
+                            all = views::folder_row(ui, t, "All inboxes", Role::Inbox, unread, self.unified).on_hover_text("The Inbox of every account, newest first").clicked();
+                            ui.add_space(8.0);
+                        }
                         ui.label(RichText::new("ACCOUNTS").size(12.0).color(t.text_dim));
-                        for view in &self.accounts {
-                            let header = egui::CollapsingHeader::new(RichText::new(&view.account.name).strong())
+                        for (at, view) in self.accounts.iter().enumerate() {
+                            // The colour that marks this account's mail in All inboxes.
+                            let mut title = egui::text::LayoutJob::default();
+                            if self.accounts.len() >= 2 {
+                                title.append("● ", 0.0, egui::TextFormat::simple(egui::FontId::proportional(13.0), theme::account_color(at)));
+                            }
+                            title.append(&view.account.name, 0.0, egui::TextFormat::simple(egui::FontId::proportional(15.0), t.text));
+                            let header = egui::CollapsingHeader::new(title)
                                 .id_salt(view.serial)
                                 .default_open(true)
                                 .show(ui, |ui| {
@@ -3109,7 +3233,7 @@ impl BeaverApp {
                                         }
                                         row.context_menu(|ui| folder_menu(ui, mailbox.role, self.settings.hold_suspicious, &mut recheck, &mut empty, (view.serial, i)));
                                         if holding {
-                                            let count = if here { held } else { 0 };
+                                            let count = held_of.get(&view.serial).copied().unwrap_or(0);
                                             let row = views::suspicious_row(ui, t, count, here && self.show_suspicious).on_hover_text("Mail from new senders that failed a check, held apart from the Inbox");
                                             if row.clicked() {
                                                 suspicious = Some((view.serial, i));
@@ -3136,7 +3260,7 @@ impl BeaverApp {
                 });
             });
         });
-        SidebarOutcome { chosen, suspicious, recheck, empty, removed, edit, add }
+        SidebarOutcome { chosen, suspicious, recheck, empty, removed, edit, add, all }
     }
 
     /// Search, refresh and the message list. Returns the message the user clicked and whether to add an account.
@@ -3193,7 +3317,7 @@ impl BeaverApp {
                     for (serial, hit) in &self.hits[range] {
                         let id = hit.message.id;
                         let selected = if self.picked.len() >= 2 { self.picked.contains(&id) } else { self.message == Some(id) };
-                        let row = views::message_row(ui, t, &hit.message, selected, Some(&hit.folder), None, 1);
+                        let row = views::message_row(ui, t, &hit.message, selected, Some(&hit.folder), None, 1, None);
                         let (ctrl, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
                         let keep = row.double_clicked() || row.triple_clicked() || row.middle_clicked();
                         if row.clicked() && !keep && ctrl {
@@ -3250,7 +3374,8 @@ impl BeaverApp {
                     let open = self.message.is_some_and(|id| if threaded { self.conversations.same(id, message.id) } else { id == message.id });
                     let selected = if self.picked.len() >= 2 { self.picked.contains(&message.id) } else { open };
                     let summary = MessageSummary { unread, ..(*message).clone() };
-                    let row = views::message_row(ui, t, &summary, selected, None, warning, count);
+                    let mark = self.origin.get(&message.id).and_then(|s| self.accounts.iter().position(|v| v.serial == *s)).filter(|_| self.unified).map(theme::account_color);
+                    let row = views::message_row(ui, t, &summary, selected, None, warning, count, mark);
                     let (ctrl, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
                     // A click just before the double click makes egui count three: that opens the tab too.
                     if row.double_clicked() || row.triple_clicked() || row.middle_clicked() {
@@ -3617,8 +3742,12 @@ impl eframe::App for BeaverApp {
                 _ => {}
             }
         }
-        let SidebarOutcome { chosen, suspicious, recheck, empty, removed, edit, mut add } =
+        let SidebarOutcome { chosen, suspicious, recheck, empty, removed, edit, mut add, all } =
             if self.in_tab { SidebarOutcome::default() } else { self.sidebar(ui, &t) };
+        if all {
+            self.show_suspicious = false;
+            self.show_all_inboxes();
+        }
         if let Some(serial) = edit {
             self.show_settings = true;
             self.leave_settings_page(Some(SettingsPage::Account(serial)));
@@ -3657,7 +3786,7 @@ impl eframe::App for BeaverApp {
             && let Some(message) = self.summary_of(id).cloned()
         {
             let role = if self.sent.iter().any(|m| m.id == id) { Role::Sent } else { self.role() };
-            let (serial, pinned) = (self.tabs[at].serial, self.tabs[at].pinned);
+            let (serial, pinned) = (self.serial_of(id).unwrap_or(self.tabs[at].serial), self.tabs[at].pinned);
             self.tabs[at] = tabs::Tab { serial, message, role, pinned };
             self.activate(at);
         }

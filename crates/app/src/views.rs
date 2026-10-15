@@ -197,10 +197,15 @@ pub fn thread_row(ui: &mut Ui, t: &Tokens, message: &MessageSummary, current: bo
 /// A message in the list: avatar, sender with unread dot, date, subject and a one-line preview.
 /// `warning`, the spam check that failed, takes the preview's place (the preview is the sender's
 /// text), so spam is judged without opening it. `count`: messages in its conversation, shown from two.
-pub fn message_row(ui: &mut Ui, t: &Tokens, message: &MessageSummary, selected: bool, folder: Option<&str>, warning: Option<&str>, count: usize) -> Response {
+/// `mark`: the colour of its account, in All inboxes.
+#[allow(clippy::too_many_arguments)]
+pub fn message_row(ui: &mut Ui, t: &Tokens, message: &MessageSummary, selected: bool, folder: Option<&str>, warning: Option<&str>, count: usize, mark: Option<Color32>) -> Response {
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), MESSAGE_ROW_H), Sense::click());
     let card = rect.shrink2(vec2(8.0, 2.0));
     row_background(ui, card, &response, selected, t);
+    if let Some(color) = mark {
+        ui.painter().rect_filled(Rect::from_min_size(pos2(card.left() + 3.0, card.top() + 14.0), vec2(3.0, card.height() - 28.0)), CornerRadius::same(2), color);
+    }
     avatar(ui, t, &message.from, pos2(card.left() + 14.0 + AVATAR / 2.0, card.top() + 14.0 + AVATAR / 2.0), AVATAR);
     let left = card.left() + 14.0 + AVATAR + 12.0;
     let width = card.right() - 14.0 - left;
