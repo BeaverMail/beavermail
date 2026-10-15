@@ -21,7 +21,7 @@ fn tint(t: &Tokens) -> Color32 {
 }
 
 /// Single-line text that ends in an ellipsis instead of overflowing `width`.
-fn truncated(ui: &Ui, text: &str, font: FontId, color: Color32, width: f32) -> Arc<egui::Galley> {
+pub fn truncated(ui: &Ui, text: &str, font: FontId, color: Color32, width: f32) -> Arc<egui::Galley> {
     let mut job = LayoutJob::simple_singleline(text.to_owned(), font, color);
     job.wrap = TextWrapping::truncate_at_width(width.max(0.0));
     ui.painter().layout_job(job)

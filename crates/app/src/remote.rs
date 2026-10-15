@@ -113,6 +113,17 @@ fn get(agent: &ureq::Agent, mut url: Url) -> Option<Vec<u8>> {
     None
 }
 
+/// Asks a mailing list to stop sending, the RFC 8058 way: one POST to the sender's `https` link, with
+/// the same limits as loading images. A redirect is not followed: the RFC forbids the sender one.
+pub fn one_click(link: &str) -> Result<(), String> {
+    let url = Url::parse(link).ok().filter(|u| u.scheme() == "https" && allowed(u)).ok_or("the unsubscribe link is not an https address")?;
+    let response = agent().post(url.as_str()).content_type("application/x-www-form-urlencoded").send("List-Unsubscribe=One-Click").map_err(|e| e.to_string())?;
+    match response.status().as_u16() {
+        200..300 => Ok(()),
+        status => Err(format!("the sender answered {status}")),
+    }
+}
+
 /// Only the web: names and addresses are checked when the client resolves them (see [`PublicOnly`]).
 fn allowed(url: &Url) -> bool {
     matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
@@ -149,6 +160,16 @@ mod tests {
         for bad in ["ftp://example.com/x", "file:///etc/passwd", "data:text/plain,x"] {
             assert!(!allowed(&Url::parse(bad).unwrap()), "{bad}");
         }
+    }
+
+    #[test]
+    fn one_click_needs_https_and_a_public_server() {
+        assert!(one_click("http://example.com/u").is_err());
+        assert!(one_click("mailto:a@example.com").is_err());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        assert!(one_click(&format!("https://localhost:{}/u", listener.local_addr().unwrap().port())).is_err());
+        assert!(listener.accept().is_err(), "nothing may connect to a local address");
     }
 
     #[test]

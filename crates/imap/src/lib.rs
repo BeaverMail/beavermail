@@ -605,7 +605,20 @@ fn parse_body(raw: &[u8]) -> Result<MessageBody, MailError> {
         auth: trace_headers(raw).iter().filter(|(n, _)| n == "authentication-results").map(|(_, v)| auth_result(v)).collect(),
         spam: trace_headers(raw).iter().any(|(n, v)| spam_verdict(n, v)),
         spam_tests: trace_headers(raw).iter().flat_map(|(n, v)| spam_tests(n, v)).collect(),
+        unsubscribe: trace_headers(raw).iter().filter(|(n, _)| n == "list-unsubscribe").flat_map(|(_, v)| unsubscribe_links(v)).collect(),
+        one_click: trace_headers(raw).iter().any(|(n, v)| n == "list-unsubscribe-post" && v.replace(' ', "").eq_ignore_ascii_case("List-Unsubscribe=One-Click")),
     })
+}
+
+/// The `<…>` links of a `List-Unsubscribe` value that a mail client may use: `https:` and `mailto:`.
+fn unsubscribe_links(value: &str) -> Vec<String> {
+    value
+        .split('<')
+        .skip(1)
+        .filter_map(|part| part.split_once('>'))
+        .map(|(link, _)| link.split_whitespace().collect::<String>())
+        .filter(|link| ["https:", "mailto:"].iter().any(|s| link.get(..s.len()).is_some_and(|p| p.eq_ignore_ascii_case(s))))
+        .collect()
 }
 
 /// The header lines of a message as (lower-case name, unfolded value), in order.
@@ -1054,6 +1067,16 @@ mod tests {
         assert_eq!(checks, [("dkim", "pass", "bank.com"), ("spf", "fail", "attacker.io"), ("dmarc", "pass", "bank.com")]);
         assert_eq!(body.auth[1].server, "mx.attacker.io");
         assert!(!parse_body(b"From: a@b.org\r\nX-Spam-Status: No, score=0\r\n\r\nhi").unwrap().spam);
+    }
+
+    #[test]
+    fn list_unsubscribe_links_and_one_click_are_read() {
+        let raw = "From: news@shop.example\r\nList-Unsubscribe: <mailto:leave@shop.example?subject=unsubscribe>,\r\n <https://shop.example/u?id=1>, <http://shop.example/plain>, <ftp://x>\r\nList-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n\r\nhi";
+        let body = parse_body(raw.as_bytes()).unwrap();
+        assert_eq!(body.unsubscribe, ["mailto:leave@shop.example?subject=unsubscribe", "https://shop.example/u?id=1"], "plain http and other schemes are left out");
+        assert!(body.one_click);
+        let body = parse_body(b"From: a@b.org\r\nList-Unsubscribe-Post: List-Unsubscribe=Maybe\r\n\r\nhi").unwrap();
+        assert!(body.unsubscribe.is_empty() && !body.one_click);
     }
 
     #[test]

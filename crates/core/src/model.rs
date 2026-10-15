@@ -101,6 +101,11 @@ pub struct MessageBody {
     /// The rules the server's spam filter reports as hit (SpamAssassin names, such as `SPF_FAIL`).
     /// Anyone can write these headers, so they may only raise suspicion, never lower it.
     pub spam_tests: Vec<String>,
+    /// The `List-Unsubscribe` links (RFC 2369), `https:` and `mailto:` only, in the sender's order.
+    pub unsubscribe: Vec<String>,
+    /// `List-Unsubscribe-Post: List-Unsubscribe=One-Click` (RFC 8058): an `https` link takes a POST, with no
+    /// page to visit. Anyone can write the header, so it counts only for a sender the server verified.
+    pub one_click: bool,
 }
 
 /// One `Authentication-Results` header: the server that wrote it and the checks it reports.

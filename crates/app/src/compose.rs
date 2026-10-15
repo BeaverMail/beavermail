@@ -117,6 +117,11 @@ impl Compose {
         .settled()
     }
 
+    /// A message already addressed and written, such as the one a mailing list asks for to unsubscribe.
+    pub fn addressed(from: u64, to: &str, subject: &str, body: &str) -> Self {
+        Self { to: to.to_owned(), subject: subject.to_owned(), body: body.to_owned(), focus_to: false, ..Self::new(from) }.settled()
+    }
+
     /// Treats the text as it is now as already saved: an untouched reply is not worth a draft.
     fn settled(mut self) -> Self {
         self.saved = self.fingerprint();

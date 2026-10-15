@@ -20,6 +20,7 @@ mod icons;
 mod learn;
 mod security;
 mod theme;
+mod unsubscribe;
 mod views;
 
 use beavermail_accounts as store;
@@ -47,7 +48,7 @@ enum Event {
     /// One sync of the selected folder finished; more history may remain.
     Synced(u64, usize, Result<SyncReport, MailError>),
     Messages(u64, usize, Result<Vec<MessageSummary>, MailError>),
-    Body(u64, MessageId, Result<MessageBody, MailError>),
+    Body(u64, MessageId, Result<Box<MessageBody>, MailError>),
     /// The checks' verdicts on the Inbox loaded as (account, folder index).
     Screened(u64, usize, Result<std::collections::HashMap<MessageId, screen::Screened>, MailError>),
     /// A write (read flag, archive, trash) finished; the UI already showed its result.
@@ -67,6 +68,8 @@ enum Event {
     DraftPushed(u64, String, u64, Result<(), MailError>),
     /// A copy of an attachment was made in the vault for a draft: (draft id, where in the vault, result).
     FileStored(String, std::path::PathBuf, Result<(), String>),
+    /// A one-click unsubscribe ended: (who, result).
+    Unsubscribed(String, Result<(), String>),
 }
 
 enum VaultOutcome {
@@ -167,6 +170,10 @@ struct ReaderOutcome {
     mark: Option<Correction>,
     /// A command for all the messages picked in the list.
     bulk: Option<Action>,
+    /// Unsubscribe was pressed: who sent the message, and how to leave the list.
+    unsubscribe: Option<(String, unsubscribe::Method)>,
+    /// Block sender was pressed on this message.
+    block: Option<MessageId>,
 }
 
 struct AccountView {
@@ -522,6 +529,10 @@ struct BeaverApp {
     settings_leave: Option<Option<SettingsPage>>,
     /// The account the user asked to remove, until they confirm.
     confirm_remove: Option<u64>,
+    /// Unsubscribe was pressed (who, how), until the user confirms.
+    confirm_unsubscribe: Option<(String, unsubscribe::Method)>,
+    /// Block sender was pressed on this message, until the user confirms.
+    confirm_block: Option<MessageId>,
     /// Asking whether to forget the senders and messages marked as spam or not spam.
     confirm_forget_marks: bool,
     /// The compose field last typed in: Esc takes the focus away, and Keep editing gives it back.
@@ -612,6 +623,8 @@ impl BeaverApp {
             account_edit: None,
             settings_leave: None,
             confirm_remove: None,
+            confirm_unsubscribe: None,
+            confirm_block: None,
             confirm_forget_marks: false,
             compose_focus: None,
             refocus: 0,
@@ -832,7 +845,7 @@ impl BeaverApp {
         self.body = None;
         self.view_mode = None;
         self.attach_selected.clear();
-        self.spawn(async move { Event::Body(serial, id, source.body(id).await) });
+        self.spawn(async move { Event::Body(serial, id, source.body(id).await.map(Box::new)) });
     }
 
     /// Back to the mail, with the message that was in the reading pane.
@@ -1901,6 +1914,77 @@ impl BeaverApp {
         }
     }
 
+    /// Confirms leaving a mailing list, naming where the request goes.
+    fn unsubscribe_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
+        let Some((who, way)) = self.confirm_unsubscribe.clone() else { return };
+        let host = way.host();
+        let (text, button) = match &way {
+            unsubscribe::Method::Page(_) => (format!("The unsubscribe page of {host} opens in your browser. It may ask you to confirm there."), "Open unsubscribe page"),
+            _ => (format!("BeaverMail asks {host} to stop sending you this mail. Nothing opens in your browser."), "Unsubscribe"),
+        };
+        let (mut confirm, mut cancel) = (false, false);
+        let modal = egui::Modal::new(egui::Id::new("confirm_unsubscribe")).show(ctx, |ui| {
+            ui.set_width(FORM_WIDTH * 0.8);
+            ui.heading(format!("Unsubscribe from {who}?"));
+            ui.label(RichText::new(text).color(t.text_dim));
+            ui.add_space(12.0);
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
+                confirm = ui.add(egui::Button::new(RichText::new(button).color(t.on_accent)).fill(t.accent)).clicked();
+                cancel = ui.button("Cancel").clicked();
+            });
+        });
+        if confirm {
+            match way {
+                unsubscribe::Method::OneClick(link) => self.spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || remote::one_click(&link)).await.unwrap_or_else(|e| Err(e.to_string()));
+                    Event::Unsubscribed(who, result)
+                }),
+                unsubscribe::Method::Page(link) => ctx.open_url(egui::OpenUrl::new_tab(link)),
+                unsubscribe::Method::Mail(..) => {}
+            }
+        }
+        if confirm || cancel || modal.should_close() {
+            self.confirm_unsubscribe = None;
+        }
+    }
+
+    /// Confirms blocking the sender of a message: the same as marking it as spam, asked for on any message.
+    fn block_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
+        let Some(id) = self.confirm_block else { return };
+        let Some(key) = self.summary_of(id).map(|m| screen::sender_key(&m.address)) else {
+            self.confirm_block = None;
+            return;
+        };
+        let who = key.trim_start_matches('@').to_owned();
+        let later = if self.settings.hold_suspicious {
+            "New mail from them is held apart from the Inbox."
+        } else {
+            "New mail from them still reaches the Inbox while holding suspicious mail is off in Settings."
+        };
+        let (mut confirm, mut cancel) = (false, false);
+        let modal = egui::Modal::new(egui::Id::new("confirm_block")).show(ctx, |ui| {
+            ui.set_width(FORM_WIDTH * 0.8);
+            ui.heading(format!("Block {who}?"));
+            ui.label(RichText::new(format!("This message and their mail in this folder move to Spam. {later} Choose Not spam on any of their messages to undo it.")).color(t.text_dim));
+            ui.add_space(12.0);
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
+                confirm = ui.add(egui::Button::new(RichText::new("Block sender").color(t.on_accent)).fill(t.danger)).clicked();
+                cancel = ui.button("Cancel").clicked();
+            });
+        });
+        if confirm {
+            // The message itself too: from a tab or a search it may not be in the list shown.
+            let mut ids: Vec<MessageId> = self.messages.iter().filter(|m| screen::sender_key(&m.address) == key).map(|m| m.id).collect();
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+            self.move_to_spam(&ids);
+        }
+        if confirm || cancel || modal.should_close() {
+            self.confirm_block = None;
+        }
+    }
+
     /// Confirms removing an account: what was downloaded and the saved password go with it.
     fn remove_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
         let Some(serial) = self.confirm_remove else { return };
@@ -2126,7 +2210,7 @@ impl BeaverApp {
 
     /// Up/Down move through the list, E archives, Delete trashes, U toggles unread.
     fn handle_keys(&mut self, ctx: &egui::Context) {
-        if self.form.is_some() || !self.confirm_erase.is_empty() || self.confirm_spam || self.confirm_empty.is_some() || self.confirm_remove.is_some() || self.compose.is_some() || self.show_settings || self.locked() {
+        if self.form.is_some() || !self.confirm_erase.is_empty() || self.confirm_spam || self.confirm_empty.is_some() || self.confirm_remove.is_some() || self.confirm_unsubscribe.is_some() || self.confirm_block.is_some() || self.compose.is_some() || self.show_settings || self.locked() {
             return;
         }
         // Unlike the plain keys, this one also works while the search box has the keyboard.
@@ -2440,7 +2524,7 @@ impl BeaverApp {
                 match result {
                     Ok(body) => {
                         let findings = self.findings(serial, id, &body);
-                        self.body = Some(OpenBody::new(body, findings));
+                        self.body = Some(OpenBody::new(*body, findings));
                     }
                     Err(e) => self.error = Some(e.to_string()),
                 }
@@ -2501,6 +2585,10 @@ impl BeaverApp {
                     }
                 }
             }
+            Event::Unsubscribed(who, result) => match result {
+                Ok(()) => self.notice = Some((format!("Unsubscribed from {who}. Mail already on its way may still arrive."), std::time::Instant::now())),
+                Err(e) => self.error = Some(format!("Could not unsubscribe from {who}: {e}. Try the unsubscribe link in the message.")),
+            },
             Event::Saved(result) => match result {
                 Ok(Some(text)) => {
                     self.notice = Some((text, std::time::Instant::now()));
@@ -3029,6 +3117,7 @@ impl BeaverApp {
         let mut allow_sender = None;
         let mut mark = None;
         let mut suspicious = false;
+        let (mut leave, mut block) = (None, None);
         // The correction that makes sense; the reasons are the warnings shown just above it.
         let correction = self.message.and_then(|id| self.correction(id)).map(|(choice, _)| choice);
         let (settings_mode, view_mode) = (self.settings.clone(), self.view_mode);
@@ -3085,6 +3174,16 @@ impl BeaverApp {
                         action = Some((message.id, what));
                     }
                 }
+                // In Sent and Drafts the sender is the user.
+                let blockable = !matches!(role, Role::Junk | Role::Sent | Role::Drafts) && !message.address.is_empty();
+                let tip = match role {
+                    _ if blockable => "Block sender…",
+                    Role::Junk => "Already in Spam",
+                    _ => "Your own mail",
+                };
+                if icons::button(ui, t, Icon::Ban, tip, blockable, false).clicked() {
+                    block = Some(message.id);
+                }
             });
             ui.add_space(6.0);
             ui.separator();
@@ -3103,12 +3202,32 @@ impl BeaverApp {
                             ui.add_space(12.0);
                             let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), views::AVATAR), egui::Sense::hover());
                             views::avatar(ui, t, &message.from, rect.left_center() + vec2(views::AVATAR / 2.0, 0.0), views::AVATAR);
-                            let name = ui.painter().layout_no_wrap(message.from.clone(), egui::FontId::proportional(15.5), t.text);
-                            let detail = if message.address.is_empty() || message.address == message.from { message.received.clone() } else { format!("{}  ·  {}", message.address, message.received) };
-                            let date = ui.painter().layout_no_wrap(detail, egui::FontId::proportional(13.0), t.text_dim);
-                            ui.painter().galley(pos2(rect.left() + views::AVATAR + 12.0, rect.top() + 3.0), name, t.text);
-                            ui.painter().galley(pos2(rect.left() + views::AVATAR + 12.0, rect.top() + 23.0), date, t.text_dim);
                             let authenticity = sender::authenticity(&body.data.auth, &server_host, &message.address);
+                            suspicious = body.findings.iter().any(|f| f.level == screen::Level::Danger);
+                            // Never for spam: leaving a list it sends only tells the spammer the address is read.
+                            let way = unsubscribe::method(&body.data.unsubscribe, body.data.one_click, authenticity == sender::Authenticity::Verified)
+                                .filter(|_| role != Role::Junk && !suspicious);
+                            let mut text_right = rect.right();
+                            if let Some(way) = way {
+                                ui.scope_builder(egui::UiBuilder::new().max_rect(rect).layout(Layout::right_to_left(Align::Center)), |ui| {
+                                    let tip = match &way {
+                                        unsubscribe::Method::OneClick(_) => format!("Ask {} to stop sending this mail", way.host()),
+                                        unsubscribe::Method::Mail(..) => format!("Write the email {} asks for to unsubscribe", way.host()),
+                                        unsubscribe::Method::Page(_) => format!("Open the unsubscribe page of {}", way.host()),
+                                    };
+                                    let button = ui.button("Unsubscribe").on_hover_text(tip);
+                                    text_right = button.rect.left() - 12.0;
+                                    if button.clicked() {
+                                        leave = Some((message.from.clone(), way));
+                                    }
+                                });
+                            }
+                            let left = rect.left() + views::AVATAR + 12.0;
+                            let detail = if message.address.is_empty() || message.address == message.from { message.received.clone() } else { format!("{}  ·  {}", message.address, message.received) };
+                            let name = views::truncated(ui, &message.from, egui::FontId::proportional(15.5), t.text, text_right - left);
+                            let date = views::truncated(ui, &detail, egui::FontId::proportional(13.0), t.text_dim, text_right - left);
+                            ui.painter().galley(pos2(left, rect.top() + 3.0), name, t.text);
+                            ui.painter().galley(pos2(left, rect.top() + 23.0), date, t.text_dim);
                             for finding in &body.findings {
                                 let color = if finding.level == screen::Level::Danger { t.danger } else { t.text_dim };
                                 ui.add_space(6.0);
@@ -3121,13 +3240,13 @@ impl BeaverApp {
                                 ui.add_space(6.0);
                                 ui.label(RichText::new(format!("Sender domain verified by your server: {}", sender::domain(&message.address))).size(13.0).color(t.text_dim));
                             }
-                            suspicious = body.findings.iter().any(|f| f.level == screen::Level::Danger);
                             if let Some(choice) = correction {
                                 let key = screen::sender_key(&message.address);
                                 let who = key.trim_start_matches('@');
                                 let (text, held, button, tip) = match choice {
                                     Correction::NotSpam => ("Held apart from the Inbox as suspicious.".to_owned(), true, "Not spam", format!("Show mail from {who} in the Inbox from now on")),
-                                    Correction::Spam => (format!("First mail from {who}."), false, "Spam", format!("Move mail from {who} to the Spam folder, now and from now on")),
+                                    // New means never written to, not never heard from: a newsletter can stay "new" for years.
+                                    Correction::Spam => (format!("You have never written to {}.", if key.starts_with('@') { format!("anyone at {who}") } else { who.to_owned() }), false, "Spam", format!("Move mail from {who} to the Spam folder, now and from now on")),
                                     Correction::OutOfSpam => ("In the Spam folder.".to_owned(), true, "Not spam", format!("Move it back to the Inbox, and keep mail from {who} there from now on")),
                                 };
                                 ui.add_space(10.0);
@@ -3220,7 +3339,7 @@ impl BeaverApp {
         } else {
             egui::Panel::right("reader").frame(frame).default_size(470.0).size_range(360.0..=900.0).show(ui, draw);
         }
-        ReaderOutcome { action, url, mode: chosen_mode, remember, attachment, save_many, allow_sender, mark, bulk }
+        ReaderOutcome { action, url, mode: chosen_mode, remember, attachment, save_many, allow_sender, mark, bulk, unsubscribe: leave, block }
     }
 }
 
@@ -3285,7 +3404,17 @@ impl eframe::App for BeaverApp {
         self.confirm_remove = removed.or(self.confirm_remove);
 
         self.handle_keys(ui.ctx());
-        let ReaderOutcome { action, url, mode, remember, attachment, save_many, allow_sender, mark, bulk } = self.reader(ui, &t);
+        let ReaderOutcome { action, url, mode, remember, attachment, save_many, allow_sender, mark, bulk, unsubscribe, block } = self.reader(ui, &t);
+        match unsubscribe {
+            // The compose window is the question: nothing goes out until Send.
+            Some((_, unsubscribe::Method::Mail(to, subject, text))) => {
+                let from = self.open_tab().map(|t| t.serial);
+                self.start_compose(from.map(|f| compose::Compose::addressed(f, &to, &subject, &text)));
+            }
+            Some(asked) => self.confirm_unsubscribe = Some(asked),
+            None => {}
+        }
+        self.confirm_block = block.or(self.confirm_block);
         if let Some(action) = bulk {
             self.request_all(self.targets(), action);
         }
@@ -3330,6 +3459,8 @@ impl eframe::App for BeaverApp {
         // After Settings, so the dialogs it opens show above it.
         self.account_form(ui.ctx());
         self.remove_dialog(ui.ctx(), &t);
+        self.unsubscribe_dialog(ui.ctx(), &t);
+        self.block_dialog(ui.ctx(), &t);
         if self.locked()
             && let Some(request) = security::unlock_prompt(ui.ctx(), &t, &mut self.security, self.unlocking)
         {

@@ -159,7 +159,7 @@ pub fn place(known: &Known, settings: &Settings, id: MessageId, address: &str, f
         None if known.replies.contains(&id) => (Place::Inbox, "a reply to a message you sent".into(), false),
         None => match organisation.filter(|o| known.organisations.contains(*o)) {
             Some(o) => (Place::Inbox, format!("you write to others at {o}"), false),
-            None => (Place::Inbox, "first message from this sender".into(), true),
+            None => (Place::Inbox, "you have never written to this sender".into(), true),
         },
     }
 }
