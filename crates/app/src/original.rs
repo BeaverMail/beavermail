@@ -58,14 +58,14 @@ pub struct Page {
 }
 
 impl Page {
-    /// `remote`: the user agreed to load what the message links to.
-    pub fn new(ctx: &egui::Context, html: &str, width: f32, scale: f32, remote: bool) -> Option<Self> {
+    /// `remote`: the user agreed to load what the message links to, except `trackers`.
+    pub fn new(ctx: &egui::Context, html: &str, width: f32, scale: f32, remote: bool, trackers: &[String]) -> Option<Self> {
         let cut = (0..=MAX_INPUT.min(html.len())).rev().find(|i| html.is_char_boundary(*i)).unwrap_or(0);
         let html = &html[..cut];
         let pixels = pixels(width, scale);
         let net = remote.then(|| {
             let ctx = ctx.clone();
-            Net::new(move || ctx.request_repaint())
+            Net::new(trackers, move || ctx.request_repaint())
         });
         let config = DocumentConfig {
             viewport: Some(Viewport::new(pixels, 800, scale, ColorScheme::Light)),
@@ -138,7 +138,7 @@ mod tests {
     fn a_page_is_drawn_without_fetching_and_its_links_are_found_at_any_scale() {
         let ctx = egui::Context::default();
         for scale in [1.0, 2.0] {
-            let page = Page::new(&ctx, HTML, 400.0, scale, false).unwrap();
+            let page = Page::new(&ctx, HTML, 400.0, scale, false, &[]).unwrap();
             assert!(page.size.x > 399.0 && page.size.y > 40.0 && page.size.y < 400.0, "{:?}", page.size);
             assert_eq!(page.link_at(Vec2::new(20.0, 20.0)).as_deref(), Some("https://a.example/x"), "scale {scale}");
             assert_eq!(page.link_at(Vec2::new(20.0, 90.0)), None, "scale {scale}");
@@ -162,16 +162,19 @@ mod tests {
                 let _ = stream.write_all(PNG);
             }
         });
-        let html = format!(r#"<body style="margin:0"><img src="http://{addr}/p.png" width="40" height="40"></body>"#);
+        let html = format!(r#"<body style="margin:0"><img src="http://{addr}/t.gif" width="1" height="1"><img src="http://{addr}/p.png" width="40" height="40"></body>"#);
+        let trackers = crate::html::trackers(&html);
         let ctx = egui::Context::default();
-        let blocked = Page::new(&ctx, &html, 200.0, 1.0, false).unwrap();
+        let blocked = Page::new(&ctx, &html, 200.0, 1.0, false, &trackers).unwrap();
         std::thread::sleep(Duration::from_millis(300));
         assert!(rx.try_recv().is_err(), "nothing is requested without consent");
         drop(blocked);
 
-        let mut page = Page::new(&ctx, &html, 200.0, 1.0, true).unwrap();
+        let mut page = Page::new(&ctx, &html, 200.0, 1.0, true, &trackers).unwrap();
         let request = rx.recv_timeout(Duration::from_secs(5)).expect("the image is requested after consent");
         assert!(request.starts_with("get /p.png") && !request.contains("referer") && !request.contains("cookie"), "{request}");
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(rx.try_recv().is_err(), "the tracking pixel is never requested, even with consent");
         for _ in 0..50 {
             if page.net.as_ref().unwrap().done.load(Ordering::Relaxed) > 0 {
                 break;

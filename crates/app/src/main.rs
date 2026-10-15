@@ -161,13 +161,15 @@ struct OpenBody {
     remote: bool,
     /// The HTML links to images, styles or fonts on a server.
     has_remote: bool,
+    /// Images that only report the message was opened: never loaded (see [`html::trackers`]).
+    trackers: Vec<String>,
     /// What deserves a second look about the message, the most serious first.
     findings: Vec<screen::Finding>,
 }
 
 impl OpenBody {
     fn new(p: Prepared) -> Self {
-        Self { data: p.data, plain: p.plain, simplified: p.simplified, original: None, remote: false, has_remote: p.has_remote, findings: p.findings }
+        Self { data: p.data, plain: p.plain, simplified: p.simplified, original: None, remote: false, has_remote: p.has_remote, trackers: p.trackers, findings: p.findings }
     }
 }
 
@@ -178,6 +180,7 @@ struct Prepared {
     plain: Vec<html::Block>,
     simplified: Option<Vec<html::Block>>,
     has_remote: bool,
+    trackers: Vec<String>,
     findings: Vec<screen::Finding>,
 }
 
@@ -186,7 +189,8 @@ impl Prepared {
         let plain = html::plain_blocks(&data.text);
         let simplified = data.html.as_deref().map(html::blocks);
         let has_remote = data.html.as_deref().is_some_and(html::has_remote);
-        Self { data, plain, simplified, has_remote, findings }
+        let trackers = data.html.as_deref().map(html::trackers).unwrap_or_default();
+        Self { data, plain, simplified, has_remote, trackers, findings }
     }
 }
 
@@ -3678,10 +3682,10 @@ impl BeaverApp {
                                 // A permission given to a sender never applies to a message that fails the server's checks.
                                 let remote = body.remote || (settings_mode.allows_remote(&message.address) && !suspicious);
                                 if !body.original.as_ref().is_some_and(|p| p.fits(width, scale, remote)) {
-                                    body.original = original::Page::new(ui.ctx(), source, width, scale, remote);
+                                    body.original = original::Page::new(ui.ctx(), source, width, scale, remote, &body.trackers);
                                 }
                                 if body.has_remote {
-                                    match views::remote_bar(ui, t, remote, if suspicious { "" } else { &message.address }) {
+                                    match views::remote_bar(ui, t, remote, if suspicious { "" } else { &message.address }, &body.trackers) {
                                         Some(views::Remote::Once) => body.remote = true,
                                         Some(views::Remote::Always) => allow_sender = Some(true),
                                         Some(views::Remote::Block) => {

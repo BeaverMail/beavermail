@@ -80,6 +80,39 @@ pub fn has_remote(html: &str) -> bool {
     })
 }
 
+/// The remote images of the HTML that only report the message was opened: pixel-sized or hidden
+/// images, and known open-tracking addresses. As absolute URLs, to leave out when loading images.
+pub fn trackers(html: &str) -> Vec<String> {
+    let mut end = html.len().min(MAX_INPUT);
+    while !html.is_char_boundary(end) {
+        end -= 1;
+    }
+    let document = Html::parse_document(&html[..end]);
+    let mut out: Vec<String> = Vec::new();
+    for node in document.tree.nodes() {
+        let Node::Element(e) = node.value() else { continue };
+        if e.name() != "img" {
+            continue;
+        }
+        let Some(src) = e.attr("src").map(str::trim) else { continue };
+        let src = if src.starts_with("//") { format!("https:{src}") } else { src.to_owned() };
+        let Ok(url) = blitz_traits::net::Url::parse(&src) else { continue };
+        if !matches!(url.scheme(), "http" | "https") {
+            continue;
+        }
+        let style: String = e.attr("style").unwrap_or("").to_ascii_lowercase().chars().filter(|c| !c.is_whitespace()).collect();
+        // A size of at most 2: "1", "1px", "0".
+        let tiny = |v: &str| v.trim().trim_end_matches("px").parse::<f32>().is_ok_and(|n| n <= 2.0);
+        let styled = |prop: &str| style.split(';').filter_map(|d| d.strip_prefix(prop)).next_back().is_some_and(tiny);
+        let pixel = e.attr("width").is_some_and(tiny) || e.attr("height").is_some_and(tiny) || styled("width:") || styled("height:");
+        let hidden = e.attr("hidden").is_some() || style.contains("display:none") || style.contains("visibility:hidden") || style.contains("opacity:0");
+        if (pixel || hidden || crate::remote::tracking(&url)) && !out.contains(&url.to_string()) {
+            out.push(url.to_string());
+        }
+    }
+    out
+}
+
 /// How many letters and digits the HTML hides from the reader (`display: none`, zero size and the
 /// like). A short hidden preheader is normal in newsletters; a long one is meant for spam filters.
 pub fn hidden_text(html: &str) -> usize {
@@ -425,6 +458,16 @@ pub fn clean_url(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pixels_hidden_images_and_known_trackers_are_found_but_pictures_are_not() {
+        let html = r#"<img src="https://t.example/o.gif" width="1" height="1">
+            <img src="//t.example/p.gif" style="display: none">
+            <img src="https://x.us5.list-manage.com/track/open.php?u=1">
+            <img src="https://shop.example/logo.png" width="120">
+            <img src="cid:part1" width="1">"#;
+        assert_eq!(trackers(html), ["https://t.example/o.gif", "https://t.example/p.gif", "https://x.us5.list-manage.com/track/open.php?u=1"]);
+    }
 
     fn texts(blocks: &[Block]) -> Vec<String> {
         blocks

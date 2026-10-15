@@ -380,18 +380,32 @@ pub enum Remote {
 }
 
 /// The bar above a message shown as designed: says what is blocked or loaded and offers the choice.
-pub fn remote_bar(ui: &mut Ui, t: &Tokens, loaded: bool, sender: &str) -> Option<Remote> {
+/// `trackers`: the images that only report the message was opened, which stay blocked either way.
+pub fn remote_bar(ui: &mut Ui, t: &Tokens, loaded: bool, sender: &str, trackers: &[String]) -> Option<Remote> {
     let mut choice = None;
     egui::Frame::new().fill(t.input).stroke(egui::Stroke::new(1.0, t.border)).corner_radius(egui::CornerRadius::same(crate::theme::CONTROL_RADIUS)).inner_margin(egui::Margin::symmetric(12, 10)).show(ui, |ui| {
         ui.set_width(ui.available_width());
+        // Who would have been told: the hosts of the trackers, once each.
+        let mut hosts: Vec<String> = trackers.iter().filter_map(|u| blitz_traits::net::Url::parse(u).ok()?.host_str().map(str::to_owned)).collect();
+        hosts.dedup();
+        let blocked = match trackers.len() {
+            0 => None,
+            n => Some(format!("{n} tracker{} blocked{}: {}", if n == 1 { "" } else { "s" }, if loaded { "" } else { ", also when images load" }, hosts.join(", "))),
+        };
         if loaded {
             ui.label(egui::RichText::new("Images and styles from the internet are loaded. The sender can see that you opened this message.").size(13.0).color(t.text_dim));
+            if let Some(blocked) = &blocked {
+                ui.label(egui::RichText::new(blocked).size(13.0).color(t.text_dim));
+            }
             if ui.small_button("Block again").clicked() {
                 choice = Some(Remote::Block);
             }
         } else {
             ui.label(egui::RichText::new("Images and styles from the internet are blocked.").size(13.5).color(t.text));
             ui.label(egui::RichText::new("Loading them tells the sender you opened this message, and shows your network address.").size(13.0).color(t.text_dim));
+            if let Some(blocked) = &blocked {
+                ui.label(egui::RichText::new(blocked).size(13.0).color(t.text_dim));
+            }
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
                 if primary_button(ui, t, "Load for this message", true).clicked() {

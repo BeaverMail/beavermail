@@ -29,17 +29,37 @@ pub static TEST_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU1
 
 type Job = (Url, Box<dyn NetHandler>);
 
+/// Addresses that report a message was opened, as (host or its parent domain, a piece of the path).
+/// shortcut: a short list kept by hand, beside the pixel-shaped images found in the HTML (see
+/// `html::trackers`); a maintained blocklist would catch more senders.
+const OPEN_TRACKING: [(&str, &str); 5] = [
+    ("list-manage.com", "/track/open"),
+    ("sendgrid.net", "/wf/open"),
+    ("mandrillapp.com", "/track/open"),
+    ("exct.net", "open.aspx"),
+    ("", "/track/open.php"),
+];
+
+/// Whether `url` is a known address for reporting that a message was opened.
+pub fn tracking(url: &Url) -> bool {
+    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+    let path = url.path().to_ascii_lowercase();
+    OPEN_TRACKING.iter().any(|(domain, piece)| (domain.is_empty() || host == *domain || host.ends_with(&format!(".{domain}"))) && path.contains(piece))
+}
+
 /// Downloads for one open message. Dropping it stops the workers.
 pub struct Net {
     jobs: mpsc::Sender<Job>,
+    /// Trackers found in the message: never fetched, even with images allowed.
+    blocked: std::collections::HashSet<String>,
     requested: AtomicUsize,
     /// Files finished (loaded or failed); the page redraws when this changes.
     pub done: Arc<AtomicUsize>,
 }
 
 impl Net {
-    /// `wake` is called whenever a file has arrived.
-    pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Arc<Self> {
+    /// `wake` is called whenever a file has arrived; `blocked` are the trackers found in the message.
+    pub fn new(blocked: &[String], wake: impl Fn() + Send + Sync + 'static) -> Arc<Self> {
         let (jobs, queue) = mpsc::channel::<Job>();
         let queue = Arc::new(Mutex::new(queue));
         let done = Arc::new(AtomicUsize::new(0));
@@ -59,12 +79,15 @@ impl Net {
                 }
             });
         }
-        Arc::new(Self { jobs, requested: AtomicUsize::new(0), done })
+        Arc::new(Self { jobs, blocked: blocked.iter().cloned().collect(), requested: AtomicUsize::new(0), done })
     }
 }
 
 impl NetProvider for Net {
     fn fetch(&self, _doc_id: usize, request: Request, handler: Box<dyn NetHandler>) {
+        if self.blocked.contains(request.url.as_str()) || tracking(&request.url) {
+            return;
+        }
         if request.method == blitz_traits::net::Method::GET && self.requested.fetch_add(1, Ordering::Relaxed) < MAX_FILES {
             let _ = self.jobs.send((request.url, handler));
         }
@@ -160,6 +183,16 @@ mod tests {
         for bad in ["ftp://example.com/x", "file:///etc/passwd", "data:text/plain,x"] {
             assert!(!allowed(&Url::parse(bad).unwrap()), "{bad}");
         }
+    }
+
+    #[test]
+    fn known_open_trackers_are_recognised() {
+        let is = |u: &str| tracking(&Url::parse(u).unwrap());
+        assert!(is("https://shop.us5.list-manage.com/track/open.php?u=1&id=2"));
+        assert!(is("https://u123.ct.sendgrid.net/wf/open?upn=x"));
+        assert!(is("https://news.example.com/track/open.php?x"), "the generic path, any host");
+        assert!(!is("https://shop.us5.list-manage.com/images/logo.png"), "the sender's own pictures load");
+        assert!(!is("https://evil-sendgrid.net/wf/open"), "a look-alike host is not the domain");
     }
 
     #[test]
