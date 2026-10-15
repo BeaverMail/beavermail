@@ -343,8 +343,6 @@ struct BeaverApp {
     search_seq: u64,
     hits_seq: u64,
     hits: Vec<(u64, Hit)>,
-    /// A message to open once its folder has loaded (after clicking a search result).
-    pending_open: Option<MessageId>,
     focus_search: bool,
     compose: Option<compose::Compose>,
     /// Drafts on this computer for the account being shown (filled while a Drafts folder is open).
@@ -432,7 +430,6 @@ impl BeaverApp {
             search_seq: 0,
             hits_seq: 0,
             hits: Vec::new(),
-            pending_open: None,
             focus_search: false,
             compose: None,
             drafts: Vec::new(),
@@ -615,27 +612,33 @@ impl BeaverApp {
 
     /// Shows message `id`: in the reading pane, or `pin`, in its tab (opened if need be).
     fn open_message(&mut self, id: MessageId, pin: bool) {
-        let slot = tabs::slot(&self.tabs, id, pin);
-        let at = match slot {
+        let listed = self.selected.zip(self.messages.iter().find(|m| m.id == id)).map(|((serial, _), m)| tabs::Tab { serial, message: m.clone(), role: self.role(), pinned: pin });
+        let tabbed = || self.tabs.iter().find(|t| t.message.id == id).map(|t| tabs::Tab { serial: t.serial, message: t.message.clone(), role: t.role, pinned: pin });
+        if let Some(tab) = listed.or_else(tabbed) {
+            self.open(tab);
+        }
+    }
+
+    /// Shows `tab`'s message, from any folder: in the reading pane, or when pinned, in its tab.
+    fn open(&mut self, tab: tabs::Tab) {
+        let (id, unread) = (tab.message.id, tab.message.unread);
+        // Suspicious mail and spam are opened to judge them, not to read them.
+        let judging = self.show_suspicious || tab.role == Role::Junk;
+        let at = match tabs::slot(&self.tabs, id, tab.pinned) {
             tabs::Slot::Existing(at) => at,
-            tabs::Slot::Replace(_) | tabs::Slot::Push => {
-                let (Some((serial, _)), Some(message)) = (self.selected, self.messages.iter().find(|m| m.id == id).cloned()) else { return };
-                let tab = tabs::Tab { serial, message, role: self.role(), pinned: pin };
-                if let tabs::Slot::Replace(preview) = slot {
-                    self.tabs[preview] = tab;
-                    preview
-                } else {
-                    self.tabs.push(tab);
-                    self.tabs.len() - 1
-                }
+            tabs::Slot::Replace(preview) => {
+                self.tabs[preview] = tab;
+                preview
+            }
+            tabs::Slot::Push => {
+                self.tabs.push(tab);
+                self.tabs.len() - 1
             }
         };
         if self.active() != Some(at) {
             self.activate(at);
         }
-        // Suspicious mail and spam are opened to judge them, not to read them.
-        let judging = self.show_suspicious || self.role() == Role::Junk;
-        if !judging && self.messages.iter().any(|m| m.id == id && m.unread) {
+        if !judging && unread {
             self.act(id, Action::Unread(false));
         }
     }
@@ -744,6 +747,7 @@ impl BeaverApp {
         }
         if let Action::Unread(unread) = action {
             self.tabs.iter_mut().filter(|t| t.message.id == id).for_each(|t| t.message.unread = unread);
+            self.hits.iter_mut().filter(|(_, h)| h.message.id == id).for_each(|(_, h)| h.message.unread = unread);
         }
         self.spawn(async move {
             let result = match action {
@@ -762,7 +766,13 @@ impl BeaverApp {
             // its place in the list.
             let was_open = self.message == Some(id);
             self.tabs.retain(|t| t.message.id != id);
-            if was_open {
+            self.hits.retain(|(_, h)| h.message.id != id);
+            // While searching, the list on screen is the results: nothing else is opened.
+            if was_open && self.searching() {
+                self.in_tab = false;
+                self.message = None;
+                self.body = None;
+            } else if was_open {
                 self.in_tab = false;
                 self.message = None;
                 self.body = None;
@@ -1006,13 +1016,10 @@ impl BeaverApp {
     }
 
     /// A search result was clicked: show its folder with the message open.
-    fn open_hit(&mut self, serial: u64, hit: &Hit) {
-        let Some(index) = self.view(serial).and_then(|v| v.mailboxes.iter().position(|m| m.name == hit.folder)) else { return };
-        self.query.clear();
-        self.searched.clear();
-        self.hits.clear();
-        self.pending_open = Some(hit.message.id);
-        self.select_mailbox(serial, index);
+    /// Shows a search result where it is, without leaving the search: its folder need not be the one shown.
+    fn open_hit(&mut self, serial: u64, hit: &Hit, pin: bool) {
+        let Some(role) = self.view(serial).and_then(|v| v.mailboxes.iter().find(|m| m.name == hit.folder)).map(|m| m.role) else { return };
+        self.open(tabs::Tab { serial, message: hit.message.clone(), role, pinned: pin });
     }
 
     /// Asks the server again for the selected folder and its account's folder list.
@@ -1612,13 +1619,22 @@ impl BeaverApp {
             return;
         }
         // In a message tab the list is not on screen: no moving through it.
-        let ids: Vec<MessageId> = if self.in_tab { Vec::new() } else { self.visible().iter().map(|m| m.id).collect() };
+        let ids: Vec<MessageId> = if self.in_tab {
+            Vec::new()
+        } else if self.searching() {
+            self.hits.iter().map(|(_, h)| h.message.id).collect()
+        } else {
+            self.visible().iter().map(|m| m.id).collect()
+        };
         let pos = self.message.and_then(|id| ids.iter().position(|i| *i == id));
         let step = if key(egui::Key::ArrowDown) { Some(1) } else if key(egui::Key::ArrowUp) { Some(-1) } else { None };
         if let Some(step) = step {
             let next = pos.map_or(0, |p| p.saturating_add_signed(step)).min(ids.len().saturating_sub(1));
             if let Some(id) = ids.get(next).copied().filter(|id| Some(*id) != self.message) {
-                self.select_message(id);
+                match self.hits.iter().find(|(_, h)| h.message.id == id).cloned().filter(|_| self.searching()) {
+                    Some((serial, hit)) => self.open_hit(serial, &hit, false),
+                    None => self.select_message(id),
+                }
             }
         }
         let shortcut = |modifiers, key| ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(modifiers, key)));
@@ -1854,12 +1870,6 @@ impl BeaverApp {
                     self.messages = messages;
                     self.error = None;
                     self.screen_inbox(serial, index);
-                    if let Some(id) = self.pending_open
-                        && self.messages.iter().any(|m| m.id == id)
-                    {
-                        self.pending_open = None;
-                        self.select_message(id);
-                    }
                 }
                 Err(e) => self.error = Some(e.to_string()),
             },
@@ -2339,7 +2349,7 @@ impl BeaverApp {
         let (mut open_draft, mut delete_draft): (Option<String>, Option<String>) = (None, None);
         let mut ask_spam = false;
         let mut pinned: Option<MessageId> = None;
-        let mut clicked_hit: Option<(u64, Hit)> = None;
+        let mut clicked_hit: Option<(u64, Hit, bool)> = None;
         let frame = egui::Frame::new().fill(t.surface);
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
             if self.accounts.is_empty() {
@@ -2383,8 +2393,10 @@ impl BeaverApp {
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, views::MESSAGE_ROW_H, self.hits.len(), |ui, range| {
                     ui.spacing_mut().item_spacing.y = 0.0;
                     for (serial, hit) in &self.hits[range] {
-                        if views::message_row(ui, t, &hit.message, self.message == Some(hit.message.id), Some(&hit.folder), None).clicked() {
-                            clicked_hit = Some((*serial, hit.clone()));
+                        let row = views::message_row(ui, t, &hit.message, self.message == Some(hit.message.id), Some(&hit.folder), None);
+                        let keep = row.double_clicked() || row.middle_clicked() || (row.clicked() && ui.input(|i| i.modifiers.command));
+                        if keep || row.clicked() {
+                            clicked_hit = Some((*serial, hit.clone(), keep));
                         }
                     }
                 });
@@ -2442,8 +2454,8 @@ impl BeaverApp {
         if let Some(id) = pinned {
             self.open_message(id, true);
         }
-        if let Some((serial, hit)) = clicked_hit {
-            self.open_hit(serial, &hit);
+        if let Some((serial, hit, pin)) = clicked_hit {
+            self.open_hit(serial, &hit, pin);
         }
         if let Some(id) = open_draft {
             self.open_draft(&id);
