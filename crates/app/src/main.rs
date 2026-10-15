@@ -48,7 +48,7 @@ enum Event {
     /// One sync of the selected folder finished; more history may remain.
     Synced(u64, usize, Result<SyncReport, MailError>),
     Messages(u64, usize, Result<Vec<MessageSummary>, MailError>),
-    Body(u64, MessageId, Result<Box<MessageBody>, MailError>),
+    Body(u64, MessageId, Result<Box<Prepared>, MailError>),
     /// The checks' verdicts on the Inbox loaded as (account, folder index).
     Screened(u64, usize, Result<std::collections::HashMap<MessageId, screen::Screened>, MailError>),
     /// A write (read flag, archive, trash) finished; the UI already showed its result.
@@ -100,6 +100,24 @@ impl Action {
     }
 }
 
+/// Which pane the keys act on: the list (arrows move through it) or the reader (arrows scroll it).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pane {
+    List,
+    Reader,
+}
+
+/// A scroll of the reader asked for from the keyboard.
+#[derive(Clone, Copy)]
+enum Scroll {
+    /// Lines down (negative: up).
+    Lines(f32),
+    /// Screens down (negative: up).
+    Pages(f32),
+    /// To the top, or with `true` to the end.
+    Edge(bool),
+}
+
 /// The one spam correction the reader offers for the open message.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Correction {
@@ -143,11 +161,27 @@ struct OpenBody {
 }
 
 impl OpenBody {
+    fn new(p: Prepared) -> Self {
+        Self { data: p.data, plain: p.plain, simplified: p.simplified, original: None, remote: false, has_remote: p.has_remote, findings: p.findings }
+    }
+}
+
+/// An [`OpenBody`] without what is drawn on screen, made in the background: parsing the HTML and
+/// running the sender checks take long enough to make the list stutter.
+struct Prepared {
+    data: MessageBody,
+    plain: Vec<html::Block>,
+    simplified: Option<Vec<html::Block>>,
+    has_remote: bool,
+    findings: Vec<screen::Finding>,
+}
+
+impl Prepared {
     fn new(data: MessageBody, findings: Vec<screen::Finding>) -> Self {
         let plain = html::plain_blocks(&data.text);
         let simplified = data.html.as_deref().map(html::blocks);
         let has_remote = data.html.as_deref().is_some_and(html::has_remote);
-        Self { data, plain, simplified, original: None, remote: false, has_remote, findings }
+        Self { data, plain, simplified, has_remote, findings }
     }
 }
 
@@ -369,6 +403,33 @@ fn sized_field(text: &mut String, width: f32) -> egui::TextEdit<'_> {
         .vertical_align(Align::Center)
 }
 
+/// The message list's scroll area, moved just enough to show row `reveal`, from what it showed last
+/// frame: (offset, height).
+fn list_area(reveal: Option<usize>, (offset, height): (f32, f32)) -> egui::ScrollArea {
+    let area = egui::ScrollArea::vertical().auto_shrink([false, false]);
+    match reveal.and_then(|row| reveal_offset(row, offset, height)) {
+        Some(to) => area.vertical_scroll_offset(to),
+        None => area,
+    }
+}
+
+/// The scroll offset that shows row `row` with the least movement, or `None` when it is in view already.
+fn reveal_offset(row: usize, offset: f32, height: f32) -> Option<f32> {
+    let top = row as f32 * views::MESSAGE_ROW_H;
+    if top < offset {
+        Some(top)
+    } else if top + views::MESSAGE_ROW_H > offset + height {
+        Some(top + views::MESSAGE_ROW_H - height)
+    } else {
+        None
+    }
+}
+
+/// Marks the pane the keys act on after F6.
+fn pane_ring(ui: &egui::Ui, t: &theme::Tokens, rect: egui::Rect) {
+    ui.painter().rect_stroke(rect.shrink(1.0), egui::CornerRadius::ZERO, egui::Stroke::new(2.0, t.accent), egui::StrokeKind::Inside);
+}
+
 fn section_title(ui: &mut egui::Ui, text: &str) {
     ui.add_space(24.0);
     ui.label(RichText::new(text).size(theme::SUBTITLE).strong());
@@ -533,6 +594,16 @@ struct BeaverApp {
     confirm_unsubscribe: Option<(String, unsubscribe::Method)>,
     /// Block sender was pressed on this message, until the user confirms.
     confirm_block: Option<MessageId>,
+    /// The pane F6 moved the keys to; `None` until then, and again after a click in the list.
+    pane: Option<Pane>,
+    /// A scroll of the reader asked for from the keyboard, done when it is next drawn.
+    reader_scroll: Option<Scroll>,
+    /// The message last asked for in the reader, so a load it no longer wants stops early.
+    wanted: Arc<std::sync::atomic::AtomicU64>,
+    /// A list row to bring into view after the keyboard moved to it.
+    list_reveal: Option<usize>,
+    /// What the list showed last frame: (scroll offset, height).
+    list_view: (f32, f32),
     /// Asking whether to forget the senders and messages marked as spam or not spam.
     confirm_forget_marks: bool,
     /// The compose field last typed in: Esc takes the focus away, and Keep editing gives it back.
@@ -625,6 +696,11 @@ impl BeaverApp {
             confirm_remove: None,
             confirm_unsubscribe: None,
             confirm_block: None,
+            pane: None,
+            reader_scroll: None,
+            list_reveal: None,
+            wanted: Arc::default(),
+            list_view: (0.0, 0.0),
             confirm_forget_marks: false,
             compose_focus: None,
             refocus: 0,
@@ -656,16 +732,6 @@ impl BeaverApp {
             Err(e) => app.error = Some(e),
         }
         app
-    }
-
-    /// The checks of [`screen::findings`] on an opened message; none when what they need cannot be read.
-    fn findings(&self, serial: u64, id: MessageId, body: &MessageBody) -> Vec<screen::Finding> {
-        let (Some(view), Some(message)) = (self.view(serial), self.summary_of(id)) else { return Vec::new() };
-        let own: Vec<String> = self.accounts.iter().map(|v| v.account.address().to_owned()).collect();
-        match screen::Known::load(&self.archive, &view.account, &own, &self.settings) {
-            Ok(known) => screen::findings(&known, &message.from, &message.address, body, &view.account.imap.host),
-            Err(_) => Vec::new(),
-        }
     }
 
     /// Runs one mail call in the background and wakes the UI with its result.
@@ -839,13 +905,36 @@ impl BeaverApp {
     fn activate(&mut self, at: usize) {
         let Some(tab) = self.tabs.get(at) else { return };
         let (serial, id) = (tab.serial, tab.message.id);
-        let Some(source) = self.view(serial).and_then(|v| v.source.clone()) else { return };
+        let Some(view) = self.view(serial) else { return };
+        let Some(source) = view.source.clone() else { return };
+        let (account, message) = (view.account.clone(), tab.message.clone());
+        let own: Vec<String> = self.accounts.iter().map(|v| v.account.address().to_owned()).collect();
+        let (archive, settings, wanted) = (self.archive.clone(), self.settings.clone(), self.wanted.clone());
         self.in_tab = tab.pinned;
         self.message = Some(id);
         self.body = None;
         self.view_mode = None;
         self.attach_selected.clear();
-        self.spawn(async move { Event::Body(serial, id, source.body(id).await.map(Box::new)) });
+        wanted.store(id.0, std::sync::atomic::Ordering::Relaxed);
+        self.spawn(async move {
+            // Paging through the list asks for many messages in a row: only the one it stops on is read.
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            if wanted.load(std::sync::atomic::Ordering::Relaxed) != id.0 {
+                return Event::Body(serial, id, Err(MailError::NotFound)); // dropped: another message is shown now
+            }
+            let body = match source.body(id).await {
+                Ok(body) => body,
+                Err(e) => return Event::Body(serial, id, Err(e)),
+            };
+            // The checks load what the account knows and train the spam model: seconds on a big mailbox, never on the UI thread.
+            let prepared = tokio::task::spawn_blocking(move || {
+                let findings = screen::Known::load(&archive, &account, &own, &settings)
+                    .map(|known| screen::findings(&known, &message.from, &message.address, &body, &account.imap.host))
+                    .unwrap_or_default();
+                Box::new(Prepared::new(body, findings))
+            });
+            Event::Body(serial, id, prepared.await.map_err(|e| MailError::Backend(e.to_string())))
+        });
     }
 
     /// Back to the mail, with the message that was in the reading pane.
@@ -2233,18 +2322,50 @@ impl BeaverApp {
         // In a message tab the list is not on screen: no moving through it.
         let ids: Vec<MessageId> = if self.in_tab { Vec::new() } else { self.listed() };
         let pos = self.message.and_then(|id| ids.iter().position(|i| *i == id));
+        if key(egui::Key::F6) && !self.in_tab {
+            self.pane = Some(if self.pane == Some(Pane::Reader) || self.message.is_none() { Pane::List } else { Pane::Reader });
+            return;
+        }
+        let reading = self.in_tab || self.pane == Some(Pane::Reader);
         if key(egui::Key::Escape) {
             self.picked.clear();
+            if reading && !self.in_tab {
+                self.pane = Some(Pane::List);
+            }
         }
         if !self.in_tab && ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::A))) {
             self.picked = ids.clone();
             return;
         }
-        let step = if key(egui::Key::ArrowDown) { Some(1) } else if key(egui::Key::ArrowUp) { Some(-1) } else { None };
-        if let Some(step) = step {
-            let next = pos.map_or(0, |p| p.saturating_add_signed(step)).min(ids.len().saturating_sub(1));
-            if let Some(id) = ids.get(next).copied().filter(|id| Some(*id) != self.message) {
-                self.show_listed(id);
+        let shift = ctx.input(|i| i.modifiers.shift);
+        if reading {
+            let scroll = match () {
+                _ if key(egui::Key::ArrowDown) => Some(Scroll::Lines(1.0)),
+                _ if key(egui::Key::ArrowUp) => Some(Scroll::Lines(-1.0)),
+                _ if key(egui::Key::PageDown) || (key(egui::Key::Space) && !shift) => Some(Scroll::Pages(1.0)),
+                _ if key(egui::Key::PageUp) || (key(egui::Key::Space) && shift) => Some(Scroll::Pages(-1.0)),
+                _ if key(egui::Key::Home) => Some(Scroll::Edge(false)),
+                _ if key(egui::Key::End) => Some(Scroll::Edge(true)),
+                _ => None,
+            };
+            self.reader_scroll = scroll.or(self.reader_scroll);
+        } else if !ids.is_empty() {
+            let page = (self.list_view.1 / views::MESSAGE_ROW_H).floor().max(1.0) as isize;
+            let last = ids.len() - 1;
+            let next = match () {
+                _ if key(egui::Key::ArrowDown) => Some(pos.map_or(0, |p| p.saturating_add(1))),
+                _ if key(egui::Key::ArrowUp) => Some(pos.map_or(0, |p| p.saturating_sub(1))),
+                _ if key(egui::Key::PageDown) => Some(pos.map_or(0, |p| p.saturating_add_signed(page))),
+                _ if key(egui::Key::PageUp) => Some(pos.map_or(0, |p| p.saturating_add_signed(-page))),
+                _ if key(egui::Key::Home) => Some(0),
+                _ if key(egui::Key::End) => Some(last),
+                _ => None,
+            };
+            if let Some(next) = next.map(|n| n.min(last)) {
+                self.list_reveal = Some(next);
+                if Some(ids[next]) != self.message {
+                    self.show_listed(ids[next]);
+                }
             }
         }
         let shortcut = |modifiers, key| ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(modifiers, key)));
@@ -2522,10 +2643,7 @@ impl BeaverApp {
             Event::Body(serial, id, result) if self.message == Some(id) && self.open_tab().is_some_and(|t| t.serial == serial) =>
             {
                 match result {
-                    Ok(body) => {
-                        let findings = self.findings(serial, id, &body);
-                        self.body = Some(OpenBody::new(*body, findings));
-                    }
+                    Ok(prepared) => self.body = Some(OpenBody::new(*prepared)),
                     Err(e) => self.error = Some(e.to_string()),
                 }
             }
@@ -2961,8 +3079,9 @@ impl BeaverApp {
         let mut ask_spam = false;
         let (mut pinned, mut toggled, mut ranged): (Option<MessageId>, Option<MessageId>, Option<MessageId>) = (None, None, None);
         let mut clicked_hit: Option<(u64, Hit, bool)> = None;
+        let (reveal, view) = (self.list_reveal.take(), self.list_view);
         let frame = egui::Frame::new().fill(t.surface);
-        egui::CentralPanel::default().frame(frame).show(ui, |ui| {
+        let list = egui::CentralPanel::default().frame(frame).show(ui, |ui| {
             if self.accounts.is_empty() {
                 add = views::empty_state(ui, t, "Welcome to BeaverMail", "Add an account to start reading your mail.", Some("Add account"));
                 return;
@@ -3001,14 +3120,15 @@ impl BeaverApp {
                     views::empty_state(ui, t, "No results", "Nothing stored on this computer matches. Try fewer words.", None);
                     return;
                 }
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, views::MESSAGE_ROW_H, self.hits.len(), |ui, range| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
+                ui.spacing_mut().item_spacing.y = 0.0; // rows touch, so row `i` starts at `i` times the row height
+                let area = list_area(reveal, view);
+                let shown_rows = area.show_rows(ui, views::MESSAGE_ROW_H, self.hits.len(), |ui, range| {
                     for (serial, hit) in &self.hits[range] {
                         let id = hit.message.id;
                         let selected = if self.picked.len() >= 2 { self.picked.contains(&id) } else { self.message == Some(id) };
                         let row = views::message_row(ui, t, &hit.message, selected, Some(&hit.folder), None);
                         let (ctrl, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
-                        let keep = row.double_clicked() || row.middle_clicked();
+                        let keep = row.double_clicked() || row.triple_clicked() || row.middle_clicked();
                         if row.clicked() && !keep && ctrl {
                             toggled = Some(id);
                         } else if row.clicked() && !keep && shift {
@@ -3018,6 +3138,7 @@ impl BeaverApp {
                         }
                     }
                 });
+                self.list_view = (shown_rows.state.offset.y, shown_rows.inner_rect.height());
                 return;
             }
             if !self.drafts.is_empty() {
@@ -3051,14 +3172,16 @@ impl BeaverApp {
                 views::empty_state(ui, t, title, hint, None);
                 return;
             }
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, views::MESSAGE_ROW_H, shown.len(), |ui, range| {
-                ui.spacing_mut().item_spacing.y = 0.0;
+            ui.spacing_mut().item_spacing.y = 0.0; // rows touch, so row `i` starts at `i` times the row height
+            let area = list_area(reveal, view);
+            let shown_rows = area.show_rows(ui, views::MESSAGE_ROW_H, shown.len(), |ui, range| {
                 for message in &shown[range] {
                     let warning = self.correction(message.id).and_then(|(_, warning)| warning);
                     let selected = if self.picked.len() >= 2 { self.picked.contains(&message.id) } else { self.message == Some(message.id) };
                     let row = views::message_row(ui, t, message, selected, None, warning);
                     let (ctrl, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
-                    if row.double_clicked() || row.middle_clicked() {
+                    // A click just before the double click makes egui count three: that opens the tab too.
+                    if row.double_clicked() || row.triple_clicked() || row.middle_clicked() {
                         pinned = Some(message.id);
                     } else if row.clicked() && ctrl {
                         toggled = Some(message.id);
@@ -3069,7 +3192,15 @@ impl BeaverApp {
                     }
                 }
             });
+            self.list_view = (shown_rows.state.offset.y, shown_rows.inner_rect.height());
         });
+        let list = list.response.rect;
+        if self.pane == Some(Pane::List) {
+            pane_ring(ui, t, list);
+        }
+        if opened.is_some() || pinned.is_some() || toggled.is_some() || ranged.is_some() || clicked_hit.is_some() {
+            self.pane = None; // a click in the list puts the keys back on it
+        }
         if refresh {
             self.refresh();
         }
@@ -3118,6 +3249,7 @@ impl BeaverApp {
         let mut mark = None;
         let mut suspicious = false;
         let (mut leave, mut block) = (None, None);
+        let scroll = self.reader_scroll.take();
         // The correction that makes sense; the reasons are the warnings shown just above it.
         let correction = self.message.and_then(|id| self.correction(id)).map(|(choice, _)| choice);
         let (settings_mode, view_mode) = (self.settings.clone(), self.view_mode);
@@ -3193,6 +3325,15 @@ impl BeaverApp {
                 }
                 Some(body) => {
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        if let Some(scroll) = scroll {
+                            let page = (ui.clip_rect().height() - 48.0).max(48.0);
+                            // A positive delta moves the text down, that is, scrolls up; the area stops at its ends.
+                            ui.scroll_with_delta(vec2(0.0, match scroll {
+                                Scroll::Lines(n) => -48.0 * n,
+                                Scroll::Pages(n) => -page * n,
+                                Scroll::Edge(end) => if end { -1e7 } else { 1e7 },
+                            }));
+                        }
                         // A margin, not `ui.horizontal`: horizontal layouts do not wrap text, so a long
                         // line would widen the whole panel.
                         egui::Frame::new().inner_margin(egui::Margin::symmetric(28, 0)).show(ui, |ui| {
@@ -3337,7 +3478,10 @@ impl BeaverApp {
         if in_tab {
             egui::CentralPanel::default().frame(frame).show(ui, draw);
         } else {
-            egui::Panel::right("reader").frame(frame).default_size(470.0).size_range(360.0..=900.0).show(ui, draw);
+            let reader = egui::Panel::right("reader").frame(frame).default_size(470.0).size_range(360.0..=900.0).show(ui, draw);
+            if self.pane == Some(Pane::Reader) {
+                pane_ring(ui, t, reader.response.rect);
+            }
         }
         ReaderOutcome { action, url, mode: chosen_mode, remember, attachment, save_many, allow_sender, mark, bulk, unsubscribe: leave, block }
     }
@@ -3546,6 +3690,9 @@ fn main() -> eframe::Result {
         Box::new(|cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
             theme::apply(&cc.egui_ctx);
+            // egui's 0.3 s is quicker than the systems' (0.4 to 0.5 s), and it is timed by frame, so a slow
+            // frame after the first click could split a double click in two.
+            cc.egui_ctx.options_mut(|o| o.input_options.max_double_click_delay = 0.5);
             Ok(Box::new(BeaverApp::new(cc.egui_ctx.clone())))
         }),
     )
@@ -3600,6 +3747,14 @@ mod tests {
         assert_eq!(form.build().unwrap(), account);
         form.imap_host.clear();
         assert!(!form.ready());
+    }
+
+    #[test]
+    fn the_list_scrolls_only_as_far_as_needed_to_show_a_row() {
+        let h = views::MESSAGE_ROW_H;
+        assert_eq!(reveal_offset(2, 0.0, 5.0 * h), None, "already in view");
+        assert_eq!(reveal_offset(9, 0.0, 5.0 * h), Some(5.0 * h), "below: the row ends at the bottom edge");
+        assert_eq!(reveal_offset(1, 4.0 * h, 5.0 * h), Some(h), "above: the row starts at the top edge");
     }
 
     #[test]

@@ -24,7 +24,7 @@ Licensed under AGPL-3.0-only (see [LICENSE](LICENSE)).
 - Markdown compose, drafts kept locally and on the server, attachments; undo send (configurable), signatures per account.
 - Messages open in tabs (double click).
 
-Keys: Up/Down, Enter, E, Delete, U, `!` (spam), C or Ctrl+N (new), R, A, F, `/`, Ctrl+W, Ctrl+Tab; in a new message Esc or Ctrl+Shift+D discards.
+Keys: Up/Down, Page Up/Down, Home/End, F6 (list or reader; in the reader the same keys and Space scroll), Enter, E, Delete, U, `!` (spam), C or Ctrl+N (new), R, A, F, `/`, Ctrl+W, Ctrl+Tab; in a new message Esc or Ctrl+Shift+D discards.
 
 `cargo run -p beavermail -- --screen-dry-run` prints what the spam checks would do to each Inbox, without moving anything.
 
