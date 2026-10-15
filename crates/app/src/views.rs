@@ -253,6 +253,37 @@ pub fn empty_state(ui: &mut Ui, t: &Tokens, title: &str, hint: &str, action: Opt
     clicked
 }
 
+/// The reader while several messages are picked in the list: how many, and what can be done to all.
+pub fn picked_panel(ui: &mut Ui, t: &Tokens, count: usize, any_unread: bool, role: Role) -> Option<crate::Action> {
+    use crate::Action;
+    let mut chosen = None;
+    ui.vertical_centered(|ui| {
+        ui.add_space((ui.available_height() * 0.3).max(24.0));
+        ui.heading(format!("{} messages selected", thousands(count as u32)));
+        ui.label(egui::RichText::new("Ctrl+click adds or removes one, Shift+click picks a range, Esc clears.").color(t.text_dim));
+        ui.add_space(16.0);
+        let mut commands = vec![
+            (Icon::Archive, "Archive", "E", Action::Archive, role != Role::Archive),
+            if any_unread { (Icon::MailOpen, "Mark as read", "U", Action::Unread(false), true) } else { (Icon::Mail, "Mark as unread", "U", Action::Unread(true), true) },
+            (Icon::Trash, if role == Role::Trash { "Delete permanently" } else { "Move to Trash" }, "Delete", Action::Trash, true),
+        ];
+        match role {
+            Role::Inbox => commands.push((Icon::Spam, "Spam", "!", Action::Spam, true)),
+            Role::Junk => commands.push((Icon::Spam, "Not spam", "", Action::NotSpam, true)),
+            _ => {}
+        }
+        for (icon, label, key, action, enabled) in commands {
+            let button = egui::Button::image_and_text(icon.image(icons::SIZE, t.text_dim), label).min_size(vec2(220.0, CONTROL_H));
+            let response = ui.add_enabled(enabled, button);
+            let response = if key.is_empty() { response } else { response.on_hover_text(format!("{label} ({key})")) };
+            if response.clicked() {
+                chosen = Some(action);
+            }
+        }
+    });
+    chosen
+}
+
 /// What the user chose in the remote-content bar.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Remote {

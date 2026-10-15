@@ -165,6 +165,8 @@ struct ReaderOutcome {
     allow_sender: Option<bool>,
     /// The spam correction the user chose for the open message.
     mark: Option<Correction>,
+    /// A command for all the messages picked in the list.
+    bulk: Option<Action>,
 }
 
 struct AccountView {
@@ -331,7 +333,11 @@ struct BeaverApp {
     error: Option<String>,
     form: Option<NewAccount>,
     /// A message waiting for the user to confirm erasing it for good.
-    confirm_erase: Option<MessageId>,
+    /// Messages to erase for good from the Trash, until the user confirms; empty when not asking.
+    confirm_erase: Vec<MessageId>,
+    /// Messages picked in the list with Ctrl+click, Shift+click or Ctrl+A, the first being where a
+    /// Shift+click range starts; commands apply to all of them once there are two or more.
+    picked: Vec<MessageId>,
     /// "Move all to Spam" was pressed in the suspicious view; waiting for the user to confirm.
     confirm_spam: bool,
     /// The Spam folder (account, index) the user asked to empty, until they confirm.
@@ -422,7 +428,8 @@ impl BeaverApp {
             body: None,
             error: None,
             form: None,
-            confirm_erase: None,
+            confirm_erase: Vec::new(),
+            picked: Vec::new(),
             confirm_spam: false,
             confirm_empty: None,
             query: String::new(),
@@ -533,6 +540,7 @@ impl BeaverApp {
         // The reading pane belonged to the list being left; tabs stay.
         self.tabs.retain(|t| t.pinned);
         self.in_tab = false;
+        self.picked.clear();
         self.message = None;
         self.body = None;
         self.messages.clear();
@@ -621,6 +629,7 @@ impl BeaverApp {
 
     /// Shows `tab`'s message, from any folder: in the reading pane, or when pinned, in its tab.
     fn open(&mut self, tab: tabs::Tab) {
+        self.picked.clear();
         let (id, unread) = (tab.message.id, tab.message.unread);
         // Suspicious mail and spam are opened to judge them, not to read them.
         let judging = self.show_suspicious || tab.role == Role::Junk;
@@ -709,14 +718,47 @@ impl BeaverApp {
         self.active().map(|at| &self.tabs[at])
     }
 
-    /// A message of the folder shown or of a tab.
+    /// A message of the folder shown, of a tab or of the search results.
     fn summary_of(&self, id: MessageId) -> Option<&MessageSummary> {
-        self.messages.iter().find(|m| m.id == id).or_else(|| self.tabs.iter().find(|t| t.message.id == id).map(|t| &t.message))
+        self.messages
+            .iter()
+            .find(|m| m.id == id)
+            .or_else(|| self.tabs.iter().find(|t| t.message.id == id).map(|t| &t.message))
+            .or_else(|| self.hits.iter().find(|(_, h)| h.message.id == id).map(|(_, h)| &h.message))
     }
 
-    /// What the folder of message `id` is for: its tab's, or the folder shown.
+    /// The account of message `id`: its tab's or search result's, which may not be the folder shown's.
+    fn serial_of(&self, id: MessageId) -> Option<u64> {
+        let tab = self.tabs.iter().find(|t| t.message.id == id).map(|t| t.serial);
+        let hit = || self.hits.iter().find(|(_, h)| h.message.id == id).map(|(s, _)| *s);
+        tab.or_else(hit).or(self.selected.map(|(s, _)| s))
+    }
+
+    /// What the folder of message `id` is for: its tab's, its search result's, or the folder shown.
     fn role_of(&self, id: MessageId) -> Role {
-        self.tabs.iter().find(|t| t.message.id == id).map_or_else(|| self.role(), |t| t.role)
+        let tab = self.tabs.iter().find(|t| t.message.id == id).map(|t| t.role);
+        let hit = || self.hits.iter().find(|(_, h)| h.message.id == id).and_then(|(s, h)| self.view(*s)?.mailboxes.iter().find(|m| m.name == h.folder)).map(|m| m.role);
+        tab.or_else(hit).unwrap_or_else(|| self.role())
+    }
+
+    /// The messages listed, in order: the search results while searching, else the folder's.
+    fn listed(&self) -> Vec<MessageId> {
+        if self.searching() { self.hits.iter().map(|(_, h)| h.message.id).collect() } else { self.visible().iter().map(|m| m.id).collect() }
+    }
+
+    /// Shows a listed message in the reading pane: a search result where it is, or one of the folder.
+    fn show_listed(&mut self, id: MessageId) {
+        match self.hits.iter().find(|(_, h)| h.message.id == id).cloned().filter(|_| self.searching()) {
+            Some((serial, hit)) => self.open_hit(serial, &hit, false),
+            None => self.select_message(id),
+        }
+    }
+
+    /// The folder role the picked messages share, or `Other` when they come from different kinds of folder.
+    fn picked_role(&self) -> Role {
+        let mut roles = self.picked.iter().map(|id| self.role_of(*id));
+        let first = roles.next().unwrap_or(Role::Other);
+        if roles.all(|r| r == first) { first } else { Role::Other }
     }
 
     /// Applies a write to the list at once and sends it to the server; a failure reloads the folder.
@@ -725,7 +767,7 @@ impl BeaverApp {
             return;
         }
         // The message's account: its tab's, which may not be the folder shown, or the folder's.
-        let Some(serial) = self.tabs.iter().find(|t| t.message.id == id).map(|t| t.serial).or(self.selected.map(|(s, _)| s)) else { return };
+        let Some(serial) = self.serial_of(id) else { return };
         let index = self.selected.filter(|(s, _)| *s == serial).map_or(usize::MAX, |(_, i)| i);
         let Some(source) = self.view(serial).and_then(|v| v.source.clone()) else { return };
         let pos = self.messages.iter().position(|m| m.id == id);
@@ -922,10 +964,12 @@ impl BeaverApp {
     /// Keeps these messages as training examples of spam (or not), with the text they have now: they
     /// count at once, and still after they move or the server empties its Spam folder.
     fn learn(&mut self, ids: &[MessageId], spam: bool) {
-        let serial = ids.first().and_then(|id| self.tabs.iter().find(|t| t.message.id == *id)).map(|t| t.serial).or(self.selected.map(|(s, _)| s));
-        let Some(account) = serial.and_then(|s| self.view(s)).map(|v| v.account.key()) else { return };
-        let messages: Vec<MessageSummary> = ids.iter().filter_map(|id| self.summary_of(*id).cloned()).collect();
-        self.keep_examples(&account, &messages, spam);
+        for id in ids {
+            let account = self.serial_of(*id).and_then(|s| self.view(s)).map(|v| v.account.key());
+            if let (Some(account), Some(m)) = (account, self.summary_of(*id).cloned()) {
+                self.keep_examples(&account, &[m], spam);
+            }
+        }
     }
 
     /// Keeps `messages` as examples for the spam checks to learn from, whatever happens to them later.
@@ -943,7 +987,7 @@ impl BeaverApp {
     /// These Inbox messages are spam: their senders are marked, they are kept as examples, and they
     /// move to the server's Spam folder, where other devices and the server's own filter learn it too.
     fn move_to_spam(&mut self, ids: &[MessageId]) {
-        let mut keys: Vec<String> = self.messages.iter().filter(|m| ids.contains(&m.id)).map(|m| screen::sender_key(&m.address)).collect();
+        let mut keys: Vec<String> = ids.iter().filter_map(|id| self.summary_of(*id)).map(|m| screen::sender_key(&m.address)).collect();
         keys.sort();
         keys.dedup();
         self.mark_senders(&keys, false);
@@ -1480,9 +1524,70 @@ impl BeaverApp {
         if matches!(action, Action::Reply | Action::ReplyAll | Action::Forward) {
             self.answer(id, action);
         } else if matches!(action, Action::Trash) && self.role_of(id) == Role::Trash {
-            self.confirm_erase = Some(id);
+            self.confirm_erase = vec![id];
         } else {
             self.act(id, action);
+        }
+    }
+
+    /// The messages a command applies to: those picked in the list, or else the one open.
+    fn targets(&self) -> Vec<MessageId> {
+        if self.picked.len() >= 2 { self.picked.clone() } else { self.message.into_iter().collect() }
+    }
+
+    /// Runs `action` on several messages at once, as [`Self::request`] does on one. Spam and Not spam
+    /// mark the senders and keep the messages as examples, as one at a time.
+    fn request_all(&mut self, ids: Vec<MessageId>, action: Action) {
+        let Some(&first) = ids.first() else { return };
+        if ids.len() == 1 && !matches!(action, Action::Spam | Action::NotSpam) {
+            return self.request(first, action);
+        }
+        if matches!(action, Action::Trash) && self.role_of(first) == Role::Trash {
+            self.confirm_erase = ids;
+            return;
+        }
+        // The reader is left empty rather than walking through messages about to go.
+        if action.removes() && self.message.is_some_and(|id| ids.contains(&id)) {
+            self.message = None;
+            self.body = None;
+            self.in_tab = false;
+        }
+        match action {
+            Action::Spam => self.move_to_spam(&ids),
+            Action::NotSpam => ids.iter().for_each(|id| self.not_spam(*id)),
+            _ => ids.iter().for_each(|id| self.act(*id, action)),
+        }
+        // Marking read keeps the selection, as the messages are still there.
+        if action.removes() {
+            self.picked.clear();
+        }
+    }
+
+    /// Ctrl+click: adds message `id` to the picked ones, or takes it out. The open message is the
+    /// first picked, as a list shows it selected.
+    fn toggle_pick(&mut self, id: MessageId) {
+        if self.picked.is_empty()
+            && let Some(open) = self.message.filter(|open| *open != id && self.listed().contains(open))
+        {
+            self.picked.push(open);
+        }
+        match self.picked.iter().position(|p| *p == id) {
+            Some(at) => {
+                self.picked.remove(at);
+            }
+            None => self.picked.push(id),
+        }
+        if let [only] = self.picked[..] {
+            self.show_listed(only);
+        }
+    }
+
+    /// Shift+click: picks every message from the first picked (or the open one) to `id`, in list order.
+    fn pick_range(&mut self, id: MessageId) {
+        let ids = self.listed();
+        let Some(anchor) = self.picked.first().copied().or(self.message) else { return self.show_listed(id) };
+        if let Some(range) = range(&ids, anchor, id) {
+            self.picked = range;
         }
     }
 
@@ -1606,7 +1711,7 @@ impl BeaverApp {
 
     /// Up/Down move through the list, E archives, Delete trashes, U toggles unread.
     fn handle_keys(&mut self, ctx: &egui::Context) {
-        if self.form.is_some() || self.confirm_erase.is_some() || self.confirm_spam || self.confirm_empty.is_some() || self.compose.is_some() || self.show_settings || self.locked() || ctx.egui_wants_keyboard_input() {
+        if self.form.is_some() || !self.confirm_erase.is_empty() || self.confirm_spam || self.confirm_empty.is_some() || self.compose.is_some() || self.show_settings || self.locked() || ctx.egui_wants_keyboard_input() {
             return;
         }
         let key = |k| ctx.input(|i| i.key_pressed(k));
@@ -1619,22 +1724,20 @@ impl BeaverApp {
             return;
         }
         // In a message tab the list is not on screen: no moving through it.
-        let ids: Vec<MessageId> = if self.in_tab {
-            Vec::new()
-        } else if self.searching() {
-            self.hits.iter().map(|(_, h)| h.message.id).collect()
-        } else {
-            self.visible().iter().map(|m| m.id).collect()
-        };
+        let ids: Vec<MessageId> = if self.in_tab { Vec::new() } else { self.listed() };
         let pos = self.message.and_then(|id| ids.iter().position(|i| *i == id));
+        if key(egui::Key::Escape) {
+            self.picked.clear();
+        }
+        if !self.in_tab && ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::A))) {
+            self.picked = ids.clone();
+            return;
+        }
         let step = if key(egui::Key::ArrowDown) { Some(1) } else if key(egui::Key::ArrowUp) { Some(-1) } else { None };
         if let Some(step) = step {
             let next = pos.map_or(0, |p| p.saturating_add_signed(step)).min(ids.len().saturating_sub(1));
             if let Some(id) = ids.get(next).copied().filter(|id| Some(*id) != self.message) {
-                match self.hits.iter().find(|(_, h)| h.message.id == id).cloned().filter(|_| self.searching()) {
-                    Some((serial, hit)) => self.open_hit(serial, &hit, false),
-                    None => self.select_message(id),
-                }
+                self.show_listed(id);
             }
         }
         let shortcut = |modifiers, key| ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(modifiers, key)));
@@ -1647,6 +1750,21 @@ impl BeaverApp {
         let back = shortcut(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Tab);
         if back || shortcut(egui::Modifiers::COMMAND, egui::Key::Tab) {
             self.cycle_tabs(back);
+            return;
+        }
+        if self.picked.len() >= 2 {
+            let ids = self.targets();
+            let spam = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Text(t) if t == "!")));
+            if key(egui::Key::E) {
+                self.request_all(ids, Action::Archive);
+            } else if key(egui::Key::Delete) {
+                self.request_all(ids, Action::Trash);
+            } else if key(egui::Key::U) {
+                let unread = ids.iter().any(|id| self.summary_of(*id).is_some_and(|m| m.unread));
+                self.request_all(ids, Action::Unread(!unread));
+            } else if spam && self.picked_role() == Role::Inbox {
+                self.request_all(ids, Action::Spam);
+            }
             return;
         }
         let Some(id) = self.message else { return };
@@ -1980,12 +2098,16 @@ impl BeaverApp {
     }
 
     fn erase_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
-        let Some(id) = self.confirm_erase else { return };
+        if self.confirm_erase.is_empty() {
+            return;
+        }
+        let count = self.confirm_erase.len();
         let (mut confirm, mut cancel) = (false, false);
         let modal = egui::Modal::new(egui::Id::new("confirm_erase")).show(ctx, |ui| {
             ui.set_width(FORM_WIDTH * 0.8);
-            ui.heading("Delete permanently?");
-            ui.label(RichText::new("This message will be erased from the server and cannot be recovered.").color(t.text_dim));
+            ui.heading(if count == 1 { "Delete permanently?".to_owned() } else { format!("Delete {count} messages permanently?") });
+            let what = if count == 1 { "This message" } else { "These messages" };
+            ui.label(RichText::new(format!("{what} will be erased from the server and cannot be recovered.")).color(t.text_dim));
             ui.add_space(12.0);
             ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
                 let erase = egui::Button::new(RichText::new("Delete permanently").color(t.on_accent)).fill(t.danger);
@@ -1994,10 +2116,17 @@ impl BeaverApp {
             });
         });
         if confirm {
-            self.act(id, Action::Erase);
+            let ids = std::mem::take(&mut self.confirm_erase);
+            if self.message.is_some_and(|id| ids.contains(&id)) {
+                self.message = None;
+                self.body = None;
+                self.in_tab = false;
+            }
+            ids.iter().for_each(|id| self.act(*id, Action::Erase));
+            self.picked.clear();
         }
         if confirm || cancel || modal.should_close() {
-            self.confirm_erase = None;
+            self.confirm_erase.clear();
         }
     }
 
@@ -2348,7 +2477,7 @@ impl BeaverApp {
         let (mut opened, mut add, mut refresh) = (None, false, false);
         let (mut open_draft, mut delete_draft): (Option<String>, Option<String>) = (None, None);
         let mut ask_spam = false;
-        let mut pinned: Option<MessageId> = None;
+        let (mut pinned, mut toggled, mut ranged): (Option<MessageId>, Option<MessageId>, Option<MessageId>) = (None, None, None);
         let mut clicked_hit: Option<(u64, Hit, bool)> = None;
         let frame = egui::Frame::new().fill(t.surface);
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
@@ -2393,9 +2522,16 @@ impl BeaverApp {
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, views::MESSAGE_ROW_H, self.hits.len(), |ui, range| {
                     ui.spacing_mut().item_spacing.y = 0.0;
                     for (serial, hit) in &self.hits[range] {
-                        let row = views::message_row(ui, t, &hit.message, self.message == Some(hit.message.id), Some(&hit.folder), None);
-                        let keep = row.double_clicked() || row.middle_clicked() || (row.clicked() && ui.input(|i| i.modifiers.command));
-                        if keep || row.clicked() {
+                        let id = hit.message.id;
+                        let selected = if self.picked.len() >= 2 { self.picked.contains(&id) } else { self.message == Some(id) };
+                        let row = views::message_row(ui, t, &hit.message, selected, Some(&hit.folder), None);
+                        let (ctrl, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
+                        let keep = row.double_clicked() || row.middle_clicked();
+                        if row.clicked() && !keep && ctrl {
+                            toggled = Some(id);
+                        } else if row.clicked() && !keep && shift {
+                            ranged = Some(id);
+                        } else if keep || row.clicked() {
                             clicked_hit = Some((*serial, hit.clone(), keep));
                         }
                     }
@@ -2437,10 +2573,15 @@ impl BeaverApp {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 for message in &shown[range] {
                     let warning = self.correction(message.id).and_then(|(_, warning)| warning);
-                    let row = views::message_row(ui, t, message, self.message == Some(message.id), None, warning);
-                    let keep = row.double_clicked() || row.middle_clicked() || (row.clicked() && ui.input(|i| i.modifiers.command));
-                    if keep {
+                    let selected = if self.picked.len() >= 2 { self.picked.contains(&message.id) } else { self.message == Some(message.id) };
+                    let row = views::message_row(ui, t, message, selected, None, warning);
+                    let (ctrl, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
+                    if row.double_clicked() || row.middle_clicked() {
                         pinned = Some(message.id);
+                    } else if row.clicked() && ctrl {
+                        toggled = Some(message.id);
+                    } else if row.clicked() && shift {
+                        ranged = Some(message.id);
                     } else if row.clicked() {
                         opened = Some(message.id);
                     }
@@ -2453,6 +2594,12 @@ impl BeaverApp {
         self.confirm_spam |= ask_spam;
         if let Some(id) = pinned {
             self.open_message(id, true);
+        }
+        if let Some(id) = toggled {
+            self.toggle_pick(id);
+        }
+        if let Some(id) = ranged {
+            self.pick_range(id);
         }
         if let Some((serial, hit, pin)) = clicked_hit {
             self.open_hit(serial, &hit, pin);
@@ -2499,7 +2646,15 @@ impl BeaverApp {
         let current = open.map(|(message, ..)| message);
         let frame = egui::Frame::new().fill(t.surface);
         let in_tab = self.in_tab;
+        let picked = if in_tab { 0 } else { self.picked.len() };
+        let picked_unread = self.picked.iter().any(|id| self.summary_of(*id).is_some_and(|m| m.unread));
+        let folder_role = self.picked_role();
+        let mut bulk = None;
         let draw = |ui: &mut egui::Ui| {
+            if picked >= 2 {
+                bulk = views::picked_panel(ui, t, picked, picked_unread, folder_role);
+                return;
+            }
             let Some(message) = current else {
                 views::empty_state(ui, t, "No message selected", "Choose a message from the list to read it. Double-click to open it in a tab.", None);
                 return;
@@ -2671,7 +2826,7 @@ impl BeaverApp {
         } else {
             egui::Panel::right("reader").frame(frame).default_size(470.0).size_range(360.0..=900.0).show(ui, draw);
         }
-        ReaderOutcome { action, url, mode: chosen_mode, remember, attachment, save_many, allow_sender, mark }
+        ReaderOutcome { action, url, mode: chosen_mode, remember, attachment, save_many, allow_sender, mark, bulk }
     }
 }
 
@@ -2740,7 +2895,10 @@ impl eframe::App for BeaverApp {
         self.account_form(ui.ctx());
 
         self.handle_keys(ui.ctx());
-        let ReaderOutcome { action, url, mode, remember, attachment, save_many, allow_sender, mark } = self.reader(ui, &t);
+        let ReaderOutcome { action, url, mode, remember, attachment, save_many, allow_sender, mark, bulk } = self.reader(ui, &t);
+        if let Some(action) = bulk {
+            self.request_all(self.targets(), action);
+        }
         if let (Some(choice), Some(id)) = (mark, self.message) {
             self.correct(id, choice);
         }
@@ -2858,9 +3016,26 @@ fn main() -> eframe::Result {
     )
 }
 
+/// The messages from `anchor` to `to` in list order `ids`, `anchor` first (where the next range starts).
+fn range(ids: &[MessageId], anchor: MessageId, to: MessageId) -> Option<Vec<MessageId>> {
+    let (a, b) = (ids.iter().position(|i| *i == anchor)?, ids.iter().position(|i| *i == to)?);
+    let mut range: Vec<MessageId> = ids[a.min(b)..=a.max(b)].iter().copied().filter(|i| *i != anchor).collect();
+    range.insert(0, anchor);
+    Some(range)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_range_runs_either_way_from_its_anchor() {
+        let ids: Vec<MessageId> = (1..=5).map(MessageId).collect();
+        assert_eq!(range(&ids, MessageId(2), MessageId(4)), Some(vec![MessageId(2), MessageId(3), MessageId(4)]));
+        assert_eq!(range(&ids, MessageId(4), MessageId(2)), Some(vec![MessageId(4), MessageId(2), MessageId(3)]));
+        assert_eq!(range(&ids, MessageId(3), MessageId(3)), Some(vec![MessageId(3)]));
+        assert_eq!(range(&ids, MessageId(9), MessageId(3)), None, "an anchor no longer listed");
+    }
 
     fn filled() -> NewAccount {
         NewAccount { user: "ada@example.org".into(), password: "pw".into(), imap_host: "mail.example.org".into(), ..NewAccount::default() }
