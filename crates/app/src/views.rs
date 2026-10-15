@@ -405,6 +405,10 @@ pub fn body(ui: &mut Ui, t: &Tokens, blocks: &[Block]) -> Option<String> {
             Kind::Pre => {
                 clicked = runs_ui(ui, t, &block.runs, 14.5, t.text, true).or(clicked);
             }
+            Kind::Table { header } => {
+                clicked = table(ui, t, &block.rows, header).or(clicked);
+                ui.add_space(10.0);
+            }
             Kind::Para | Kind::Line => {
                 if block.runs.is_empty() {
                     ui.add_space(8.0);
@@ -415,6 +419,40 @@ pub fn body(ui: &mut Ui, t: &Tokens, blocks: &[Block]) -> Option<String> {
                     }
                 }
             }
+        }
+    }
+    clicked
+}
+
+/// A table of data: columns as wide as their longest cell asks, within the reader's width, a line
+/// under the header and between rows. Returns the link clicked.
+fn table(ui: &mut Ui, t: &Tokens, rows: &[Vec<Vec<Run>>], header: bool) -> Option<String> {
+    const GAP: f32 = 16.0;
+    const MIN_W: f32 = 48.0;
+    let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let length = |cell: &[Run]| cell.iter().map(|r| match r { Run::Text { text, .. } | Run::Link { text, .. } => text.chars().count() }).sum::<usize>();
+    let wants: Vec<f32> = (0..columns).map(|c| rows.iter().filter_map(|r| r.get(c)).map(|cell| length(cell)).max().unwrap_or(0).max(4) as f32).collect();
+    let room = (ui.available_width() - GAP * (columns.saturating_sub(1)) as f32).max(MIN_W * columns as f32);
+    let total: f32 = wants.iter().sum();
+    let widths: Vec<f32> = wants.iter().map(|w| (room * w / total).max(MIN_W)).collect();
+    let mut clicked = None;
+    let line = egui::Stroke::new(1.0, t.border);
+    for (i, row) in rows.iter().enumerate() {
+        let shown = ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = GAP;
+            for (cell, width) in row.iter().zip(&widths) {
+                ui.allocate_ui_with_layout(vec2(*width, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                    ui.set_width(*width);
+                    let color = if header && i == 0 { t.text_dim } else { t.text };
+                    clicked = runs_ui(ui, t, cell, 15.0, color, false).or(clicked.take());
+                });
+            }
+        });
+        let r = shown.response.rect;
+        if i + 1 < rows.len() {
+            let stroke = if header && i == 0 { egui::Stroke::new(1.0, t.border_strong) } else { line };
+            ui.painter().line_segment([pos2(r.left(), r.bottom() + 3.0), pos2(r.left() + widths.iter().sum::<f32>() + GAP * (columns.saturating_sub(1)) as f32, r.bottom() + 3.0)], stroke);
+            ui.add_space(6.0);
         }
     }
     clicked

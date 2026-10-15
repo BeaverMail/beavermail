@@ -28,6 +28,8 @@ pub enum Kind {
     Quote,
     Pre,
     Rule,
+    /// A table of data, in `rows`; `header`: the first row names the columns.
+    Table { header: bool },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,6 +39,8 @@ pub struct Block {
     pub depth: u8,
     pub marker: Option<String>,
     pub runs: Vec<Run>,
+    /// A table's rows of cells; empty for any other kind.
+    pub rows: Vec<Vec<Vec<Run>>>,
 }
 
 #[derive(Clone, Default)]
@@ -127,7 +131,7 @@ impl Walker {
             return;
         }
         if self.blocks.len() < MAX_BLOCKS {
-            self.blocks.push(Block { kind: self.kind, depth: self.depth, marker, runs });
+            self.blocks.push(Block { kind: self.kind, depth: self.depth, marker, runs, rows: Vec::new() });
         }
     }
 
@@ -155,6 +159,15 @@ impl Walker {
         }
         let mut style = style.clone();
         let (outer_kind, outer_depth, outer_pre) = (self.kind, self.depth, self.pre);
+        if name == "table"
+            && let Some((header, rows)) = data_table(el, &style)
+        {
+            self.start(Kind::Para);
+            if self.blocks.len() < MAX_BLOCKS {
+                self.blocks.push(Block { kind: Kind::Table { header }, depth: self.depth, marker: None, runs: Vec::new(), rows });
+            }
+            return;
+        }
         match name {
             "p" | "div" | "section" | "article" | "header" | "footer" | "main" | "aside" | "nav" | "table" | "tbody" | "thead" | "tfoot" | "tr" | "address" | "figure" | "dl" => self.start(Kind::Para),
             "td" | "th" | "dd" | "dt" | "figcaption" | "caption" => self.start(Kind::Line),
@@ -244,6 +257,54 @@ impl Walker {
     }
 }
 
+/// A table holding data rather than laying out the message, as its rows of cells and whether the
+/// first row is a header: at least two rows of two cells or more, short cells, no table inside.
+/// Newsletters lay out with tables; those stay flowing text.
+fn data_table(table: ElementRef<'_>, style: &Style) -> Option<(bool, Vec<Vec<Vec<Run>>>)> {
+    const MAX_CELL: usize = 120;
+    const MAX_COLUMNS: usize = 8;
+    if table.value().attr("role").is_some_and(|r| r.eq_ignore_ascii_case("presentation") || r.eq_ignore_ascii_case("none")) {
+        return None;
+    }
+    let elements = || table.descendants().skip(1).filter_map(ElementRef::wrap);
+    if elements().any(|e| e.value().name() == "table") {
+        return None;
+    }
+    let mut header = false;
+    let mut rows = Vec::new();
+    for (i, tr) in elements().filter(|e| e.value().name() == "tr").enumerate() {
+        let cells: Vec<ElementRef<'_>> = tr.children().filter_map(ElementRef::wrap).filter(|c| matches!(c.value().name(), "td" | "th")).collect();
+        if cells.len() > MAX_COLUMNS || cells.iter().any(|c| c.text().map(|t| t.chars().count()).sum::<usize>() > MAX_CELL) {
+            return None;
+        }
+        let row: Vec<Vec<Run>> = cells.iter().map(|c| cell_runs(*c, style)).collect();
+        if row.iter().all(Vec::is_empty) {
+            continue;
+        }
+        if rows.is_empty() {
+            header = i == 0 && (cells.iter().all(|c| c.value().name() == "th") || tr.parent().and_then(ElementRef::wrap).is_some_and(|p| p.value().name() == "thead"));
+        }
+        rows.push(row);
+    }
+    (rows.iter().filter(|r| r.len() >= 2).count() >= 2).then_some((header, rows))
+}
+
+/// A cell's content on one line: its paragraphs and lines joined by spaces.
+fn cell_runs(cell: ElementRef<'_>, style: &Style) -> Vec<Run> {
+    let style = Style { bold: style.bold || cell.value().name() == "th", ..style.clone() };
+    let mut walker = Walker { blocks: Vec::new(), runs: Vec::new(), kind: Kind::Line, depth: 0, marker: None, lists: Vec::new(), pre: false };
+    walker.element(cell, &style);
+    walker.flush();
+    let mut runs = Vec::new();
+    for block in walker.blocks {
+        if !runs.is_empty() {
+            runs.push(Run::Text { text: " ".into(), bold: false, italic: false, code: false });
+        }
+        runs.extend(block.runs);
+    }
+    runs
+}
+
 /// Only web and mail links are kept; `javascript:`, `data:` and the like become plain text.
 fn is_safe_link(href: &str) -> bool {
     let lower = href.to_ascii_lowercase();
@@ -298,7 +359,7 @@ pub fn plain_blocks(text: &str) -> Vec<Block> {
             runs.push(Run::Text { text: rest.to_owned(), bold: false, italic: false, code: false });
         }
         let kind = if line.trim().is_empty() { Kind::Para } else if quoted > 0 { Kind::Quote } else { Kind::Line };
-        blocks.push(Block { kind, depth: quoted, marker: None, runs });
+        blocks.push(Block { kind, depth: quoted, marker: None, runs, rows: Vec::new() });
     }
     blocks
 }
@@ -442,6 +503,26 @@ mod tests {
         assert_eq!(hidden_text(html), 3 + 2 + 2 + 1 + 1, "only letters and digits count");
         let layout = r#"<td style="font-size:0px"><div style="font-size:16px">Hello Ada, your invoice</div></td>"#;
         assert_eq!(hidden_text(layout), 0, "a zero-size container whose text sets its own size back is visible");
+    }
+
+    #[test]
+    fn a_table_of_data_keeps_its_rows_and_a_layout_table_flows() {
+        let invoice = "<p>Your order</p><table><thead><tr><th>Item</th><th>Qty</th><th>Price</th></tr></thead>\
+            <tr><td><a href='https://shop.example/a'>Lamp</a></td><td>2</td><td>40 €</td></tr><tr><td></td><td></td></tr>\
+            <tr><td colspan=2>Total</td><td><b>80 €</b></td></tr></table><p>Thanks</p>";
+        let b = blocks(invoice);
+        assert_eq!(b.len(), 3);
+        assert_eq!(b[1].kind, Kind::Table { header: true });
+        assert_eq!(b[1].rows.len(), 3, "the empty row is dropped");
+        assert!(matches!(&b[1].rows[0][0][0], Run::Text { text, bold: true, .. } if text == "Item"));
+        assert!(matches!(&b[1].rows[1][0][0], Run::Link { text, .. } if text == "Lamp"));
+        assert_eq!(texts(&b), ["Your order", "", "Thanks"]);
+
+        let layout = "<table><tr><td><table><tr><td>Logo</td><td>Menu</td></tr><tr><td>a</td><td>b</td></tr></table></td></tr></table>";
+        assert_eq!(blocks(layout).iter().filter(|b| matches!(b.kind, Kind::Table { .. })).count(), 1, "the outer one holds a table, the inner one is data");
+        let story = format!("<table><tr><td>{}</td><td>x</td></tr><tr><td>a</td><td>b</td></tr></table>", "long text ".repeat(20));
+        assert!(blocks(&story).iter().all(|b| !matches!(b.kind, Kind::Table { .. })), "long cells are prose laid out in columns");
+        assert!(blocks("<table><tr><td>a</td><td>b</td></tr></table>").iter().all(|b| !matches!(b.kind, Kind::Table { .. })), "one row is a layout");
     }
 
     #[test]

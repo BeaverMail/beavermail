@@ -354,7 +354,7 @@ pub fn findings(known: &Known, name: &str, address: &str, body: &MessageBody, se
     if let Some(markup) = &body.html {
         let links: Vec<(String, String)> = html::blocks(markup)
             .into_iter()
-            .flat_map(|b| b.runs)
+            .flat_map(|b| b.runs.into_iter().chain(b.rows.into_iter().flatten().flatten()))
             .filter_map(|r| match r {
                 html::Run::Link { text, url } => Some((text, url)),
                 html::Run::Text { .. } => None,
