@@ -180,7 +180,7 @@ pub fn message_row(ui: &mut Ui, t: &Tokens, message: &MessageSummary, selected: 
             ui.painter().galley(pos2(left + 20.0, card.top() + 56.0), line, t.danger);
         }
         None => {
-            let preview = truncated(ui, &message.preview, FontId::proportional(13.5), t.text_dim, width - label_w);
+            let preview = truncated(ui, &message.preview.chars().take(200).collect::<String>(), FontId::proportional(13.5), t.text_dim, width - label_w);
             ui.painter().galley(pos2(left, card.top() + 56.0), preview, t.text_dim);
         }
     }

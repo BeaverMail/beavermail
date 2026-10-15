@@ -55,9 +55,6 @@ fn passphrase_field(ui: &mut Ui, text: &mut String, hint: &str) -> egui::Respons
 
 /// The "Stored mail" part of the settings window.
 pub fn section(ui: &mut Ui, t: &Tokens, form: &mut Form, current: Mode, locked: bool, job: Option<&Job>) -> Option<Request> {
-    ui.label(RichText::new("Stored mail").strong());
-    ui.label(RichText::new("How downloaded messages are kept on this computer.").color(t.text_dim));
-    ui.add_space(6.0);
     if let Some(job) = job {
         let (done, total) = (job.done.load(Ordering::Relaxed), job.total.load(Ordering::Relaxed).max(1));
         ui.add(egui::ProgressBar::new(done as f32 / total as f32).text(format!("Updating stored mail… {done} of {total}")));

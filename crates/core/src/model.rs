@@ -280,6 +280,9 @@ pub struct Settings {
     /// Senders (lower-case addresses) whose messages may load remote images and styles in the original view.
     #[serde(default)]
     pub remote_senders: std::collections::BTreeSet<String>,
+    /// Seconds a message waits after Send, so it can be taken back; 0 sends at once.
+    #[serde(default = "undo_secs")]
+    pub undo_send_secs: u32,
     /// Hold suspicious mail from new senders apart from the Inbox.
     #[serde(default = "yes")]
     pub hold_suspicious: bool,
@@ -296,9 +299,13 @@ fn yes() -> bool {
     true
 }
 
+fn undo_secs() -> u32 {
+    10
+}
+
 impl Default for Settings {
     fn default() -> Self {
-        Self { display: DisplayMode::default(), sender_display: Default::default(), rich_outgoing: true, remote_senders: Default::default(), hold_suspicious: true, marked: Default::default() }
+        Self { display: DisplayMode::default(), sender_display: Default::default(), rich_outgoing: true, undo_send_secs: undo_secs(), remote_senders: Default::default(), hold_suspicious: true, marked: Default::default() }
     }
 }
 

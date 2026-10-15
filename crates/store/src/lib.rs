@@ -260,6 +260,9 @@ fn fts_term(word: &str) -> String {
     if clean.contains(char::is_whitespace) { format!("\"{clean}\"") } else { format!("\"{clean}\"*") }
 }
 
+/// How much of a message's text the preview keeps.
+const PREVIEW_CHARS: usize = 1500;
+
 const SUMMARY_COLUMNS: &str = "id, CASE WHEN from_name = '' THEN from_addr ELSE from_name END, from_addr, subject, preview, received, timestamp, unread, attach, message_id";
 
 /// The key as SQLCipher takes a raw one: `x'<hex>'`.
@@ -399,6 +402,11 @@ fn migrate(conn: &Connection) -> Result<(), MailError> {
                  PRAGMA user_version = 12;",
             )
             .map_err(db)?;
+        }
+        // Version 13: the preview keeps more of the text (the spam filter reads it), so stored messages
+        // are read again to make it.
+        if version < 13 {
+            conn.execute_batch("UPDATE messages SET indexed = 0 WHERE stored = 1; PRAGMA user_version = 13;").map_err(db)?;
         }
     Ok(())
 }
@@ -744,6 +752,11 @@ impl Store {
             .map_err(db)
     }
 
+    /// Forgets every message the user called spam or not spam, on all accounts.
+    pub fn clear_examples(&self) -> Result<(), MailError> {
+        self.conn().execute("DELETE FROM examples", []).map(|_| ()).map_err(db)
+    }
+
     /// The training examples of an account: (message id, spam, text, sender domain).
     pub fn examples(&self, account: &str) -> Result<Vec<(String, bool, String, String)>, MailError> {
         let conn = self.conn();
@@ -860,9 +873,9 @@ impl Store {
         self.conn().execute("DELETE FROM messages WHERE id = ?1", [id.0 as i64]).map(|_| ()).map_err(db)
     }
 
-    /// Keeps a one-line preview for the list, taken from the message text once it is downloaded.
+    /// Keeps a one-line preview (the list shows only its start; the spam filter reads all of it), taken from the message text once it is downloaded.
     pub fn set_preview(&self, id: MessageId, text: &str) -> Result<(), MailError> {
-        let preview: String = text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(120).collect();
+        let preview: String = text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(PREVIEW_CHARS).collect();
         self.conn().execute("UPDATE messages SET preview = ?2 WHERE id = ?1", params![id.0 as i64, preview]).map(|_| ()).map_err(db)
     }
 
@@ -1094,6 +1107,8 @@ mod tests {
         store.set_preview(id, "Hello\n\n  world").unwrap();
         assert_eq!(store.messages("me", "INBOX").unwrap()[0].preview, "Hello world");
         assert!(store.search("me", "world", 10).unwrap().len() == 1, "the preview is searchable");
+        store.set_preview(id, &"word ".repeat(1000)).unwrap();
+        assert_eq!(store.messages("me", "INBOX").unwrap()[0].preview.chars().count(), PREVIEW_CHARS, "a long text is cut");
     }
 
     #[test]
@@ -1358,6 +1373,8 @@ mod tests {
         store.add_example("me", "a@x", true, "korean gelatin", "spam.io").unwrap();
         store.add_example("me", "a@x", false, "korean gelatin", "spam.io").unwrap();
         assert_eq!(store.examples("me").unwrap(), [("a@x".to_owned(), false, "korean gelatin".to_owned(), "spam.io".to_owned())], "a changed mind replaces");
+        store.clear_examples().unwrap();
+        assert!(store.examples("me").unwrap().is_empty());
         let replies = store.replies_to_sent("me", "INBOX").unwrap();
         assert_eq!(replies.len(), 2);
         assert!(!replies.contains(&id));

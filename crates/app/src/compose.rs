@@ -23,6 +23,8 @@ pub struct Compose {
     in_reply_to: Option<String>,
     references: Vec<String>,
     pub sending: bool,
+    /// When the message is handed to the server; until then Undo takes it back.
+    pub send_at: Option<std::time::Instant>,
     pub error: Option<String>,
     focus_to: bool,
     /// Put the caret at the top of the body on the first frame (replies and forwards).
@@ -57,6 +59,8 @@ pub enum Outcome {
     Close,
     /// Open the dialog to pick files to attach.
     Attach,
+    /// Take back a message that is waiting to be sent.
+    Undo,
 }
 
 /// A file that goes with the message. Its content is a copy in the vault (under the draft), so it
@@ -84,6 +88,7 @@ impl Compose {
             in_reply_to: None,
             references: Vec::new(),
             sending: false,
+            send_at: None,
             error: None,
             focus_to: true,
             focus_body: false,
@@ -459,6 +464,9 @@ fn format_text(text: &mut String, from: usize, to: usize, format: Format) -> (us
     }
 }
 
+/// Clickable but out of the Tab order: Tab goes from the subject straight to the text.
+const NO_TAB: egui::Sense = egui::Sense::CLICK;
+
 /// Formatting buttons above the text, and the switch between writing and the recipient's view.
 fn toolbar(ui: &mut Ui, ctx: &egui::Context, t: &Tokens, compose: &mut Compose, id: egui::Id) {
     ui.horizontal(|ui| {
@@ -475,7 +483,7 @@ fn toolbar(ui: &mut Ui, ctx: &egui::Context, t: &Tokens, compose: &mut Compose, 
                 "I" => RichText::new(label).italics(),
                 _ => RichText::new(label),
             };
-            if ui.add_enabled(!compose.preview, egui::Button::new(text).frame(false)).on_hover_text(tip).clicked()
+            if ui.add_enabled(!compose.preview, egui::Button::new(text).frame(false).sense(NO_TAB)).on_hover_text(tip).clicked()
                 && let Some(mut state) = TextEdit::load_state(ctx, id)
             {
                 let range = state.cursor.char_range().map_or((0, 0), |r| (r.primary.index.into(), r.secondary.index.into()));
@@ -486,8 +494,11 @@ fn toolbar(ui: &mut Ui, ctx: &egui::Context, t: &Tokens, compose: &mut Compose, 
             }
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.selectable_value(&mut compose.preview, true, "Preview");
-            ui.selectable_value(&mut compose.preview, false, "Write");
+            for (preview, label) in [(true, "Preview"), (false, "Write")] {
+                if ui.add(egui::Button::selectable(compose.preview == preview, label).sense(NO_TAB)).clicked() {
+                    compose.preview = preview;
+                }
+            }
         });
     });
     ui.label(RichText::new("Markdown: sent as plain text with a simple HTML version. No images or tracking.").size(12.5).color(t.text_dim));
@@ -597,11 +608,17 @@ pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &
                 if ui.add_enabled(!compose.sending, egui::Button::image_and_text(Icon::Paperclip.image(crate::icons::SIZE, t.text_dim), "Attach")).on_hover_text(if on_wayland() { "Attach files. Dropping files in does not work on Wayland yet; start the app with WAYLAND_DISPLAY unset to use X11." } else { "Attach files, or drop them in the window" }).clicked() {
                     outcome = Outcome::Attach;
                 }
-                if compose.sending {
+                if let Some(at) = compose.send_at {
+                    let left = at.saturating_duration_since(std::time::Instant::now());
+                    if ui.button(format!("Undo ({}s)", left.as_secs() + 1)).on_hover_text("Take the message back before it is sent").clicked() {
+                        outcome = Outcome::Undo;
+                    }
+                    ctx.request_repaint_after(std::time::Duration::from_millis(250));
+                } else if compose.sending {
                     ui.spinner();
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.add_enabled(!compose.sending, egui::Button::image_and_text(Icon::Trash.image(crate::icons::SIZE, t.text_dim), "Discard")).on_hover_text("Delete this message and its draft").clicked() {
+                    if ui.add_enabled(!compose.sending, egui::Button::image_and_text(Icon::Trash.image(crate::icons::SIZE, t.text_dim), "Discard")).on_hover_text("Delete this message and its draft (Esc or Ctrl+Shift+D)").clicked() {
                         outcome = Outcome::Discard;
                     }
                     if ui.add_enabled(!compose.sending, egui::Button::image_and_text(Icon::X.image(crate::icons::SIZE, t.text_dim), "Close")).on_hover_text("Close and keep it as a draft").clicked() {
@@ -624,6 +641,9 @@ pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &
     }
     if ready && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Enter)) {
         outcome = Outcome::Send;
+    }
+    if !compose.sending && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::D)) {
+        outcome = Outcome::Discard;
     }
     outcome
 }

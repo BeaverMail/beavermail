@@ -20,10 +20,10 @@ Licensed under AGPL-3.0-only (see [LICENSE](LICENSE)).
 - Reader: plain text, simplified HTML or original HTML (Blitz); nothing remote loads unless allowed.
 - Sender checks (server authentication results, look-alike names and domains, misleading links, risky attachments).
 - Spam: mail from new senders that fails a check is held as "Suspicious"; a classifier learns from what you mark.
-- Markdown compose, drafts kept locally and on the server, attachments.
+- Markdown compose, drafts kept locally and on the server, attachments; undo send (configurable).
 - Messages open in tabs (double click).
 
-Keys: Up/Down, Enter, E, Delete, U, `!` (spam), C, R, A, F, `/`, Ctrl+W, Ctrl+Tab.
+Keys: Up/Down, Enter, E, Delete, U, `!` (spam), C or Ctrl+N (new), R, A, F, `/`, Ctrl+W, Ctrl+Tab; in a new message Esc or Ctrl+Shift+D discards.
 
 `cargo run -p beavermail -- --screen-dry-run` prints what the spam checks would do to each Inbox, without moving anything.
 

@@ -284,7 +284,39 @@ impl NewAccount {
     }
 }
 
+#[derive(Clone, Copy, Default, PartialEq)]
+enum SettingsPage {
+    #[default]
+    Reading,
+    Writing,
+    Spam,
+    Storage,
+}
+
+impl SettingsPage {
+    const ALL: [Self; 4] = [Self::Reading, Self::Writing, Self::Spam, Self::Storage];
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Reading => "Reading",
+            Self::Writing => "Writing",
+            Self::Spam => "Suspicious mail",
+            Self::Storage => "Stored mail",
+        }
+    }
+
+    fn about(self) -> &'static str {
+        match self {
+            Self::Reading => "Most unwanted mail and tracking arrives as HTML, so messages start as text.",
+            Self::Writing => "How messages you write are composed and sent.",
+            Self::Spam => "Mail from people you know is never held. Nothing moves on the server.",
+            Self::Storage => "How downloaded messages are kept on this computer.",
+        }
+    }
+}
+
 const FORM_WIDTH: f32 = 460.0;
+const SETTINGS_WIDTH: f32 = 680.0;
 /// Text field width in the account form: the form minus its label column and spacing.
 const FIELD_WIDTH: f32 = 310.0;
 
@@ -367,6 +399,12 @@ struct BeaverApp {
     /// Syncs in flight; the list shows a spinner while it is not zero.
     syncing: u32,
     show_settings: bool,
+    settings_page: SettingsPage,
+    /// Asking whether to forget the senders and messages marked as spam or not spam.
+    confirm_forget_marks: bool,
+    /// The compose field last typed in: Esc takes the focus away, and Keep editing gives it back.
+    compose_focus: Option<egui::Id>,
+    refocus: u8,
     /// The user paused the background downloads.
     downloads_paused: bool,
     /// An attachment that runs code, waiting for the user to say yes to opening it.
@@ -448,6 +486,10 @@ impl BeaverApp {
             vault: Arc::new(vault),
             syncing: 0,
             show_settings: false,
+            settings_page: SettingsPage::default(),
+            confirm_forget_marks: false,
+            compose_focus: None,
+            refocus: 0,
             downloads_paused: false,
             confirm_open: None,
             attach_selected: std::collections::BTreeSet::new(),
@@ -1117,6 +1159,32 @@ impl BeaverApp {
         }
     }
 
+    /// Hands the message to the server in the background; the answer comes back as `Event::Sent`.
+    fn dispatch_send(&mut self, compose: &mut compose::Compose) {
+        let Some(view) = self.view(compose.from) else { return };
+        let (account, sender, source) = (view.account.clone(), view.sender.clone(), view.source.clone());
+        let Some(sender) = sender else { return };
+        let mut message = compose.outgoing(account.address(), self.settings.rich_outgoing);
+        let files = compose.file_list();
+        let vault = self.vault.clone();
+        compose.sending = true;
+        compose.error = None;
+        self.spawn(async move {
+            // The copies are read now, off the window's thread, as they can be large.
+            match tokio::task::spawn_blocking(move || attachments::read_files(&vault, &files)).await {
+                Ok(Ok(read)) => message.attachments = read,
+                Ok(Err(e)) => return Event::Sent(Err(MailError::Backend(e)), None),
+                Err(e) => return Event::Sent(Err(MailError::Backend(e.to_string())), None),
+            }
+            let result = sender.send(message).await;
+            let copy_error = match (&result, source) {
+                (Ok(raw), Some(source)) if account.save_sent => source.save_sent(raw.clone()).await.err().map(|e| e.to_string()),
+                _ => None,
+            };
+            Event::Sent(result.map(|_| ()), copy_error)
+        });
+    }
+
     fn compose_window(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
         let Some(mut compose) = self.compose.take() else { return };
         // Files dragged onto the window while composing.
@@ -1128,7 +1196,19 @@ impl BeaverApp {
             compose = back;
         }
         let senders = self.senders();
-        match compose::window(ctx, t, &mut compose, &senders, self.settings.rich_outgoing) {
+        // The focus is dropped again the frame after the question closes, so it is asked for a few times.
+        if self.refocus > 0 && let Some(field) = self.compose_focus {
+            self.refocus -= 1;
+            ctx.memory_mut(|m| m.request_focus(field));
+            ctx.request_repaint();
+        }
+        if !self.confirm_discard && let Some(focused) = ctx.memory(|m| m.focused()) {
+            self.compose_focus = Some(focused);
+        }
+        // Esc is Discard (asked first when there is text), unless it is meant for a menu or the question itself.
+        let esc = !self.confirm_discard && !compose.sending && !egui::Popup::is_any_open(ctx) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        let outcome = if esc { compose::Outcome::Discard } else { compose::window(ctx, t, &mut compose, &senders, self.settings.rich_outgoing) };
+        match outcome {
             compose::Outcome::Keep => {}
             compose::Outcome::Close => {
                 self.save_draft(&mut compose);
@@ -1148,32 +1228,20 @@ impl BeaverApp {
                     Event::Picked(files.unwrap_or_default().into_iter().map(|f| f.path().to_path_buf()).collect())
                 });
             }
-            compose::Outcome::Send => {
-                if let Some(view) = self.view(compose.from) {
-                    let (account, sender, source) = (view.account.clone(), view.sender.clone(), view.source.clone());
-                    if let Some(sender) = sender {
-                        let mut message = compose.outgoing(account.address(), self.settings.rich_outgoing);
-                        let files = compose.file_list();
-                        let vault = self.vault.clone();
-                        compose.sending = true;
-                        compose.error = None;
-                        self.spawn(async move {
-                            // The copies are read now, off the window's thread, as they can be large.
-                            match tokio::task::spawn_blocking(move || attachments::read_files(&vault, &files)).await {
-                                Ok(Ok(read)) => message.attachments = read,
-                                Ok(Err(e)) => return Event::Sent(Err(MailError::Backend(e)), None),
-                                Err(e) => return Event::Sent(Err(MailError::Backend(e.to_string())), None),
-                            }
-                            let result = sender.send(message).await;
-                            let copy_error = match (&result, source) {
-                                (Ok(raw), Some(source)) if account.save_sent => source.save_sent(raw.clone()).await.err().map(|e| e.to_string()),
-                                _ => None,
-                            };
-                            Event::Sent(result.map(|_| ()), copy_error)
-                        });
-                    }
-                }
+            compose::Outcome::Send if self.settings.undo_send_secs > 0 => {
+                compose.sending = true;
+                compose.error = None;
+                compose.send_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(self.settings.undo_send_secs.into()));
             }
+            compose::Outcome::Send => self.dispatch_send(&mut compose),
+            compose::Outcome::Undo => {
+                compose.sending = false;
+                compose.send_at = None;
+            }
+        }
+        if compose.send_at.is_some_and(|at| at <= std::time::Instant::now()) {
+            compose.send_at = None;
+            self.dispatch_send(&mut compose);
         }
         // Keep a draft of what is being written, once the text has been still for a moment.
         if !compose.sending {
@@ -1190,25 +1258,38 @@ impl BeaverApp {
             }
         }
         if self.confirm_discard {
-            let (mut discard, mut keep) = (false, false);
+            let (mut discard, mut keep, mut save) = (false, false, false);
             let modal = egui::Modal::new(egui::Id::new("confirm_discard")).show(ctx, |ui| {
                 ui.set_width(FORM_WIDTH * 0.8);
                 ui.heading("Discard this message?");
-                ui.label(RichText::new("What you wrote will be lost.").color(t.text_dim));
+                ui.label(RichText::new("What you wrote will be lost, unless you keep it as a draft.").color(t.text_dim));
                 ui.add_space(12.0);
                 ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
-                    let button = egui::Button::new(RichText::new("Discard").color(t.on_accent)).fill(t.danger);
+                    let button = egui::Button::new(accelerated("Discard", 0, t.on_accent)).fill(t.danger);
                     discard = ui.add(button).clicked();
-                    keep = ui.button("Keep editing").clicked();
+                    save = ui.button(accelerated("Save draft", 0, egui::Color32::PLACEHOLDER)).clicked();
+                    keep = ui.button(accelerated("Keep editing", 0, egui::Color32::PLACEHOLDER)).clicked();
                 });
             });
+            let letter = |k| ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, k));
+            let (discard, save) = (discard || letter(egui::Key::D), save || letter(egui::Key::S));
+            let keep = keep || letter(egui::Key::K);
             if discard {
                 self.confirm_discard = false;
                 self.delete_draft(&compose);
                 return;
             }
+            if save {
+                self.confirm_discard = false;
+                self.save_draft(&mut compose);
+                if !compose.is_empty() && compose.snapshot() != compose.server_saved {
+                    self.push_draft(&mut compose);
+                }
+                return;
+            }
             if keep || modal.should_close() {
                 self.confirm_discard = false;
+                self.refocus = 3;
             }
         }
         self.compose = Some(compose);
@@ -1389,13 +1470,29 @@ impl BeaverApp {
         let mut unlock_again = false;
         let (mode, locked, job) = (self.vault.mode(), self.vault.is_locked(), self.vault_job.clone());
         let modal = egui::Modal::new(egui::Id::new("settings")).show(ctx, |ui| {
-            ui.set_width(FORM_WIDTH);
+            ui.set_width(SETTINGS_WIDTH);
+            // The same height on every page, so the window does not jump when the page changes.
+            let height = (ctx.content_rect().height() - 220.0).clamp(160.0, 480.0);
             ui.heading("Settings");
             ui.add_space(8.0);
-            egui::ScrollArea::vertical().max_height((ctx.content_rect().height() - 220.0).max(160.0)).auto_shrink([false, true]).show(ui, |ui| {
-            ui.label(RichText::new("Reading").strong());
-            ui.label(RichText::new("Most unwanted mail and tracking arrives as HTML, so messages start as text.").color(t.text_dim));
-            ui.add_space(6.0);
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_width(150.0);
+                    for page in SettingsPage::ALL {
+                        if ui.selectable_label(self.settings_page == page, page.title()).clicked() {
+                            self.settings_page = page;
+                        }
+                    }
+                });
+                ui.add_space(16.0);
+                ui.vertical(|ui| {
+                    egui::ScrollArea::vertical().min_scrolled_height(height).max_height(height).auto_shrink([false, false]).show(ui, |ui| {
+                        let hint = |ui: &mut egui::Ui, text: &str| ui.label(RichText::new(text).size(13.0).color(t.text_dim));
+                        ui.label(RichText::new(self.settings_page.title()).heading());
+                        ui.label(RichText::new(self.settings_page.about()).color(t.text_dim));
+                        ui.add_space(10.0);
+                        match self.settings_page {
+                            SettingsPage::Reading => {
             let modes = [
                 (DisplayMode::Plain, "Plain text", "The safest view. Links stay clickable; images and styling are dropped."),
                 (DisplayMode::Simplified, "Simplified HTML", "Keeps headings, lists, quotes and links. Never loads images, fonts or trackers."),
@@ -1409,8 +1506,8 @@ impl BeaverApp {
                 ui.label(RichText::new(hint).size(13.0).color(t.text_dim));
                 ui.add_space(4.0);
             }
+                                ui.add_space(12.0);
             if !self.settings.remote_senders.is_empty() {
-                ui.add_space(12.0);
                 ui.label(RichText::new("Senders that may load remote content").strong());
                 let mut forget = None;
                 for address in &self.settings.remote_senders {
@@ -1428,41 +1525,7 @@ impl BeaverApp {
                     changed = true;
                 }
             }
-            ui.add_space(12.0);
-            ui.label(RichText::new("Suspicious mail").strong());
-            if ui.checkbox(&mut self.settings.hold_suspicious, "Hold suspicious mail from new senders apart from the Inbox").changed() {
-                changed = true;
-                rescreen = true;
-            }
-            ui.label(RichText::new("Mail from people you know is never held. Nothing moves on the server.").size(13.0).color(t.text_dim));
-            if !self.settings.marked.is_empty() {
-                ui.add_space(6.0);
-                let mut forget = None;
-                for (key, not_spam) in &self.settings.marked {
-                    ui.horizontal(|ui| {
-                        let who = key.strip_prefix('@').map_or_else(|| key.clone(), |d| format!("everyone at {d}"));
-                        ui.label(format!("{who}  ·  {}", if *not_spam { "not spam" } else { "spam" }));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.small_button("Forget").on_hover_text("Let the checks decide again").clicked() {
-                                forget = Some(key.clone());
-                            }
-                        });
-                    });
-                }
-                if let Some(key) = forget {
-                    self.settings.set_mark(&key, None);
-                    changed = true;
-                    rescreen = true;
-                }
-            }
-            ui.add_space(12.0);
-            ui.label(RichText::new("Writing").strong());
-            if ui.checkbox(&mut self.settings.rich_outgoing, "Write in Markdown and send an HTML version too").changed() {
-                changed = true;
-            }
-            ui.label(RichText::new("Bold, lists, links and quotes. The plain-text part is always sent, readable as written. Off: plain text only.").size(13.0).color(t.text_dim));
             if !self.settings.sender_display.is_empty() {
-                ui.add_space(12.0);
                 ui.label(RichText::new("Senders with their own setting").strong());
                 let mut forget = None;
                 for (address, mode) in &self.settings.sender_display {
@@ -1481,13 +1544,64 @@ impl BeaverApp {
                     changed = true;
                 }
             }
-            ui.add_space(16.0);
-            ui.separator();
-            ui.add_space(8.0);
-            vault_request = security::section(ui, t, &mut self.security, mode, locked, job.as_deref());
-            if locked && ui.button("Unlock…").clicked() {
-                unlock_again = true;
+                            }
+                            SettingsPage::Writing => {
+            if ui.checkbox(&mut self.settings.rich_outgoing, "Write in Markdown and send an HTML version too").changed() {
+                changed = true;
             }
+            ui.label(RichText::new("Bold, lists, links and quotes. The plain-text part is always sent, readable as written. Off: plain text only.").size(13.0).color(t.text_dim));
+                                ui.add_space(12.0);
+                                ui.label("Undo send");
+                                let secs = &mut self.settings.undo_send_secs;
+                                egui::ComboBox::from_id_salt("undo_send").selected_text(if *secs == 0 { "Off".to_owned() } else { format!("{secs} seconds") }).show_ui(ui, |ui| {
+                                    for n in [0, 5, 10, 20, 30] {
+                                        changed |= ui.selectable_value(secs, n, if n == 0 { "Off".to_owned() } else { format!("{n} seconds") }).changed();
+                                    }
+                                });
+                                hint(ui, "After Send the message waits here, so you can take it back. Off sends it at once.");
+                            }
+                            SettingsPage::Spam => {
+            if ui.checkbox(&mut self.settings.hold_suspicious, "Hold suspicious mail from new senders apart from the Inbox").changed() {
+                changed = true;
+                rescreen = true;
+            }
+                                ui.add_space(12.0);
+                                let marked = self.settings.marked.len();
+                                if marked == 0 {
+                                    hint(ui, "Nothing learned from your choices yet. Mark a message as spam, or as not spam, and the filter learns from it.");
+                                } else if !self.confirm_forget_marks {
+                                    ui.label(format!("{marked} sender{} marked by you.", if marked == 1 { "" } else { "s" }));
+                                    hint(ui, "To change one, open its message and choose Not spam (or Spam). Mail in your Spam folder keeps counting.");
+                                    if ui.button("Forget what I marked…").clicked() {
+                                        self.confirm_forget_marks = true;
+                                    }
+                                } else {
+                                    ui.label("Forget every sender and message you marked?");
+                                    hint(ui, "The filter goes back to its own checks and the Spam folder. Nothing moves on the server.");
+                                    ui.horizontal(|ui| {
+                                        if ui.add(egui::Button::new(RichText::new("Forget").color(t.on_accent)).fill(t.danger)).clicked() {
+                                            self.settings.marked.clear();
+                                            match self.archive.clear_examples() {
+                                                Ok(()) => (changed, rescreen) = (true, true),
+                                                Err(e) => self.error = Some(e.to_string()),
+                                            }
+                                            self.confirm_forget_marks = false;
+                                        }
+                                        if ui.button("Cancel").clicked() {
+                                            self.confirm_forget_marks = false;
+                                        }
+                                    });
+                                }
+                            }
+                            SettingsPage::Storage => {
+                                vault_request = security::section(ui, t, &mut self.security, mode, locked, job.as_deref());
+                                if locked && ui.button("Unlock…").clicked() {
+                                    unlock_again = true;
+                                }
+                            }
+                        }
+                    });
+                });
             });
             ui.add_space(14.0);
             ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
@@ -1711,7 +1825,15 @@ impl BeaverApp {
 
     /// Up/Down move through the list, E archives, Delete trashes, U toggles unread.
     fn handle_keys(&mut self, ctx: &egui::Context) {
-        if self.form.is_some() || !self.confirm_erase.is_empty() || self.confirm_spam || self.confirm_empty.is_some() || self.compose.is_some() || self.show_settings || self.locked() || ctx.egui_wants_keyboard_input() {
+        if self.form.is_some() || !self.confirm_erase.is_empty() || self.confirm_spam || self.confirm_empty.is_some() || self.compose.is_some() || self.show_settings || self.locked() {
+            return;
+        }
+        // Unlike the plain keys, this one also works while the search box has the keyboard.
+        if ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::N))) {
+            self.new_message();
+            return;
+        }
+        if ctx.egui_wants_keyboard_input() {
             return;
         }
         let key = |k| ctx.input(|i| i.key_pressed(k));
@@ -2403,7 +2525,7 @@ impl BeaverApp {
         egui::Panel::left("accounts").frame(frame).default_size(260.0).size_range(210.0..=340.0).show(ui, |ui| {
             let can_send = !self.senders().is_empty();
             let why = if can_send { None } else { Some("Add an account to send mail") };
-            if views::primary_wide(ui, t, Icon::Pencil, "New email", why).on_hover_text("New message (C)").clicked() && can_send {
+            if views::primary_wide(ui, t, Icon::Pencil, "New email", why).on_hover_text("New message (C or Ctrl+N)").clicked() && can_send {
                 self.new_message();
             }
             ui.add_space(8.0);
@@ -2987,6 +3109,17 @@ fn folder_menu(ui: &mut egui::Ui, role: Role, holding: bool, recheck: &mut Optio
 /// The bytes of an attachment, through the mail source (a function so tasks can call it without a method).
 async fn source_attachment(source: &ImapSource, id: MessageId, index: u32) -> Result<(String, Vec<u8>), MailError> {
     source.attachment(id, index).await
+}
+
+/// A button label with its shortcut letter (the one at `at`) underlined.
+fn accelerated(label: &str, at: usize, color: egui::Color32) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    let font = egui::FontId::proportional(14.0);
+    for (i, c) in label.chars().enumerate() {
+        let underline = if i == at { egui::Stroke::new(1.0, color) } else { egui::Stroke::NONE };
+        job.append(&c.to_string(), 0.0, egui::text::TextFormat { font_id: font.clone(), color, underline, ..Default::default() });
+    }
+    job
 }
 
 fn main() -> eframe::Result {
