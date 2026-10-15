@@ -112,7 +112,7 @@ mod tests {
     fn account(user: &str) -> Account {
         let imap = Server { host: "mail.example.org".into(), port: 143, tls: Tls::StartTls };
         let smtp = Server { host: "mail.example.org".into(), port: 465, tls: Tls::Tls };
-        Account { name: "Work".into(), user: user.into(), email: user.into(), imap, smtp, save_sent: true, keep: beavermail_core::Keep::default() }
+        Account { name: "Work".into(), user: user.into(), email: user.into(), imap, smtp, save_sent: true, keep: beavermail_core::Keep::default(), signature: String::new() }
     }
 
     #[test]

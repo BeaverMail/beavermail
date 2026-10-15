@@ -204,6 +204,7 @@ struct NewAccount {
     smtp_tls: Tls,
     save_sent: bool,
     keep: Keep,
+    signature: String,
     error: Option<String>,
     /// Focus the first field on the first frame only.
     focus_first: bool,
@@ -225,6 +226,7 @@ impl Default for NewAccount {
             smtp_tls: Tls::StartTls,
             save_sent: true,
             keep: Keep::default(),
+            signature: String::new(),
             error: None,
             focus_first: true,
         }
@@ -248,9 +250,15 @@ impl NewAccount {
             smtp_tls: account.smtp.tls,
             save_sent: account.save_sent,
             keep: account.keep,
+            signature: account.signature.clone(),
             focus_first: true,
             ..Self::default()
         }
+    }
+
+    /// Whether saving would change `account`: an invalid form counts as a change, so it is never dropped silently.
+    fn changed(&self, account: &Account) -> bool {
+        !self.password.is_empty() || self.build().map_or(true, |built| built != *account)
     }
 
     /// Whether the required fields are filled in.
@@ -280,17 +288,20 @@ impl NewAccount {
             smtp: Server { host: smtp_host.to_owned(), port: port(&self.smtp_port, "SMTP")?, tls: self.smtp_tls },
             save_sent: self.save_sent,
             keep: self.keep,
+            signature: self.signature.trim_end().to_owned(),
         })
     }
 }
 
-#[derive(Clone, Copy, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 enum SettingsPage {
     #[default]
     Reading,
     Writing,
     Spam,
     Storage,
+    /// One account's page, by serial.
+    Account(u64),
 }
 
 impl SettingsPage {
@@ -302,6 +313,17 @@ impl SettingsPage {
             Self::Writing => "Writing",
             Self::Spam => "Suspicious mail",
             Self::Storage => "Stored mail",
+            Self::Account(_) => "Account",
+        }
+    }
+
+    fn icon(self) -> Option<Icon> {
+        match self {
+            Self::Reading => Some(Icon::MailOpen),
+            Self::Writing => Some(Icon::Pencil),
+            Self::Spam => Some(Icon::Spam),
+            Self::Storage => Some(Icon::Lock),
+            Self::Account(_) => None,
         }
     }
 
@@ -311,12 +333,15 @@ impl SettingsPage {
             Self::Writing => "How messages you write are composed and sent.",
             Self::Spam => "Mail from people you know is never held. Nothing moves on the server.",
             Self::Storage => "How downloaded messages are kept on this computer.",
+            Self::Account(_) => "",
         }
     }
 }
 
 const FORM_WIDTH: f32 = 460.0;
-const SETTINGS_WIDTH: f32 = 680.0;
+const SETTINGS_WIDTH: f32 = 780.0;
+/// The settings sidebar, page list and accounts.
+const SETTINGS_NAV: f32 = 220.0;
 /// Text field width in the account form: the form minus its label column and spacing.
 const FIELD_WIDTH: f32 = 310.0;
 
@@ -335,6 +360,96 @@ fn sized_field(text: &mut String, width: f32) -> egui::TextEdit<'_> {
         .min_size(vec2(width, theme::CONTROL_H))
         .margin(egui::Margin::symmetric(12, 0))
         .vertical_align(Align::Center)
+}
+
+fn section_title(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(24.0);
+    ui.label(RichText::new(text).size(theme::SUBTITLE).strong());
+    ui.add_space(2.0);
+}
+
+/// One account's page in Settings; returns whether Remove account was pressed.
+fn account_page(ui: &mut egui::Ui, t: &theme::Tokens, form: &mut NewAccount) -> bool {
+    let hint = |ui: &mut egui::Ui, text: &str| ui.label(RichText::new(text).size(13.0).color(t.text_dim));
+    form_grid(ui, "account_identity", |ui| {
+        ui.label("Name");
+        ui.add(field(&mut form.name).hint_text("Shown in the sidebar"));
+        ui.end_row();
+        ui.label("Email");
+        ui.add(field(&mut form.email).hint_text("Address mail is sent from"));
+        ui.end_row();
+    });
+
+    section_title(ui, "Signature");
+    ui.add(egui::TextEdit::multiline(&mut form.signature).id_salt("signature").desired_rows(4).desired_width(f32::INFINITY).margin(egui::Margin::same(12)));
+    hint(ui, "Added under new messages, replies and forwards. Leave empty for none.");
+
+    section_title(ui, "Sync");
+    form_grid(ui, "account_sync", |ui| {
+        ui.label("Keep offline");
+        let label = |k: Keep| match k {
+            Keep::All => "Everything",
+            Keep::Year => "Last 12 months",
+            Keep::Month => "Last 30 days",
+            Keep::Opened => "Only messages I open",
+        };
+        egui::ComboBox::from_id_salt("keep").width(FIELD_WIDTH).selected_text(label(form.keep)).show_ui(ui, |ui| {
+            for keep in [Keep::All, Keep::Year, Keep::Month, Keep::Opened] {
+                ui.selectable_value(&mut form.keep, keep, label(keep));
+            }
+        });
+        ui.end_row();
+    });
+    ui.add_space(4.0);
+    ui.checkbox(&mut form.save_sent, "Keep a copy of sent messages in Sent");
+    hint(ui, "Turn off for providers that already do it, such as Gmail and Microsoft 365.");
+
+    section_title(ui, "Connection");
+    hint(ui, "Saving a change here reconnects the account. A different user or server downloads its mail again.");
+    ui.add_space(4.0);
+    form_grid(ui, "account_login", |ui| login_rows(ui, form));
+    server_sections(ui, form);
+
+    section_title(ui, "Remove account");
+    hint(ui, "Deletes the mail downloaded to this computer and the saved password. Nothing changes on the server.");
+    ui.add_space(4.0);
+    let remove = egui::Button::new(RichText::new("Remove account…").color(t.danger)).stroke(egui::Stroke::new(1.0, t.danger));
+    let pressed = ui.add(remove).clicked();
+    ui.add_space(8.0);
+    pressed
+}
+
+/// User and password, as rows of the caller's form grid.
+fn login_rows(ui: &mut egui::Ui, form: &mut NewAccount) {
+    ui.label("User");
+    ui.add(field(&mut form.user).hint_text("Login name, often the same address"));
+    ui.end_row();
+    ui.label("Password");
+    let hint = if form.editing.is_some() { "Leave empty to keep the current one" } else { "" };
+    ui.add(field(&mut form.password).password(true).hint_text(hint));
+    ui.end_row();
+}
+
+/// The incoming and outgoing servers, each under its own title.
+fn server_sections(ui: &mut egui::Ui, form: &mut NewAccount) {
+    for (title, id, host, port, tls, hint) in [
+        ("Incoming mail (IMAP)", "imap", &mut form.imap_host, &mut form.imap_port, &mut form.imap_tls, "imap.example.com"),
+        ("Outgoing mail (SMTP)", "smtp", &mut form.smtp_host, &mut form.smtp_port, &mut form.smtp_tls, "Same as IMAP"),
+    ] {
+        ui.add_space(8.0);
+        ui.label(RichText::new(title).strong());
+        form_grid(ui, &format!("{id}_form"), |ui| {
+            ui.label("Server");
+            ui.add(field(host).hint_text(hint));
+            ui.end_row();
+            ui.label("Port");
+            ui.horizontal(|ui| {
+                ui.add(sized_field(port, 72.0));
+                tls_picker(ui, &format!("{id}_tls"), tls);
+            });
+            ui.end_row();
+        });
+    }
 }
 
 fn tls_picker(ui: &mut egui::Ui, id: &str, tls: &mut Tls) {
@@ -400,6 +515,13 @@ struct BeaverApp {
     syncing: u32,
     show_settings: bool,
     settings_page: SettingsPage,
+    /// The account page being edited in Settings; nothing is saved until Save changes.
+    account_edit: Option<NewAccount>,
+    /// Where the user asked to go from an account page with unsaved changes (`None`: close Settings),
+    /// until they choose to discard them.
+    settings_leave: Option<Option<SettingsPage>>,
+    /// The account the user asked to remove, until they confirm.
+    confirm_remove: Option<u64>,
     /// Asking whether to forget the senders and messages marked as spam or not spam.
     confirm_forget_marks: bool,
     /// The compose field last typed in: Esc takes the focus away, and Keep editing gives it back.
@@ -487,6 +609,9 @@ impl BeaverApp {
             syncing: 0,
             show_settings: false,
             settings_page: SettingsPage::default(),
+            account_edit: None,
+            settings_leave: None,
+            confirm_remove: None,
             confirm_forget_marks: false,
             compose_focus: None,
             refocus: 0,
@@ -512,7 +637,9 @@ impl BeaverApp {
             Err(e) => app.error = Some(e),
         }
         match store::load() {
-            Ok(accounts) => accounts.into_iter().for_each(|a| app.add_view(a)),
+            Ok(accounts) => accounts.into_iter().for_each(|a| {
+                app.add_view(a);
+            }),
             Err(e) => app.error = Some(e),
         }
         app
@@ -538,8 +665,8 @@ impl BeaverApp {
     }
 
     /// Shows an account and starts loading its folders.
-    fn add_view(&mut self, account: Account) {
-        self.insert_view(account, None);
+    fn add_view(&mut self, account: Account) -> u64 {
+        self.insert_view(account, None)
     }
 
     /// Shows an account, at `position` or at the end, and returns its serial.
@@ -1132,7 +1259,8 @@ impl BeaverApp {
         }
         let senders = self.senders();
         let from = self.selected.map(|(s, _)| s).filter(|s| senders.iter().any(|(x, _)| x == s)).or_else(|| senders.first().map(|(s, _)| *s));
-        self.start_compose(from.map(compose::Compose::new));
+        let signature = from.and_then(|f| self.view(f)).map(|v| v.account.signature.clone()).unwrap_or_default();
+        self.start_compose(from.map(|f| compose::Compose::new(f).with_signature(&signature)));
     }
 
     /// Shows a compose window, remembering which account's drafts it belongs to.
@@ -1208,6 +1336,10 @@ impl BeaverApp {
         // Esc is Discard (asked first when there is text), unless it is meant for a menu or the question itself.
         let esc = !self.confirm_discard && !compose.sending && !egui::Popup::is_any_open(ctx) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         let outcome = if esc { compose::Outcome::Discard } else { compose::window(ctx, t, &mut compose, &senders, self.settings.rich_outgoing) };
+        if compose.from != compose.sig_from {
+            let signature = self.view(compose.from).map(|v| v.account.signature.clone()).unwrap_or_default();
+            compose.change_signature(compose.from, &signature);
+        }
         match outcome {
             compose::Outcome::Keep => {}
             compose::Outcome::Close => {
@@ -1464,34 +1596,107 @@ impl BeaverApp {
         if !self.show_settings {
             return;
         }
+        // An account page edits a copy of the account; the page of a removed account falls back to the first page.
+        if let SettingsPage::Account(serial) = self.settings_page {
+            match self.view(serial) {
+                Some(view) if self.account_edit.as_ref().is_none_or(|f| f.editing != Some(serial)) => {
+                    self.account_edit = Some(NewAccount::editing(serial, &view.account));
+                }
+                Some(_) => {}
+                None => self.leave_settings_page(Some(SettingsPage::Reading)),
+            }
+        }
+        let account = match self.settings_page {
+            SettingsPage::Account(serial) => self.view(serial).map(|v| v.account.clone()),
+            _ => None,
+        };
+        let dirty = account.as_ref().zip(self.account_edit.as_ref()).is_some_and(|(a, form)| form.changed(a));
         let mut changed = false;
         let mut rescreen = false;
         let mut vault_request = None;
         let mut unlock_again = false;
+        // Where the user asked to go: another page, or `None` to close Settings.
+        let mut goto: Option<Option<SettingsPage>> = None;
+        let (mut save, mut discard, mut add, mut remove) = (false, false, false, false);
         let (mode, locked, job) = (self.vault.mode(), self.vault.is_locked(), self.vault_job.clone());
-        let modal = egui::Modal::new(egui::Id::new("settings")).show(ctx, |ui| {
+        // The same height on every page, so the window does not jump when the page changes.
+        let height = (ctx.content_rect().height() - 120.0).clamp(380.0, 640.0);
+        let frame = egui::Frame::window(&ctx.global_style()).inner_margin(0);
+        let modal = egui::Modal::new(egui::Id::new("settings")).frame(frame).show(ctx, |ui| {
             ui.set_width(SETTINGS_WIDTH);
-            // The same height on every page, so the window does not jump when the page changes.
-            let height = (ctx.content_rect().height() - 220.0).clamp(160.0, 480.0);
-            ui.heading("Settings");
-            ui.add_space(8.0);
+            ui.set_height(height);
+            // Painted once the sidebar's width is known, behind it and down to the window's bottom edge.
+            let nav_fill = ui.painter().add(egui::Shape::Noop);
             ui.horizontal_top(|ui| {
-                ui.vertical(|ui| {
-                    ui.set_width(150.0);
+                ui.spacing_mut().item_spacing.x = 0.0;
+                let nav = egui::Frame::new().inner_margin(12);
+                let nav = nav.show(ui, |ui| ui.vertical(|ui| {
+                    ui.set_width(SETTINGS_NAV - 24.0);
+                    ui.set_height(height - 24.0);
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    let label = |ui: &mut egui::Ui, text: RichText| {
+                        ui.horizontal(|ui| {
+                            ui.add_space(12.0);
+                            ui.label(text);
+                        });
+                    };
+                    ui.add_space(6.0);
+                    label(ui, RichText::new("Settings").heading());
+                    ui.add_space(14.0);
                     for page in SettingsPage::ALL {
-                        if ui.selectable_label(self.settings_page == page, page.title()).clicked() {
-                            self.settings_page = page;
+                        if views::settings_row(ui, t, page.title(), page.icon(), self.settings_page == page).clicked() && self.settings_page != page {
+                            goto = Some(Some(page));
                         }
                     }
-                });
-                ui.add_space(16.0);
-                ui.vertical(|ui| {
-                    egui::ScrollArea::vertical().min_scrolled_height(height).max_height(height).auto_shrink([false, false]).show(ui, |ui| {
+                    ui.add_space(18.0);
+                    label(ui, RichText::new("Accounts").size(13.0).strong().color(t.text_dim));
+                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical().id_salt("settings_accounts").show(ui, |ui| {
+                        for view in &self.accounts {
+                            let page = SettingsPage::Account(view.serial);
+                            let row = views::settings_row(ui, t, &view.account.name, None, self.settings_page == page).on_hover_text(view.account.address());
+                            if row.clicked() && self.settings_page != page {
+                                goto = Some(Some(page));
+                            }
+                        }
+                        add = views::settings_row(ui, t, "Add account", Some(Icon::Plus), false).clicked();
+                    });
+                }));
+                let side = egui::Rect::from_min_size(nav.response.rect.min, vec2(nav.response.rect.width(), height));
+                ui.painter().set(nav_fill, egui::epaint::RectShape::filled(side, egui::CornerRadius { nw: 14, sw: 14, ne: 0, se: 0 }, t.bg));
+                ui.painter().vline(side.right(), side.y_range(), egui::Stroke::new(1.0, t.border));
+                egui::Frame::new().inner_margin(egui::Margin { left: 28, right: 24, top: 26, bottom: 20 }).show(ui, |ui| ui.vertical(|ui| {
+                    ui.set_width(SETTINGS_WIDTH - SETTINGS_NAV - 52.0);
+                    ui.set_height(height - 46.0);
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    match &account {
+                        Some(account) => {
+                            ui.horizontal(|ui| {
+                                let (rect, _) = ui.allocate_exact_size(vec2(views::AVATAR, views::AVATAR), egui::Sense::hover());
+                                views::avatar(ui, t, &account.name, rect.center(), views::AVATAR);
+                                ui.vertical(|ui| {
+                                    ui.spacing_mut().item_spacing.y = 2.0;
+                                    ui.label(RichText::new(&account.name).heading());
+                                    ui.label(RichText::new(account.address()).color(t.text_dim));
+                                });
+                            });
+                        }
+                        None => {
+                            ui.label(RichText::new(self.settings_page.title()).heading());
+                            ui.label(RichText::new(self.settings_page.about()).color(t.text_dim));
+                        }
+                    }
+                    ui.add_space(14.0);
+                    // What is left once the footer, its gap and the spacing around both are taken off.
+                    let body = (ui.available_height() - theme::CONTROL_H - 8.0 - 2.0 * ui.spacing().item_spacing.y).max(0.0);
+                    egui::ScrollArea::vertical().id_salt(("settings_page", self.settings_page)).max_height(body).min_scrolled_height(body).auto_shrink([false, false]).show(ui, |ui| {
                         let hint = |ui: &mut egui::Ui, text: &str| ui.label(RichText::new(text).size(13.0).color(t.text_dim));
-                        ui.label(RichText::new(self.settings_page.title()).heading());
-                        ui.label(RichText::new(self.settings_page.about()).color(t.text_dim));
-                        ui.add_space(10.0);
                         match self.settings_page {
+                            SettingsPage::Account(_) => {
+                                if let Some(form) = &mut self.account_edit {
+                                    remove = account_page(ui, t, form);
+                                }
+                            }
                             SettingsPage::Reading => {
             let modes = [
                 (DisplayMode::Plain, "Plain text", "The safest view. Links stay clickable; images and styling are dropped."),
@@ -1601,18 +1806,55 @@ impl BeaverApp {
                             }
                         }
                     });
-                });
-            });
-            ui.add_space(14.0);
-            ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
-                if ui.button("Done").clicked() {
-                    self.show_settings = false;
-                }
+                    ui.add_space(8.0);
+                    ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
+                        if !dirty {
+                            if ui.button("Done").clicked() {
+                                goto = Some(None);
+                            }
+                            return;
+                        }
+                        let ready = self.account_edit.as_ref().is_some_and(NewAccount::ready);
+                        let button = egui::Button::new(RichText::new("Save changes").color(t.on_accent)).fill(t.accent);
+                        save = ui.add_enabled(ready, button).on_disabled_hover_text("User and IMAP server are required").clicked();
+                        discard = ui.button("Discard changes").clicked();
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| match self.account_edit.as_ref().and_then(|f| f.error.as_deref()) {
+                            Some(error) => ui.add(egui::Label::new(RichText::new(error).size(13.0).color(t.danger)).wrap()),
+                            None => ui.label(RichText::new("Unsaved changes").color(t.text_dim)),
+                        });
+                    });
+                }));
             });
         });
         if modal.should_close() {
-            self.show_settings = false;
+            goto = Some(None);
         }
+        if let Some(target) = goto {
+            if dirty {
+                self.settings_leave = Some(target);
+            } else {
+                self.leave_settings_page(target);
+            }
+        }
+        if discard {
+            self.account_edit = None;
+        }
+        if save && let Some(form) = self.account_edit.take() {
+            match self.save_account(&form) {
+                Ok(serial) => {
+                    self.settings_page = SettingsPage::Account(serial);
+                    self.notice = Some(("Account saved".into(), std::time::Instant::now()));
+                }
+                Err(e) => self.account_edit = Some(NewAccount { error: Some(e), ..form }),
+            }
+        }
+        if remove && let SettingsPage::Account(serial) = self.settings_page {
+            self.confirm_remove = Some(serial);
+        }
+        if add {
+            self.form = Some(NewAccount::default());
+        }
+        self.leave_dialog(ctx, t);
         if changed {
             self.save_settings();
         }
@@ -1624,6 +1866,64 @@ impl BeaverApp {
         }
         if let Some(request) = vault_request {
             self.run_vault(request, ctx);
+        }
+    }
+
+    /// Goes to another settings page, or closes Settings with `None`, dropping any unsaved account changes.
+    fn leave_settings_page(&mut self, target: Option<SettingsPage>) {
+        self.account_edit = None;
+        match target {
+            Some(page) => self.settings_page = page,
+            None => self.show_settings = false,
+        }
+    }
+
+    /// Asks before an account page with unsaved changes is left.
+    fn leave_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
+        let Some(target) = self.settings_leave else { return };
+        let name = self.account_edit.as_ref().and_then(|f| self.view(f.editing?)).map(|v| v.account.name.clone()).unwrap_or_default();
+        let (mut confirm, mut cancel) = (false, false);
+        let modal = egui::Modal::new(egui::Id::new("settings_leave")).show(ctx, |ui| {
+            ui.set_width(FORM_WIDTH * 0.8);
+            ui.heading(format!("Discard changes to {name}?"));
+            ui.label(RichText::new("What you changed on this page has not been saved.").color(t.text_dim));
+            ui.add_space(12.0);
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
+                confirm = ui.add(egui::Button::new(RichText::new("Discard changes").color(t.on_accent)).fill(t.danger)).clicked();
+                cancel = ui.button("Keep editing").clicked();
+            });
+        });
+        if confirm {
+            self.leave_settings_page(target);
+        }
+        if confirm || cancel || modal.should_close() {
+            self.settings_leave = None;
+        }
+    }
+
+    /// Confirms removing an account: what was downloaded and the saved password go with it.
+    fn remove_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
+        let Some(serial) = self.confirm_remove else { return };
+        let Some(name) = self.view(serial).map(|v| v.account.name.clone()) else {
+            self.confirm_remove = None;
+            return;
+        };
+        let (mut confirm, mut cancel) = (false, false);
+        let modal = egui::Modal::new(egui::Id::new("confirm_remove")).show(ctx, |ui| {
+            ui.set_width(FORM_WIDTH * 0.8);
+            ui.heading(format!("Remove {name}?"));
+            ui.label(RichText::new("The mail downloaded to this computer and the saved password are deleted. Nothing changes on the server, so the account can be added again.").color(t.text_dim));
+            ui.add_space(12.0);
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
+                confirm = ui.add(egui::Button::new(RichText::new("Remove account").color(t.on_accent)).fill(t.danger)).clicked();
+                cancel = ui.button("Cancel").clicked();
+            });
+        });
+        if confirm {
+            self.remove_account(serial);
+        }
+        if confirm || cancel || modal.should_close() {
+            self.confirm_remove = None;
         }
     }
 
@@ -1713,10 +2013,11 @@ impl BeaverApp {
         let Some(view) = self.view(serial).filter(|v| v.sender.is_some()) else { return };
         let own = view.account.address();
         let key = view.account.key();
-        let mut compose = match action {
+        let compose = match action {
             Action::Forward => compose::Compose::forward(serial, &key, summary, body, &body.attachments),
             _ => compose::Compose::reply(serial, own, summary, body, matches!(action, Action::ReplyAll)),
         };
+        let mut compose = compose.with_signature(&view.account.signature);
         let carry = std::mem::take(&mut compose.carry);
         let source = view.source.clone();
         let draft = compose.id.clone();
@@ -1825,7 +2126,7 @@ impl BeaverApp {
 
     /// Up/Down move through the list, E archives, Delete trashes, U toggles unread.
     fn handle_keys(&mut self, ctx: &egui::Context) {
-        if self.form.is_some() || !self.confirm_erase.is_empty() || self.confirm_spam || self.confirm_empty.is_some() || self.compose.is_some() || self.show_settings || self.locked() {
+        if self.form.is_some() || !self.confirm_erase.is_empty() || self.confirm_spam || self.confirm_empty.is_some() || self.confirm_remove.is_some() || self.compose.is_some() || self.show_settings || self.locked() {
             return;
         }
         // Unlike the plain keys, this one also works while the search box has the keyboard.
@@ -1913,19 +2214,30 @@ impl BeaverApp {
 
     /// Adds the account, or applies an edit. The password goes to the credential store first and
     /// the settings file second, so a failure never leaves one without the other.
-    fn save_account(&mut self, form: &NewAccount) -> Result<(), String> {
+    /// Saves the form as a new or changed account and returns the serial it is shown under now.
+    fn save_account(&mut self, form: &NewAccount) -> Result<u64, String> {
         let account = form.build()?;
         let editing = form.editing.and_then(|serial| self.accounts.iter().position(|v| v.serial == serial));
         let old = editing.map(|at| self.accounts[at].account.clone());
         if self.accounts.iter().enumerate().any(|(i, v)| Some(i) != editing && v.account.key() == account.key()) {
             return Err("this account is already configured".into());
         }
+        let mut all: Vec<Account> = self.accounts.iter().map(|v| v.account.clone()).collect();
+        if let Some(at) = editing
+            && form.password.is_empty()
+            && old.as_ref().is_some_and(|o| o.key() == account.key() && o.imap == account.imap && o.smtp == account.smtp)
+        {
+            // Name, address, signature or sync choices only: the password, the connection and the open folder stay as they are.
+            all[at] = account.clone();
+            store::save(&all)?;
+            self.accounts[at].account = account;
+            return Ok(self.accounts[at].serial);
+        }
         let password = match (&old, form.password.is_empty()) {
             (Some(old), true) => store::password(old)?, // moving the stored password to the new key
             _ => form.password.clone(),
         };
         store::set_password(&account, &password)?;
-        let mut all: Vec<Account> = self.accounts.iter().map(|v| v.account.clone()).collect();
         match editing {
             Some(at) => all[at] = account.clone(),
             None => all.push(account.clone()),
@@ -1938,8 +2250,7 @@ impl BeaverApp {
             return Err(e);
         }
         let Some(at) = editing else {
-            self.add_view(account);
-            return Ok(());
+            return Ok(self.add_view(account));
         };
         let old = self.accounts.remove(at);
         old.progress.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1960,7 +2271,7 @@ impl BeaverApp {
         {
             compose.from = serial;
         }
-        Ok(())
+        Ok(serial)
     }
 
     /// Deletes everything downloaded for an account: its index rows and its message files.
@@ -2325,77 +2636,33 @@ impl BeaverApp {
         }
     }
 
+    /// The Add account dialog; an existing account is changed on its page in Settings.
     fn account_form(&mut self, ctx: &egui::Context) {
         let Some(mut form) = self.form.take() else { return };
         let t = theme::Tokens::get(ctx);
         let (mut submit, mut cancel) = (false, false);
         let ready = form.ready();
-        let editing = form.editing.is_some();
         let modal = egui::Modal::new(egui::Id::new("add_account")).show(ctx, |ui| {
             ui.set_width(FORM_WIDTH);
-            ui.heading(if editing { "Edit account" } else { "Add account" });
+            ui.heading("Add account");
             ui.label(RichText::new("Connect an existing mailbox over IMAP and SMTP.").color(t.text_dim));
             ui.add_space(8.0);
-            form_grid(ui, "account_form", |ui| {
-                ui.label("Name");
-                let name = ui.add(field(&mut form.name).hint_text("Optional"));
-                if std::mem::take(&mut form.focus_first) {
-                    name.request_focus();
-                }
-                ui.end_row();
-                ui.label("Email");
-                ui.add(field(&mut form.email).hint_text("Address mail is sent from"));
-                ui.end_row();
-                ui.label("User");
-                ui.add(field(&mut form.user).hint_text("Login name, often the same address"));
-                ui.end_row();
-                ui.label("Password");
-                let hint = if editing { "Leave empty to keep the current one" } else { "" };
-                ui.add(field(&mut form.password).password(true).hint_text(hint));
-                ui.end_row();
-            });
-            ui.add_space(8.0);
-            ui.label(RichText::new("Incoming mail (IMAP)").strong());
-            form_grid(ui, "imap_form", |ui| {
-                ui.label("Server");
-                ui.add(field(&mut form.imap_host).hint_text("imap.example.com"));
-                ui.end_row();
-                ui.label("Port");
-                ui.horizontal(|ui| {
-                    ui.add(sized_field(&mut form.imap_port, 72.0));
-                    tls_picker(ui, "imap_tls", &mut form.imap_tls);
-                });
-                ui.end_row();
-            });
-            ui.add_space(8.0);
-            ui.label(RichText::new("Outgoing mail (SMTP)").strong());
-            form_grid(ui, "smtp_form", |ui| {
-                ui.label("Server");
-                ui.add(field(&mut form.smtp_host).hint_text("Same as IMAP"));
-                ui.end_row();
-                ui.label("Port");
-                ui.horizontal(|ui| {
-                    ui.add(sized_field(&mut form.smtp_port, 72.0));
-                    tls_picker(ui, "smtp_tls", &mut form.smtp_tls);
-                });
-                ui.end_row();
-            });
-            ui.horizontal(|ui| {
-                ui.label("Keep mail offline");
-                let label = |k: Keep| match k {
-                    Keep::All => "Everything",
-                    Keep::Year => "Last 12 months",
-                    Keep::Month => "Last 30 days",
-                    Keep::Opened => "Only messages I open",
-                };
-                egui::ComboBox::from_id_salt("keep").selected_text(label(form.keep)).show_ui(ui, |ui| {
-                    for keep in [Keep::All, Keep::Year, Keep::Month, Keep::Opened] {
-                        ui.selectable_value(&mut form.keep, keep, label(keep));
+            // Scrolls on a short window, so the buttons below stay in reach.
+            egui::ScrollArea::vertical().max_height((ctx.content_rect().height() - 240.0).max(160.0)).show(ui, |ui| {
+                form_grid(ui, "account_form", |ui| {
+                    ui.label("Name");
+                    let name = ui.add(field(&mut form.name).hint_text("Optional"));
+                    if std::mem::take(&mut form.focus_first) {
+                        name.request_focus();
                     }
+                    ui.end_row();
+                    ui.label("Email");
+                    ui.add(field(&mut form.email).hint_text("Address mail is sent from"));
+                    ui.end_row();
+                    login_rows(ui, &mut form);
                 });
+                server_sections(ui, &mut form);
             });
-            ui.checkbox(&mut form.save_sent, "Keep a copy of sent messages in Sent")
-                .on_hover_text("Turn off for providers that already do it, such as Gmail and Microsoft 365");
             if let Some(error) = &form.error {
                 ui.add_space(8.0);
                 ui.colored_label(t.danger, error);
@@ -2403,7 +2670,7 @@ impl BeaverApp {
             ui.add_space(12.0);
             // A fixed-height row: a bare right-to-left layout would claim the rest of the window.
             ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
-                let add = egui::Button::new(RichText::new(if editing { "Save changes" } else { "Add account" }).color(t.on_accent)).fill(t.accent);
+                let add = egui::Button::new(RichText::new("Add account").color(t.on_accent)).fill(t.accent);
                 let add = ui.add_enabled(ready, add).on_disabled_hover_text("User, password and IMAP server are required");
                 submit = add.clicked() || (ready && ui.input(|i| i.key_pressed(egui::Key::Enter)));
                 cancel = ui.button("Cancel").clicked();
@@ -2412,7 +2679,12 @@ impl BeaverApp {
         let mut open = !(cancel || modal.should_close());
         if submit {
             match self.save_account(&form) {
-                Ok(()) => open = false,
+                Ok(serial) => {
+                    open = false;
+                    if self.show_settings {
+                        self.settings_page = SettingsPage::Account(serial);
+                    }
+                }
                 Err(e) => form.error = Some(e),
             }
         }
@@ -2574,11 +2846,11 @@ impl BeaverApp {
                                     }
                                 });
                             header.header_response.context_menu(|ui| {
-                                if ui.button("Edit account…").clicked() {
+                                if ui.button("Account settings…").clicked() {
                                     edit = Some(view.serial);
                                     ui.close();
                                 }
-                                if ui.button("Remove account").clicked() {
+                                if ui.button("Remove account…").clicked() {
                                     removed = Some(view.serial);
                                     ui.close();
                                 }
@@ -2983,10 +3255,9 @@ impl eframe::App for BeaverApp {
         }
         let SidebarOutcome { chosen, suspicious, recheck, empty, removed, edit, mut add } =
             if self.in_tab { SidebarOutcome::default() } else { self.sidebar(ui, &t) };
-        if let Some(serial) = edit
-            && let Some(view) = self.view(serial)
-        {
-            self.form = Some(NewAccount::editing(serial, &view.account));
+        if let Some(serial) = edit {
+            self.show_settings = true;
+            self.leave_settings_page(Some(SettingsPage::Account(serial)));
         }
         if let Some((serial, index)) = chosen {
             self.show_suspicious = false;
@@ -3011,10 +3282,7 @@ impl eframe::App for BeaverApp {
         if empty.is_some() {
             self.confirm_empty = empty;
         }
-        if let Some(serial) = removed {
-            self.remove_account(serial);
-        }
-        self.account_form(ui.ctx());
+        self.confirm_remove = removed.or(self.confirm_remove);
 
         self.handle_keys(ui.ctx());
         let ReaderOutcome { action, url, mode, remember, attachment, save_many, allow_sender, mark, bulk } = self.reader(ui, &t);
@@ -3059,6 +3327,9 @@ impl eframe::App for BeaverApp {
         self.empty_dialog(ui.ctx(), &t);
         self.open_dialog(ui.ctx(), &t);
         self.settings_window(ui.ctx(), &t);
+        // After Settings, so the dialogs it opens show above it.
+        self.account_form(ui.ctx());
+        self.remove_dialog(ui.ctx(), &t);
         if self.locked()
             && let Some(request) = security::unlock_prompt(ui.ctx(), &t, &mut self.security, self.unlocking)
         {
@@ -3198,5 +3469,20 @@ mod tests {
         assert_eq!(form.build().unwrap(), account);
         form.imap_host.clear();
         assert!(!form.ready());
+    }
+
+    #[test]
+    fn an_account_page_knows_when_it_has_unsaved_changes() {
+        let account = filled().build().unwrap();
+        let mut form = NewAccount::editing(7, &account);
+        assert!(!form.changed(&account), "a page just opened has nothing to save");
+        form.signature = "Ada".into();
+        assert!(form.changed(&account));
+        let mut form = NewAccount::editing(7, &account);
+        form.password = "new".into();
+        assert!(form.changed(&account), "a new password is a change");
+        let mut form = NewAccount::editing(7, &account);
+        form.imap_port = "not a port".into();
+        assert!(form.changed(&account), "an invalid form is never dropped silently");
     }
 }

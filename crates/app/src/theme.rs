@@ -8,6 +8,8 @@ use eframe::egui::{self, Color32, CornerRadius, Margin, Shadow, Stroke, TextStyl
 /// One geometry contract for every view (mirrors the Flectar/Slint `LayoutMetrics`): views never invent sizes.
 pub const CONTROL_H: f32 = 40.0;
 pub const CONTROL_RADIUS: u8 = 8;
+/// Section titles inside a page: between body (15) and heading (22).
+pub const SUBTITLE: f32 = 17.0;
 
 const fn rgb(hex: u32) -> Color32 {
     Color32::from_rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)

@@ -157,6 +157,9 @@ pub struct Account {
     /// How much of the mailbox is downloaded for offline use.
     #[serde(default)]
     pub keep: Keep,
+    /// Text added under new messages, replies and forwards; empty for none.
+    #[serde(default)]
+    pub signature: String,
 }
 
 /// How much mail is kept on this computer. Headers and flags are always synchronised.

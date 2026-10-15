@@ -26,7 +26,7 @@ async fn start(good_password: &'static str, password: &str) -> (SmtpSender, Arc<
         }
     });
     let server = Server { host: "127.0.0.1".into(), port, tls: Tls::None };
-    let account = Account { name: "mock".into(), user: "me@example.com".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true, keep: beavermail_core::Keep::default() };
+    let account = Account { name: "mock".into(), user: "me@example.com".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true, keep: beavermail_core::Keep::default(), signature: String::new() };
     (SmtpSender::new(&account, password.into()), transcript)
 }
 

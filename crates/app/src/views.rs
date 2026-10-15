@@ -94,19 +94,32 @@ fn role_icon(role: Role) -> Icon {
 
 /// A folder in the sidebar: coloured icon, name, and the unread count in a pill.
 pub fn folder_row(ui: &mut Ui, t: &Tokens, title: &str, role: Role, unread: u32, selected: bool) -> Response {
-    nav_row(ui, t, title, role_icon(role), theme::role_color(role), unread, selected)
+    nav_row(ui, t, title, Some((role_icon(role), theme::role_color(role))), unread, selected)
 }
 
 /// Under an Inbox: the mail held apart as suspicious, with how many messages in the pill.
 pub fn suspicious_row(ui: &mut Ui, t: &Tokens, held: u32, selected: bool) -> Response {
-    nav_row(ui, t, "Suspicious", Icon::Spam, t.danger, held, selected)
+    nav_row(ui, t, "Suspicious", Some((Icon::Spam, t.danger)), held, selected)
 }
 
-fn nav_row(ui: &mut Ui, t: &Tokens, title: &str, icon: Icon, color: Color32, unread: u32, selected: bool) -> Response {
+/// A page in the settings sidebar: its icon, or with none the initials of `title` (an account).
+pub fn settings_row(ui: &mut Ui, t: &Tokens, title: &str, icon: Option<Icon>, selected: bool) -> Response {
+    let response = nav_row(ui, t, title, icon.map(|i| (i, if selected { t.accent } else { t.text_dim })), 0, selected);
+    response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, title));
+    response
+}
+
+fn nav_row(ui: &mut Ui, t: &Tokens, title: &str, icon: Option<(Icon, Color32)>, unread: u32, selected: bool) -> Response {
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), FOLDER_ROW_H), Sense::click());
     row_background(ui, rect, &response, selected, t);
-    icon.image(icons::SIZE, color)
-        .paint_at(ui, Rect::from_center_size(pos2(rect.left() + 22.0, rect.center().y), vec2(icons::SIZE, icons::SIZE)));
+    let lead = pos2(rect.left() + 22.0, rect.center().y);
+    match icon {
+        Some((icon, color)) => icon.image(icons::SIZE, color).paint_at(ui, Rect::from_center_size(lead, vec2(icons::SIZE, icons::SIZE))),
+        None => avatar(ui, t, title, lead, 24.0),
+    }
+    if response.has_focus() {
+        ui.painter().rect_stroke(rect, CornerRadius::same(CONTROL_RADIUS), egui::Stroke::new(1.0, t.accent), egui::StrokeKind::Inside);
+    }
     let mut right = 12.0;
     if unread > 0 {
         let galley = ui.painter().layout_no_wrap(unread.to_string(), FontId::proportional(12.5), if selected { t.accent } else { t.text_dim });

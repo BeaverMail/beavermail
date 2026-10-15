@@ -84,6 +84,8 @@ pub fn markdown_html(markdown: &str) -> String {
     let mut dropped_link = false;
     let events = Parser::new_ext(markdown, Options::ENABLE_STRIKETHROUGH).filter_map(|event| match event {
         Event::Html(text) | Event::InlineHtml(text) => Some(Event::Text(text)),
+        // A line break the writer typed stays one (a signature's lines would run together otherwise).
+        Event::SoftBreak => Some(Event::HardBreak),
         Event::Start(Tag::Image { .. }) | Event::End(TagEnd::Image) => None,
         Event::Start(Tag::Link { ref dest_url, .. }) if !["http://", "https://", "mailto:"].iter().any(|s| dest_url.to_ascii_lowercase().starts_with(s)) => {
             dropped_link = true;
@@ -262,6 +264,7 @@ mod tests {
         let html = markdown_html(&rich.body);
         assert!(html.contains("<h1>Hi</h1>") && html.contains("<strong>bold</strong>") && html.contains("href=\"https://a.example\""), "{html}");
         assert!(!html.contains("<script") && !html.contains("<img") && !html.contains("javascript:") && !html.contains("t.example"), "{html}");
+        assert!(markdown_html("Ada\nAcme").contains("Ada<br />\nAcme"), "a typed line break stays a line break");
         rich.attachments = vec![beavermail_core::OutgoingFile { name: "a.txt".into(), mime: "text/plain".into(), data: b"x".to_vec() }];
         let mixed = String::from_utf8(render_draft(&rich, "d").unwrap()).unwrap();
         assert!(mixed.find("multipart/mixed").unwrap() < mixed.find("multipart/alternative").unwrap(), "{mixed}");

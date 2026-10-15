@@ -49,6 +49,12 @@ pub struct Compose {
     touched: bool,
     /// Show the message as the recipient will read it instead of the text being edited.
     pub preview: bool,
+    /// The signature in the body, with the blank lines before it; empty when there is none.
+    sig: String,
+    /// The account whose signature `sig` is.
+    pub sig_from: u64,
+    /// Put the caret at the top of the body when it is first drawn (above a signature).
+    caret_top: bool,
 }
 
 pub enum Outcome {
@@ -104,6 +110,9 @@ impl Compose {
             pushing: false,
             touched: false,
             preview: false,
+            sig: String::new(),
+            sig_from: from,
+            caret_top: false,
         }
         .settled()
     }
@@ -294,10 +303,33 @@ impl Compose {
         forward.settled()
     }
 
-    /// Nothing typed yet, so closing loses nothing.
+    /// Nothing typed yet (a signature does not count), so closing loses nothing.
     pub fn is_empty(&self) -> bool {
-        [&self.to, &self.cc, &self.subject, &self.body].iter().all(|t| t.trim().is_empty()) && self.files.is_empty()
+        [&self.to, &self.cc, &self.subject, &self.body.replacen(&self.sig, "", 1)].iter().all(|t| t.trim().is_empty()) && self.files.is_empty()
     }
+
+    /// The body starts with the signature of the account the message is sent from.
+    pub fn with_signature(mut self, signature: &str) -> Self {
+        self.sig = signature_block(signature);
+        self.body.insert_str(0, &self.sig);
+        self.caret_top = !self.sig.is_empty();
+        self.settled()
+    }
+
+    /// The message is now sent from account `from`, whose signature is `signature`: the one in the body is
+    /// replaced. shortcut: a body that has text but no signature to replace is left alone.
+    pub fn change_signature(&mut self, from: u64, signature: &str) {
+        let new = signature_block(signature);
+        if !self.sig.is_empty() && self.body.contains(&self.sig) {
+            self.body = self.body.replacen(&self.sig, &new, 1);
+        } else if self.sig.is_empty() && self.body.trim().is_empty() {
+            self.body = new.clone();
+            self.caret_top = !new.is_empty();
+        }
+        self.sig = new;
+        self.sig_from = from;
+    }
+
 
     pub fn attached_size(&self) -> u64 {
         self.files.iter().map(|f| f.size).sum()
@@ -321,6 +353,11 @@ impl Compose {
             rich,
         }
     }
+}
+
+/// A signature as it goes in the body: after a blank line and the "-- " line mail programs know it by.
+fn signature_block(signature: &str) -> String {
+    if signature.trim().is_empty() { String::new() } else { format!("\n\n-- \n{}", signature.trim_end()) }
 }
 
 /// The files among `paths` that can be attached (folders and missing files are left out), with the
@@ -545,6 +582,11 @@ pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &
                         crate::views::body(ui, t, &blocks);
                         return;
                     }
+                    if std::mem::take(&mut compose.caret_top) {
+                        let mut state = egui::text_edit::TextEditState::default();
+                        state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(0))));
+                        state.store(ctx, id);
+                    }
                     let mut output = TextEdit::multiline(&mut compose.body)
                         .id(id)
                         .frame(Frame::NONE)
@@ -651,6 +693,29 @@ pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_signature_goes_under_the_text_and_is_not_text() {
+        let mut c = Compose::new(1).with_signature("Ada\nAcme\n");
+        assert_eq!(c.body, "\n\n-- \nAda\nAcme");
+        assert!(c.is_empty(), "only a signature: nothing to lose");
+        c.change_signature(2, "Other");
+        assert_eq!((c.body.as_str(), c.sig_from), ("\n\n-- \nOther", 2), "another account, its signature");
+        c.change_signature(3, "");
+        assert_eq!(c.body, "", "an account without one");
+        let mut c = Compose::new(1).with_signature("A");
+        c.body.insert_str(0, "hello");
+        c.change_signature(2, "B");
+        assert_eq!(c.body, "hello\n\n-- \nB", "what was typed stays above");
+        assert!(!c.is_empty());
+        let mut c = Compose::new(1);
+        c.change_signature(2, "B");
+        assert_eq!(c.body, "\n\n-- \nB", "an empty body takes the new account's signature");
+        let mut c = Compose::new(1);
+        c.body = "hi".into();
+        c.change_signature(2, "B");
+        assert_eq!(c.body, "hi", "text without a signature to replace is left alone");
+    }
 
     #[test]
     fn toolbar_edits_wrap_prefix_and_link() {
