@@ -438,6 +438,12 @@ impl Compose {
     }
 
     /// The body starts with the signature of the account the message is sent from.
+    /// Addressed to `to` (list items, the last finished with a separator), as an untouched draft.
+    pub fn with_to(mut self, to: &str) -> Self {
+        self.to = to.to_owned();
+        self.settled()
+    }
+
     pub fn with_signature(mut self, signature: &str) -> Self {
         self.sig = signature_block(signature);
         self.body.insert_str(0, &self.sig);
@@ -609,7 +615,7 @@ fn suggestions<'a>(contacts: &'a [Contact], typed: &str, taken: &[String]) -> Ve
 }
 
 /// A contact as a list item: "Ada Lovelace <ada@x.org>", the name quoted when it has a comma or the like.
-fn list_item(name: &str, address: &str) -> String {
+pub fn list_item(name: &str, address: &str) -> String {
     match name {
         "" => address.to_owned(),
         name if name.contains([',', ';', '"', '<', '>', '@', '(', ')']) => format!("\"{}\" <{address}>", name.replace('"', "")),

@@ -143,6 +143,19 @@ impl Contact {
     }
 }
 
+/// What the archive knows of someone, for their card.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ContactCard {
+    pub name: String,
+    pub address: String,
+    /// In the address book the user keeps, not only suggested from mail.
+    pub saved: bool,
+    pub notes: String,
+    /// Messages the user sent them, from every account, and when the last one went.
+    pub sent: u32,
+    pub last_sent: Option<i64>,
+}
+
 /// Lower case without accents, each run of other characters one space, and a space in front
 /// (" nicolo rossi n rossi x org"): a word starts after a space.
 pub fn fold(text: &str) -> String {
@@ -570,6 +583,10 @@ fn migrate(conn: &Connection) -> Result<(), MailError> {
             .map_err(db)?;
             learn_archive(conn).map_err(db)?;
             conn.execute_batch("PRAGMA user_version = 14;").map_err(db)?;
+        }
+        // Version 15: notes on a contact.
+        if version < 15 {
+            conn.execute_batch("ALTER TABLE contacts ADD COLUMN notes TEXT NOT NULL DEFAULT ''; PRAGMA user_version = 15;").map_err(db)?;
         }
     Ok(())
 }
@@ -1001,6 +1018,66 @@ impl Store {
         rows.collect::<Result<_, _>>().map_err(db)
     }
 
+    /// Someone's card: as the address book or mail knows them; `None` for someone never written to nor saved.
+    pub fn contact_card(&self, address: &str) -> Result<Option<ContactCard>, MailError> {
+        self.conn()
+            .query_row(
+                "SELECT c.name, c.address, c.saved, c.notes, COALESCE(SUM(a.sent), 0), MAX(a.last) FROM contacts c LEFT JOIN contact_accounts a ON a.address = c.address WHERE c.address = ?1 GROUP BY c.address",
+                [address.trim().to_lowercase()],
+                |r| Ok(ContactCard { name: r.get(0)?, address: r.get(1)?, saved: r.get::<_, i64>(2)? != 0, notes: r.get(3)?, sent: r.get::<_, i64>(4)? as u32, last_sent: r.get(5)? }),
+            )
+            .optional()
+            .map_err(db)
+    }
+
+    /// Puts someone in the address book with this name and notes; mail never renames them after.
+    pub fn save_contact(&self, address: &str, name: &str, notes: &str) -> Result<(), MailError> {
+        let address = address.trim().to_lowercase();
+        self.conn()
+            .execute(
+                "INSERT INTO contacts (address, name, folded, saved, notes) VALUES (?1, ?2, ?3, 1, ?4)
+                 ON CONFLICT (address) DO UPDATE SET name = excluded.name, folded = excluded.folded, saved = 1, notes = excluded.notes",
+                params![address, name.trim(), fold(&format!("{} {address}", name.trim())), notes.trim_end()],
+            )
+            .map(|_| ())
+            .map_err(db)
+    }
+
+    /// Takes someone out of the address book, notes and all: they stay a suggestion if the user wrote to them.
+    pub fn unsave_contact(&self, address: &str) -> Result<(), MailError> {
+        let address = address.trim().to_lowercase();
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(db)?;
+        tx.execute("UPDATE contacts SET saved = 0, notes = '' WHERE address = ?1", [&address]).map_err(db)?;
+        tx.execute("DELETE FROM contacts WHERE address = ?1 AND address NOT IN (SELECT address FROM contact_accounts)", [&address]).map_err(db)?;
+        tx.commit().map_err(db)
+    }
+
+    /// The address book: the contacts the user saved, by name.
+    pub fn saved_contacts(&self) -> Result<Vec<Contact>, MailError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT name, address, folded FROM contacts WHERE saved = 1 ORDER BY CASE WHEN name = '' THEN address ELSE lower(name) END").map_err(db)?;
+        let rows = stmt.query_map([], |r| Ok(Contact { name: r.get(0)?, address: r.get(1)?, folded: r.get(2)? })).map_err(db)?;
+        rows.collect::<Result<_, _>>().map_err(db)
+    }
+
+    /// The latest messages from someone, or sent to them, in every account, as (account, where it
+    /// is); Spam and Trash are left out.
+    pub fn messages_with(&self, address: &str, limit: usize) -> Result<Vec<(String, Hit)>, MailError> {
+        let conn = self.conn();
+        let sql = format!(
+            "SELECT {SUMMARY_COLUMNS}, folder, account FROM messages m
+             WHERE (lower(from_addr) = ?1 OR instr(' ' || COALESCE(recipients, '') || ' ', ' ' || ?1 || ' ') > 0)
+               AND folder NOT IN (SELECT name FROM folders f WHERE f.account = m.account AND f.role IN (?2, ?3))
+             ORDER BY timestamp DESC LIMIT ?4"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(db)?;
+        let rows = stmt
+            .query_map(params![address.trim().to_lowercase(), role_to_int(Role::Junk), role_to_int(Role::Trash), limit as i64], |r| Ok((r.get(13)?, Hit { message: summary(r)?, folder: r.get(12)? })))
+            .map_err(db)?;
+        rows.collect::<Result<_, _>>().map_err(db)
+    }
+
     /// Messages of `folder` that answer one the user sent: their In-Reply-To or References name a
     /// message of the Sent folder.
     pub fn replies_to_sent(&self, account: &str, folder: &str) -> Result<std::collections::HashSet<MessageId>, MailError> {
@@ -1379,6 +1456,38 @@ mod tests {
         }
         assert_eq!(names(&store, "me"), [("Bob Brown".to_owned(), "bob@y.org".to_owned()), ("Nicolò Rossi".to_owned(), "nico@x.org".to_owned())]);
         assert_eq!(count("bob@y.org"), 2);
+    }
+
+    #[test]
+    fn a_saved_contact_keeps_its_name_and_notes_and_has_a_history() {
+        let store = store();
+        store.set_folders("me", &[("INBOX".into(), Role::Inbox), ("Sent".into(), Role::Sent), ("Junk".into(), Role::Junk)]).unwrap();
+        let from = |uid, at| Header { from_name: "Bob B".into(), from_addr: "Bob@y.org".into(), ..header(uid, "from bob", at, false) };
+        store.add_headers("me", "INBOX", &[from(1, 10)]).unwrap();
+        store.add_headers("me", "Junk", &[from(2, 50)]).unwrap();
+        store.add_headers("me", "Sent", &[Header { message_id: "<a@me>".into(), recipients: "bob@y.org carl@z.org".into(), ..header(1, "to bob", 20, false) }]).unwrap();
+        let card = store.contact_card("BOB@y.org").unwrap().unwrap();
+        assert_eq!((card.name.as_str(), card.saved, card.sent, card.last_sent), ("Bob B", false, 1, Some(20)), "a suggestion, written to once");
+        assert_eq!(store.contact_card("nobody@x.org").unwrap(), None);
+        // His mail both ways, newest first, Spam left out.
+        let with: Vec<String> = store.messages_with("bob@y.org", 10).unwrap().into_iter().map(|(_, h)| h.message.subject).collect();
+        assert_eq!(with, ["to bob", "from bob"]);
+        assert!(store.messages_with("arl@z.org", 10).unwrap().is_empty(), "a whole address, not part of one");
+        // Saved: his own mail no longer renames him.
+        store.save_contact("bob@y.org", "Robert", "met at the fair").unwrap();
+        store.add_headers("me", "INBOX", &[Header { from_name: "Bobby".into(), ..from(3, 30) }]).unwrap();
+        let card = store.contact_card("bob@y.org").unwrap().unwrap();
+        assert_eq!((card.name.as_str(), card.saved, card.notes.as_str()), ("Robert", true, "met at the fair"));
+        assert!(Contact::new("Robert", "bob@y.org").matches("rob"));
+        assert_eq!(store.contacts("me").unwrap().iter().find(|c| c.address == "bob@y.org").unwrap().name, "Robert");
+        // Someone never written to can be saved too, and leaves entirely when taken out.
+        store.save_contact("dora@w.org", "Dora", "").unwrap();
+        assert_eq!(store.saved_contacts().unwrap().iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["Dora", "Robert"]);
+        store.unsave_contact("dora@w.org").unwrap();
+        assert_eq!(store.contact_card("dora@w.org").unwrap(), None);
+        store.unsave_contact("bob@y.org").unwrap();
+        let card = store.contact_card("bob@y.org").unwrap().unwrap();
+        assert!(!card.saved && card.notes.is_empty(), "back to a suggestion: written to");
     }
 
     #[test]

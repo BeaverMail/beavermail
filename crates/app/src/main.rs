@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 mod attachments;
+mod card;
 mod commands;
 mod compose;
 mod drafts;
@@ -302,6 +303,8 @@ struct ReaderOutcome {
     back: bool,
     /// Trust was pressed for this message's sender.
     trust: Option<MessageId>,
+    /// The sender's name was clicked: open their card, as (address, name).
+    card: Option<(String, String)>,
 }
 
 struct AccountView {
@@ -493,12 +496,13 @@ enum SettingsPage {
     Writing,
     Spam,
     Storage,
+    Contacts,
     /// One account's page, by serial.
     Account(u64),
 }
 
 impl SettingsPage {
-    const ALL: [Self; 4] = [Self::Reading, Self::Writing, Self::Spam, Self::Storage];
+    const ALL: [Self; 5] = [Self::Reading, Self::Writing, Self::Spam, Self::Contacts, Self::Storage];
 
     fn title(self) -> &'static str {
         match self {
@@ -506,6 +510,7 @@ impl SettingsPage {
             Self::Writing => "Writing",
             Self::Spam => "Suspicious mail",
             Self::Storage => "Stored mail",
+            Self::Contacts => "Contacts",
             Self::Account(_) => "Account",
         }
     }
@@ -516,6 +521,7 @@ impl SettingsPage {
             Self::Writing => Some(Icon::Pencil),
             Self::Spam => Some(Icon::Spam),
             Self::Storage => Some(Icon::Lock),
+            Self::Contacts => Some(Icon::Mail),
             Self::Account(_) => None,
         }
     }
@@ -526,6 +532,7 @@ impl SettingsPage {
             Self::Writing => "How messages you write are composed and sent.",
             Self::Spam => "Mail from people you know is never held. Nothing moves on the server.",
             Self::Storage => "How downloaded messages are kept on this computer.",
+            Self::Contacts => "The people you keep, with their name and notes. They stay on this computer, and come first when you write.",
             Self::Account(_) => "",
         }
     }
@@ -829,6 +836,13 @@ struct BeaverApp {
     account_edit: Option<NewAccount>,
     /// A sign-in with a provider, from Add account or an account's page, until it ends.
     signing_in: Option<SignIn>,
+    /// A person's card, open over everything else.
+    card: Option<card::Card>,
+    /// The saved contacts for Settings > Contacts, read when that page is drawn after a change.
+    address_book: Option<Vec<beavermail_store::Contact>>,
+    /// What is typed in Settings > Contacts: a search, and an address to add.
+    contact_query: String,
+    new_contact: String,
     /// Everyone written to, to suggest in a message's address fields; read again for each new message.
     contacts: Arc<Vec<beavermail_store::Contact>>,
     /// Where the user asked to go from an account page with unsaved changes (`None`: close Settings),
@@ -977,6 +991,10 @@ impl BeaverApp {
             account_edit: None,
             signing_in: None,
             contacts: Default::default(),
+            card: None,
+            address_book: None,
+            contact_query: String::new(),
+            new_contact: String::new(),
             settings_leave: None,
             confirm_remove: None,
             confirm_unsubscribe: None,
@@ -1933,6 +1951,11 @@ impl BeaverApp {
 
     /// Opens the compose window from the selected account, or the first one that can send.
     fn new_message(&mut self) {
+        self.new_message_to("");
+    }
+
+    /// Opens the compose window addressed to `to` (a list item, or nothing).
+    fn new_message_to(&mut self, to: &str) {
         if self.compose.is_some() {
             return;
         }
@@ -1941,7 +1964,7 @@ impl BeaverApp {
         let shown = self.selected.map(|(s, _)| s).or_else(|| self.message.and_then(|id| self.serial_of(id)));
         let from = shown.filter(|s| senders.iter().any(|(x, _)| x == s)).or_else(|| senders.first().map(|(s, _)| *s));
         let signature = from.and_then(|f| self.view(f)).map(|v| v.account.signature.clone()).unwrap_or_default();
-        self.start_compose(from.map(|f| compose::Compose::new(f).with_signature(&signature)));
+        self.start_compose(from.map(|f| compose::Compose::new(f).with_signature(&signature).with_to(to)));
     }
 
     /// Shows a compose window, remembering which account's drafts it belongs to.
@@ -2415,6 +2438,7 @@ impl BeaverApp {
         let mut goto: Option<Option<SettingsPage>> = None;
         let (mut save, mut discard, mut add) = (false, false, false);
         let mut page_action = None;
+        let mut open_contact: Option<String> = None;
         let (mode, locked, job) = (self.vault.mode(), self.vault.is_locked(), self.vault_job.clone());
         // The same height on every page, so the window does not jump when the page changes.
         let height = (ctx.content_rect().height() - 120.0).clamp(380.0, 640.0);
@@ -2645,6 +2669,44 @@ impl BeaverApp {
                                     });
                                 }
                             }
+                            SettingsPage::Contacts => {
+                                let archive = self.archive.clone();
+                                let book = self.address_book.get_or_insert_with(|| archive.saved_contacts().unwrap_or_default());
+                                ui.horizontal(|ui| {
+                                    let valid = beavermail_smtp::valid_address(&self.new_contact);
+                                    let typed = ui.add(sized_field(&mut self.new_contact, FIELD_WIDTH).hint_text("name@example.com"));
+                                    let add = ui.add_enabled(valid, egui::Button::new("Add contact…")).on_disabled_hover_text("Type an address first");
+                                    if valid && (add.clicked() || (typed.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))) {
+                                        open_contact = Some(std::mem::take(&mut self.new_contact));
+                                    }
+                                });
+                                if book.is_empty() {
+                                    ui.add_space(8.0);
+                                    hint(ui, "No contacts yet. Add one above, or click a sender's name in a message to open their card and save them.");
+                                } else {
+                                    ui.add_space(8.0);
+                                    ui.add(sized_field(&mut self.contact_query, FIELD_WIDTH).hint_text("Search contacts"));
+                                    ui.add_space(6.0);
+                                    ui.spacing_mut().item_spacing.y = 2.0;
+                                    let query = self.contact_query.trim();
+                                    let mut shown = 0;
+                                    for contact in book.iter().filter(|c| query.is_empty() || c.matches(query)) {
+                                        shown += 1;
+                                        let mut job = egui::text::LayoutJob::default();
+                                        if !contact.name.is_empty() {
+                                            job.append(&contact.name, 0.0, egui::TextFormat::simple(egui::FontId::proportional(15.0), t.text));
+                                        }
+                                        job.append(&contact.address, if contact.name.is_empty() { 0.0 } else { 10.0 }, egui::TextFormat::simple(egui::FontId::proportional(13.0), t.text_dim));
+                                        let row = egui::Button::selectable(false, job).truncate().min_size(vec2(ui.available_width(), 32.0));
+                                        if ui.add(row).on_hover_text("Open their card").clicked() {
+                                            open_contact = Some(contact.address.clone());
+                                        }
+                                    }
+                                    if shown == 0 {
+                                        hint(ui, "No contact matches.");
+                                    }
+                                }
+                            }
                             SettingsPage::Storage => {
                                 vault_request = security::section(ui, t, &mut self.security, mode, locked, job.as_deref());
                                 if locked && ui.button("Unlock…").clicked() {
@@ -2694,6 +2756,9 @@ impl BeaverApp {
                 }
                 Err(e) => self.account_edit = Some(NewAccount { error: Some(e), ..form }),
             }
+        }
+        if let Some(address) = open_contact {
+            self.open_card(&address, "");
         }
         match (page_action, self.settings_page) {
             (Some(PageAction::Remove), SettingsPage::Account(serial)) => self.confirm_remove = Some(serial),
@@ -2913,6 +2978,60 @@ impl BeaverApp {
         }
         if confirm || cancel || modal.should_close() {
             self.confirm_block = None;
+        }
+    }
+
+    /// Opens the card of `address`; `name` is how the message showing it names them, for someone the
+    /// archive does not know yet.
+    fn open_card(&mut self, address: &str, name: &str) {
+        let address = address.trim().to_lowercase();
+        if address.is_empty() {
+            return;
+        }
+        let data = self.archive.contact_card(&address).ok().flatten().unwrap_or_else(|| beavermail_store::ContactCard {
+            name: if name.contains('@') { String::new() } else { name.trim().to_owned() },
+            address: address.clone(),
+            ..Default::default()
+        });
+        let keys: Vec<(String, u64)> = self.accounts.iter().map(|v| (v.account.key(), v.serial)).collect();
+        let recent = self.archive.messages_with(&address, 12).unwrap_or_default().into_iter().filter_map(|(key, hit)| Some((keys.iter().find(|(k, _)| *k == key)?.1, hit))).collect();
+        self.card = Some(card::Card::new(data, recent));
+    }
+
+    fn card_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
+        let Some(card) = self.card.as_mut() else { return };
+        let Some(action) = card::show(ctx, t, card) else { return };
+        let (address, name, notes) = (card.data.address.clone(), card.name.clone(), card.notes.clone());
+        match action {
+            card::CardAction::Save => {
+                if let Err(e) = self.archive.save_contact(&address, &name, &notes) {
+                    self.error = Some(format!("Could not save the contact: {e}"));
+                    return;
+                }
+                self.address_book = None;
+                self.notice = Some((format!("{} is in your contacts", if name.trim().is_empty() { &address } else { name.trim() }), std::time::Instant::now()));
+                self.open_card(&address, &name);
+            }
+            card::CardAction::Remove => {
+                if let Err(e) = self.archive.unsave_contact(&address) {
+                    self.error = Some(format!("Could not remove the contact: {e}"));
+                    return;
+                }
+                self.address_book = None;
+                self.open_card(&address, &name);
+            }
+            card::CardAction::Write => {
+                self.card = None;
+                let to = compose::list_item(name.trim(), &address);
+                self.new_message_to(&format!("{to}, "));
+            }
+            card::CardAction::Open(i) => {
+                let Some((serial, hit)) = card.recent.get(i).cloned() else { return };
+                self.card = None;
+                self.show_settings = false;
+                self.open_hit(serial, &hit, false);
+            }
+            card::CardAction::Close => self.card = None,
         }
     }
 
@@ -4564,7 +4683,7 @@ impl BeaverApp {
         let mut allow_sender = None;
         let mut mark = None;
         let mut suspicious = false;
-        let (mut leave, mut block, mut trust) = (None, None, None);
+        let (mut leave, mut block, mut trust, mut card) = (None, None, None, None);
         let scroll = self.reader_scroll.take();
         let (mut switch, mut expand) = (None, false);
         // The open message's conversation, oldest first, when the list shows conversations.
@@ -4718,6 +4837,12 @@ impl BeaverApp {
                             let detail = if message.address.is_empty() || message.address == message.from { message.received.clone() } else { format!("{}  ·  {}", message.address, message.received) };
                             let name = views::truncated(ui, &message.from, egui::FontId::proportional(15.5), t.text, text_right - left);
                             let date = views::truncated(ui, &detail, egui::FontId::proportional(13.0), t.text_dim, text_right - left);
+                            // The name and the avatar open the sender's card.
+                            let who = egui::Rect::from_min_size(pos2(rect.left(), rect.top()), vec2(left - rect.left() + name.size().x, views::AVATAR));
+                            let open = ui.interact(who, ui.id().with("sender_card"), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Open their card: name, notes, your conversations");
+                            if open.clicked() {
+                                card = Some((message.address.clone(), message.from.clone()));
+                            }
                             ui.painter().galley(pos2(left, rect.top() + 3.0), name, t.text);
                             ui.painter().galley(pos2(left, rect.top() + 23.0), date, t.text_dim);
                             for finding in &body.findings {
@@ -4841,7 +4966,7 @@ impl BeaverApp {
                 pane_ring(ui, t, reader.response.rect);
             }
         }
-        ReaderOutcome { action, url, mode: chosen_mode, remember, attachment, save_many, allow_sender, mark, bulk, unsubscribe: leave, block, switch, expand, back, trust }
+        ReaderOutcome { action, url, mode: chosen_mode, remember, attachment, save_many, allow_sender, mark, bulk, unsubscribe: leave, block, switch, expand, back, trust, card }
     }
 }
 
@@ -4957,8 +5082,11 @@ impl eframe::App for BeaverApp {
         }
         // Without the reading pane and with no message in its place, there is no reader to draw.
         let shows_reader = self.in_tab || self.full_preview || self.settings.reading_pane;
-        let ReaderOutcome { action, url, mode, remember, attachment, save_many, allow_sender, mark, bulk, unsubscribe, block, switch, expand, back, trust } =
+        let ReaderOutcome { action, url, mode, remember, attachment, save_many, allow_sender, mark, bulk, unsubscribe, block, switch, expand, back, trust, card } =
             if shows_reader { self.reader(ui, &t) } else { ReaderOutcome::default() };
+        if let Some((address, name)) = card {
+            self.open_card(&address, &name);
+        }
         self.full_preview &= !back;
         if let Some(id) = trust {
             self.trust(id);
@@ -5030,6 +5158,7 @@ impl eframe::App for BeaverApp {
         // After Settings, so the dialogs it opens show above it.
         self.account_form(ui.ctx());
         self.remove_dialog(ui.ctx(), &t);
+        self.card_dialog(ui.ctx(), &t);
         self.unsubscribe_dialog(ui.ctx(), &t);
         self.palette_window(ui.ctx(), &t);
         self.toast(ui.ctx(), &t);
