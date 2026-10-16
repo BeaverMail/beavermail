@@ -92,9 +92,10 @@ pub fn button(ui: &mut Ui, t: &Tokens, icon: Icon, tip: &str, enabled: bool, act
     if enabled { response } else { response.interact(Sense::hover()) }
 }
 
-/// A small icon button for inside fields: no hover plate bigger than the icon.
+/// A small icon button for inside fields: no hover plate bigger than the icon. Tab passes it by, so
+/// it does not sit between a field and the next (removing a chip or a file has its key: Backspace).
 pub fn button_small(ui: &mut Ui, t: &Tokens, icon: Icon, tip: &str) -> Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::CLICK);
     let color = if response.hovered() { t.text } else { t.text_dim };
     icon.image(14.0, color).paint_at(ui, egui::Rect::from_center_size(rect.center(), Vec2::splat(14.0)));
     response.on_hover_cursor(CursorIcon::PointingHand).on_hover_text(tip)

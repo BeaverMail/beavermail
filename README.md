@@ -22,7 +22,7 @@ Licensed under AGPL-3.0-only (see [LICENSE](LICENSE)).
 - Sender checks (server authentication results, look-alike names and domains, misleading links, risky attachments).
 - Spam: mail from new senders that fails a check is held as "Suspicious"; a classifier learns from what you mark; trust or block a sender, and review both lists in Settings.
 - Unsubscribe from mailing lists (one-click for verified senders, else an email or the sender's page) and block a sender.
-- Markdown compose, drafts kept locally and on the server, attachments; undo send (configurable), send later, signatures per account.
+- Markdown compose, addresses as chips (a wrong one in red), Cc and Bcc on demand (Bcc kept in your Sent copy only), drafts kept locally and on the server, attachments; undo send (configurable), send later, signatures per account.
 - Conversations: one row per thread (References, In-Reply-To, "Re:" subjects) with your replies from Sent; can be turned off.
 - Messages open in tabs (double click); the reading pane beside the list can be turned off, so a message opens in the list's place.
 

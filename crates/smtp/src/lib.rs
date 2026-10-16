@@ -42,10 +42,35 @@ fn address(text: &str) -> Result<Mailbox, MailError> {
     text.trim().parse().map_err(|_| backend(format!("{:?} is not a valid email address", text.trim())))
 }
 
+/// Whether `text` is an address a message can go to ("ada@example.org", "Ada <ada@example.org>"). A
+/// domain without a dot ("ada@example") is allowed by the standard but is nearly always a slip.
+pub fn valid_address(text: &str) -> bool {
+    text.trim().parse::<Mailbox>().is_ok_and(|m| {
+        let domain = m.email.domain();
+        domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.')
+    })
+}
+
+/// A Message-ID for a message sent now, at the sender's domain: unique by the time, this process and a count.
+fn new_message_id(from: &str) -> String {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNT: AtomicU32 = AtomicU32::new(0);
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let domain = from.rsplit('@').next().map(|d| d.trim().trim_end_matches('>')).filter(|d| !d.is_empty() && !d.contains(' ')).unwrap_or("beavermail.invalid");
+    format!("{nanos:x}.{:x}.{:x}@{domain}", std::process::id(), COUNT.fetch_add(1, Ordering::Relaxed))
+}
+
 /// Builds the RFC 5322 message, checking every address.
+#[cfg(test)]
 fn build(message: &Outgoing) -> Result<Message, MailError> {
+    build_with(message, &new_message_id(&message.from), std::time::SystemTime::now(), false)
+}
+
+/// As [`build`], with its Message-ID and date given, so the copy kept in Sent can be the same message.
+/// `keep_bcc`: the Bcc header stays (the sender's copy); without it only the envelope carries them.
+fn build_with(message: &Outgoing, id: &str, date: std::time::SystemTime, keep_bcc: bool) -> Result<Message, MailError> {
     let mut builder = Message::builder().from(address(&message.from)?).subject(message.subject.clone());
-    if message.to.is_empty() {
+    if message.to.is_empty() && message.cc.is_empty() && message.bcc.is_empty() {
         return Err(backend("add at least one recipient"));
     }
     for to in &message.to {
@@ -54,6 +79,12 @@ fn build(message: &Outgoing) -> Result<Message, MailError> {
     for cc in &message.cc {
         builder = builder.cc(address(cc)?);
     }
+    for bcc in &message.bcc {
+        builder = builder.bcc(address(bcc)?);
+    }
+    if keep_bcc {
+        builder = builder.keep_bcc();
+    }
     if let Some(id) = &message.in_reply_to {
         builder = builder.in_reply_to(bracketed(id));
     }
@@ -61,7 +92,7 @@ fn build(message: &Outgoing) -> Result<Message, MailError> {
         let refs: Vec<String> = message.references.iter().map(|r| bracketed(r)).collect();
         builder = builder.references(refs.join(" "));
     }
-    let builder = builder.date_now().message_id(None);
+    let builder = builder.date(date).message_id(Some(bracketed(id)));
     with_content(builder, message)
 }
 
@@ -169,6 +200,11 @@ pub fn render_draft(message: &Outgoing, id: &str) -> Result<Vec<u8>, MailError> 
     for cc in message.cc.iter().filter_map(|a| a.trim().parse::<Mailbox>().ok()) {
         builder = builder.cc(cc);
     }
+    // A draft keeps its blind copies, so they are there when it is opened again on any device.
+    for bcc in message.bcc.iter().filter_map(|a| a.trim().parse::<Mailbox>().ok()) {
+        builder = builder.bcc(bcc);
+    }
+    builder = builder.keep_bcc();
     if let Some(reply) = &message.in_reply_to {
         builder = builder.in_reply_to(bracketed(reply));
     }
@@ -218,8 +254,10 @@ impl MailSender for SmtpSender {
         if self.offline.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(MailError::Offline("working offline".into()));
         }
-        let email = build(&message)?;
-        let raw = email.formatted();
+        // What the recipients get has no Bcc header; the copy for Sent, otherwise the same, keeps it.
+        let (id, date) = (new_message_id(&message.from), std::time::SystemTime::now());
+        let email = build_with(&message, &id, date, false)?;
+        let raw = if message.bcc.is_empty() { email.formatted() } else { build_with(&message, &id, date, true)?.formatted() };
         match self.transport()?.send(email).await {
             Ok(_) => Ok(raw),
             Err(e) if e.status().is_some_and(|code| code.to_string() == "535") => Err(MailError::Auth(e.to_string())),
@@ -233,6 +271,16 @@ impl MailSender for SmtpSender {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_address_needs_a_domain_with_a_dot() {
+        for good in ["ada@example.org", "Ada Lovelace <ada@example.org>", "\"Doe, John\" <john@mail.example.co.uk>"] {
+            assert!(valid_address(good), "{good}");
+        }
+        for bad in ["ada@acmecorp", "ada", "ada@", "@example.org", "ada@example.", "a b@example.org"] {
+            assert!(!valid_address(bad), "{bad}");
+        }
+    }
 
     #[test]
     fn blank_lines_the_writer_left_stay_but_code_is_untouched() {

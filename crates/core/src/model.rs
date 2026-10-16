@@ -252,6 +252,8 @@ pub struct Outgoing {
     pub from: String,
     pub to: Vec<String>,
     pub cc: Vec<String>,
+    /// Blind copies: they get the message, and no other recipient sees them.
+    pub bcc: Vec<String>,
     pub subject: String,
     pub body: String,
     /// `Message-ID` of the message being answered, without angle brackets.

@@ -9,6 +9,11 @@ use crate::theme::{self, Tokens};
 use crate::views;
 
 const ROW_H: f32 = 38.0;
+/// An address chip: its text and remove button with the frame's margin.
+const CHIP_H: f32 = 28.0;
+/// Show and go to the Cc and Bcc fields, as in Gmail.
+const CC_KEY: egui::KeyboardShortcut = egui::KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::C);
+const BCC_KEY: egui::KeyboardShortcut = egui::KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::B);
 const LABEL_W: f32 = 76.0;
 
 pub struct Compose {
@@ -16,6 +21,10 @@ pub struct Compose {
     pub from: u64,
     to: String,
     cc: String,
+    bcc: String,
+    /// Cc and Bcc show once asked for, or when they hold an address.
+    show_cc: bool,
+    show_bcc: bool,
     subject: String,
     body: String,
     /// Window title: "New message", "Reply" or "Forward".
@@ -165,6 +174,9 @@ impl Compose {
             from,
             to: String::new(),
             cc: String::new(),
+            bcc: String::new(),
+            show_cc: false,
+            show_bcc: false,
             subject: String::new(),
             body: String::new(),
             title: "New message",
@@ -214,7 +226,7 @@ impl Compose {
     fn fingerprint(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        (self.from, &self.to, &self.cc, &self.subject, &self.body, self.title, &self.in_reply_to, &self.references).hash(&mut hasher);
+        (self.from, &self.to, &self.cc, &self.bcc, &self.subject, &self.body, self.title, &self.in_reply_to, &self.references).hash(&mut hasher);
         for f in &self.files {
             (&f.name, f.size, &f.vault).hash(&mut hasher);
         }
@@ -282,6 +294,7 @@ impl Compose {
             title: self.title.to_owned(),
             to: self.to.clone(),
             cc: self.cc.clone(),
+            bcc: self.bcc.clone(),
             subject: self.subject.clone(),
             body: self.body.clone(),
             in_reply_to: self.in_reply_to.clone(),
@@ -304,6 +317,7 @@ impl Compose {
         Self {
             to: draft.to,
             cc: draft.cc,
+            bcc: draft.bcc,
             subject: draft.subject,
             body: draft.body,
             title,
@@ -413,7 +427,7 @@ impl Compose {
 
     /// Nothing typed yet (a signature does not count), so closing loses nothing.
     pub fn is_empty(&self) -> bool {
-        [&self.to, &self.cc, &self.subject, &self.body.replacen(&self.sig, "", 1)].iter().all(|t| t.trim().is_empty()) && self.files.is_empty()
+        [&self.to, &self.cc, &self.bcc, &self.subject, &self.body.replacen(&self.sig, "", 1)].iter().all(|t| t.trim().is_empty()) && self.files.is_empty()
     }
 
     /// The body starts with the signature of the account the message is sent from.
@@ -453,6 +467,7 @@ impl Compose {
             from: from_address.to_owned(),
             to: addresses(&self.to),
             cc: addresses(&self.cc),
+            bcc: addresses(&self.bcc),
             subject: self.subject.trim().to_owned(),
             body: self.body.clone(),
             in_reply_to: self.in_reply_to.clone(),
@@ -538,7 +553,137 @@ pub fn drop_hint(ctx: &egui::Context, t: &Tokens, rect: egui::Rect, text: &str) 
 /// Splits a recipient field on commas, semicolons and newlines.
 // shortcut: a comma inside a quoted display name ("Doe, John" <j@x.org>) splits it wrongly; write a real parser with contacts.
 pub fn addresses(text: &str) -> Vec<String> {
-    text.split([',', ';', '\n']).map(str::trim).filter(|a| !a.is_empty()).map(str::to_owned).collect()
+    split_addresses(text).0
+}
+
+/// The addresses of a list, and whether it ends with a separator (the last one is finished). A comma
+/// or semicolon separates outside quotes, except inside a name written "Doe, John <john@x.org>": before
+/// any address, with the `<address>` still to come before the next separator.
+fn split_addresses(text: &str) -> (Vec<String>, bool) {
+    let chars: Vec<char> = text.chars().collect();
+    let (mut out, mut current, mut quoted) = (Vec::new(), String::new(), false);
+    for (i, &c) in chars.iter().enumerate() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                current.push(c);
+            }
+            ',' | ';' | '\n' if !quoted => {
+                let next: String = chars[i + 1..].iter().take_while(|c| !matches!(c, ',' | ';' | '\n')).collect();
+                if !current.contains(['@', '<']) && !current.trim().is_empty() && next.contains('<') {
+                    current.push(c); // a name with a comma in it
+                } else {
+                    out.push(std::mem::take(&mut current));
+                }
+            }
+            c => current.push(c),
+        }
+    }
+    let finished = current.trim().is_empty();
+    out.push(current);
+    (out.into_iter().map(|a| a.trim().to_owned()).filter(|a| !a.is_empty()).collect(), finished)
+}
+
+/// The first address of the To, Cc and Bcc lists that cannot be sent to, for the reason Send is off.
+fn first_invalid(compose: &Compose) -> Option<String> {
+    [&compose.to, &compose.cc, &compose.bcc].into_iter().flat_map(|list| addresses(list)).find(|a| !beavermail_smtp::valid_address(a))
+}
+
+/// An address field as chips, one per address finished (a comma, Enter, or leaving the field), red
+/// when it cannot be sent to; what is being typed follows them. `text` stays the plain list. The
+/// caller draws the divider under the row: inside a row a separator is a vertical line that widens it.
+fn recipients(ui: &mut Ui, t: &Tokens, id: egui::Id, text: &mut String, hint: &str, width: f32) -> egui::Response {
+    let (mut done, finished) = split_addresses(text);
+    let mut typing = if finished { String::new() } else { done.pop().unwrap_or_default() };
+    let (mut remove, mut reopen) = (None, None);
+    // Chips are as tall as their text, not as the theme's 40-point controls, so the row keeps its height;
+    // set before the row is made, which takes its first line's height from it.
+    let controls = ui.spacing().interact_size;
+    ui.spacing_mut().interact_size.y = 0.0;
+    // Top-aligned with a margin that centres one line of chips in the row: centring inside a wrapping
+    // row places each item at its own height.
+    let pad = ((ROW_H - CHIP_H) / 2.0) as i8;
+    let shown = Frame::new().inner_margin(egui::Margin::symmetric(0, pad)).show(ui, |ui| {
+        ui.set_width(width);
+        ui.with_layout(Layout::left_to_right(Align::Min).with_main_wrap(true), |ui| {
+            ui.spacing_mut().item_spacing = vec2(6.0, 4.0);
+            for (i, address) in done.iter().enumerate() {
+                let valid = beavermail_smtp::valid_address(address);
+                // "Ada <ada@x.org>" shows as Ada; the address is on hover.
+                let name = address.split_once('<').map(|(n, _)| n.trim().trim_matches('"')).filter(|n| !n.is_empty()).unwrap_or(address);
+                // A wrong one as an error badge: a faint red ground, red outline and red text, readable in
+                // both themes (white on red would fall short of the contrast text needs).
+                let (fill, stroke, color) = if valid { (t.hover, egui::Stroke::NONE, t.text) } else { (t.danger.gamma_multiply(0.16), egui::Stroke::new(1.0, t.danger), t.danger) };
+                let margin = egui::Margin { left: 8, right: 3, top: 2, bottom: 2 };
+                let chip = Frame::new().fill(fill).stroke(stroke).corner_radius(egui::CornerRadius::same(6)).inner_margin(margin).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    // One line height for the icon, the name and the remove button, so they centre together.
+                    ui.spacing_mut().interact_size.y = CHIP_H - 6.0;
+                    ui.horizontal(|ui| {
+                        if !valid {
+                            ui.add(Icon::Spam.image(14.0, color));
+                        }
+                        // Clickable, but Tab passes it by: from one field to the next, not through every chip.
+                        let label = ui.add(egui::Label::new(RichText::new(name).size(14.0).color(color)).sense(egui::Sense::CLICK));
+                        let tip = if valid { address.clone() } else { format!("{address} is not an address mail can go to. Click to correct it.") };
+                        if label.on_hover_text(tip).clicked() {
+                            reopen = Some(i);
+                        }
+                        if crate::icons::button_small(ui, t, Icon::X, "Remove").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                });
+                chip.response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, address));
+            }
+            // With an address typed, Tab finishes it as a chip and stays here; on an empty field it goes on.
+            let holding = !typing.trim().is_empty();
+            ui.add(
+                TextEdit::singleline(&mut typing)
+                    .id(id)
+                    .lock_focus(holding)
+                    .frame(Frame::NONE)
+                    .hint_text(if done.is_empty() { hint } else { "" })
+                    // What is left of the line, less the gap before it: `available_width` in a wrapping row is
+                    // the whole width, which would always drop the field to a line of its own.
+                    .desired_width((ui.available_size_before_wrap().x - ui.spacing().item_spacing.x).max(120.0))
+                    // As tall as a chip: items of one height line up in a wrapping row.
+                    .min_size(vec2(0.0, CHIP_H))
+                    .vertical_align(Align::Center),
+            )
+        })
+        .inner
+    });
+    ui.spacing_mut().interact_size = controls;
+    let field = shown.inner;
+    let (enter, backspace, tab) = ui.input(|i| (i.key_pressed(Key::Enter), i.key_pressed(Key::Backspace), i.key_pressed(Key::Tab) && !i.modifiers.shift));
+    if let Some(i) = remove {
+        done.remove(i);
+    }
+    if let Some(i) = reopen {
+        // Back into the field to be corrected; what was being typed becomes a chip first.
+        let address = done.remove(i);
+        if !typing.trim().is_empty() {
+            done.push(std::mem::take(&mut typing));
+        }
+        typing = address;
+        field.request_focus();
+    } else if field.has_focus() && backspace && typing.is_empty() && !field.changed() {
+        typing = done.pop().unwrap_or_default();
+    }
+    let finish = (enter || tab) && field.has_focus();
+    if !typing.trim().is_empty() && (field.lost_focus() || finish) {
+        done.push(std::mem::take(&mut typing));
+        if finish {
+            field.request_focus(); // Enter and Tab finish the address, not the field
+        }
+    }
+    *text = match (done.is_empty(), typing.is_empty()) {
+        (true, _) => typing,
+        (false, true) => format!("{}, ", done.join(", ")),
+        (false, false) => format!("{}, {typing}", done.join(", ")),
+    };
+    field
 }
 
 /// A dim label in a fixed-width column, left-aligned so the fields start at the same x.
@@ -556,6 +701,7 @@ fn row(ui: &mut Ui, t: &Tokens, name: &str, text: &mut String, hint: &str) -> eg
             label(ui, t, name);
             ui.add(
                 TextEdit::singleline(text)
+                    .id(egui::Id::new(("compose_row", name)))
                     .frame(Frame::NONE)
                     .hint_text(hint)
                     .desired_width(f32::INFINITY)
@@ -653,7 +799,15 @@ fn toolbar(ui: &mut Ui, ctx: &egui::Context, t: &Tokens, compose: &mut Compose, 
 pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &[(u64, String)], rich: bool) -> Outcome {
     let mut outcome = Outcome::Keep;
     let waiting_for_files = compose.pending() > 0;
-    let ready = !compose.sending && !compose.to.trim().is_empty() && !waiting_for_files;
+    let invalid = first_invalid(compose);
+    let anyone = [&compose.to, &compose.cc, &compose.bcc].iter().any(|l| !addresses(l).is_empty());
+    let ready = !compose.sending && anyone && invalid.is_none() && !waiting_for_files;
+    let why_not = match &invalid {
+        _ if waiting_for_files => "Waiting for the attachments to be added".to_owned(),
+        Some(address) => format!("{address} is not an address mail can go to"),
+        None if !anyone => "Add a recipient first".to_owned(),
+        None => String::new(),
+    };
     let shown = egui::Window::new(compose.title)
         .id(egui::Id::new("compose"))
         .anchor(Align2::RIGHT_BOTTOM, [-16.0, -16.0])
@@ -699,11 +853,51 @@ pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &
                     });
                 });
                 ui.separator();
-                let to = row(ui, t, "To", &mut compose.to, "name@example.com, …");
+                // Cc and Bcc are asked for beside To, or with their keys; one in use stays shown.
+                for (key, show, salt) in [(CC_KEY, &mut compose.show_cc, "compose_cc"), (BCC_KEY, &mut compose.show_bcc, "compose_bcc")] {
+                    if ctx.input_mut(|i| i.consume_shortcut(&key)) {
+                        *show = true;
+                        ctx.memory_mut(|m| m.request_focus(egui::Id::new(salt)));
+                    }
+                }
+                let (show_cc, show_bcc) = (compose.show_cc || !compose.cc.trim().is_empty(), compose.show_bcc || !compose.bcc.trim().is_empty());
+                let to = ui
+                    .horizontal_top(|ui| {
+                        label(ui, t, "To");
+                        let links = if show_cc && show_bcc { 0.0 } else { 80.0 };
+                        // The links' width and the gap before them: asking for more would widen the window each frame.
+                        let gap = if links > 0.0 { ui.spacing().item_spacing.x } else { 0.0 };
+                        let field = recipients(ui, t, egui::Id::new("compose_to"), &mut compose.to, "name@example.com, …", ui.available_width() - links - gap);
+                        if links > 0.0 {
+                            ui.allocate_ui_with_layout(vec2(links, ROW_H), Layout::right_to_left(Align::Center), |ui| {
+                                // Out of the Tab order (To goes straight on to the next field); the keys open them.
+                                let link = |ui: &mut Ui, text: &str, tip: &str| {
+                                    ui.add(egui::Label::new(RichText::new(text).color(t.text_dim)).sense(egui::Sense::CLICK)).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip).clicked()
+                                };
+                                if !show_bcc && link(ui, "Bcc", &format!("Add blind copies: they get the message and nobody sees them ({})", ctx.format_shortcut(&BCC_KEY))) {
+                                    compose.show_bcc = true;
+                                }
+                                if !show_cc && link(ui, "Cc", &format!("Add copies ({})", ctx.format_shortcut(&CC_KEY))) {
+                                    compose.show_cc = true;
+                                }
+                            });
+                        }
+                        field
+                    })
+                    .inner;
+                ui.separator();
                 if std::mem::take(&mut compose.focus_to) {
                     to.request_focus();
                 }
-                row(ui, t, "Cc", &mut compose.cc, "");
+                for (shown, name, list, salt) in [(show_cc, "Cc", &mut compose.cc, "compose_cc"), (show_bcc, "Bcc", &mut compose.bcc, "compose_bcc")] {
+                    if shown {
+                        ui.horizontal_top(|ui| {
+                            label(ui, t, name);
+                            recipients(ui, t, egui::Id::new(salt), list, "", ui.available_width());
+                        });
+                        ui.separator();
+                    }
+                }
                 row(ui, t, "Subject", &mut compose.subject, "");
                 // Leave room for the header rows and buttons so the window never outgrows a small screen.
                 let body_h = (ctx.content_rect().height() - 360.0).clamp(120.0, 420.0);
@@ -790,7 +984,7 @@ pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &
             ui.add_space(8.0);
             ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::left_to_right(Align::Center), |ui| {
                 let send = views::primary_wide_fixed(ui, t, Icon::Send, if compose.sending { "Sending…" } else { "Send" }, ready, 120.0);
-                let send = if waiting_for_files { send.on_disabled_hover_text("Waiting for the attachments to be added") } else { send };
+                let send = if why_not.is_empty() { send } else { send.on_disabled_hover_text(&why_not) };
                 if send.clicked() {
                     outcome = Outcome::Send;
                 }
@@ -918,6 +1112,94 @@ mod tests {
         let rect = ctx.memory(|m| m.area_rect(egui::Id::new("pick_when"))).expect("the dialog is shown");
         assert!(rect.width() < PICK_WIDTH + 80.0, "as wide as the dialog, not a row of every day: {rect:?}");
         assert!(rect.height() > 300.0 && rect.height() < 560.0, "weeks under each other: {rect:?}");
+    }
+
+    #[test]
+    fn the_compose_window_keeps_its_size_with_chips_and_the_optional_rows() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let input = || egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(1600.0, 1000.0))), ..Default::default() };
+        let mut compose = Compose::new(1);
+        compose.to = "Ada Lovelace <ada@x.org>, dasds, grace@y.org, bo".into();
+        let size = |compose: &mut Compose| {
+            for _ in 0..2 {
+                let mut output = ctx.run_ui(input(), |ui| {
+                    window(ui.ctx(), &Tokens::dark(), compose, &[(1, "me@x.org".into())], false);
+                });
+                output.textures_delta.clear(); // nothing is drawn here
+            }
+            ctx.memory(|m| m.area_rect(egui::Id::new("compose"))).expect("the window is shown").size()
+        };
+        size(&mut compose);
+        let plain = size(&mut compose);
+        assert!(plain.x < 900.0 && plain.y < 800.0, "chips wrap inside the window: {plain:?}");
+        // Two short chips leave room for the field beside them: the row stays one line.
+        let mut short = Compose::new(1);
+        short.to = "ada@x.org, bob@y.org, ".into();
+        size(&mut short);
+        let chips = size(&mut short);
+        let mut empty = Compose::new(1);
+        size(&mut empty);
+        assert_eq!(chips.y, size(&mut empty).y, "the field stays beside the chips, not on a line of its own");
+        compose.show_cc = true;
+        compose.show_bcc = true;
+        size(&mut compose); // the new rows take a frame or two to be measured
+        let more = size(&mut compose);
+        assert!(more.y > plain.y && more.y < plain.y + 4.0 * ROW_H, "Cc and Bcc add a row each: {plain:?} then {more:?}");
+        assert_eq!(size(&mut compose), more, "the window settles: frames after do not widen it");
+    }
+
+    #[test]
+    fn tab_goes_from_to_to_the_next_field_not_through_chips_or_links() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let mut compose = Compose::new(1);
+        compose.to = "ada@x.org, bob@y.org, ".into();
+        let frame = |events: Vec<egui::Event>, compose: &mut Compose| {
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(1600.0, 1000.0))), events, ..Default::default() };
+            let mut output = ctx.run_ui(input, |ui| {
+                window(ui.ctx(), &Tokens::dark(), compose, &[(1, "me@x.org".into())], false);
+            });
+            output.textures_delta.clear(); // nothing is drawn here
+        };
+        frame(Vec::new(), &mut compose);
+        ctx.memory_mut(|m| m.request_focus(egui::Id::new("compose_to")));
+        frame(Vec::new(), &mut compose);
+        let tab = egui::Event::Key { key: Key::Tab, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE };
+        // An address being typed: Tab makes it a chip and stays for the next one.
+        compose.to.push_str("carl@z.org");
+        frame(Vec::new(), &mut compose);
+        frame(vec![tab.clone()], &mut compose);
+        frame(Vec::new(), &mut compose);
+        assert_eq!(ctx.memory(|m| m.focused()), Some(egui::Id::new("compose_to")), "still in To");
+        assert_eq!(addresses(&compose.to), ["ada@x.org", "bob@y.org", "carl@z.org"]);
+        assert!(compose.to.ends_with(", "), "carl@z.org is a chip now: {:?}", compose.to);
+        // Nothing typed: Tab goes on.
+        frame(vec![tab], &mut compose);
+        frame(Vec::new(), &mut compose);
+        assert_eq!(ctx.memory(|m| m.focused()), Some(egui::Id::new(("compose_row", "Subject"))));
+    }
+
+    #[test]
+    fn addresses_split_on_separators_but_not_inside_a_name() {
+        assert_eq!(split_addresses("ada@x.org, bob@y.org; carl@z.org"), (vec!["ada@x.org".into(), "bob@y.org".into(), "carl@z.org".into()], false));
+        assert_eq!(addresses("Doe, John <john@x.org>, \"Lee, Ann\" <ann@y.org>"), ["Doe, John <john@x.org>", "\"Lee, Ann\" <ann@y.org>"]);
+        assert_eq!(split_addresses("ada@x.org, "), (vec!["ada@x.org".into()], true), "a separator at the end: the last one is finished");
+        assert_eq!(split_addresses("ada@x.org, bo"), (vec!["ada@x.org".into(), "bo".into()], false), "still being typed");
+        assert_eq!(addresses("asdas,asdasd,adasdasdas"), ["asdas", "asdasd", "adasdasdas"], "a comma makes a chip, even of a wrong address");
+        assert_eq!(split_addresses("Doe,"), (vec!["Doe".into()], true), "typed so far: a chip, until the rest of the name comes");
+        assert!(split_addresses("").0.is_empty());
+    }
+
+    #[test]
+    fn send_names_the_first_address_it_cannot_go_to() {
+        let mut c = Compose::new(1);
+        c.to = "ada@x.org, dasds".into();
+        assert_eq!(first_invalid(&c), Some("dasds".into()));
+        c.to = "ada@x.org".into();
+        c.bcc = "hidden@y.org".into();
+        assert_eq!(first_invalid(&c), None);
+        assert_eq!(c.outgoing("me@x.org", false).bcc, ["hidden@y.org"]);
     }
 
     #[test]

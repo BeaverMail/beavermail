@@ -16,6 +16,8 @@ pub struct DraftData {
     pub title: String,
     pub to: String,
     pub cc: String,
+    #[serde(default)]
+    pub bcc: String,
     pub subject: String,
     pub body: String,
     pub in_reply_to: Option<String>,

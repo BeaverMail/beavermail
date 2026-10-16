@@ -111,6 +111,20 @@ async fn delivers_to_every_recipient() {
 }
 
 #[tokio::test]
+async fn a_blind_copy_is_delivered_but_shown_only_in_the_senders_copy() {
+    let (sender, transcript) = start("secret", "secret").await;
+    let mut with_bcc = message();
+    with_bcc.bcc = vec!["hidden@example.com".into()];
+    let raw = String::from_utf8(sender.send(with_bcc).await.unwrap()).unwrap();
+    let t = transcript.lock().unwrap();
+    assert!(t.commands.iter().any(|c| c.starts_with("RCPT TO:<hidden@example.com>")), "{:?}", t.commands);
+    assert!(!t.data.to_ascii_lowercase().contains("bcc:") && !t.data.contains("hidden@example.com"), "the recipients never see it: {}", t.data);
+    assert!(raw.contains("Bcc: hidden@example.com"), "the copy for Sent keeps it: {raw}");
+    let id = |text: &str| text.lines().find(|l| l.to_ascii_lowercase().starts_with("message-id:")).map(str::to_owned);
+    assert_eq!(id(&raw), id(&t.data), "the copy in Sent is the same message");
+}
+
+#[tokio::test]
 async fn a_wrong_password_is_an_auth_error() {
     let (sender, _) = start("secret", "wrong").await;
     let error = sender.send(message()).await.unwrap_err();
