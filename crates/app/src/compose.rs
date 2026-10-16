@@ -1,6 +1,7 @@
 //! The compose window (new message, reply, forward): addresses, subject and a plain-text body.
 
 use beavermail_core::{MessageBody, MessageSummary, Outgoing};
+use beavermail_store::Contact;
 use eframe::egui::{self, Align, Align2, Frame, Key, Layout, Modifiers, RichText, TextEdit, Ui, vec2};
 
 use crate::drafts::{self, DraftData, DraftFile};
@@ -70,6 +71,10 @@ pub struct Compose {
     pub sig_from: u64,
     /// Put the caret at the top of the body when it is first drawn (above a signature).
     caret_top: bool,
+    /// People to suggest in the address fields, as (name, address), best first.
+    pub contacts: std::sync::Arc<Vec<Contact>>,
+    /// An address field shows suggestions: Esc closes them, not the window.
+    pub suggesting: bool,
 }
 
 pub enum Outcome {
@@ -206,6 +211,8 @@ impl Compose {
             sig: String::new(),
             sig_from: from,
             caret_top: false,
+            contacts: Default::default(),
+            suggesting: false,
         }
         .settled()
     }
@@ -589,13 +596,47 @@ fn first_invalid(compose: &Compose) -> Option<String> {
     [&compose.to, &compose.cc, &compose.bcc].into_iter().flat_map(|list| addresses(list)).find(|a| !beavermail_smtp::valid_address(a))
 }
 
+/// The address in a list item: what is inside `<>`, or the whole item; lower case.
+fn address_of(item: &str) -> String {
+    item.rsplit_once('<').map_or(item, |(_, rest)| rest.trim_end_matches('>')).trim().to_lowercase()
+}
+
+/// Up to six contacts, in their order, with a word of the name or address starting with each word
+/// typed ("ada lo", "lovelace", "ada@ex", "nicolo" for Nicolò); those already in the list are left out.
+fn suggestions<'a>(contacts: &'a [Contact], typed: &str, taken: &[String]) -> Vec<&'a Contact> {
+    let taken: Vec<String> = taken.iter().map(|a| address_of(a)).collect();
+    contacts.iter().filter(|c| c.matches(typed) && !taken.contains(&c.address)).take(6).collect()
+}
+
+/// A contact as a list item: "Ada Lovelace <ada@x.org>", the name quoted when it has a comma or the like.
+fn list_item(name: &str, address: &str) -> String {
+    match name {
+        "" => address.to_owned(),
+        name if name.contains([',', ';', '"', '<', '>', '@', '(', ')']) => format!("\"{}\" <{address}>", name.replace('"', "")),
+        name => format!("{name} <{address}>"),
+    }
+}
+
 /// An address field as chips, one per address finished (a comma, Enter, or leaving the field), red
-/// when it cannot be sent to; what is being typed follows them. `text` stays the plain list. The
-/// caller draws the divider under the row: inside a row a separator is a vertical line that widens it.
-fn recipients(ui: &mut Ui, t: &Tokens, id: egui::Id, text: &mut String, hint: &str, width: f32) -> egui::Response {
+/// when it cannot be sent to; what is being typed follows them, with the `contacts` it may mean below
+/// (Up and Down choose, Enter or Tab or a click take one, Esc hides them). `text` stays the plain list.
+/// Returns the field and whether suggestions are shown. The caller draws the divider under the row:
+/// inside a row a separator is a vertical line that widens it.
+fn recipients(ui: &mut Ui, t: &Tokens, id: egui::Id, text: &mut String, hint: &str, width: f32, contacts: &[Contact]) -> (egui::Response, bool) {
     let (mut done, finished) = split_addresses(text);
     let mut typing = if finished { String::new() } else { done.pop().unwrap_or_default() };
     let (mut remove, mut reopen) = (None, None);
+    // What was offered last frame: before the field sees the keys, Up and Down move through it and Esc hides it.
+    let (shown_id, pick_id, hidden_id) = (id.with("suggested"), id.with("pick"), id.with("hidden"));
+    let was_shown = ui.data(|d| d.get_temp::<bool>(shown_id)).unwrap_or(false) && ui.memory(|m| m.has_focus(id));
+    let (step, esc) = if was_shown {
+        ui.input_mut(|i| (isize::from(i.consume_key(Modifiers::NONE, Key::ArrowDown)) - isize::from(i.consume_key(Modifiers::NONE, Key::ArrowUp)), i.consume_key(Modifiers::NONE, Key::Escape)))
+    } else {
+        (0, false)
+    };
+    if esc {
+        ui.data_mut(|d| d.insert_temp(hidden_id, typing.clone()));
+    }
     // Chips are as tall as their text, not as the theme's 40-point controls, so the row keeps its height;
     // set before the row is made, which takes its first line's height from it.
     let controls = ui.spacing().interact_size;
@@ -657,6 +698,44 @@ fn recipients(ui: &mut Ui, t: &Tokens, id: egui::Id, text: &mut String, hint: &s
     ui.spacing_mut().interact_size = controls;
     let field = shown.inner;
     let (enter, backspace, tab) = ui.input(|i| (i.key_pressed(Key::Enter), i.key_pressed(Key::Backspace), i.key_pressed(Key::Tab) && !i.modifiers.shift));
+    // Also the frame the field lets go of the keys: a click on a suggestion takes them away from it.
+    let here = field.has_focus() || field.lost_focus();
+    let hidden = ui.data(|d| d.get_temp::<String>(hidden_id)).is_some_and(|h| h == typing);
+    let found = if here && !hidden { suggestions(contacts, &typing, &done) } else { Vec::new() };
+    let mut picked = None;
+    if !found.is_empty() {
+        let last = ui.data(|d| d.get_temp::<(String, usize)>(pick_id)).filter(|(typed, _)| *typed == typing).map_or(0, |(_, at)| at);
+        let pick = last.saturating_add_signed(step).min(found.len() - 1);
+        ui.data_mut(|d| d.insert_temp(pick_id, (typing.clone(), pick)));
+        egui::Popup::from_response(&field).open(true).width(width.min(360.0)).show(|ui| {
+            ui.spacing_mut().interact_size.y = 28.0; // a list, not a row of 40-point controls
+            for (i, contact) in found.iter().enumerate() {
+                let mut job = egui::text::LayoutJob::default();
+                if !contact.name.is_empty() {
+                    job.append(&contact.name, 0.0, egui::TextFormat::simple(egui::FontId::proportional(14.0), t.text));
+                }
+                job.append(&contact.address, if contact.name.is_empty() { 0.0 } else { 8.0 }, egui::TextFormat::simple(egui::FontId::proportional(13.0), t.text_dim));
+                // Not focusable, so pressing it leaves the field the keys; taken on the press, before the field lets go.
+                // One line each, as wide as the list: a long name or address is cut, not wrapped.
+                let row = ui.add(egui::Button::selectable(i == pick, job).truncate().min_size(vec2(ui.available_width(), 0.0)).sense(egui::Sense::CLICK));
+                if row.clicked() || row.is_pointer_button_down_on() {
+                    picked = Some(i);
+                }
+            }
+        });
+        if (enter || tab) && here {
+            picked = picked.or(Some(pick));
+        }
+    }
+    ui.data_mut(|d| d.insert_temp(shown_id, !found.is_empty()));
+    // With suggestions shown Esc is for them: egui would otherwise take the keys away from the field first.
+    let filter = egui::EventFilter { tab: !typing.trim().is_empty(), horizontal_arrows: true, vertical_arrows: true, escape: !found.is_empty() };
+    ui.memory_mut(|m| m.set_focus_lock_filter(id, filter));
+    if let Some(i) = picked {
+        typing = list_item(&found[i].name, &found[i].address);
+        done.push(std::mem::take(&mut typing));
+        field.request_focus();
+    }
     if let Some(i) = remove {
         done.remove(i);
     }
@@ -683,7 +762,7 @@ fn recipients(ui: &mut Ui, t: &Tokens, id: egui::Id, text: &mut String, hint: &s
         (false, true) => format!("{}, ", done.join(", ")),
         (false, false) => format!("{}, {typing}", done.join(", ")),
     };
-    field
+    (field, !found.is_empty())
 }
 
 /// A dim label in a fixed-width column, left-aligned so the fields start at the same x.
@@ -808,6 +887,7 @@ pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &
         None if !anyone => "Add a recipient first".to_owned(),
         None => String::new(),
     };
+    let (contacts, mut suggesting) = (compose.contacts.clone(), false);
     let shown = egui::Window::new(compose.title)
         .id(egui::Id::new("compose"))
         .anchor(Align2::RIGHT_BOTTOM, [-16.0, -16.0])
@@ -867,7 +947,8 @@ pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &
                         let links = if show_cc && show_bcc { 0.0 } else { 80.0 };
                         // The links' width and the gap before them: asking for more would widen the window each frame.
                         let gap = if links > 0.0 { ui.spacing().item_spacing.x } else { 0.0 };
-                        let field = recipients(ui, t, egui::Id::new("compose_to"), &mut compose.to, "name@example.com, …", ui.available_width() - links - gap);
+                        let (field, offered) = recipients(ui, t, egui::Id::new("compose_to"), &mut compose.to, "name@example.com, …", ui.available_width() - links - gap, &contacts);
+                        suggesting |= offered;
                         if links > 0.0 {
                             ui.allocate_ui_with_layout(vec2(links, ROW_H), Layout::right_to_left(Align::Center), |ui| {
                                 // Out of the Tab order (To goes straight on to the next field); the keys open them.
@@ -893,7 +974,7 @@ pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &
                     if shown {
                         ui.horizontal_top(|ui| {
                             label(ui, t, name);
-                            recipients(ui, t, egui::Id::new(salt), list, "", ui.available_width());
+                            suggesting |= recipients(ui, t, egui::Id::new(salt), list, "", ui.available_width(), &contacts).1;
                         });
                         ui.separator();
                     }
@@ -1040,6 +1121,7 @@ pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &
     if !compose.sending && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::D)) {
         outcome = Outcome::Discard;
     }
+    compose.suggesting = suggesting;
     outcome
 }
 
@@ -1178,6 +1260,67 @@ mod tests {
         frame(vec![tab], &mut compose);
         frame(Vec::new(), &mut compose);
         assert_eq!(ctx.memory(|m| m.focused()), Some(egui::Id::new(("compose_row", "Subject"))));
+    }
+
+    #[test]
+    fn suggestions_match_the_start_of_any_word_and_skip_who_is_already_there() {
+        let contacts = [Contact::new("Ada Lovelace", "ada@x.org"), Contact::new("", "adam@y.org"), Contact::new("Grace Hopper", "grace@navy.mil")];
+        let found = |typed: &str, taken: &[String]| suggestions(&contacts, typed, taken).into_iter().map(|c| c.address.as_str()).collect::<Vec<_>>();
+        assert_eq!(found("ada", &[]), ["ada@x.org", "adam@y.org"]);
+        assert_eq!(found("love", &[]), ["ada@x.org"]);
+        assert_eq!(found("ada lo", &[]), ["ada@x.org"], "every word typed");
+        assert_eq!(found("navy", &[]), ["grace@navy.mil"]);
+        assert_eq!(found("ada", &["Ada <ADA@x.org>".into()]), ["adam@y.org"], "already in the list");
+        assert!(found("  ", &[]).is_empty() && found("zed", &[]).is_empty());
+        assert_eq!(list_item("Ada Lovelace", "ada@x.org"), "Ada Lovelace <ada@x.org>");
+        assert_eq!(list_item("Doe, John", "john@x.org"), "\"Doe, John\" <john@x.org>");
+        assert_eq!(list_item("", "adam@y.org"), "adam@y.org");
+    }
+
+    #[test]
+    fn a_suggestion_is_taken_with_enter_or_a_click_and_esc_hides_them() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let mut compose = Compose::new(1);
+        let long = "ada.lovelace.countess.of.lovelace.analytical.engine@a-very-long-domain-name.example.org";
+        compose.contacts = std::sync::Arc::new(vec![Contact::new("Ada Augusta King, Countess of Lovelace", long), Contact::new("Adam Smith", "adam@y.org")]);
+        let frame = |events: Vec<egui::Event>, compose: &mut Compose| {
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(1600.0, 1000.0))), events, ..Default::default() };
+            let mut output = ctx.run_ui(input, |ui| {
+                window(ui.ctx(), &Tokens::dark(), compose, &[(1, "me@x.org".into())], false);
+            });
+            output.textures_delta.clear(); // nothing is drawn here
+        };
+        let key = |key: Key| egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE };
+        frame(Vec::new(), &mut compose);
+        frame(vec![egui::Event::Text("ad".into())], &mut compose);
+        frame(Vec::new(), &mut compose);
+        assert!(compose.suggesting, "two people start with ad");
+        // Down to the second, Enter takes it.
+        frame(vec![key(Key::ArrowDown)], &mut compose);
+        frame(vec![key(Key::Enter)], &mut compose);
+        frame(Vec::new(), &mut compose);
+        assert_eq!(compose.to, "Adam Smith <adam@y.org>, ");
+        assert_eq!(ctx.memory(|m| m.focused()), Some(egui::Id::new("compose_to")), "still in To for the next one");
+        // Esc hides them, and the window stays: the caller only discards when nothing is suggested.
+        frame(vec![egui::Event::Text("lov".into())], &mut compose);
+        frame(Vec::new(), &mut compose);
+        assert!(compose.suggesting);
+        frame(vec![key(Key::Escape)], &mut compose);
+        frame(Vec::new(), &mut compose);
+        assert!(!compose.suggesting, "hidden");
+        assert!(compose.to.ends_with("lov"), "what was typed stays: {:?}", compose.to);
+        // Typing on shows them again; a click takes one.
+        frame(vec![egui::Event::Text("e".into())], &mut compose);
+        frame(Vec::new(), &mut compose);
+        let list = ctx.memory(|m| m.area_rect(egui::Id::new("compose_to").with("popup"))).expect("the suggestions are shown");
+        assert!(list.height() < 60.0, "one person, one line (wrapped it was 100 tall): {list:?}");
+        let at = list.center();
+        frame(vec![egui::Event::PointerMoved(at)], &mut compose);
+        frame(vec![egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE }], &mut compose);
+        frame(vec![egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE }], &mut compose);
+        frame(Vec::new(), &mut compose);
+        assert_eq!(addresses(&compose.to), ["Adam Smith <adam@y.org>".to_owned(), format!("\"Ada Augusta King, Countess of Lovelace\" <{long}>")], "{:?}", compose.to);
     }
 
     #[test]

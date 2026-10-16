@@ -121,6 +121,115 @@ pub struct Pending {
     pub size: u32,
 }
 
+/// Someone to suggest in an address field.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Contact {
+    pub name: String,
+    /// Lower case.
+    pub address: String,
+    /// The name and address as [`fold`] makes them, to search.
+    pub folded: String,
+}
+
+impl Contact {
+    pub fn new(name: &str, address: &str) -> Self {
+        Self { name: name.to_owned(), address: address.to_lowercase(), folded: fold(&format!("{name} {address}")) }
+    }
+
+    /// Whether every word of `query` starts a word of the name or address, accents and case aside.
+    pub fn matches(&self, query: &str) -> bool {
+        let words = fold(query);
+        !words.trim().is_empty() && words.split_whitespace().all(|w| self.folded.contains(&format!(" {w}")))
+    }
+}
+
+/// Lower case without accents, each run of other characters one space, and a space in front
+/// (" nicolo rossi n rossi x org"): a word starts after a space.
+pub fn fold(text: &str) -> String {
+    let mut out = String::from(" ");
+    for c in text.to_lowercase().chars() {
+        let plain = match c {
+            'à'..='å' | 'ā' | 'ă' | 'ą' => "a",
+            'æ' => "ae",
+            'ç' | 'ć' | 'č' => "c",
+            'ð' | 'ď' | 'đ' => "d",
+            'è'..='ë' | 'ē' | 'ė' | 'ę' | 'ě' => "e",
+            'ì'..='ï' | 'ī' | 'į' | 'ı' => "i",
+            'ł' | 'ľ' => "l",
+            'ñ' | 'ń' | 'ň' => "n",
+            'ò'..='ö' | 'ø' | 'ō' | 'ő' => "o",
+            'œ' => "oe",
+            'ř' => "r",
+            'ß' => "ss",
+            'ś' | 'š' | 'ş' => "s",
+            'ť' | 'ţ' => "t",
+            'ù'..='ü' | 'ū' | 'ů' | 'ű' => "u",
+            'ý' | 'ÿ' => "y",
+            'ź' | 'ż' | 'ž' => "z",
+            c if c.is_alphanumeric() => {
+                out.push(c);
+                continue;
+            }
+            _ => {
+                if !out.ends_with(' ') {
+                    out.push(' ');
+                }
+                continue;
+            }
+        };
+        out.push_str(plain);
+    }
+    out.trim_end().to_owned()
+}
+
+/// Counts a message the user sent for each of its recipients, once: by its Message-ID (`key`), so a
+/// folder downloaded again, or the same message in two Sent folders, counts nothing twice.
+fn learn_sent(conn: &Connection, account: &str, key: &str, recipients: &str, at: i64) -> rusqlite::Result<()> {
+    if recipients.trim().is_empty() || conn.execute("INSERT OR IGNORE INTO contacts_learned (account, message) VALUES (?1, ?2)", params![account, key])? == 0 {
+        return Ok(());
+    }
+    let mut seen = std::collections::HashSet::new();
+    for address in recipients.split_whitespace().filter(|a| a.contains('@') && seen.insert(*a)) {
+        if conn.execute("INSERT OR IGNORE INTO contacts (address, folded) VALUES (?1, ?2)", params![address, fold(address)])? == 1 {
+            // New: named as the latest of their own mail already here names them, Spam aside.
+            let name: Option<String> = conn
+                .query_row(
+                    "SELECT m.from_name FROM messages m LEFT JOIN folders f ON f.account = m.account AND f.name = m.folder
+                     WHERE lower(m.from_addr) = ?1 AND m.from_name != '' AND COALESCE(f.role, ?2) != ?3 ORDER BY m.timestamp DESC LIMIT 1",
+                    params![address, role_to_int(Role::Other), role_to_int(Role::Junk)],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            learn_name(conn, address, &name.unwrap_or_default())?;
+        }
+        conn.execute(
+            "INSERT INTO contact_accounts (address, account, sent, last) VALUES (?1, ?2, 1, ?3)
+             ON CONFLICT (address, account) DO UPDATE SET sent = sent + 1, last = MAX(last, excluded.last)",
+            params![address, account, at],
+        )?;
+    }
+    Ok(())
+}
+
+/// Names a contact learned from mail as their own mail names them; a saved contact keeps its name.
+/// shortcut: the last message read wins, which while history downloads may be an older one; keep the
+/// newest name if that shows.
+fn learn_name(conn: &Connection, address: &str, name: &str) -> rusqlite::Result<()> {
+    if name.trim().is_empty() {
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE contacts SET name = ?2, folded = ?3 WHERE address = ?1 AND saved = 0 AND name != ?2",
+        params![address.to_lowercase(), name.trim(), fold(&format!("{name} {address}"))],
+    )
+    .map(|_| ())
+}
+
+/// The key a sent message is learned under: its Message-ID, or where it is when it has none.
+fn learn_key(message_id: &str, folder: &str, uid: u32) -> String {
+    if message_id.is_empty() { format!("{folder}\0{uid}") } else { message_id.to_owned() }
+}
+
 /// What the archive remembers about a folder.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FolderState {
@@ -433,6 +542,50 @@ fn migrate(conn: &Connection) -> Result<(), MailError> {
         if version < 13 {
             conn.execute_batch("UPDATE messages SET indexed = 0 WHERE stored = 1; PRAGMA user_version = 13;").map_err(db)?;
         }
+        // Version 14: contacts, learned from the Sent folders as messages arrive. A learned one is a
+        // suggestion for the address fields only, kept on this computer; `saved` marks the address book
+        // the user keeps (and may sync), which nothing learned enters by itself.
+        if version < 14 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS contacts (
+                     address TEXT PRIMARY KEY,
+                     name TEXT NOT NULL DEFAULT '',
+                     folded TEXT NOT NULL,
+                     saved INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE IF NOT EXISTS contact_accounts (
+                     address TEXT NOT NULL,
+                     account TEXT NOT NULL,
+                     sent INTEGER NOT NULL,
+                     last INTEGER NOT NULL,
+                     PRIMARY KEY (address, account)
+                 ) WITHOUT ROWID;
+                 CREATE TABLE IF NOT EXISTS contacts_learned (
+                     account TEXT NOT NULL,
+                     message TEXT NOT NULL,
+                     PRIMARY KEY (account, message)
+                 ) WITHOUT ROWID;
+                 CREATE INDEX IF NOT EXISTS messages_sender ON messages (lower(from_addr));",
+            )
+            .map_err(db)?;
+            learn_archive(conn).map_err(db)?;
+            conn.execute_batch("PRAGMA user_version = 14;").map_err(db)?;
+        }
+    Ok(())
+}
+
+/// Learns the contacts of everything already in the archive: whom each Sent message went to.
+fn learn_archive(conn: &Connection) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare(
+        "SELECT m.account, m.folder, m.uid, m.message_id, m.recipients, m.timestamp FROM messages m JOIN folders f ON f.account = m.account AND f.name = m.folder
+         WHERE f.role = ?1 AND m.recipients IS NOT NULL",
+    )?;
+    let sent = stmt
+        .query_map([role_to_int(Role::Sent)], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)? as u32, r.get::<_, String>(3)?, r.get::<_, String>(4)?, r.get::<_, i64>(5)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (account, folder, uid, message_id, recipients, at) in sent {
+        learn_sent(conn, &account, &learn_key(&message_id, &folder, uid), &recipients, at)?;
+    }
     Ok(())
 }
 
@@ -555,6 +708,10 @@ impl Store {
         tx.execute("DELETE FROM messages WHERE account = ?1", [account]).map_err(db)?;
         tx.execute("DELETE FROM folders WHERE account = ?1", [account]).map_err(db)?;
         tx.execute("DELETE FROM examples WHERE account = ?1", [account]).map_err(db)?;
+        tx.execute("DELETE FROM contact_accounts WHERE account = ?1", [account]).map_err(db)?;
+        tx.execute("DELETE FROM contacts_learned WHERE account = ?1", [account]).map_err(db)?;
+        // Suggestions only this account had written to go; saved contacts stay.
+        tx.execute("DELETE FROM contacts WHERE saved = 0 AND address NOT IN (SELECT address FROM contact_accounts)", []).map_err(db)?;
         tx.commit().map_err(db)
     }
 
@@ -615,10 +772,19 @@ impl Store {
             .map_err(db)
     }
 
-    /// Adds headers; a UID already in the archive keeps its row (and its body and preview).
+    /// Adds headers; a UID already in the archive keeps its row (and its body and preview). Sent
+    /// messages teach whom the user writes to; other mail, outside Spam, how they name themselves.
     pub fn add_headers(&self, account: &str, folder: &str, headers: &[Header]) -> Result<(), MailError> {
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(db)?;
+        let role = tx.query_row("SELECT role FROM folders WHERE account = ?1 AND name = ?2", params![account, folder], |r| r.get(0)).optional().map_err(db)?.map(role_from_int);
+        for h in headers {
+            match role {
+                Some(Role::Sent) => learn_sent(&tx, account, &learn_key(&h.message_id, folder, h.uid), &h.recipients, h.timestamp).map_err(db)?,
+                Some(Role::Junk) => {}
+                _ => learn_name(&tx, &h.from_addr, &h.from_name).map_err(db)?,
+            }
+        }
         {
             let mut stmt = tx
                 .prepare(
@@ -715,12 +881,24 @@ impl Store {
         rows.collect::<Result<_, _>>().map_err(db)
     }
 
-    /// Records the To and Cc addresses of a message (lower case, separated by spaces).
+    /// Records the To and Cc addresses of a message (lower case, separated by spaces); in Sent, its
+    /// recipients are learned as contacts then.
     pub fn set_recipients(&self, account: &str, folder: &str, uid: u32, recipients: &str) -> Result<(), MailError> {
-        self.conn()
-            .execute("UPDATE messages SET recipients = ?4 WHERE account = ?1 AND folder = ?2 AND uid = ?3", params![account, folder, i64::from(uid), recipients])
-            .map(|_| ())
-            .map_err(db)
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(db)?;
+        tx.execute("UPDATE messages SET recipients = ?4 WHERE account = ?1 AND folder = ?2 AND uid = ?3", params![account, folder, i64::from(uid), recipients]).map_err(db)?;
+        let sent = tx
+            .query_row(
+                "SELECT m.message_id, m.timestamp FROM messages m JOIN folders f ON f.account = m.account AND f.name = m.folder WHERE m.account = ?1 AND m.folder = ?2 AND m.uid = ?3 AND f.role = ?4",
+                params![account, folder, i64::from(uid), role_to_int(Role::Sent)],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(db)?;
+        if let Some((message_id, at)) = sent {
+            learn_sent(&tx, account, &learn_key(&message_id, folder, uid), recipients, at).map_err(db)?;
+        }
+        tx.commit().map_err(db)
     }
 
     /// UIDs of a folder whose header fields were never kept (rows from before they were).
@@ -803,6 +981,24 @@ impl Store {
             out.extend(row.map_err(db)?.split_whitespace().map(str::to_owned));
         }
         Ok(out)
+    }
+
+    /// The contacts to suggest while writing from `account`: the saved ones and everyone written to
+    /// from any account, those this account writes to most first, then those written to most, then the
+    /// latest. Senders never written to are not here: one may be a stranger or a spammer.
+    pub fn contacts(&self, account: &str) -> Result<Vec<Contact>, MailError> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT c.name, c.address, c.folded FROM contacts c
+                 LEFT JOIN (SELECT address, SUM(sent) AS sent, MAX(last) AS last, SUM(CASE WHEN account = ?1 THEN sent ELSE 0 END) AS mine
+                            FROM contact_accounts GROUP BY address) a ON a.address = c.address
+                 WHERE a.address IS NOT NULL OR c.saved = 1
+                 ORDER BY COALESCE(a.mine, 0) DESC, COALESCE(a.sent, 0) DESC, COALESCE(a.last, 0) DESC, c.address",
+            )
+            .map_err(db)?;
+        let rows = stmt.query_map([account], |r| Ok(Contact { name: r.get(0)?, address: r.get(1)?, folded: r.get(2)? })).map_err(db)?;
+        rows.collect::<Result<_, _>>().map_err(db)
     }
 
     /// Messages of `folder` that answer one the user sent: their In-Reply-To or References name a
@@ -1139,6 +1335,53 @@ mod tests {
     }
 
     #[test]
+    fn contacts_are_learned_once_from_sent_mail_and_named_by_their_own() {
+        let store = store();
+        store.set_folders("me", &[("INBOX".into(), Role::Inbox), ("Sent".into(), Role::Sent), ("Junk".into(), Role::Junk)]).unwrap();
+        let sent = |uid, id: &str, to: &str, at| Header { message_id: id.into(), recipients: to.into(), ..header(uid, "s", at, false) };
+        let from = |uid, name: &str, address: &str| Header { from_name: name.into(), from_addr: address.into(), ..header(uid, "hi", 5, false) };
+        store.add_headers("me", "INBOX", &[from(1, "Nicolò Rossi", "nico@x.org")]).unwrap();
+        store.add_headers("me", "Sent", &[sent(1, "<a@me>", "nico@x.org bob@y.org", 10), sent(2, "<b@me>", "bob@y.org bob@y.org", 20)]).unwrap();
+        let names = |store: &Store, account| store.contacts(account).unwrap().into_iter().map(|c| (c.name, c.address)).collect::<Vec<_>>();
+        assert_eq!(names(&store, "me"), [(String::new(), "bob@y.org".to_owned()), ("Nicolò Rossi".to_owned(), "nico@x.org".to_owned())], "bob twice, nico once, named by mail that came first");
+        // The folder downloaded again counts nothing twice.
+        store.reset_folder("me", "Sent", 2).unwrap();
+        store.add_headers("me", "Sent", &[sent(7, "<a@me>", "nico@x.org bob@y.org", 10), sent(8, "<b@me>", "bob@y.org", 20)]).unwrap();
+        let count = |address: &str| store.conn().query_row("SELECT SUM(sent) FROM contact_accounts WHERE address = ?1", [address], |r| r.get::<_, i64>(0)).unwrap();
+        assert_eq!((count("bob@y.org"), count("nico@x.org")), (2, 1));
+        // A name from later mail, not from Spam.
+        store.add_headers("me", "INBOX", &[from(2, "Bob Brown", "Bob@y.org")]).unwrap();
+        store.add_headers("me", "Junk", &[Header { timestamp: 99, ..from(1, "Free Money", "nico@x.org") }]).unwrap();
+        assert_eq!(names(&store, "me")[0].0, "Bob Brown");
+        assert_eq!(names(&store, "me")[1].0, "Nicolò Rossi");
+        // Writing from another account: its own people come first there.
+        store.set_folders("work", &[("Sent".into(), Role::Sent)]).unwrap();
+        store.add_headers("work", "Sent", &[sent(1, "<c@work>", "nico@x.org", 30)]).unwrap();
+        assert_eq!(names(&store, "work")[0].1, "nico@x.org");
+        assert_eq!(names(&store, "me")[0].1, "bob@y.org");
+        // A Sent row read before recipients were kept is learned when they are.
+        store.add_headers("work", "Sent", &[Header { message_id: "<d@work>".into(), ..header(2, "s", 40, false) }]).unwrap();
+        store.set_recipients("work", "Sent", 2, "erin@z.org").unwrap();
+        assert!(names(&store, "work").iter().any(|(_, a)| a == "erin@z.org"));
+        // Accents and case aside, by the start of any word.
+        let nico = Contact::new("Nicolò Rossi", "nico@x.org");
+        assert!(nico.matches("nicolo") && nico.matches("ROSSI ni") && nico.matches("x.org") && !nico.matches("icol") && !nico.matches(" "));
+        assert_eq!(fold("Ærø-Straße"), " aero strasse");
+        // Removing an account forgets whom only it wrote to.
+        store.forget_account("work").unwrap();
+        assert!(!names(&store, "me").iter().any(|(_, a)| a == "erin@z.org"));
+        assert!(names(&store, "me").iter().any(|(_, a)| a == "nico@x.org"), "also written to from this one");
+        // An archive from before contacts learns them from what it holds.
+        {
+            let conn = store.conn();
+            conn.execute_batch("DROP TABLE contacts; DROP TABLE contact_accounts; DROP TABLE contacts_learned; PRAGMA user_version = 13;").unwrap();
+            migrate(&conn).unwrap();
+        }
+        assert_eq!(names(&store, "me"), [("Bob Brown".to_owned(), "bob@y.org".to_owned()), ("Nicolò Rossi".to_owned(), "nico@x.org".to_owned())]);
+        assert_eq!(count("bob@y.org"), 2);
+    }
+
+    #[test]
     fn a_preview_is_one_clean_line() {
         let store = store();
         store.add_headers("me", "INBOX", &[header(1, "a", 1, false)]).unwrap();
@@ -1418,6 +1661,12 @@ mod tests {
         assert_eq!(store.unknown_recipients("me", "Sent", 10).unwrap(), [2]);
         store.set_recipients("me", "Sent", 2, "dan@x.org").unwrap();
         assert!(store.correspondents().unwrap().contains("dan@x.org"));
+        store.add_headers("me", "Sent", &[Header { recipients: "ada@example.org".into(), ..header(6, "s", 9, false) }, Header { recipients: "ada@example.org".into(), ..header(7, "s", 1, false) }]).unwrap();
+        let contacts = store.contacts("me").unwrap();
+        assert_eq!(contacts[0], Contact::new("Ada Lovelace", "ada@example.org"), "written to most, named as her mail named her before: {contacts:?}");
+        let rest: Vec<&str> = contacts[1..].iter().map(|c| c.address.as_str()).collect();
+        assert_eq!(rest, ["bob@x.org", "carol@y.org", "dan@x.org", "erin@w.org"], "written to once on the same day: by address");
+        assert!(!contacts.iter().any(|c| c.address == "me@z.org"), "only people written to");
         assert_eq!(store.senders("me").unwrap(), [("Ada Lovelace".to_owned(), "ada@example.org".to_owned())]);
         let id = store.id_of("me", "INBOX", 1).unwrap().unwrap();
         assert_eq!(store.headers(id).unwrap(), Some(Vec::new()));

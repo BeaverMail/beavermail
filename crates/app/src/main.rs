@@ -78,6 +78,8 @@ enum Event {
     Unsubscribed(String, Result<(), String>),
     /// A sign-in with a provider ended: (its cancel flag, which tells it from an earlier one, result).
     SignedIn(Arc<std::sync::atomic::AtomicBool>, Result<store::oauth::Grant, String>),
+    /// Everyone the user has written to, for the address fields.
+    Contacts(Result<Vec<beavermail_store::Contact>, MailError>),
 }
 
 /// A sign-in with a provider waiting for the user in the browser.
@@ -737,6 +739,8 @@ struct BeaverApp {
     account_edit: Option<NewAccount>,
     /// A sign-in with a provider, from Add account or an account's page, until it ends.
     signing_in: Option<SignIn>,
+    /// Everyone written to, to suggest in a message's address fields; read again for each new message.
+    contacts: Arc<Vec<beavermail_store::Contact>>,
     /// Where the user asked to go from an account page with unsaved changes (`None`: close Settings),
     /// until they choose to discard them.
     settings_leave: Option<Option<SettingsPage>>,
@@ -879,6 +883,7 @@ impl BeaverApp {
             settings_page: SettingsPage::default(),
             account_edit: None,
             signing_in: None,
+            contacts: Default::default(),
             settings_leave: None,
             confirm_remove: None,
             confirm_unsubscribe: None,
@@ -1842,6 +1847,12 @@ impl BeaverApp {
 
     /// Shows a compose window, remembering which account's drafts it belongs to.
     fn start_compose(&mut self, compose: Option<compose::Compose>) {
+        if let Some(c) = &compose {
+            // Fresh for each message, ranked for its account; the user's own addresses are not suggested.
+            let (archive, key) = (self.archive.clone(), self.view(c.from).map(|v| v.account.key()).unwrap_or_default());
+            let own: Vec<String> = self.accounts.iter().map(|v| v.account.address().to_lowercase()).collect();
+            self.spawn(async move { Event::Contacts(archive.contacts(&key).map(|all| all.into_iter().filter(|c| !own.contains(&c.address)).collect())) });
+        }
         self.compose = compose.map(|mut c| {
             c.key = self.view(c.from).map(|v| v.account.key()).unwrap_or_default();
             c
@@ -1999,7 +2010,8 @@ impl BeaverApp {
             self.compose_focus = Some(focused);
         }
         // Esc is Discard (asked first when there is text), unless it is meant for a menu or the question itself.
-        let esc = !self.confirm_discard && !compose.sending && !compose.picking && !egui::Popup::is_any_open(ctx) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        let esc = !self.confirm_discard && !compose.sending && !compose.picking && !compose.suggesting && !egui::Popup::is_any_open(ctx) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        compose.contacts = self.contacts.clone();
         let outcome = if esc { compose::Outcome::Discard } else { compose::window(ctx, t, &mut compose, &senders, self.settings.rich_outgoing) };
         if compose.from != compose.sig_from {
             let signature = self.view(compose.from).map(|v| v.account.signature.clone()).unwrap_or_default();
@@ -3567,6 +3579,8 @@ impl BeaverApp {
                 }
             }
             Event::SignedIn(cancel, result) => self.signed_in(cancel, result),
+            Event::Contacts(Ok(contacts)) => self.contacts = Arc::new(contacts),
+            Event::Contacts(Err(_)) => {} // the fields only miss their suggestions
             Event::Unsubscribed(who, result) => match result {
                 Ok(()) => self.notice = Some((format!("Unsubscribed from {who}. Mail already on its way may still arrive."), std::time::Instant::now())),
                 Err(e) => self.error = Some(format!("Could not unsubscribe from {who}: {e}. Try the unsubscribe link in the message.")),
