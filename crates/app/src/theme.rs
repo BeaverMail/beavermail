@@ -117,13 +117,23 @@ fn visuals(t: &Tokens, dark: bool) -> Visuals {
     v
 }
 
+/// The family for bold text. egui draws a variable font at its default weight only, and its
+/// `strong()` changes the colour, not the weight: bold needs a font of its own.
+pub fn bold() -> egui::FontFamily {
+    egui::FontFamily::Name("bold".into())
+}
+
 /// Inter (SIL OFL, see `assets/fonts/Inter-LICENSE.txt`) first in the proportional family; egui's defaults stay as fallback for symbols.
+/// `Inter-SemiBold.ttf` is the same font at weight 600 (`fonttools varLib.instancer InterVariable.ttf wght=600 opsz=14`).
 fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert("Inter".into(), Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/InterVariable.ttf"))));
+    fonts.font_data.insert("InterSemiBold".into(), Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/Inter-SemiBold.ttf"))));
     if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
         family.insert(0, "Inter".into());
     }
+    let fallback = fonts.families.get(&egui::FontFamily::Proportional).cloned().unwrap_or_default();
+    fonts.families.insert(bold(), std::iter::once("InterSemiBold".to_owned()).chain(fallback).collect());
     ctx.set_fonts(fonts);
 }
 
@@ -142,7 +152,7 @@ pub fn apply(ctx: &egui::Context) {
         s.text_styles.insert(TextStyle::Body, egui::FontId::proportional(15.0));
         s.text_styles.insert(TextStyle::Button, egui::FontId::proportional(15.0));
         s.text_styles.insert(TextStyle::Small, egui::FontId::proportional(13.0));
-        s.text_styles.insert(TextStyle::Heading, egui::FontId::proportional(22.0));
+        s.text_styles.insert(TextStyle::Heading, egui::FontId::new(22.0, bold()));
         s.interaction.tooltip_delay = 0.4;
     });
 }

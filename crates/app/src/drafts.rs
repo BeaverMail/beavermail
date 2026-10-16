@@ -26,6 +26,9 @@ pub struct DraftData {
     /// In the Outbox: Send was pressed without a connection; it goes when the server can be reached.
     #[serde(default)]
     pub queued: bool,
+    /// With `queued`: not before this moment (seconds since the Unix epoch), "send later".
+    #[serde(default)]
+    pub send_at: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

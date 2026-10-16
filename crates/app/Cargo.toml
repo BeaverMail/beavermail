@@ -34,3 +34,5 @@ beavermail-smtp.workspace = true
 beavermail-store.workspace = true
 beavermail-vault.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread"] }
+# Times on this computer's clock for "send later"; already in the tree through the store.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }

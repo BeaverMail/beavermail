@@ -160,6 +160,74 @@ pub fn palette_row(ui: &mut Ui, t: &Tokens, label: &str, keys: &str, chosen: boo
     if enabled { response.on_hover_cursor(egui::CursorIcon::PointingHand) } else { response }
 }
 
+/// A month to pick a day from: the chosen `day` filled, today ringed, days before `today` dimmed and
+/// out of reach; ‹ › move `month` (its first day). Drawn in place, so it works inside a menu.
+pub fn calendar(ui: &mut Ui, t: &Tokens, day: &mut chrono::NaiveDate, month: &mut chrono::NaiveDate, today: chrono::NaiveDate) {
+    use chrono::{Datelike, Months};
+    const CELL: egui::Vec2 = vec2(34.0, 30.0);
+    let width = CELL.x * 7.0;
+    ui.spacing_mut().item_spacing = vec2(0.0, 2.0);
+    // Rows of days, not controls: the theme's 40-point control height would space the weeks apart.
+    ui.spacing_mut().interact_size.y = 0.0;
+    ui.allocate_ui_with_layout(vec2(width, CELL.y), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        let first = today.with_day(1).unwrap_or(today);
+        let arrow = |ui: &mut Ui, text: &str, enabled: bool| ui.add_enabled(enabled, egui::Button::new(egui::RichText::new(text).size(18.0)).frame(false).min_size(CELL)).clicked();
+        if arrow(ui, "‹", *month > first) {
+            *month = month.checked_sub_months(Months::new(1)).unwrap_or(*month);
+        }
+        let title = month.format("%B %Y").to_string();
+        ui.allocate_ui_with_layout(vec2(width - CELL.x * 2.0, CELL.y), egui::Layout::centered_and_justified(egui::Direction::LeftToRight), |ui| {
+            ui.label(egui::RichText::new(title).family(theme::bold()));
+        });
+        if arrow(ui, "›", true) {
+            *month = month.checked_add_months(Months::new(1)).unwrap_or(*month);
+        }
+    });
+    let cell_text = |ui: &Ui, rect: Rect, text: &str, color: Color32, size: f32| {
+        ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, text, FontId::proportional(size), color);
+    };
+    ui.horizontal(|ui| {
+        for name in ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"] {
+            let (rect, _) = ui.allocate_exact_size(CELL, Sense::hover());
+            cell_text(ui, rect, name, t.text_dim, 12.0);
+        }
+    });
+    let lead = month.weekday().num_days_from_monday() as usize;
+    let days = month.checked_add_months(Months::new(1)).map_or(30, |next| (next - *month).num_days()) as usize;
+    for week in 0..(lead + days).div_ceil(7) {
+        ui.horizontal(|ui| {
+            for slot in 0..7 {
+                let n = week * 7 + slot;
+                if n < lead || n >= lead + days {
+                    ui.allocate_exact_size(CELL, Sense::hover());
+                    continue;
+                }
+                let date = *month + chrono::Duration::days((n - lead) as i64);
+                let open = date >= today;
+                let (rect, response) = ui.allocate_exact_size(CELL, if open { Sense::click() } else { Sense::hover() });
+                let spot = Rect::from_center_size(rect.center(), vec2(28.0, 26.0));
+                let chosen = date == *day;
+                if chosen {
+                    ui.painter().rect_filled(spot, CornerRadius::same(CONTROL_RADIUS), t.accent);
+                } else if open && response.hovered() {
+                    ui.painter().rect_filled(spot, CornerRadius::same(CONTROL_RADIUS), t.hover);
+                }
+                if date == today && !chosen {
+                    ui.painter().rect_stroke(spot, CornerRadius::same(CONTROL_RADIUS), egui::Stroke::new(1.0, t.accent), egui::StrokeKind::Inside);
+                }
+                let color = if chosen { t.on_accent } else if open { t.text } else { t.text_dim.gamma_multiply(0.5) };
+                cell_text(ui, rect, &date.day().to_string(), color, 14.0);
+                if response.clicked() {
+                    *day = date;
+                }
+                if open {
+                    response.on_hover_cursor(egui::CursorIcon::PointingHand).widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, chosen, date.format("%A %-d %B").to_string()));
+                }
+            }
+        });
+    }
+}
+
 /// An on/off setting: its name and a line saying what it does on the left, a switch on the right.
 /// The whole row flips it; the response is `changed` when it did.
 pub fn switch_row(ui: &mut Ui, t: &Tokens, on: &mut bool, label: &str, hint: &str) -> Response {
@@ -256,7 +324,9 @@ pub fn message_row(ui: &mut Ui, t: &Tokens, message: &MessageSummary, selected: 
     let flagged = crate::sender::warning(&message.from, &message.address).is_some();
     let room = width - date_w - 12.0 - dot - clip;
     let name_room = if domain.is_empty() { room } else { room * 0.6 };
-    let sender = truncated(ui, &message.from, FontId::proportional(15.5), primary, name_room);
+    // Unread: the sender and subject in bold, beside the dot.
+    let weight = if message.unread { theme::bold() } else { egui::FontFamily::Proportional };
+    let sender = truncated(ui, &message.from, FontId::new(15.5, weight.clone()), primary, name_room);
     let sender_w = sender.size().x;
     ui.painter().galley(pos2(left, card.top() + 11.0), sender, primary);
     let mut x = left + sender_w + 10.0;
@@ -273,7 +343,7 @@ pub fn message_row(ui: &mut Ui, t: &Tokens, message: &MessageSummary, selected: 
         let shown = truncated(ui, &domain, FontId::proportional(13.0), color, (left + room - x).max(0.0));
         ui.painter().galley(pos2(x, card.top() + 13.0), shown, color);
     }
-    let subject = truncated(ui, &message.subject, FontId::proportional(14.5), primary, width);
+    let subject = truncated(ui, &message.subject, FontId::new(14.5, weight), primary, width);
     ui.painter().galley(pos2(left, card.top() + 33.0), subject, primary);
     // In search results: which folder the message is in, so identical subjects can be told apart.
     let label = folder.map(|f| ui.painter().layout_no_wrap(folder_title(f, Role::Other), FontId::proportional(12.5), t.accent));
@@ -472,7 +542,7 @@ pub fn primary_wide(ui: &mut Ui, t: &Tokens, icon: Icon, label: &str, why_disabl
     } else {
         (t.accent, t.on_accent)
     };
-    let button = egui::Button::image_and_text(icon.image(icons::SIZE, text), egui::RichText::new(label).color(text).strong())
+    let button = egui::Button::image_and_text(icon.image(icons::SIZE, text), egui::RichText::new(label).color(text).family(theme::bold()))
         .fill(fill)
         .min_size(vec2(ui.available_width(), CONTROL_H));
     match why_disabled {
@@ -483,7 +553,7 @@ pub fn primary_wide(ui: &mut Ui, t: &Tokens, icon: Icon, label: &str, why_disabl
 
 /// The filled button with a leading icon and a fixed width.
 pub fn primary_wide_fixed(ui: &mut Ui, t: &Tokens, icon: Icon, label: &str, enabled: bool, width: f32) -> Response {
-    let button = egui::Button::image_and_text(icon.image(icons::SIZE, t.on_accent), egui::RichText::new(label).color(t.on_accent).strong())
+    let button = egui::Button::image_and_text(icon.image(icons::SIZE, t.on_accent), egui::RichText::new(label).color(t.on_accent).family(theme::bold()))
         .fill(t.accent)
         .min_size(vec2(width, CONTROL_H));
     ui.add_enabled(enabled, button)
@@ -499,22 +569,29 @@ fn heading_size(level: u8) -> f32 {
 }
 
 /// One line of runs that wraps like text. Returns the (cleaned) link the user clicked.
-fn runs_ui(ui: &mut Ui, t: &Tokens, runs: &[Run], size: f32, color: Color32, mono: bool) -> Option<String> {
+/// `mono`: a code block, all of it in a fixed-width font. `strong`: a heading, all of it bold.
+fn runs_ui(ui: &mut Ui, t: &Tokens, runs: &[Run], size: f32, color: Color32, mono: bool, strong: bool) -> Option<String> {
     let mut clicked = None;
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
         for run in runs {
             match run {
-                Run::Text { text, bold, italic, code } => {
+                Run::Text { text, bold, italic, code, strike } => {
                     let mut rich = egui::RichText::new(text).size(size).color(color);
-                    if *bold {
-                        rich = rich.strong();
+                    if *bold || strong {
+                        rich = rich.family(theme::bold());
                     }
                     if *italic {
                         rich = rich.italics();
                     }
-                    if *code || mono {
+                    if *strike {
+                        rich = rich.strikethrough();
+                    }
+                    if mono {
                         rich = rich.monospace();
+                    } else if *code {
+                        // Inline code stands apart from the words around it, not only by its font.
+                        rich = rich.monospace().size(size - 1.0).background_color(t.hover);
                     }
                     ui.label(rich);
                 }
@@ -542,6 +619,9 @@ fn runs_ui(ui: &mut Ui, t: &Tokens, runs: &[Run], size: f32, color: Color32, mon
 /// A message body as blocks. Returns the link the user clicked, already cleaned of tracking parameters.
 pub fn body(ui: &mut Ui, t: &Tokens, blocks: &[Block]) -> Option<String> {
     ui.spacing_mut().item_spacing.y = 2.0;
+    // Lines of text, not controls: the theme's 40-point control height would make every row (a list
+    // item, a line of a paragraph) that tall, with the text centred and a list's bullet left at the top.
+    ui.spacing_mut().interact_size.y = 0.0;
     let mut clicked = None;
     for block in blocks {
         let indent = f32::from(block.depth) * 14.0;
@@ -551,26 +631,35 @@ pub fn body(ui: &mut Ui, t: &Tokens, blocks: &[Block]) -> Option<String> {
             }
             Kind::Heading(level) => {
                 ui.add_space(6.0);
-                clicked = runs_ui(ui, t, &block.runs, heading_size(level), t.text, false).or(clicked);
+                clicked = runs_ui(ui, t, &block.runs, heading_size(level), t.text, false, true).or(clicked);
                 ui.add_space(4.0);
             }
             Kind::Item => {
                 ui.horizontal_top(|ui| {
                     ui.add_space(indent);
-                    ui.label(egui::RichText::new(block.marker.as_deref().unwrap_or("•")).size(16.0).color(t.text_dim));
-                    clicked = runs_ui(ui, t, &block.runs, 16.0, t.text, false).or(clicked.take());
+                    // A continued line keeps the marker's room, drawn invisibly, so it lines up with the item's text.
+                    let marker_color = if block.continued { Color32::TRANSPARENT } else { t.text_dim };
+                    ui.label(egui::RichText::new(block.marker.as_deref().unwrap_or("•")).size(16.0).color(marker_color));
+                    clicked = runs_ui(ui, t, &block.runs, 16.0, t.text, false, false).or(clicked.take());
                 });
                 ui.add_space(2.0);
             }
             Kind::Quote => {
                 let frame = egui::Frame::new().inner_margin(Margin { left: 12 + indent as i8, right: 0, top: 0, bottom: 0 });
-                let shown = frame.show(ui, |ui| runs_ui(ui, t, &block.runs, 15.5, t.text_dim, false));
+                let shown = frame.show(ui, |ui| runs_ui(ui, t, &block.runs, 15.5, t.text_dim, false, false));
                 let r = shown.response.rect;
                 ui.painter().line_segment([pos2(r.left() + indent, r.top()), pos2(r.left() + indent, r.bottom())], egui::Stroke::new(2.0, t.border_strong));
                 clicked = shown.inner.or(clicked);
             }
             Kind::Pre => {
-                clicked = runs_ui(ui, t, &block.runs, 14.5, t.text, true).or(clicked);
+                // A code block in its own box, as wide as the text column.
+                let frame = egui::Frame::new().fill(t.hover).corner_radius(CornerRadius::same(CONTROL_RADIUS)).inner_margin(Margin::symmetric(12, 8));
+                let shown = frame.show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    runs_ui(ui, t, &block.runs, 14.5, t.text, true, false)
+                });
+                clicked = shown.inner.or(clicked);
+                ui.add_space(6.0);
             }
             Kind::Table { header } => {
                 clicked = table(ui, t, &block.rows, header).or(clicked);
@@ -580,7 +669,7 @@ pub fn body(ui: &mut Ui, t: &Tokens, blocks: &[Block]) -> Option<String> {
                 if block.runs.is_empty() {
                     ui.add_space(8.0);
                 } else {
-                    clicked = runs_ui(ui, t, &block.runs, 16.0, t.text, false).or(clicked);
+                    clicked = runs_ui(ui, t, &block.runs, 16.0, t.text, false, false).or(clicked);
                     if block.kind == Kind::Para {
                         ui.add_space(8.0);
                     }
@@ -611,7 +700,7 @@ fn table(ui: &mut Ui, t: &Tokens, rows: &[Vec<Vec<Run>>], header: bool) -> Optio
                 ui.allocate_ui_with_layout(vec2(*width, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
                     ui.set_width(*width);
                     let color = if header && i == 0 { t.text_dim } else { t.text };
-                    clicked = runs_ui(ui, t, cell, 15.0, color, false).or(clicked.take());
+                    clicked = runs_ui(ui, t, cell, 15.0, color, false, false).or(clicked.take());
                 });
             }
         });
@@ -674,6 +763,10 @@ pub enum DraftAction {
     None,
     Open,
     Delete,
+    /// A scheduled one goes now.
+    SendNow,
+    /// A scheduled one goes back to being a draft.
+    Unschedule,
 }
 
 /// "just now", "3 min ago", "2 h ago", "5 d ago".
@@ -698,7 +791,11 @@ pub fn draft_row(ui: &mut Ui, t: &Tokens, draft: &crate::drafts::DraftData) -> D
     let left = card.left() + 14.0 + AVATAR + 12.0;
     let width = card.right() - 14.0 - left;
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
-    let (when, color) = if draft.queued { ("Waiting to send".to_owned(), t.accent) } else { (ago(draft.updated, now), t.text_dim) };
+    let (when, color) = match (draft.queued, draft.send_at) {
+        (true, Some(at)) => (format!("Scheduled for {}", crate::compose::when_text(at)), t.accent),
+        (true, None) => ("Waiting to send".to_owned(), t.accent),
+        _ => (ago(draft.updated, now), t.text_dim),
+    };
     let when = ui.painter().layout_no_wrap(when, FontId::proportional(13.0), color);
     let when_w = when.size().x;
     ui.painter().galley(pos2(card.right() - 14.0 - when_w, card.top() + 13.0), when, color);
@@ -713,12 +810,27 @@ pub fn draft_row(ui: &mut Ui, t: &Tokens, draft: &crate::drafts::DraftData) -> D
     ui.painter().galley(pos2(left, card.top() + 56.0), start, t.text_dim);
     let mut action = if response.clicked() { DraftAction::Open } else { DraftAction::None };
     response.on_hover_cursor(egui::CursorIcon::PointingHand).context_menu(|ui| {
+        if draft.queued && draft.send_at.is_some() {
+            if ui.button("Send now").clicked() {
+                action = DraftAction::SendNow;
+                ui.close();
+            }
+            if ui.button("Cancel schedule").on_hover_text("Keep it as a draft, not sent").clicked() {
+                action = DraftAction::Unschedule;
+                ui.close();
+            }
+        }
         if ui.button("Delete draft").clicked() {
             action = DraftAction::Delete;
             ui.close();
         }
     });
     action
+}
+
+/// A row of the sidebar that is not a folder: its icon, title and count.
+pub fn icon_row(ui: &mut Ui, t: &Tokens, title: &str, icon: Icon, count: u32, selected: bool) -> Response {
+    nav_row(ui, t, title, Some((icon, if selected { t.accent } else { t.text_dim })), count, selected)
 }
 
 /// 1240 as "1,240".

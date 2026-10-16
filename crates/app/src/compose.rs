@@ -25,6 +25,12 @@ pub struct Compose {
     pub sending: bool,
     /// When the message is handed to the server; until then Undo takes it back.
     pub send_at: Option<std::time::Instant>,
+    /// The day picked under "Send later", the month its calendar shows (its first day), and the time typed.
+    later_day: chrono::NaiveDate,
+    later_month: chrono::NaiveDate,
+    later_time: String,
+    /// The "Pick date & time" dialog is open.
+    pub picking: bool,
     pub error: Option<String>,
     focus_to: bool,
     /// Put the caret at the top of the body on the first frame (replies and forwards).
@@ -67,6 +73,77 @@ pub enum Outcome {
     Attach,
     /// Take back a message that is waiting to be sent.
     Undo,
+    /// Send later, at this moment (seconds since the Unix epoch).
+    Schedule(i64),
+}
+
+/// What "send later" offers from `now`, as (label, moment): tomorrow morning and afternoon, and
+/// Monday morning when that is not tomorrow.
+pub fn later_choices(now: chrono::DateTime<chrono::Local>) -> Vec<(String, i64)> {
+    use chrono::{Datelike, Duration, Timelike, Weekday};
+    let at = |day: chrono::NaiveDate, hour: u32, minute: u32| day.and_hms_opt(hour, minute, 0).and_then(|t| t.and_local_timezone(chrono::Local).earliest()).map(|t| t.timestamp());
+    let (today, tomorrow) = (now.date_naive(), now.date_naive() + Duration::days(1));
+    let mut out = Vec::new();
+    // Later today: in three hours, on the next half hour, while that is still a working day's hour.
+    let minutes = (now.hour() * 60 + now.minute() + 180).div_ceil(30) * 30;
+    if minutes < 21 * 60 {
+        out.push(("Later today".to_owned(), at(today, minutes / 60, minutes % 60)));
+    }
+    // Not when "later today" is already about the evening.
+    if minutes < 17 * 60 {
+        out.push(("This evening".to_owned(), at(today, 18, 0)));
+    }
+    out.push(("Tomorrow morning".to_owned(), at(tomorrow, 8, 0)));
+    out.push(("Tomorrow afternoon".to_owned(), at(tomorrow, 13, 0)));
+    if tomorrow.weekday() != Weekday::Mon {
+        let monday = now.date_naive() + Duration::days(i64::from(7 - now.weekday().num_days_from_monday()));
+        out.push(("Monday morning".to_owned(), at(monday, 8, 0)));
+    }
+    out.into_iter().filter_map(|(label, at)| Some((format!("{label}  ·  {}", when_text(at?)), at?))).collect()
+}
+
+/// A day picked and a time typed ("8:30"), as a moment that is still to come.
+pub fn parse_when(date: chrono::NaiveDate, time: &str, now: i64) -> Option<i64> {
+    let time = chrono::NaiveTime::parse_from_str(time.trim(), "%H:%M").ok()?;
+    let at = date.and_time(time).and_local_timezone(chrono::Local).earliest()?.timestamp();
+    (at > now).then_some(at)
+}
+
+/// After Enter, with the caret at char `cursor` just past the new line: when the line before is a list
+/// item or a quote, the next line starts the same way ("- ", "> ", the next number); when that item
+/// was empty, it is taken away and the list ends there. The text and caret to use, or `None`.
+pub fn continue_list(text: &str, cursor: usize) -> Option<(String, usize)> {
+    let chars: Vec<char> = text.chars().collect();
+    if cursor == 0 || chars.get(cursor - 1) != Some(&'\n') {
+        return None;
+    }
+    let end = cursor - 1;
+    let start = chars[..end].iter().rposition(|c| *c == '\n').map_or(0, |p| p + 1);
+    let line: String = chars[start..end].iter().collect();
+    let indent: String = line.chars().take_while(|c| *c == ' ').collect();
+    let rest = &line[indent.len()..];
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    let (own, next) = if let Some(mark) = ["- ", "* ", "+ ", "> "].into_iter().find(|m| rest.starts_with(m)) {
+        (mark.to_owned(), mark.to_owned())
+    } else if !digits.is_empty() && rest[digits.len()..].starts_with(". ") {
+        (format!("{digits}. "), format!("{}. ", digits.parse::<u64>().ok()?.checked_add(1)?))
+    } else {
+        return None;
+    };
+    let tail: String = chars[cursor..].iter().collect();
+    let head: String = chars[..start].iter().collect();
+    if rest.trim_end() == own.trim_end() {
+        // An empty item: Enter ends the list and leaves an empty line where it was.
+        return Some((format!("{head}{tail}"), start));
+    }
+    let added = format!("{indent}{next}");
+    let before: String = chars[..cursor].iter().collect();
+    Some((format!("{before}{added}{tail}"), cursor + added.chars().count()))
+}
+
+/// "Thu 16 Oct, 08:00", on this computer's clock.
+pub fn when_text(at: i64) -> String {
+    chrono::DateTime::from_timestamp(at, 0).map(|t| t.with_timezone(&chrono::Local).format("%a %-d %b, %H:%M").to_string()).unwrap_or_default()
 }
 
 /// A file that goes with the message. Its content is a copy in the vault (under the draft), so it
@@ -95,6 +172,10 @@ impl Compose {
             references: Vec::new(),
             sending: false,
             send_at: None,
+            later_day: chrono::Local::now().date_naive() + chrono::Duration::days(1),
+            later_month: chrono::Datelike::with_day(&(chrono::Local::now().date_naive() + chrono::Duration::days(1)), 1).unwrap_or_default(),
+            later_time: "08:00".to_owned(),
+            picking: false,
             error: None,
             focus_to: true,
             focus_body: false,
@@ -175,6 +256,26 @@ impl Compose {
         self.fingerprint() != self.saved
     }
 
+    /// What the header says about the message: being sent, being copied to the server, or saved.
+    /// Nothing while it is being written, so the header does not flicker at every key.
+    fn status(&self) -> &'static str {
+        match () {
+            _ if self.sending && self.send_at.is_none() => "Sending…",
+            _ if self.sending || self.is_empty() || self.unsaved() => "",
+            _ if self.pushing => "Saving to the server…",
+            _ if self.touched => "Draft saved",
+            _ => "",
+        }
+    }
+
+    /// The window's title: the subject once there is one, else what kind of message it is.
+    fn heading(&self) -> &str {
+        match self.subject.trim() {
+            "" => self.title,
+            subject => subject,
+        }
+    }
+
     pub fn to_draft(&self, updated: i64) -> DraftData {
         DraftData {
             id: self.id.clone(),
@@ -188,6 +289,7 @@ impl Compose {
             files: self.files.iter().filter(|f| f.ready).map(|f| DraftFile { name: f.name.clone(), size: f.size, path: f.vault.clone() }).collect(),
             updated,
             queued: false,
+            send_at: None,
         }
     }
 
@@ -522,7 +624,7 @@ fn toolbar(ui: &mut Ui, ctx: &egui::Context, t: &Tokens, compose: &mut Compose, 
         ];
         for (label, tip, format) in tools {
             let text = match label {
-                "B" => RichText::new(label).strong(),
+                "B" => RichText::new(label).family(theme::bold()),
                 "I" => RichText::new(label).italics(),
                 _ => RichText::new(label),
             };
@@ -558,7 +660,34 @@ pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &
         .default_width(620.0)
         .resizable(true)
         .collapsible(false)
+        .title_bar(false)
         .show(ctx, |ui| {
+            // The header: what kind of message, its subject once written, and whether it is saved.
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::left_to_right(Align::Center), |ui| {
+                let icon = match compose.title {
+                    "Reply" => Icon::Reply,
+                    "Reply all" => Icon::ReplyAll,
+                    "Forward" => Icon::Forward,
+                    _ => Icon::Pencil,
+                };
+                ui.add(icon.image(crate::icons::SIZE, t.accent));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if crate::icons::button(ui, t, Icon::X, "Close and keep it as a draft", !compose.sending, false).clicked() {
+                        outcome = Outcome::Close;
+                    }
+                    let status = compose.status();
+                    if !status.is_empty() {
+                        ui.label(RichText::new(status).size(12.5).color(t.text_dim));
+                    }
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        ui.add(egui::Label::new(RichText::new(compose.heading()).size(theme::SUBTITLE).family(theme::bold()).color(t.text)).truncate());
+                        if !compose.subject.trim().is_empty() {
+                            ui.label(RichText::new(compose.title).size(12.5).color(t.text_dim));
+                        }
+                    });
+                });
+            });
+            ui.separator();
             ui.add_enabled_ui(!compose.sending, |ui| {
                 ui.horizontal(|ui| {
                     label(ui, t, "From");
@@ -593,6 +722,7 @@ pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &
                         state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(0))));
                         state.store(ctx, id);
                     }
+                    let length = compose.body.chars().count();
                     let mut output = TextEdit::multiline(&mut compose.body)
                         .id(id)
                         .frame(Frame::NONE)
@@ -600,6 +730,17 @@ pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &
                         .desired_width(f32::INFINITY)
                         .desired_rows(8)
                         .show(ui);
+                    // One character typed, and it was a new line: carry a list or quote on to it.
+                    if output.response.changed()
+                        && compose.body.chars().count() == length + 1
+                        && let Some(range) = output.cursor_range.filter(|r| r.is_empty())
+                        && let Some((text, caret)) = continue_list(&compose.body, range.primary.index.0)
+                    {
+                        compose.body = text;
+                        let mut state = output.state.clone();
+                        state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(caret))));
+                        state.store(ctx, id);
+                    }
                     if std::mem::take(&mut compose.focus_body) {
                         output.response.request_focus();
                         output.state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(0))));
@@ -653,6 +794,22 @@ pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &
                 if send.clicked() {
                     outcome = Outcome::Send;
                 }
+                ui.add_enabled_ui(ready, |ui| {
+                    let menu = ui.menu_button("Send later", |ui| {
+                        for (label, at) in later_choices(chrono::Local::now()) {
+                            if ui.button(label).clicked() {
+                                outcome = Outcome::Schedule(at);
+                                ui.close();
+                            }
+                        }
+                        ui.separator();
+                        if ui.button("Pick date & time…").clicked() {
+                            compose.picking = true;
+                            ui.close();
+                        }
+                    });
+                    menu.response.on_hover_text("Choose when it is sent; BeaverMail sends it then, if it is open");
+                });
                 if ui.add_enabled(!compose.sending, egui::Button::image_and_text(Icon::Paperclip.image(crate::icons::SIZE, t.text_dim), "Attach")).on_hover_text(if on_wayland() { "Attach files. Dropping files in does not work on Wayland yet; start the app with WAYLAND_DISPLAY unset to use X11." } else { "Attach files, or drop them in the window" }).clicked() {
                     outcome = Outcome::Attach;
                 }
@@ -669,18 +826,14 @@ pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &
                     if ui.add_enabled(!compose.sending, egui::Button::image_and_text(Icon::Trash.image(crate::icons::SIZE, t.text_dim), "Discard")).on_hover_text("Delete this message and its draft (Esc or Ctrl+Shift+D)").clicked() {
                         outcome = Outcome::Discard;
                     }
-                    if ui.add_enabled(!compose.sending, egui::Button::image_and_text(Icon::X.image(crate::icons::SIZE, t.text_dim), "Close")).on_hover_text("Close and keep it as a draft").clicked() {
-                        outcome = Outcome::Close;
-                    }
-                    // Only when there is room: squeezed in, it would be drawn over the buttons.
-                    let hint = RichText::new("Saved as a draft while you write").size(12.5).color(t.text_dim);
-                    let width = ui.painter().layout_no_wrap("Saved as a draft while you write".to_owned(), egui::FontId::proportional(12.5), t.text_dim).size().x;
-                    if ui.available_width() > width + 24.0 {
-                        ui.label(hint);
-                    }
                 });
             });
         });
+    if compose.picking
+        && let Some(at) = pick_when(ctx, t, compose)
+    {
+        outcome = Outcome::Schedule(at);
+    }
     // While files are being dragged over the app, say where they would go.
     if let Some(window) = shown
         && hovering_files(ctx)
@@ -696,9 +849,130 @@ pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &
     outcome
 }
 
+/// The width of the "Pick date & time" dialog: the month, a gap, and the date and time beside it.
+const PICK_WIDTH: f32 = 460.0;
+
+/// The "Pick date & time" dialog, as Gmail's: a month to pick the day from and the time in half
+/// hours. The moment chosen when Schedule send is pressed; the dialog closes then or on Cancel and Esc.
+fn pick_when(ctx: &egui::Context, t: &Tokens, compose: &mut Compose) -> Option<i64> {
+    let now = chrono::Local::now();
+    let (mut chosen, mut cancel) = (None, false);
+    let modal = egui::Modal::new(egui::Id::new("pick_when")).show(ctx, |ui| {
+        ui.set_width(PICK_WIDTH);
+        ui.heading("Pick date & time");
+        ui.label(RichText::new("BeaverMail sends it then, if it is open.").color(t.text_dim));
+        ui.add_space(12.0);
+        // As Gmail: the month on the left, the day picked and the time on the right.
+        ui.horizontal_top(|ui| {
+            // Its own column: inside the row it would lay its weeks side by side.
+            ui.vertical(|ui| views::calendar(ui, t, &mut compose.later_day, &mut compose.later_month, now.date_naive()));
+            ui.add_space(24.0);
+            ui.vertical(|ui| {
+                ui.add_space(4.0);
+                ui.label(RichText::new("Date").size(13.0).color(t.text_dim));
+                ui.label(RichText::new(compose.later_day.format("%A %-d %B").to_string()).size(theme::SUBTITLE).family(theme::bold()));
+                ui.add_space(16.0);
+                ui.label(RichText::new("Time").size(13.0).color(t.text_dim));
+                egui::ComboBox::from_id_salt("pick_time").width(140.0).selected_text(compose.later_time.clone()).show_ui(ui, |ui| {
+                    for minutes in (0..24 * 60).step_by(30) {
+                        let text = format!("{:02}:{:02}", minutes / 60, minutes % 60);
+                        ui.selectable_value(&mut compose.later_time, text.clone(), text);
+                    }
+                });
+            });
+        });
+        ui.add_space(16.0);
+        let at = parse_when(compose.later_day, &compose.later_time, now.timestamp());
+        ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
+            let button = egui::Button::new(RichText::new("Schedule send").color(t.on_accent)).fill(t.accent);
+            if ui.add_enabled(at.is_some(), button).on_disabled_hover_text("That moment has passed: pick a later one").clicked() {
+                chosen = at;
+            }
+            cancel = ui.button("Cancel").clicked();
+        });
+    });
+    if chosen.is_some() || cancel || modal.should_close() {
+        compose.picking = false;
+    }
+    chosen
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_pick_dialog_lays_the_month_out_as_weeks_beside_the_date_and_time() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let input = || egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(1600.0, 1000.0))), ..Default::default() };
+        let mut compose = Compose::new(1);
+        compose.picking = true;
+        // Two passes: the first one measures.
+        for _ in 0..2 {
+            let mut output = ctx.run_ui(input(), |ui| {
+                pick_when(ui.ctx(), &Tokens::dark(), &mut compose);
+            });
+            output.textures_delta.clear(); // nothing is drawn here
+        }
+        let rect = ctx.memory(|m| m.area_rect(egui::Id::new("pick_when"))).expect("the dialog is shown");
+        assert!(rect.width() < PICK_WIDTH + 80.0, "as wide as the dialog, not a row of every day: {rect:?}");
+        assert!(rect.height() > 300.0 && rect.height() < 560.0, "weeks under each other: {rect:?}");
+    }
+
+    #[test]
+    fn enter_carries_a_list_on_and_ends_it_on_an_empty_item() {
+        let after_enter = |text: &str| continue_list(text, text.chars().count());
+        assert_eq!(after_enter("- milk\n"), Some(("- milk\n- ".into(), 9)));
+        assert_eq!(after_enter("  * eggs\n"), Some(("  * eggs\n  * ".into(), 13)), "the indent stays");
+        assert_eq!(after_enter("9. bread\n"), Some(("9. bread\n10. ".into(), 13)), "the next number");
+        assert_eq!(after_enter("> quoted\n"), Some(("> quoted\n> ".into(), 11)));
+        assert_eq!(after_enter("- milk\n- \n"), Some(("- milk\n".into(), 7)), "an empty item ends the list");
+        assert_eq!(after_enter("plain text\n"), None);
+        assert_eq!(after_enter("-not a list\n"), None);
+        assert_eq!(continue_list("- a\nb", 4), Some(("- a\n- b".into(), 6)), "Enter inside an item splits it in two items");
+        assert_eq!(continue_list("- a\nb", 5), None, "only right after the new line");
+    }
+
+    #[test]
+    fn the_header_names_the_subject_and_says_when_the_draft_is_saved() {
+        let mut c = Compose::new(1);
+        assert_eq!((c.heading(), c.status()), ("New message", ""), "nothing written, nothing to say");
+        c.subject = "  Lunch on Friday ".into();
+        assert_eq!(c.heading(), "Lunch on Friday");
+        assert_eq!(c.status(), "", "written but not saved yet: quiet");
+        c.mark_saved();
+        assert_eq!(c.status(), "Draft saved");
+        c.pushing = true;
+        assert_eq!(c.status(), "Saving to the server…");
+        c.sending = true;
+        assert_eq!(c.status(), "Sending…");
+    }
+
+    #[test]
+    fn send_later_offers_moments_to_come_and_reads_a_typed_one() {
+        use chrono::TimeZone;
+        let labels = |now| later_choices(now).into_iter().map(|(l, _)| l.split("  ·").next().unwrap_or_default().to_owned()).collect::<Vec<_>>();
+        // A Sunday afternoon: tomorrow is Monday, so "Monday morning" is not offered twice.
+        let sunday = chrono::Local.with_ymd_and_hms(2026, 10, 18, 15, 0, 0).unwrap();
+        assert_eq!(labels(sunday), ["Later today", "Tomorrow morning", "Tomorrow afternoon"]);
+        // A Thursday morning: later today, this evening, and the days after.
+        let morning = chrono::Local.with_ymd_and_hms(2026, 10, 15, 9, 10, 0).unwrap();
+        assert_eq!(labels(morning), ["Later today", "This evening", "Tomorrow morning", "Tomorrow afternoon", "Monday morning"]);
+        let choices = later_choices(morning);
+        assert_eq!(when_text(choices[0].1), "Thu 15 Oct, 12:30", "three hours on, on the next half hour");
+        assert!(choices.iter().all(|(_, at)| *at > morning.timestamp()));
+        assert_eq!(when_text(choices[4].1), "Mon 19 Oct, 08:00");
+        // Late at night there is nothing left of today.
+        let night = chrono::Local.with_ymd_and_hms(2026, 10, 15, 22, 0, 0).unwrap();
+        assert_eq!(labels(night)[0], "Tomorrow morning");
+        let thursday = morning;
+        let now = thursday.timestamp();
+        let day = |d: &str| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").unwrap();
+        assert!(parse_when(day("2026-10-16"), "8:30", now).is_some());
+        assert_eq!(parse_when(day("2026-10-14"), "08:00", now), None, "a moment gone by");
+        assert_eq!(parse_when(day("2026-10-16"), "8h30", now), None);
+    }
 
     #[test]
     fn a_signature_goes_under_the_text_and_is_not_text() {

@@ -12,7 +12,7 @@ const MAX_BLOCKS: usize = 3_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Run {
-    Text { text: String, bold: bool, italic: bool, code: bool },
+    Text { text: String, bold: bool, italic: bool, code: bool, strike: bool },
     Link { text: String, url: String },
 }
 
@@ -38,6 +38,8 @@ pub struct Block {
     /// Nesting depth of lists and quotes.
     pub depth: u8,
     pub marker: Option<String>,
+    /// A line of a list item after a line break: aligned with the item's text, without its marker.
+    pub continued: bool,
     pub runs: Vec<Run>,
     /// A table's rows of cells; empty for any other kind.
     pub rows: Vec<Vec<Vec<Run>>>,
@@ -48,6 +50,8 @@ struct Style {
     bold: bool,
     italic: bool,
     code: bool,
+    /// Struck through: `<del>`, `<s>`, Markdown's `~~`.
+    strike: bool,
     link: Option<String>,
 }
 
@@ -60,6 +64,8 @@ struct Walker {
     /// Counters of the open lists: `Some(n)` for ordered, `None` for bullets.
     lists: Vec<Option<u32>>,
     pre: bool,
+    /// The block being gathered continues a list item after a line break.
+    continued: bool,
 }
 
 /// Whether showing the message as designed would fetch anything: an image, style or font on a server.
@@ -147,7 +153,7 @@ pub fn blocks(html: &str) -> Vec<Block> {
     }
     let html = &html[..end];
     let document = Html::parse_document(html);
-    let mut walker = Walker { blocks: Vec::new(), runs: Vec::new(), kind: Kind::Para, depth: 0, marker: None, lists: Vec::new(), pre: false };
+    let mut walker = Walker { blocks: Vec::new(), runs: Vec::new(), kind: Kind::Para, depth: 0, marker: None, lists: Vec::new(), pre: false, continued: false };
     walker.element(document.root_element(), &Style::default());
     walker.flush();
     walker.blocks
@@ -164,7 +170,7 @@ impl Walker {
             return;
         }
         if self.blocks.len() < MAX_BLOCKS {
-            self.blocks.push(Block { kind: self.kind, depth: self.depth, marker, runs, rows: Vec::new() });
+            self.blocks.push(Block { kind: self.kind, depth: self.depth, marker, continued: std::mem::take(&mut self.continued), runs, rows: Vec::new() });
         }
     }
 
@@ -181,7 +187,7 @@ impl Walker {
         }
         match &style.link {
             Some(url) => self.runs.push(Run::Link { text, url: url.clone() }),
-            None => self.runs.push(Run::Text { text, bold: style.bold, italic: style.italic, code: style.code || self.pre }),
+            None => self.runs.push(Run::Text { text, bold: style.bold, italic: style.italic, code: style.code || self.pre, strike: style.strike }),
         }
     }
 
@@ -197,7 +203,7 @@ impl Walker {
         {
             self.start(Kind::Para);
             if self.blocks.len() < MAX_BLOCKS {
-                self.blocks.push(Block { kind: Kind::Table { header }, depth: self.depth, marker: None, runs: Vec::new(), rows });
+                self.blocks.push(Block { kind: Kind::Table { header }, depth: self.depth, marker: None, continued: false, runs: Vec::new(), rows });
             }
             return;
         }
@@ -238,15 +244,22 @@ impl Walker {
                 return;
             }
             "br" => {
-                let kind = self.kind;
+                let (kind, marker) = (self.kind, self.marker.clone());
+                // A paragraph's room comes after its last line, not after each line that breaks.
+                if kind == Kind::Para {
+                    self.kind = Kind::Line;
+                }
                 self.start(Kind::Line);
-                self.kind = if matches!(kind, Kind::Heading(_) | Kind::Item | Kind::Quote | Kind::Pre) { kind } else { Kind::Line };
-                self.marker = None;
+                self.kind = if matches!(kind, Kind::Heading(_) | Kind::Item | Kind::Quote | Kind::Pre | Kind::Para) { kind } else { Kind::Line };
+                // The next line of a list item stays in it: same place, no marker of its own.
+                self.continued = kind == Kind::Item;
+                self.marker = if self.continued { marker.or_else(|| self.blocks.last().and_then(|b| b.marker.clone())) } else { None };
                 return;
             }
             "b" | "strong" => style.bold = true,
             "i" | "em" | "cite" | "dfn" => style.italic = true,
             "code" | "tt" | "kbd" | "samp" => style.code = true,
+            "s" | "del" | "strike" => style.strike = true,
             "a" => {
                 if let Some(href) = el.value().attr("href").map(str::trim).filter(|h| is_safe_link(h)) {
                     style.link = Some(href.to_owned());
@@ -325,13 +338,13 @@ fn data_table(table: ElementRef<'_>, style: &Style) -> Option<(bool, Vec<Vec<Vec
 /// A cell's content on one line: its paragraphs and lines joined by spaces.
 fn cell_runs(cell: ElementRef<'_>, style: &Style) -> Vec<Run> {
     let style = Style { bold: style.bold || cell.value().name() == "th", ..style.clone() };
-    let mut walker = Walker { blocks: Vec::new(), runs: Vec::new(), kind: Kind::Line, depth: 0, marker: None, lists: Vec::new(), pre: false };
+    let mut walker = Walker { blocks: Vec::new(), runs: Vec::new(), kind: Kind::Line, depth: 0, marker: None, lists: Vec::new(), pre: false, continued: false };
     walker.element(cell, &style);
     walker.flush();
     let mut runs = Vec::new();
     for block in walker.blocks {
         if !runs.is_empty() {
-            runs.push(Run::Text { text: " ".into(), bold: false, italic: false, code: false });
+            runs.push(Run::Text { text: " ".into(), bold: false, italic: false, code: false, strike: false });
         }
         runs.extend(block.runs);
     }
@@ -383,16 +396,16 @@ pub fn plain_blocks(text: &str) -> Vec<Block> {
             let end = rest[start..].find(char::is_whitespace).map_or(rest.len(), |e| start + e);
             let url = rest[start..end].trim_end_matches(['.', ',', ';', ':', '!', '?', ')', '>', '"', '\'']);
             if start > 0 {
-                runs.push(Run::Text { text: rest[..start].to_owned(), bold: false, italic: false, code: false });
+                runs.push(Run::Text { text: rest[..start].to_owned(), bold: false, italic: false, code: false, strike: false });
             }
             runs.push(Run::Link { text: url.to_owned(), url: url.to_owned() });
             rest = &rest[start + url.len()..];
         }
         if !rest.is_empty() {
-            runs.push(Run::Text { text: rest.to_owned(), bold: false, italic: false, code: false });
+            runs.push(Run::Text { text: rest.to_owned(), bold: false, italic: false, code: false, strike: false });
         }
         let kind = if line.trim().is_empty() { Kind::Para } else if quoted > 0 { Kind::Quote } else { Kind::Line };
-        blocks.push(Block { kind, depth: quoted, marker: None, runs, rows: Vec::new() });
+        blocks.push(Block { kind, depth: quoted, marker: None, continued: false, runs, rows: Vec::new() });
     }
     blocks
 }
@@ -458,6 +471,32 @@ pub fn clean_url(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_broken_paragraph_has_its_room_after_its_last_line() {
+        let kinds: Vec<Kind> = blocks("<p>one<br>two</p><ul><li>item</li></ul>").iter().map(|b| b.kind).collect();
+        assert_eq!(kinds, [Kind::Line, Kind::Para, Kind::Item]);
+    }
+
+    #[test]
+    fn a_line_break_in_a_list_item_continues_the_item() {
+        let b = blocks("<ul><li>first<br>still first</li><li>second</li></ul>");
+        let items: Vec<(bool, &str)> = b.iter().map(|b| (b.continued, match &b.runs[0] {
+            Run::Text { text, .. } => text.as_str(),
+            Run::Link { text, .. } => text.as_str(),
+        })).collect();
+        assert_eq!(items, [(false, "first"), (true, "still first"), (false, "second")]);
+    }
+
+    #[test]
+    fn struck_text_keeps_its_line_through() {
+        let b = blocks("<p>Price <del>10</del> <s>9</s> 8</p>");
+        let struck: Vec<&str> = b[0].runs.iter().filter_map(|r| match r {
+            Run::Text { text, strike: true, .. } => Some(text.trim()),
+            _ => None,
+        }).collect();
+        assert_eq!(struck, ["10", "9"]);
+    }
 
     #[test]
     fn pixels_hidden_images_and_known_trackers_are_found_but_pictures_are_not() {

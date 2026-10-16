@@ -84,7 +84,8 @@ fn with_content(builder: lettre::message::MessageBuilder, message: &Outgoing) ->
 pub fn markdown_html(markdown: &str) -> String {
     use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
     let mut dropped_link = false;
-    let events = Parser::new_ext(markdown, Options::ENABLE_STRIKETHROUGH).filter_map(|event| match event {
+    let markdown = keep_blank_lines(markdown);
+    let events = Parser::new_ext(&markdown, Options::ENABLE_STRIKETHROUGH).filter_map(|event| match event {
         Event::Html(text) | Event::InlineHtml(text) => Some(Event::Text(text)),
         // A line break the writer typed stays one (a signature's lines would run together otherwise).
         Event::SoftBreak => Some(Event::HardBreak),
@@ -99,6 +100,34 @@ pub fn markdown_html(markdown: &str) -> String {
     let mut html = String::new();
     pulldown_cmark::html::push_html(&mut html, events);
     html
+}
+
+/// Markdown folds a run of blank lines into one, but a message keeps the room its writer left: each
+/// blank line after the first becomes a line holding only a zero-width space, which Markdown keeps
+/// and every mail program shows as an empty line. Code blocks are left as they are.
+fn keep_blank_lines(markdown: &str) -> String {
+    let lines: Vec<&str> = markdown.split('\n').collect();
+    let (mut out, mut fenced, mut i) = (Vec::with_capacity(lines.len()), false, 0);
+    while i < lines.len() {
+        let line = lines[i].trim();
+        if line.starts_with("```") || line.starts_with("~~~") {
+            fenced = !fenced;
+        }
+        if fenced || !line.is_empty() {
+            out.push(lines[i].to_owned());
+            i += 1;
+            continue;
+        }
+        let run = lines[i..].iter().take_while(|l| l.trim().is_empty()).count();
+        out.push(String::new());
+        // Not at the very end: trailing blank lines are just the end of the message.
+        if run >= 2 && i + run < lines.len() {
+            out.extend(std::iter::repeat_n("\u{200B}".to_owned(), run - 1));
+            out.push(String::new());
+        }
+        i += run;
+    }
+    out.join("\n")
 }
 
 /// Marks the copy of a draft kept on the server, so that a later save can find and replace it.
@@ -204,6 +233,15 @@ impl MailSender for SmtpSender {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blank_lines_the_writer_left_stay_but_code_is_untouched() {
+        assert_eq!(keep_blank_lines("a\n\nb"), "a\n\nb", "one blank line: a new paragraph, as always");
+        assert_eq!(keep_blank_lines("a\n\n\n\nb"), "a\n\n\u{200B}\n\u{200B}\n\nb");
+        assert_eq!(keep_blank_lines("a\n\n\n"), "a\n", "trailing blank lines are the end of the text");
+        assert_eq!(keep_blank_lines("```\nx\n\n\ny\n```"), "```\nx\n\n\ny\n```");
+        assert!(markdown_html("a\n\n\n\nb").contains("\u{200B}"), "the room shows in the HTML too");
+    }
 
     fn outgoing() -> Outgoing {
         Outgoing {

@@ -191,6 +191,8 @@ struct SidebarOutcome {
     add: bool,
     /// "All inboxes" was clicked.
     all: bool,
+    /// "Scheduled" was clicked.
+    scheduled: bool,
 }
 
 /// The open message's body, already reduced to blocks for both display modes.
@@ -500,7 +502,7 @@ fn pane_ring(ui: &egui::Ui, t: &theme::Tokens, rect: egui::Rect) {
 
 fn section_title(ui: &mut egui::Ui, text: &str) {
     ui.add_space(24.0);
-    ui.label(RichText::new(text).size(theme::SUBTITLE).strong());
+    ui.label(RichText::new(text).size(theme::SUBTITLE).family(theme::bold()));
     ui.add_space(2.0);
 }
 
@@ -583,7 +585,7 @@ fn server_sections(ui: &mut egui::Ui, form: &mut NewAccount) {
         ("Outgoing mail (SMTP)", "smtp", &mut form.smtp_host, &mut form.smtp_port, &mut form.smtp_tls, "Same as IMAP"),
     ] {
         ui.add_space(8.0);
-        ui.label(RichText::new(title).strong());
+        ui.label(RichText::new(title).family(theme::bold()));
         form_grid(ui, &format!("{id}_form"), |ui| {
             ui.label("Server");
             ui.add(field(host).hint_text(hint));
@@ -678,8 +680,12 @@ struct BeaverApp {
     pending: Option<Pending>,
     /// Outbox messages being sent now: (account, the draft).
     outbox_sending: std::collections::HashMap<String, (u64, drafts::DraftData)>,
-    /// Messages waiting in the Outbox, every account together.
+    /// Messages waiting in the Outbox to go as soon as they can, every account together.
     outbox: usize,
+    /// Messages to send later, every account's, with the account they go from.
+    scheduled: Vec<(u64, drafts::DraftData)>,
+    /// The list shows the scheduled messages instead of a folder.
+    show_scheduled: bool,
     /// Without the reading pane, the open message is shown in the list's place.
     full_preview: bool,
     /// The user chose to work offline: nothing goes to the network until they go online again. Not
@@ -807,6 +813,8 @@ impl BeaverApp {
             pending: None,
             outbox_sending: std::collections::HashMap::new(),
             outbox: 0,
+            scheduled: Vec::new(),
+            show_scheduled: false,
             offline_changes: Vec::new(),
             work_offline: false,
             full_preview: false,
@@ -912,6 +920,7 @@ impl BeaverApp {
         self.send_pending(); // Undo puts mail back in the list it left
         self.selected = Some((serial, index));
         self.unified = false;
+        self.show_scheduled = false;
         self.refresh_drafts();
         // The reading pane belonged to the list being left; tabs stay.
         self.tabs.retain(|t| t.pinned);
@@ -932,6 +941,7 @@ impl BeaverApp {
         self.send_pending();
         self.selected = None;
         self.unified = true;
+        self.show_scheduled = false;
         self.drafts.clear();
         self.tabs.retain(|t| t.pinned);
         self.in_tab = false;
@@ -945,6 +955,50 @@ impl BeaverApp {
         self.checking = false;
         for (serial, index) in self.shown() {
             self.load_folder(serial, index);
+        }
+    }
+
+    /// Shows the messages scheduled to send later, from every account, in the list's place.
+    fn show_scheduled_list(&mut self) {
+        self.send_pending();
+        (self.selected, self.unified, self.show_scheduled, self.show_suspicious) = (None, false, true, false);
+        self.tabs.retain(|t| t.pinned);
+        (self.in_tab, self.full_preview) = (false, false);
+        self.picked.clear();
+        (self.message, self.body) = (None, None);
+        self.messages.clear();
+        self.origin.clear();
+        self.sent.clear();
+        self.screening.clear();
+        self.count_outbox();
+    }
+
+    /// What was chosen on a scheduled message's row: opened to change it (which unschedules it, as
+    /// any opened Outbox message), sent now, kept as a plain draft, or deleted.
+    fn scheduled_action(&mut self, serial: u64, draft: drafts::DraftData, action: views::DraftAction) {
+        let Some(key) = self.view(serial).map(|v| v.account.key()) else { return };
+        let result = match action {
+            views::DraftAction::Open => {
+                if self.compose.is_none() {
+                    self.start_compose(Some(compose::Compose::from_draft(serial, draft)));
+                }
+                Ok(())
+            }
+            views::DraftAction::SendNow => drafts::save(&self.vault, &key, &drafts::DraftData { send_at: None, ..draft }),
+            views::DraftAction::Unschedule => {
+                self.notice = Some(("Moved back to Drafts".into(), std::time::Instant::now()));
+                drafts::save(&self.vault, &key, &drafts::DraftData { queued: false, send_at: None, ..draft })
+            }
+            views::DraftAction::Delete => self.forget_draft(serial, &key, &draft.id, true),
+            views::DraftAction::None => return,
+        };
+        if let Err(e) = result {
+            self.error = Some(format!("Could not change the scheduled message: {e}"));
+        }
+        self.count_outbox();
+        self.refresh_drafts();
+        if matches!(action, views::DraftAction::SendNow) {
+            self.send_outbox(serial);
         }
     }
 
@@ -1315,17 +1369,13 @@ impl BeaverApp {
     /// connection, and back among the drafts, with the reason, when the server refused it.
     fn sent_from_outbox(&mut self, serial: u64, draft: drafts::DraftData, result: Result<(), MailError>) {
         let Some(view) = self.view(serial) else { return };
-        let (key, source) = (view.account.key(), view.source.clone());
+        let key = view.account.key();
         let subject = if draft.subject.trim().is_empty() { "(no subject)".to_owned() } else { draft.subject.trim().to_owned() };
         match result {
             Ok(()) => {
-                if let Err(e) = drafts::delete(&self.vault, &key, &draft.id) {
-                    self.error = Some(format!("“{subject}” was sent, but it could not be taken out of the Outbox: {e}"));
-                }
                 // A copy may have been kept in the server's Drafts folder before it was sent.
-                if let Some(source) = source {
-                    let id = draft.id.clone();
-                    self.spawn(async move { Event::DraftPushed(serial, id.clone(), 0, source.delete_draft(&id).await) });
+                if let Err(e) = self.forget_draft(serial, &key, &draft.id, true) {
+                    self.error = Some(format!("“{subject}” was sent, but it could not be taken out of the Outbox: {e}"));
                 }
                 self.notice = Some((format!("Sent “{subject}” from the Outbox"), std::time::Instant::now()));
             }
@@ -1768,11 +1818,16 @@ impl BeaverApp {
     }
 
     /// Puts the compose window's message in the Outbox: kept as a draft marked to send, the window closes.
-    fn queue(&mut self, compose: compose::Compose) {
+    /// `send_at`: not before then ("send later"); `None` as soon as the server can be reached.
+    fn queue(&mut self, compose: compose::Compose, send_at: Option<i64>) {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
-        let draft = drafts::DraftData { queued: true, ..compose.to_draft(now) };
+        let draft = drafts::DraftData { queued: true, send_at, ..compose.to_draft(now) };
+        let told = match send_at {
+            Some(at) => format!("Scheduled for {}. BeaverMail sends it then, if it is open", compose::when_text(at)),
+            None => "Saved to the Outbox: it is sent when the server can be reached".to_owned(),
+        };
         match drafts::save(&self.vault, &compose.key, &draft) {
-            Ok(()) => self.notice = Some(("Saved to the Outbox: it is sent when the server can be reached".into(), std::time::Instant::now())),
+            Ok(()) => self.notice = Some((told, std::time::Instant::now())),
             Err(e) => {
                 self.error = Some(format!("Could not keep the message to send later: {e}"));
                 self.compose = Some(compose); // nothing is lost: the window stays
@@ -1796,7 +1851,8 @@ impl BeaverApp {
             }
         }
         let open = self.compose.as_ref().map(|c| c.id.clone());
-        for draft in drafts::load_all(&self.vault, &key).into_iter().filter(|d| d.queued) {
+        let now = chrono::Local::now().timestamp();
+        for draft in drafts::load_all(&self.vault, &key).into_iter().filter(|d| d.queued && d.send_at.is_none_or(|at| at <= now)) {
             // One being edited, or already on its way, is left alone.
             if open.as_ref() == Some(&draft.id) || self.outbox_sending.contains_key(&draft.id) {
                 continue;
@@ -1811,7 +1867,36 @@ impl BeaverApp {
 
     /// Counts the messages in every account's Outbox, for the status bar.
     fn count_outbox(&mut self) {
-        self.outbox = self.accounts.iter().map(|v| drafts::load_all(&self.vault, &v.account.key()).iter().filter(|d| d.queued).count()).sum();
+        self.outbox = 0;
+        self.scheduled.clear();
+        let now = chrono::Local::now().timestamp();
+        for view in &self.accounts {
+            for draft in drafts::load_all(&self.vault, &view.account.key()).into_iter().filter(|d| d.queued) {
+                match draft.send_at {
+                    Some(at) if at > now => self.scheduled.push((view.serial, draft)),
+                    // Its time has come: it waits like any Outbox message for the server to answer, so a
+                    // send that fails offline is not tried again every frame.
+                    _ => self.outbox += 1,
+                }
+            }
+        }
+    }
+
+    /// Sends the scheduled messages whose time has come, and wakes the window for the next one.
+    fn send_scheduled(&mut self, ctx: &egui::Context) {
+        let now = chrono::Local::now().timestamp();
+        let at = |d: &drafts::DraftData| d.send_at.unwrap_or(i64::MAX);
+        let due: Vec<u64> = self.scheduled.iter().filter(|(_, d)| at(d) <= now).map(|(serial, _)| *serial).collect();
+        if !due.is_empty() {
+            // Once each: the answer counts the Outbox again.
+            self.scheduled.retain(|(_, d)| at(d) > now);
+            for serial in due {
+                self.send_outbox(serial);
+            }
+        }
+        if let Some(next) = self.scheduled.iter().map(|(_, d)| at(d)).min() {
+            ctx.request_repaint_after(std::time::Duration::from_secs((next - now).clamp(1, 60) as u64));
+        }
     }
 
     fn compose_window(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
@@ -1835,7 +1920,7 @@ impl BeaverApp {
             self.compose_focus = Some(focused);
         }
         // Esc is Discard (asked first when there is text), unless it is meant for a menu or the question itself.
-        let esc = !self.confirm_discard && !compose.sending && !egui::Popup::is_any_open(ctx) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        let esc = !self.confirm_discard && !compose.sending && !compose.picking && !egui::Popup::is_any_open(ctx) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         let outcome = if esc { compose::Outcome::Discard } else { compose::window(ctx, t, &mut compose, &senders, self.settings.rich_outgoing) };
         if compose.from != compose.sig_from {
             let signature = self.view(compose.from).map(|v| v.account.signature.clone()).unwrap_or_default();
@@ -1870,6 +1955,10 @@ impl BeaverApp {
             compose::Outcome::Undo => {
                 compose.sending = false;
                 compose.send_at = None;
+            }
+            compose::Outcome::Schedule(at) => {
+                self.queue(compose, Some(at));
+                return;
             }
         }
         if compose.send_at.is_some_and(|at| at <= std::time::Instant::now()) {
@@ -2150,7 +2239,7 @@ impl BeaverApp {
                         }
                     }
                     ui.add_space(18.0);
-                    label(ui, RichText::new("Accounts").size(13.0).strong().color(t.text_dim));
+                    label(ui, RichText::new("Accounts").size(13.0).family(theme::bold()).color(t.text_dim));
                     ui.add_space(4.0);
                     egui::ScrollArea::vertical().id_salt("settings_accounts").show(ui, |ui| {
                         for view in &self.accounts {
@@ -2219,7 +2308,7 @@ impl BeaverApp {
                                 changed |= views::switch_row(ui, t, &mut self.settings.reading_pane, "Show the message beside the list", about).changed();
                                 ui.add_space(12.0);
             if !self.settings.remote_senders.is_empty() {
-                ui.label(RichText::new("Senders that may load remote content").strong());
+                ui.label(RichText::new("Senders that may load remote content").family(theme::bold()));
                 let mut forget = None;
                 for address in &self.settings.remote_senders {
                     ui.horizontal(|ui| {
@@ -2237,7 +2326,7 @@ impl BeaverApp {
                 }
             }
             if !self.settings.sender_display.is_empty() {
-                ui.label(RichText::new("Senders with their own setting").strong());
+                ui.label(RichText::new("Senders with their own setting").family(theme::bold()));
                 let mut forget = None;
                 for (address, mode) in &self.settings.sender_display {
                     ui.horizontal(|ui| {
@@ -2793,19 +2882,25 @@ impl BeaverApp {
     }
 
     fn delete_draft(&mut self, compose: &compose::Compose) {
-        if let Err(e) = drafts::delete(&self.vault, &compose.key, &compose.id) {
+        if let Err(e) = self.forget_draft(compose.from, &compose.key, &compose.id, compose.may_be_on_server()) {
             self.error = Some(format!("Could not delete the draft: {e}"));
         }
-        // A copy was put on the server: take it away too.
-        if compose.may_be_on_server() {
-            let source = self.view(compose.from).and_then(|v| v.source.clone());
-            if let Some(source) = source {
-                let id = compose.id.clone();
-                let serial = compose.from;
-                self.spawn(async move { Event::DraftPushed(serial, id.clone(), 0, source.delete_draft(&id).await) });
-            }
+    }
+
+    /// Deletes draft `id` of account `serial` (whose key is `key`): on this computer, in the server's
+    /// Drafts folder when a copy may be there, and from the lists at once, since the server's copy
+    /// would otherwise show in Drafts until the next sync.
+    fn forget_draft(&mut self, serial: u64, key: &str, id: &str, on_server: bool) -> Result<(), MailError> {
+        let result = drafts::delete(&self.vault, key, id);
+        if on_server && let Some(source) = self.view(serial).and_then(|v| v.source.clone()) {
+            let gone = id.to_owned();
+            self.spawn(async move { Event::DraftPushed(serial, gone.clone(), 0, source.delete_draft(&gone).await) });
         }
+        let copy = beavermail_smtp::draft_message_id(id);
+        self.messages.retain(|m| m.message_id != copy);
         self.refresh_drafts();
+        self.count_outbox();
+        result
     }
 
     /// Stores a copy of the draft in the account's Drafts folder, so other devices see it. The files are
@@ -3398,7 +3493,7 @@ impl BeaverApp {
                         Err(MailError::Offline(_)) => {
                             if let Some(mut compose) = self.compose.take() {
                                 compose.sending = false;
-                                self.queue(compose);
+                                self.queue(compose, None);
                             }
                         }
                         Err(e) => {
@@ -3642,6 +3737,9 @@ impl BeaverApp {
                     ui.label(dim(format!("Offline{who}: showing mail stored on this computer{waiting}")));
                 } else if self.outbox > 0 {
                     ui.label(dim(format!("{} message{} in the Outbox", views::thousands(self.outbox as u32), if self.outbox == 1 { "" } else { "s" })));
+                } else if let Some(next) = self.scheduled.iter().filter_map(|(_, d)| d.send_at).min() {
+                    let n = self.scheduled.len();
+                    ui.label(dim(format!("{n} message{} scheduled, the next {}", if n == 1 { "" } else { "s" }, compose::when_text(next))));
                 } else if let Some(why) = &self.draft_error {
                     ui.label(RichText::new(format!("Draft not saved on the server: {why}")).size(13.0).color(t.danger));
                 } else {
@@ -3741,7 +3839,7 @@ impl BeaverApp {
     /// Accounts and their folders. Returns (folder chosen, account to remove, account to edit, add-account clicked).
     fn sidebar(&mut self, ui: &mut egui::Ui, t: &theme::Tokens) -> SidebarOutcome {
         let (mut chosen, mut removed, mut edit, mut add, mut suspicious, mut recheck, mut empty) = (None, None, None, false, None, None, None);
-        let mut all = false;
+        let (mut all, mut scheduled) = (false, false);
         let mut fold = None;
         // shortcut: only the Inboxes being shown have verdicts, so only their suspicious mail shows a count;
         // check every account in the background (during sync) to count them all.
@@ -3774,6 +3872,12 @@ impl BeaverApp {
                         if self.accounts.len() >= 2 {
                             let unread = self.accounts.iter().filter_map(|v| v.mailboxes.iter().find(|m| m.role == Role::Inbox)).map(|m| m.unread).sum();
                             all = views::folder_row(ui, t, "All inboxes", Role::Inbox, unread, self.unified).on_hover_text("The Inbox of every account, newest first").clicked();
+                        }
+                        if !self.scheduled.is_empty() {
+                            let row = views::icon_row(ui, t, "Scheduled", Icon::Calendar, self.scheduled.len() as u32, self.show_scheduled);
+                            scheduled = row.on_hover_text("Messages to send later, every account's").clicked();
+                        }
+                        if self.accounts.len() >= 2 || !self.scheduled.is_empty() {
                             ui.add_space(8.0);
                         }
                         ui.label(RichText::new("ACCOUNTS").size(12.0).color(t.text_dim));
@@ -3842,13 +3946,14 @@ impl BeaverApp {
             }
             self.save_settings();
         }
-        SidebarOutcome { chosen, suspicious, recheck, empty, removed, edit, add, all }
+        SidebarOutcome { chosen, suspicious, recheck, empty, removed, edit, add, all, scheduled }
     }
 
     /// Search, refresh and the message list. Returns the message the user clicked and whether to add an account.
     fn message_list(&mut self, ui: &mut egui::Ui, t: &theme::Tokens) -> (Option<MessageId>, bool) {
         let (mut opened, mut add, mut refresh) = (None, false, false);
         let (mut open_draft, mut delete_draft): (Option<String>, Option<String>) = (None, None);
+        let mut scheduled_choice: Option<(u64, drafts::DraftData, views::DraftAction)> = None;
         let mut ask_spam = false;
         let (mut pinned, mut toggled, mut ranged): (Option<MessageId>, Option<MessageId>, Option<MessageId>) = (None, None, None);
         let mut clicked_hit: Option<(u64, Hit, bool)> = None;
@@ -3888,6 +3993,22 @@ impl BeaverApp {
                 });
             }
             ui.add_space(6.0);
+            if self.show_scheduled {
+                ui.horizontal(|ui| {
+                    ui.add_space(16.0);
+                    ui.label(RichText::new("Scheduled  ·  sent at their time while BeaverMail is open").size(13.0).color(t.text_dim));
+                });
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    for (serial, draft) in &self.scheduled {
+                        let action = views::draft_row(ui, t, draft);
+                        if !matches!(action, views::DraftAction::None) {
+                            scheduled_choice = Some((*serial, draft.clone(), action));
+                        }
+                    }
+                });
+                return;
+            }
             if self.searching() {
                 if self.hits.is_empty() {
                     views::empty_state(ui, t, "No results", "Nothing stored on this computer matches. Try fewer words.", None);
@@ -3917,7 +4038,7 @@ impl BeaverApp {
             if !self.drafts.is_empty() {
                 ui.horizontal(|ui| {
                     ui.add_space(16.0);
-                    ui.label(RichText::new(format!("Drafts on this computer ({})", self.drafts.len())).size(13.0).strong().color(t.text_dim));
+                    ui.label(RichText::new(format!("Drafts on this computer ({})", self.drafts.len())).size(13.0).family(theme::bold()).color(t.text_dim));
                 });
                 egui::ScrollArea::vertical().id_salt("drafts").max_height(views::MESSAGE_ROW_H * 2.6).auto_shrink([false, true]).show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
@@ -3926,6 +4047,8 @@ impl BeaverApp {
                             views::DraftAction::Open => open_draft = Some(draft.id.clone()),
                             views::DraftAction::Delete => delete_draft = Some(draft.id.clone()),
                             views::DraftAction::None => {}
+                            // A scheduled one, shown among the drafts of the account it goes from.
+                            action => scheduled_choice = self.selected.map(|(serial, _)| (serial, draft.clone(), action)),
                         }
                     }
                 });
@@ -3999,19 +4122,15 @@ impl BeaverApp {
         if let Some(id) = open_draft {
             self.open_draft(&id);
         }
+        if let Some((serial, draft, action)) = scheduled_choice {
+            self.scheduled_action(serial, draft, action);
+        }
         if let Some(id) = delete_draft
             && let Some((serial, _)) = self.selected
             && let Some(key) = self.view(serial).map(|v| v.account.key())
+            && let Err(e) = self.forget_draft(serial, &key, &id, true)
         {
-            if let Err(e) = drafts::delete(&self.vault, &key, &id) {
-                self.error = Some(format!("Could not delete the draft: {e}"));
-            }
-            // Its copy in the server's Drafts folder goes too.
-            if let Some(source) = self.view(serial).and_then(|v| v.source.clone()) {
-                let gone = id.clone();
-                self.spawn(async move { Event::DraftPushed(serial, gone.clone(), 0, source.delete_draft(&gone).await) });
-            }
-            self.refresh_drafts();
+            self.error = Some(format!("Could not delete the draft: {e}"));
         }
         (opened, add)
     }
@@ -4332,6 +4451,15 @@ impl eframe::App for BeaverApp {
         if self.settings.threads {
             self.conversations.update(&self.messages, &self.sent);
         }
+        self.send_scheduled(ui.ctx());
+        // The last scheduled message went (or was taken back): the view goes with its row.
+        if self.show_scheduled && self.scheduled.is_empty() {
+            match self.accounts.iter().find_map(|v| Some((v.serial, v.mailboxes.iter().position(|m| m.role == Role::Inbox)?))) {
+                _ if self.accounts.len() >= 2 => self.show_all_inboxes(),
+                Some((serial, inbox)) => self.select_mailbox(serial, inbox),
+                None => self.show_scheduled = false,
+            }
+        }
         let t = theme::Tokens::get(ui.ctx());
         self.error_banner(ui, &t);
         self.status_bar(ui, &t);
@@ -4352,11 +4480,14 @@ impl eframe::App for BeaverApp {
                 _ => {}
             }
         }
-        let SidebarOutcome { chosen, suspicious, recheck, empty, removed, edit, mut add, all } =
+        let SidebarOutcome { chosen, suspicious, recheck, empty, removed, edit, mut add, all, scheduled } =
             if self.in_tab { SidebarOutcome::default() } else { self.sidebar(ui, &t) };
         if all {
             self.show_suspicious = false;
             self.show_all_inboxes();
+        }
+        if scheduled {
+            self.show_scheduled_list();
         }
         if let Some(serial) = edit {
             self.show_settings = true;
