@@ -652,6 +652,8 @@ struct BeaverApp {
     draft_error: Option<String>,
     /// A compose window with text in it is being closed; waiting for the user to confirm.
     confirm_discard: bool,
+    /// That question was asked because the app is closing: the answer closes it, unless it is Keep editing.
+    quitting: bool,
     /// Short confirmation ("Message sent") and when it was shown.
     notice: Option<(String, std::time::Instant)>,
     settings: Settings,
@@ -797,6 +799,7 @@ impl BeaverApp {
             drafts: Vec::new(),
             draft_error: None,
             confirm_discard: false,
+            quitting: false,
             notice: None,
             settings: Settings::default(),
             archive: Arc::new(archive),
@@ -1981,36 +1984,52 @@ impl BeaverApp {
         }
         if self.confirm_discard {
             let (mut discard, mut keep, mut save) = (false, false, false);
+            let quitting = self.quitting;
             let modal = egui::Modal::new(egui::Id::new("confirm_discard")).show(ctx, |ui| {
                 ui.set_width(FORM_WIDTH * 0.8);
-                ui.heading("Discard this message?");
+                ui.heading(if quitting { "Quit with this message open?" } else { "Discard this message?" });
                 ui.label(RichText::new("What you wrote will be lost, unless you keep it as a draft.").color(t.text_dim));
                 ui.add_space(12.0);
                 ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
-                    let button = egui::Button::new(accelerated("Discard", 0, t.on_accent)).fill(t.danger);
+                    let button = egui::Button::new(accelerated(if quitting { "Discard and quit" } else { "Discard" }, 0, t.on_accent)).fill(t.danger);
                     discard = ui.add(button).clicked();
-                    save = ui.button(accelerated("Save draft", 0, egui::Color32::PLACEHOLDER)).clicked();
+                    save = ui.button(accelerated(if quitting { "Save draft and quit" } else { "Save draft" }, 0, egui::Color32::PLACEHOLDER)).clicked();
                     keep = ui.button(accelerated("Keep editing", 0, egui::Color32::PLACEHOLDER)).clicked();
                 });
             });
             let letter = |k| ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, k));
             let (discard, save) = (discard || letter(egui::Key::D), save || letter(egui::Key::S));
             let keep = keep || letter(egui::Key::K);
+            // Asked because the app is closing: it closes now, the window being gone.
+            let close = |ctx: &egui::Context| {
+                if quitting {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            };
             if discard {
                 self.confirm_discard = false;
                 self.delete_draft(&compose);
+                close(ctx);
                 return;
             }
             if save {
                 self.confirm_discard = false;
                 self.save_draft(&mut compose);
+                // Not kept (the error says why): the app stays open with the message, rather than lose it.
+                if quitting && compose.unsaved() {
+                    self.quitting = false;
+                    self.compose = Some(compose);
+                    return;
+                }
                 if !compose.is_empty() && compose.snapshot() != compose.server_saved {
                     self.push_draft(&mut compose);
                 }
+                close(ctx);
                 return;
             }
             if keep || modal.should_close() {
                 self.confirm_discard = false;
+                self.quitting = false;
                 self.refocus = 3;
             }
         }
@@ -4447,6 +4466,14 @@ impl eframe::App for BeaverApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         while let Ok(event) = self.rx.try_recv() {
             self.apply(event);
+        }
+        // Closing the app with a message being written asks first, as Discard does. One being sent, or
+        // waiting out Undo send, is kept as a draft on the way out without asking.
+        if ui.ctx().input(|i| i.viewport().close_requested())
+            && self.compose.as_ref().is_some_and(|c| !c.is_empty() && !c.sending)
+        {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            (self.confirm_discard, self.quitting) = (true, true);
         }
         if self.settings.threads {
             self.conversations.update(&self.messages, &self.sent);
