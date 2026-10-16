@@ -78,6 +78,8 @@ enum Event {
     Unsubscribed(String, Result<(), String>),
     /// A sign-in with a provider ended: (its cancel flag, which tells it from an earlier one, result).
     SignedIn(Arc<std::sync::atomic::AtomicBool>, Result<store::oauth::Grant, String>),
+    /// A "Test connection" ended: (the form it is for, what was tested, IMAP's answer, SMTP's answer).
+    Checked(Option<u64>, (Account, String), Result<(), String>, Result<(), String>),
     /// Everyone the user has written to, for the address fields.
     Contacts(Result<Vec<beavermail_store::Contact>, MailError>),
 }
@@ -99,6 +101,7 @@ impl SignIn {
 /// What the user pressed on an account's page in Settings.
 enum PageAction {
     Remove,
+    Test,
     SignIn(OAuthProvider),
     CancelSignIn,
 }
@@ -308,8 +311,8 @@ struct AccountView {
     sender: Option<Arc<SmtpSender>>,
     mailboxes: Vec<Mailbox>,
     error: Option<String>,
-    /// The server could not be reached the last time it was asked; the archive is shown.
-    offline: bool,
+    /// Why the server could not be reached the last time it was asked; the archive is shown meanwhile.
+    offline: Option<String>,
     /// The background download, shared with the status bar.
     progress: Arc<Progress>,
     /// Set to stop the Inbox watcher; `watching` says whether one is running.
@@ -339,6 +342,8 @@ struct NewAccount {
     signature: String,
     /// Signed in with a provider: kept through an edit, so the account stays an OAuth one.
     oauth: Option<OAuthProvider>,
+    /// The last "Test connection", shown while the form still says what was tested.
+    check: Option<Check>,
     error: Option<String>,
     /// Focus the first field on the first frame only.
     focus_first: bool,
@@ -362,13 +367,26 @@ impl Default for NewAccount {
             keep: Keep::default(),
             signature: String::new(),
             oauth: None,
+            check: None,
             error: None,
             focus_first: true,
         }
     }
 }
 
+/// A "Test connection": the account and password as typed when it started, and what the incoming and
+/// outgoing servers answered (`None` while it runs).
+struct Check {
+    tested: (Account, String),
+    answers: Option<(Result<(), String>, Result<(), String>)>,
+}
+
 impl NewAccount {
+    /// The test that applies to the form as it is now; one made before a change is out of date.
+    fn current_check(&self) -> Option<&Check> {
+        self.check.as_ref().filter(|c| self.build().is_ok_and(|a| a == c.tested.0) && self.password == c.tested.1)
+    }
+
     /// The form filled with an existing account's settings; the password is left empty.
     fn editing(serial: u64, account: &Account) -> Self {
         let port = |s: &Server| s.port.to_string();
@@ -613,6 +631,12 @@ fn account_page(ui: &mut egui::Ui, t: &theme::Tokens, form: &mut NewAccount, wai
             server_sections(ui, form);
         }
     }
+    if !waiting {
+        ui.add_space(8.0);
+        if check_rows(ui, t, form) {
+            action = Some(PageAction::Test);
+        }
+    }
 
     section_title(ui, "Remove account");
     hint(ui, "Deletes the mail downloaded to this computer and the saved password. Nothing changes on the server.");
@@ -635,6 +659,31 @@ fn trusted_key(text: &str) -> Option<String> {
         return None;
     }
     Some(if user.is_empty() { format!("@{}", sender::registrable(domain)) } else { text })
+}
+
+/// "Test connection" and, once it ran for the form as it is, what each server answered.
+fn check_rows(ui: &mut egui::Ui, t: &theme::Tokens, form: &NewAccount) -> bool {
+    let testing = form.current_check().is_some_and(|c| c.answers.is_none());
+    let pressed = ui.add_enabled(form.ready() && !testing, egui::Button::new("Test connection")).on_hover_text("Sign in to both servers now, to find a mistake before saving").clicked();
+    match form.current_check().map(|c| &c.answers) {
+        Some(None) => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(RichText::new("Signing in to both servers…").color(t.text_dim));
+            });
+        }
+        Some(Some((imap, smtp))) => {
+            for (what, answer) in [("Incoming mail (IMAP)", imap), ("Outgoing mail (SMTP)", smtp)] {
+                let (text, color) = match answer {
+                    Ok(()) => (format!("{what}: signed in"), t.accent),
+                    Err(why) => (format!("{what}: {why}"), t.danger),
+                };
+                ui.add(egui::Label::new(RichText::new(text).size(13.0).color(color)).wrap());
+            }
+        }
+        None => {}
+    }
+    pressed
 }
 
 /// User and password, as rows of the caller's form grid.
@@ -984,7 +1033,7 @@ impl BeaverApp {
         }
         let progress = Arc::new(Progress::default());
         progress.paused.store(self.downloads_paused, std::sync::atomic::Ordering::Relaxed);
-        let view = AccountView { serial, account, source, sender, mailboxes: Vec::new(), error, offline: false, progress, watch_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)), watching: false };
+        let view = AccountView { serial, account, source, sender, mailboxes: Vec::new(), error, offline: None, progress, watch_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)), watching: false };
         match position {
             Some(at) => self.accounts.insert(at.min(self.accounts.len()), view),
             None => self.accounts.push(view),
@@ -1489,7 +1538,7 @@ impl BeaverApp {
                 view.watching = false;
                 view.progress.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
             } else {
-                view.offline = false;
+                view.offline = None;
                 view.progress.cancel.store(false, std::sync::atomic::Ordering::Relaxed);
             }
         }
@@ -1503,9 +1552,9 @@ impl BeaverApp {
     }
 
     /// The server of account `serial` could not be reached: shown as a state, not an error.
-    fn went_offline(&mut self, serial: u64) {
+    fn went_offline(&mut self, serial: u64, why: String) {
         if let Some(view) = self.accounts.iter_mut().find(|v| v.serial == serial) {
-            view.offline = true;
+            view.offline = Some(why);
         }
     }
 
@@ -2593,6 +2642,7 @@ impl BeaverApp {
             (Some(PageAction::Remove), SettingsPage::Account(serial)) => self.confirm_remove = Some(serial),
             (Some(PageAction::SignIn(provider)), SettingsPage::Account(serial)) => self.sign_in(provider, Some(serial)),
             (Some(PageAction::CancelSignIn), _) => self.cancel_sign_in(),
+            (Some(PageAction::Test), SettingsPage::Account(serial)) => self.test_connection(Some(serial)),
             _ => {}
         }
         if add {
@@ -3372,7 +3422,9 @@ impl BeaverApp {
                         mailboxes.sort_by_key(|m| (views::folder_rank(m.role), m.name.clone()));
                         view.mailboxes = mailboxes;
                         view.error = None;
-                        view.offline &= !fresh; // the server answered
+                        if fresh {
+                            view.offline = None; // the server answered
+                        }
                         let inbox = view.mailboxes.iter().position(|m| m.role == Role::Inbox).unwrap_or(0);
                         let moved = selected_name.and_then(|name| view.mailboxes.iter().position(|m| m.name == name));
                         let has_inbox = view.mailboxes.iter().any(|m| m.role == Role::Inbox);
@@ -3387,7 +3439,7 @@ impl BeaverApp {
                             if self.accounts.len() >= 2 { self.show_all_inboxes() } else { self.select_mailbox(serial, inbox) }
                         }
                     }
-                    Err(MailError::Offline(_)) => view.offline = true,
+                    Err(MailError::Offline(why)) => view.offline = Some(why),
                     Err(e) => view.error = Some(e.to_string()),
                 }
                 if download {
@@ -3429,7 +3481,7 @@ impl BeaverApp {
                     Ok(()) => {}
                     // The status bar already says the stored mail is locked.
                     Err(MailError::Auth(_)) if self.vault.is_locked() => {}
-                    Err(MailError::Offline(_)) => self.went_offline(serial),
+                    Err(MailError::Offline(why)) => self.went_offline(serial, why),
                     Err(e) => self.error = Some(format!("Downloading mail stopped: {e}")),
                 }
                 // Previews arrive with the files.
@@ -3450,7 +3502,7 @@ impl BeaverApp {
                 match result {
                     Ok(report) => {
                         if let Some(view) = self.accounts.iter_mut().find(|v| v.serial == serial) {
-                            view.offline = false; // the server answered
+                            view.offline = None; // the server answered
                         }
                         let Some(view) = self.view(serial) else { return };
                         let (Some(source), Some(name)) = (view.source.clone(), view.mailboxes.get(index).map(|m| m.name.clone())) else { return };
@@ -3462,7 +3514,7 @@ impl BeaverApp {
                             self.start_sync(serial, index, source, name);
                         }
                     }
-                    Err(MailError::Offline(_)) => self.went_offline(serial),
+                    Err(MailError::Offline(why)) => self.went_offline(serial, why),
                     Err(e) => self.error = Some(e.to_string()),
                 }
             }
@@ -3507,16 +3559,16 @@ impl BeaverApp {
             {
                 match result {
                     Ok(prepared) => self.body = Some(OpenBody::new(*prepared)),
-                    Err(MailError::Offline(_)) => {
-                        self.went_offline(serial);
+                    Err(MailError::Offline(why)) => {
+                        self.went_offline(serial, why);
                         self.error = Some("This message is not stored on this computer. It opens once the server can be reached.".into());
                     }
                     Err(e) => self.error = Some(e.to_string()),
                 }
             }
             // No connection: the change waits and is made when the server answers again.
-            Event::Done(serial, index, Some(change), Err(MailError::Offline(_))) => {
-                self.went_offline(serial);
+            Event::Done(serial, index, Some(change), Err(MailError::Offline(why))) => {
+                self.went_offline(serial, why);
                 self.offline_changes.push((serial, index, change.0, change.1));
             }
             Event::Done(serial, index, _, Err(e)) => {
@@ -3579,6 +3631,12 @@ impl BeaverApp {
                 }
             }
             Event::SignedIn(cancel, result) => self.signed_in(cancel, result),
+            Event::Checked(editing, tested, imap, smtp) => {
+                let form = if editing.is_none() { self.form.as_mut() } else { self.account_edit.as_mut().filter(|f| f.editing == editing) };
+                if let Some(check) = form.and_then(|f| f.check.as_mut()).filter(|c| c.tested == tested) {
+                    check.answers = Some((imap, smtp));
+                }
+            }
             Event::Contacts(Ok(contacts)) => self.contacts = Arc::new(contacts),
             Event::Contacts(Err(_)) => {} // the fields only miss their suggestions
             Event::Unsubscribed(who, result) => match result {
@@ -3733,6 +3791,49 @@ impl BeaverApp {
         }
     }
 
+    /// Signs in to both servers as the form says, in the background, saving nothing; an edit with the
+    /// password left empty tests the stored one.
+    fn test_connection(&mut self, editing: Option<u64>) {
+        let stored = editing.and_then(|serial| self.view(serial)).map(|v| v.account.clone());
+        let work_offline = self.work_offline;
+        let (archive, vault) = (self.archive.clone(), self.vault.clone());
+        let Some(form) = (if editing.is_none() { self.form.as_mut() } else { self.account_edit.as_mut() }) else { return };
+        if work_offline {
+            form.error = Some("Go online to test the connection.".into());
+            return;
+        }
+        let account = match form.build() {
+            Ok(account) => account,
+            Err(e) => return form.error = Some(e),
+        };
+        let password = match (&stored, form.password.is_empty()) {
+            (Some(old), true) => match store::password(old) {
+                Ok(password) => password,
+                Err(e) => return form.error = Some(e),
+            },
+            _ => form.password.clone(),
+        };
+        form.error = None;
+        let tested = (account.clone(), form.password.clone());
+        form.check = Some(Check { tested: tested.clone(), answers: None });
+        let (mut imap, mut smtp) = (ImapSource::new(&account, password.clone(), archive, vault), SmtpSender::new(&account, password));
+        if let Some(provider) = account.oauth {
+            let token = store::oauth::token_source(provider, account.clone());
+            (imap, smtp) = (imap.with_token(token.clone()), smtp.with_token(token));
+        }
+        self.spawn(async move {
+            let said = |result: Result<(), MailError>| {
+                result.map_err(|e| match e {
+                    MailError::Auth(why) => format!("the server refused the sign-in: {why}"),
+                    MailError::Offline(why) | MailError::Backend(why) => why,
+                    e => e.to_string(),
+                })
+            };
+            let imap = said(imap.check().await);
+            Event::Checked(editing, tested, imap, said(smtp.check().await))
+        });
+    }
+
     /// Opens the provider's sign-in in the browser and waits for it in the background; `editing`: for
     /// that account's page, else for Add account.
     fn sign_in(&mut self, provider: OAuthProvider, editing: Option<u64>) {
@@ -3793,7 +3894,7 @@ impl BeaverApp {
         let Some(mut form) = self.form.take() else { return };
         let t = theme::Tokens::get(ctx);
         let (mut submit, mut cancel) = (false, false);
-        let (mut start, mut stop) = (None, false);
+        let (mut start, mut stop, mut test) = (None, false, false);
         let waiting = self.signing_in.as_ref().filter(|s| s.editing.is_none()).map(|s| s.provider);
         let ready = form.ready();
         let modal = egui::Modal::new(egui::Id::new("add_account")).show(ctx, |ui| {
@@ -3840,6 +3941,8 @@ impl BeaverApp {
                     login_rows(ui, &mut form);
                 });
                 server_sections(ui, &mut form);
+                ui.add_space(8.0);
+                test = check_rows(ui, &t, &form);
             });
             if let Some(error) = &form.error {
                 ui.add_space(8.0);
@@ -3861,6 +3964,11 @@ impl BeaverApp {
         if let Some(provider) = start {
             form.error = None;
             self.sign_in(provider, None);
+        }
+        if test && open {
+            self.form = Some(form);
+            self.test_connection(None);
+            return;
         }
         if submit {
             match self.save_account(&form) {
@@ -3929,8 +4037,9 @@ impl BeaverApp {
                 } else if running || self.syncing > 0 {
                     ui.add(egui::Spinner::new().size(12.0));
                     ui.label(dim(if activity.is_empty() { "Syncing…".to_owned() } else { format!("{activity}…") }));
-                } else if self.accounts.iter().any(|v| v.offline) {
-                    let names: Vec<&str> = self.accounts.iter().filter(|v| v.offline).map(|v| v.account.name.as_str()).collect();
+                } else if self.accounts.iter().any(|v| v.offline.is_some()) {
+                    let names: Vec<&str> = self.accounts.iter().filter(|v| v.offline.is_some()).map(|v| v.account.name.as_str()).collect();
+                    let why: Vec<String> = self.accounts.iter().filter_map(|v| Some(format!("{}: {}", v.account.name, v.offline.as_ref()?))).collect();
                     let who = if names.len() == self.accounts.len() { String::new() } else { format!(" ({})", names.join(", ")) };
                     let mut waiting = String::new();
                     if self.outbox > 0 {
@@ -3940,7 +4049,7 @@ impl BeaverApp {
                         let n = self.offline_changes.len();
                         waiting += &format!("  ·  {n} change{} waiting", if n == 1 { "" } else { "s" });
                     }
-                    ui.label(dim(format!("Offline{who}: showing mail stored on this computer{waiting}")));
+                    ui.label(dim(format!("Offline{who}: showing mail stored on this computer{waiting}"))).on_hover_text(why.join("\n"));
                 } else if self.outbox > 0 {
                     ui.label(dim(format!("{} message{} in the Outbox", views::thousands(self.outbox as u32), if self.outbox == 1 { "" } else { "s" })));
                 } else if let Some(next) = self.scheduled.iter().filter_map(|(_, d)| d.send_at).min() {
@@ -4094,12 +4203,21 @@ impl BeaverApp {
                                 title.append("● ", 0.0, egui::TextFormat::simple(egui::FontId::proportional(13.0), theme::account_color(at)));
                             }
                             title.append(&view.account.name, 0.0, egui::TextFormat::simple(egui::FontId::proportional(15.0), t.text));
+                            // Seen with the account folded too: why its mail is not coming.
+                            let small = |color| egui::TextFormat::simple(egui::FontId::proportional(12.5), color);
+                            if view.error.is_some() {
+                                title.append("not connected", 8.0, small(t.danger));
+                            } else if view.offline.is_some() && !self.work_offline {
+                                title.append("offline", 8.0, small(t.text_dim));
+                            }
                             let header = egui::CollapsingHeader::new(title)
                                 .id_salt(view.serial)
                                 .default_open(!self.settings.folded.contains(&view.account.key()))
                                 .show(ui, |ui| {
                                     if let Some(error) = &view.error {
-                                        ui.colored_label(t.danger, error);
+                                        ui.add(egui::Label::new(RichText::new(error).size(13.0).color(t.danger)).wrap());
+                                    } else if let Some(why) = view.offline.as_ref().filter(|_| !self.work_offline) {
+                                        ui.add(egui::Label::new(RichText::new(why).size(13.0).color(t.text_dim)).wrap());
                                     }
                                     let mut order: Vec<usize> = (0..view.mailboxes.len()).collect();
                                     order.sort_by_key(|&i| (views::folder_rank(view.mailboxes[i].role), view.mailboxes[i].name.clone()));
@@ -4940,6 +5058,19 @@ mod tests {
         assert_eq!((account.user.as_str(), account.address(), account.imap.host.as_str(), account.smtp.port), ("ada@gmail.com", "ada@gmail.com", "imap.gmail.com", 587));
         assert_eq!(account.oauth, Some(OAuthProvider::Google));
         assert!(!account.save_sent, "the provider files sent mail itself");
+    }
+
+    #[test]
+    fn a_test_result_stands_only_for_the_form_it_tested() {
+        let mut form = filled();
+        let tested = (form.build().unwrap(), form.password.clone());
+        form.check = Some(Check { tested, answers: Some((Ok(()), Err("bad".into()))) });
+        assert!(form.current_check().is_some());
+        form.imap_port = "993".into();
+        assert!(form.current_check().is_none(), "another port: not what was tested");
+        form.imap_port = "143".into();
+        form.password = "other".into();
+        assert!(form.current_check().is_none(), "another password either");
     }
 
     fn filled() -> NewAccount {

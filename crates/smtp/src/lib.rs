@@ -30,6 +30,14 @@ impl SmtpSender {
         self
     }
 
+    /// Connects and signs in, sending nothing: whether the server, its TLS and the login work.
+    pub async fn check(&self) -> Result<(), MailError> {
+        if self.offline.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(MailError::Offline("working offline".into()));
+        }
+        self.transport().await?.test_connection().await.map(|_| ()).map_err(smtp_error)
+    }
+
     /// The transport for one message, signed in with the password or, for a provider, a fresh token.
     async fn transport(&self) -> Result<AsyncSmtpTransport<Tokio1Executor>, MailError> {
         let (secret, mechanisms) = match &self.token {
@@ -53,6 +61,15 @@ impl SmtpSender {
             None => builder,
         }
         .build())
+    }
+}
+
+fn smtp_error(e: lettre::transport::smtp::Error) -> MailError {
+    match e {
+        e if e.status().is_some_and(|code| code.to_string() == "535") => MailError::Auth(e.to_string()),
+        // What is left once the server's answers, TLS and the message itself are ruled out: no connection.
+        e if !(e.is_response() || e.is_client() || e.is_transient() || e.is_permanent() || e.is_tls()) => MailError::Offline(e.to_string()),
+        e => backend(e),
     }
 }
 
@@ -280,13 +297,8 @@ impl MailSender for SmtpSender {
         let (id, date) = (new_message_id(&message.from), std::time::SystemTime::now());
         let email = build_with(&message, &id, date, false)?;
         let raw = if message.bcc.is_empty() { email.formatted() } else { build_with(&message, &id, date, true)?.formatted() };
-        match self.transport().await?.send(email).await {
-            Ok(_) => Ok(raw),
-            Err(e) if e.status().is_some_and(|code| code.to_string() == "535") => Err(MailError::Auth(e.to_string())),
-            // What is left once the server's answers, TLS and the message itself are ruled out: no connection.
-            Err(e) if !(e.is_response() || e.is_client() || e.is_transient() || e.is_permanent() || e.is_tls()) => Err(MailError::Offline(e.to_string())),
-            Err(e) => Err(backend(e)),
-        }
+        self.transport().await?.send(email).await.map_err(smtp_error)?;
+        Ok(raw)
     }
 }
 

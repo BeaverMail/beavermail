@@ -105,6 +105,14 @@ impl ImapSource {
         self
     }
 
+    /// Signs in and out on a connection of its own, touching nothing: whether the server, its TLS and
+    /// the login work.
+    pub async fn check(&self) -> Result<(), MailError> {
+        let mut session = tokio::time::timeout(2 * CONNECT_WAIT, connect(&self.config)).await.map_err(|_| MailError::Offline(format!("{} stopped answering", self.config.server.host)))??;
+        let _ = session.logout().await;
+        Ok(())
+    }
+
     pub fn with_poll_interval(mut self, interval: std::time::Duration) -> Self {
         self.poll_interval = interval;
         self
@@ -143,12 +151,30 @@ async fn tls(tcp: TcpStream, host: &str) -> Result<Stream, MailError> {
     Ok(Box::new(stream))
 }
 
+/// How long a server may take to accept the connection.
+const CONNECT_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// A connection that could not be made, said so the user knows what to check. Still offline: a
+/// server that is down refuses too, and changes made meanwhile wait for it.
+fn unreachable(host: &str, port: u16, e: &std::io::Error) -> MailError {
+    match e.kind() {
+        std::io::ErrorKind::ConnectionRefused => MailError::Offline(format!("{host} refused the connection on port {port}: check the port, or the server is down")),
+        // The lookup's own error has no kind of its own, only its text.
+        _ if e.to_string().contains("lookup") => MailError::Offline(format!("{host} could not be found: check the server name, or the connection")),
+        _ => MailError::Offline(format!("{host} could not be reached: {e}")),
+    }
+}
+
 async fn connect(c: &Config) -> Result<Session<Stream>, MailError> {
     if c.offline.load(std::sync::atomic::Ordering::Relaxed) {
         return Err(MailError::Offline("working offline".into()));
     }
     let Server { host, port, tls: mode } = &c.server;
-    let tcp = TcpStream::connect((host.as_str(), *port)).await.map_err(|e| MailError::Offline(e.to_string()))?;
+    let tcp = match tokio::time::timeout(CONNECT_WAIT, TcpStream::connect((host.as_str(), *port))).await {
+        Ok(Ok(tcp)) => tcp,
+        Ok(Err(e)) => return Err(unreachable(host, *port, &e)),
+        Err(_) => return Err(MailError::Offline(format!("{host} did not answer on port {port}"))),
+    };
     let mut client = match mode {
         Tls::None => Client::new(Box::new(tcp) as Stream),
         Tls::Tls => Client::new(tls(tcp, host).await?),

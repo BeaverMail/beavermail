@@ -141,6 +141,16 @@ async fn a_provider_account_signs_in_with_an_access_token() {
 }
 
 #[tokio::test]
+async fn a_check_signs_in_and_sends_nothing() {
+    let (sender, transcript) = start("secret", "secret").await;
+    sender.check().await.unwrap();
+    assert!(transcript.lock().unwrap().commands.iter().all(|c| !c.starts_with("MAIL FROM")), "nothing sent");
+    let (wrong, _) = start("secret", "wrong").await;
+    assert!(matches!(wrong.check().await.unwrap_err(), MailError::Auth(_)));
+    assert!(matches!(SmtpSender::new(&account(1), "secret".into()).check().await.unwrap_err(), MailError::Offline(_)));
+}
+
+#[tokio::test]
 async fn a_wrong_password_is_an_auth_error() {
     let (sender, _) = start("secret", "wrong").await;
     let error = sender.send(message()).await.unwrap_err();

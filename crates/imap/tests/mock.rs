@@ -321,6 +321,23 @@ async fn a_provider_account_signs_in_with_an_access_token() {
 }
 
 #[tokio::test]
+async fn a_check_signs_in_and_out_and_says_why_a_server_cannot_be_reached() {
+    let mock = start(true).await;
+    mock.source.check().await.unwrap();
+    let commands = mock.commands();
+    assert!(commands.iter().any(|c| c.starts_with("LOGIN")) && commands.iter().any(|c| c.starts_with("LOGOUT")), "{commands:?}");
+    assert!(!commands.iter().any(|c| c.starts_with("SELECT") || c.starts_with("LIST")), "nothing but the login: {commands:?}");
+    assert!(mock.store.folders(&mock.account.key()).unwrap().is_empty(), "nothing stored");
+    let mut account = mock.account.clone();
+    account.imap.port = 1; // nothing listens there
+    let error = ImapSource::new(&account, "p".into(), mock.store.clone(), mock.files.clone()).check().await.unwrap_err();
+    assert!(matches!(&error, MailError::Offline(why) if why.contains("refused the connection on port 1")), "{error:?}");
+    account.imap.host = "no-such-host.invalid".into();
+    let error = ImapSource::new(&account, "p".into(), mock.store.clone(), mock.files.clone()).check().await.unwrap_err();
+    assert!(matches!(&error, MailError::Offline(why) if why.contains("could not be found")), "{error:?}");
+}
+
+#[tokio::test]
 async fn the_archive_works_without_the_server() {
     let mock = start(true).await;
     let id = message_in(&mock, "INBOX").await;
