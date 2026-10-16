@@ -16,6 +16,12 @@ struct Transcript {
 }
 
 async fn start(good_password: &'static str, password: &str) -> (SmtpSender, Arc<Mutex<Transcript>>) {
+    let (port, transcript) = listen(good_password).await;
+    (SmtpSender::new(&account(port), password.into()), transcript)
+}
+
+/// A server on a port of its own, and what it hears.
+async fn listen(good_password: &'static str) -> (u16, Arc<Mutex<Transcript>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let transcript = Arc::new(Mutex::new(Transcript::default()));
@@ -25,12 +31,12 @@ async fn start(good_password: &'static str, password: &str) -> (SmtpSender, Arc<
             tokio::spawn(serve(socket, served.clone(), good_password));
         }
     });
-    (SmtpSender::new(&account(port), password.into()), transcript)
+    (port, transcript)
 }
 
 fn account(port: u16) -> Account {
     let server = Server { host: "127.0.0.1".into(), port, tls: Tls::None };
-    Account { name: "mock".into(), user: "me@example.com".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true, keep: beavermail_core::Keep::default(), signature: String::new(), oauth: None }
+    Account { name: "mock".into(), user: "me@example.com".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true, keep: beavermail_core::Keep::default(), signature: String::new(), oauth: None, smtp_user: None }
 }
 
 async fn serve(socket: TcpStream, transcript: Arc<Mutex<Transcript>>, good_password: &'static str) {
@@ -138,6 +144,16 @@ async fn a_provider_account_signs_in_with_an_access_token() {
     assert!(transcript.lock().unwrap().commands.iter().any(|c| c.starts_with("AUTH XOAUTH2")));
     let failing = SmtpSender::new(&Account { oauth: Some(beavermail_core::OAuthProvider::Google), ..account(1) }, String::new()).with_token(Arc::new(|| Err(MailError::Auth("sign in again".into()))));
     assert!(matches!(failing.send(message()).await.unwrap_err(), MailError::Auth(_)), "no token: the server is never asked");
+}
+
+#[tokio::test]
+async fn the_outgoing_server_signs_in_with_its_own_login() {
+    let (port, transcript) = listen("relay-secret").await;
+    let mut own = account(port);
+    own.smtp_user = Some("relay-user".into());
+    SmtpSender::new(&own, "relay-secret".into()).check().await.unwrap();
+    let auth = transcript.lock().unwrap().commands.iter().find(|c| c.starts_with("AUTH PLAIN")).cloned().unwrap();
+    assert!(decode(auth.rsplit(' ').next().unwrap()).contains("relay-user"), "{auth}");
 }
 
 #[tokio::test]

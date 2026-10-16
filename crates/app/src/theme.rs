@@ -5,7 +5,7 @@ use std::sync::Arc;
 use beavermail_core::Role;
 use eframe::egui::{self, Color32, CornerRadius, Margin, Shadow, Stroke, TextStyle, Theme, Visuals};
 
-/// One geometry contract for every view (mirrors the Flectar/Slint `LayoutMetrics`): views never invent sizes.
+/// One geometry contract for every view: views never invent sizes.
 pub const CONTROL_H: f32 = 40.0;
 pub const CONTROL_RADIUS: u8 = 8;
 /// Section titles inside a page: between body (15) and heading (22).

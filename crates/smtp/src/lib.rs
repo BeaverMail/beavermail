@@ -19,9 +19,10 @@ pub struct SmtpSender {
 }
 
 impl SmtpSender {
-    /// Creates the sender; the connection is opened for each message.
+    /// Creates the sender, signing in as the account's outgoing login with `password`; the connection
+    /// is opened for each message.
     pub fn new(account: &Account, password: String) -> Self {
-        Self { server: account.smtp.clone(), user: account.user.clone(), password, offline: Default::default(), token: None }
+        Self { server: account.smtp.clone(), user: account.smtp_login().to_owned(), password, offline: Default::default(), token: None }
     }
 
     /// Signs in with `token`'s access tokens (XOAUTH2) instead of the password.

@@ -152,7 +152,7 @@ pub struct Server {
 pub struct Account {
     /// Label shown in the UI.
     pub name: String,
-    /// Login name, shared by IMAP and SMTP. Often, but not always, the email address.
+    /// Login name, for IMAP and, unless `smtp_user` says otherwise, SMTP. Often, but not always, the email address.
     pub user: String,
     /// The address mail is sent from. Empty in files written before this field existed.
     #[serde(default)]
@@ -172,6 +172,9 @@ pub struct Account {
     /// account is then its refresh token.
     #[serde(default)]
     pub oauth: Option<OAuthProvider>,
+    /// The outgoing server's own login, when it is not the incoming one's; its password is kept apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smtp_user: Option<String>,
 }
 
 /// Who an account signs in with, when it is not a password.
@@ -249,6 +252,11 @@ impl Account {
     /// The address to send from: the configured one, else the login name.
     pub fn address(&self) -> &str {
         if self.email.trim().is_empty() { &self.user } else { self.email.trim() }
+    }
+
+    /// The login for the outgoing server.
+    pub fn smtp_login(&self) -> &str {
+        self.smtp_user.as_deref().unwrap_or(&self.user)
     }
 
     /// Stable identity of the account: also the key of its secret in the credential store.

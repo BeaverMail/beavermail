@@ -90,6 +90,11 @@ fn entry(account: &Account) -> Result<keyring::Entry, String> {
     keyring::Entry::new(SERVICE, &account.key()).map_err(|e| format!("credential store: {e}"))
 }
 
+/// Where the outgoing server's own password is kept, beside the account's.
+fn smtp_entry(account: &Account) -> Result<keyring::Entry, String> {
+    keyring::Entry::new(SERVICE, &format!("{}#smtp", account.key())).map_err(|e| format!("credential store: {e}"))
+}
+
 pub fn password(account: &Account) -> Result<String, String> {
     entry(account)?.get_password().map_err(|e| format!("credential store: {e}"))
 }
@@ -98,12 +103,35 @@ pub fn set_password(account: &Account, password: &str) -> Result<(), String> {
     entry(account)?.set_password(password).map_err(|e| format!("credential store: {e}"))
 }
 
-/// Removes the stored password; a missing one is not an error.
-pub fn forget_password(account: &Account) -> Result<(), String> {
-    match entry(account)?.delete_credential() {
+/// The password for the outgoing server: its own when it has its own login, else the account's.
+pub fn smtp_password(account: &Account) -> Result<String, String> {
+    match account.smtp_user {
+        Some(_) => smtp_entry(account)?.get_password().map_err(|e| format!("credential store, outgoing server: {e}")),
+        None => password(account),
+    }
+}
+
+pub fn set_smtp_password(account: &Account, password: &str) -> Result<(), String> {
+    smtp_entry(account)?.set_password(password).map_err(|e| format!("credential store: {e}"))
+}
+
+/// Removes the outgoing server's own password, once it shares the account's login again.
+pub fn forget_smtp_password(account: &Account) -> Result<(), String> {
+    match smtp_entry(account)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(format!("credential store: {e}")),
     }
+}
+
+/// Removes the stored passwords, the outgoing server's own too; a missing one is not an error.
+pub fn forget_password(account: &Account) -> Result<(), String> {
+    for entry in [entry(account)?, smtp_entry(account)?] {
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => {}
+            Err(e) => return Err(format!("credential store: {e}")),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -114,7 +142,7 @@ mod tests {
     fn account(user: &str) -> Account {
         let imap = Server { host: "mail.example.org".into(), port: 143, tls: Tls::StartTls };
         let smtp = Server { host: "mail.example.org".into(), port: 465, tls: Tls::Tls };
-        Account { name: "Work".into(), user: user.into(), email: user.into(), imap, smtp, save_sent: true, keep: beavermail_core::Keep::default(), signature: String::new(), oauth: None }
+        Account { name: "Work".into(), user: user.into(), email: user.into(), imap, smtp, save_sent: true, keep: beavermail_core::Keep::default(), signature: String::new(), oauth: None, smtp_user: None }
     }
 
     #[test]

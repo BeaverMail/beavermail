@@ -79,7 +79,7 @@ enum Event {
     /// A sign-in with a provider ended: (its cancel flag, which tells it from an earlier one, result).
     SignedIn(Arc<std::sync::atomic::AtomicBool>, Result<store::oauth::Grant, String>),
     /// A "Test connection" ended: (the form it is for, what was tested, IMAP's answer, SMTP's answer).
-    Checked(Option<u64>, (Account, String), Result<(), String>, Result<(), String>),
+    Checked(Option<u64>, Box<(Account, String, String)>, Result<(), String>, Result<(), String>),
     /// Everyone the user has written to, for the address fields.
     Contacts(Result<Vec<beavermail_store::Contact>, MailError>),
 }
@@ -337,6 +337,11 @@ struct NewAccount {
     smtp_host: String,
     smtp_port: String,
     smtp_tls: Tls,
+    /// The outgoing server signs in with its own user and password.
+    smtp_own: bool,
+    smtp_user: String,
+    /// Empty while editing means "keep the stored one".
+    smtp_password: String,
     save_sent: bool,
     keep: Keep,
     signature: String,
@@ -363,6 +368,9 @@ impl Default for NewAccount {
             smtp_host: String::new(),
             smtp_port: "587".into(),
             smtp_tls: Tls::StartTls,
+            smtp_own: false,
+            smtp_user: String::new(),
+            smtp_password: String::new(),
             save_sent: true,
             keep: Keep::default(),
             signature: String::new(),
@@ -377,14 +385,14 @@ impl Default for NewAccount {
 /// A "Test connection": the account and password as typed when it started, and what the incoming and
 /// outgoing servers answered (`None` while it runs).
 struct Check {
-    tested: (Account, String),
+    tested: (Account, String, String),
     answers: Option<(Result<(), String>, Result<(), String>)>,
 }
 
 impl NewAccount {
     /// The test that applies to the form as it is now; one made before a change is out of date.
     fn current_check(&self) -> Option<&Check> {
-        self.check.as_ref().filter(|c| self.build().is_ok_and(|a| a == c.tested.0) && self.password == c.tested.1)
+        self.check.as_ref().filter(|c| self.build().is_ok_and(|a| a == c.tested.0) && self.password == c.tested.1 && self.smtp_password == c.tested.2)
     }
 
     /// The form filled with an existing account's settings; the password is left empty.
@@ -401,6 +409,8 @@ impl NewAccount {
             smtp_host: if account.smtp.host == account.imap.host { String::new() } else { account.smtp.host.clone() },
             smtp_port: port(&account.smtp),
             smtp_tls: account.smtp.tls,
+            smtp_own: account.smtp_user.is_some(),
+            smtp_user: account.smtp_user.clone().unwrap_or_default(),
             save_sent: account.save_sent,
             keep: account.keep,
             signature: account.signature.clone(),
@@ -412,7 +422,7 @@ impl NewAccount {
 
     /// Whether saving would change `account`: an invalid form counts as a change, so it is never dropped silently.
     fn changed(&self, account: &Account) -> bool {
-        !self.password.is_empty() || self.build().map_or(true, |built| built != *account)
+        !self.password.is_empty() || !self.smtp_password.is_empty() || self.build().map_or(true, |built| built != *account)
     }
 
     /// Whether the required fields are filled in.
@@ -453,6 +463,11 @@ impl NewAccount {
             _ => return Err("the email address needs an @".into()),
         };
         let smtp_host = if self.smtp_host.trim().is_empty() { imap_host } else { self.smtp_host.trim() };
+        let smtp_user = match self.smtp_user.trim() {
+            _ if !self.smtp_own || self.oauth.is_some() => None,
+            "" => return Err("enter the user for the outgoing server".into()),
+            user => Some(user.to_owned()),
+        };
         Ok(Account {
             name: if self.name.trim().is_empty() { user.to_owned() } else { self.name.trim().to_owned() },
             user: user.to_owned(),
@@ -463,6 +478,7 @@ impl NewAccount {
             keep: self.keep,
             signature: self.signature.trim_end().to_owned(),
             oauth: self.oauth,
+            smtp_user,
         })
     }
 }
@@ -628,7 +644,7 @@ fn account_page(ui: &mut egui::Ui, t: &theme::Tokens, form: &mut NewAccount, wai
             hint(ui, "Saving a change here reconnects the account. A different user or server downloads its mail again.");
             ui.add_space(4.0);
             form_grid(ui, "account_login", |ui| login_rows(ui, form));
-            server_sections(ui, form);
+            server_sections(ui, t, form);
         }
     }
     if !waiting {
@@ -698,7 +714,7 @@ fn login_rows(ui: &mut egui::Ui, form: &mut NewAccount) {
 }
 
 /// The incoming and outgoing servers, each under its own title.
-fn server_sections(ui: &mut egui::Ui, form: &mut NewAccount) {
+fn server_sections(ui: &mut egui::Ui, t: &theme::Tokens, form: &mut NewAccount) {
     for (title, id, host, port, tls, hint) in [
         ("Incoming mail (IMAP)", "imap", &mut form.imap_host, &mut form.imap_port, &mut form.imap_tls, "imap.example.com"),
         ("Outgoing mail (SMTP)", "smtp", &mut form.smtp_host, &mut form.smtp_port, &mut form.smtp_tls, "Same as IMAP"),
@@ -714,6 +730,28 @@ fn server_sections(ui: &mut egui::Ui, form: &mut NewAccount) {
                 ui.add(sized_field(port, 72.0));
                 tls_picker(ui, &format!("{id}_tls"), tls);
             });
+            ui.end_row();
+        });
+    }
+    smtp_login(ui, t, form);
+}
+
+/// The outgoing server's own login, under its section, when it is not the incoming one's.
+fn smtp_login(ui: &mut egui::Ui, t: &theme::Tokens, form: &mut NewAccount) {
+    if form.oauth.is_some() {
+        return;
+    }
+    ui.add_space(4.0);
+    views::switch_row(ui, t, &mut form.smtp_own, "Different user and password for sending", "For servers that send with a login of their own.");
+    if form.smtp_own {
+        ui.add_space(4.0);
+        form_grid(ui, "smtp_login", |ui| {
+            ui.label("User");
+            ui.add(field(&mut form.smtp_user).hint_text("Login for the outgoing server"));
+            ui.end_row();
+            ui.label("Password");
+            let hint = if form.editing.is_some() { "Leave empty to keep the current one" } else { "" };
+            ui.add(field(&mut form.smtp_password).password(true).hint_text(hint));
             ui.end_row();
         });
     }
@@ -1011,7 +1049,9 @@ impl BeaverApp {
         self.next_serial += 1;
         let (source, sender, error) = match store::password(&account) {
             Ok(password) => {
-                let (mut sender, mut source) = (SmtpSender::new(&account, password.clone()), ImapSource::new(&account, password, self.archive.clone(), self.vault.clone()));
+                // A missing password of its own makes the outgoing server refuse, which sending then says.
+                let smtp_password = if account.smtp_user.is_some() { store::smtp_password(&account).unwrap_or_default() } else { password.clone() };
+                let (mut sender, mut source) = (SmtpSender::new(&account, smtp_password), ImapSource::new(&account, password, self.archive.clone(), self.vault.clone()));
                 if let Some(provider) = account.oauth {
                     // The stored secret is the provider's refresh token; the servers get access tokens.
                     let token = store::oauth::token_source(provider, account.clone());
@@ -3305,7 +3345,8 @@ impl BeaverApp {
         let mut all: Vec<Account> = self.accounts.iter().map(|v| v.account.clone()).collect();
         if let Some(at) = editing
             && form.password.is_empty()
-            && old.as_ref().is_some_and(|o| o.key() == account.key() && o.imap == account.imap && o.smtp == account.smtp)
+            && form.smtp_password.is_empty()
+            && old.as_ref().is_some_and(|o| o.key() == account.key() && o.imap == account.imap && o.smtp == account.smtp && o.smtp_user == account.smtp_user)
         {
             // Name, address, signature or sync choices only: the password, the connection and the open folder stay as they are.
             all[at] = account.clone();
@@ -3317,7 +3358,17 @@ impl BeaverApp {
             (Some(old), true) => store::password(old)?, // moving the stored password to the new key
             _ => form.password.clone(),
         };
+        let smtp_password = match (&account.smtp_user, &old, form.smtp_password.is_empty()) {
+            (None, ..) => None,
+            (Some(_), _, false) => Some(form.smtp_password.clone()),
+            (Some(_), Some(old), true) if old.smtp_user.is_some() => Some(store::smtp_password(old)?), // kept, or moved to the new key
+            (Some(_), ..) => return Err("enter the password for the outgoing server".into()),
+        };
         store::set_password(&account, &password)?;
+        match &smtp_password {
+            Some(smtp) => store::set_smtp_password(&account, smtp)?,
+            None => store::forget_smtp_password(&account)?, // the same login as the incoming server again
+        }
         match editing {
             Some(at) => all[at] = account.clone(),
             None => all.push(account.clone()),
@@ -3633,7 +3684,7 @@ impl BeaverApp {
             Event::SignedIn(cancel, result) => self.signed_in(cancel, result),
             Event::Checked(editing, tested, imap, smtp) => {
                 let form = if editing.is_none() { self.form.as_mut() } else { self.account_edit.as_mut().filter(|f| f.editing == editing) };
-                if let Some(check) = form.and_then(|f| f.check.as_mut()).filter(|c| c.tested == tested) {
+                if let Some(check) = form.and_then(|f| f.check.as_mut()).filter(|c| c.tested == *tested) {
                     check.answers = Some((imap, smtp));
                 }
             }
@@ -3806,17 +3857,27 @@ impl BeaverApp {
             Ok(account) => account,
             Err(e) => return form.error = Some(e),
         };
-        let password = match (&stored, form.password.is_empty()) {
-            (Some(old), true) => match store::password(old) {
-                Ok(password) => password,
-                Err(e) => return form.error = Some(e),
-            },
-            _ => form.password.clone(),
+        let passwords = (|| {
+            let password = match (&stored, form.password.is_empty()) {
+                (Some(old), true) => store::password(old)?,
+                _ => form.password.clone(),
+            };
+            let smtp = match (account.smtp_user.is_some(), &stored, form.smtp_password.is_empty()) {
+                (false, ..) => password.clone(),
+                (true, _, false) => form.smtp_password.clone(),
+                (true, Some(old), true) if old.smtp_user.is_some() => store::smtp_password(old)?,
+                (true, ..) => return Err("enter the password for the outgoing server".to_owned()),
+            };
+            Ok((password, smtp))
+        })();
+        let (password, smtp_password) = match passwords {
+            Ok(both) => both,
+            Err(e) => return form.error = Some(e),
         };
         form.error = None;
-        let tested = (account.clone(), form.password.clone());
+        let tested = (account.clone(), form.password.clone(), form.smtp_password.clone());
         form.check = Some(Check { tested: tested.clone(), answers: None });
-        let (mut imap, mut smtp) = (ImapSource::new(&account, password.clone(), archive, vault), SmtpSender::new(&account, password));
+        let (mut imap, mut smtp) = (ImapSource::new(&account, password, archive, vault), SmtpSender::new(&account, smtp_password));
         if let Some(provider) = account.oauth {
             let token = store::oauth::token_source(provider, account.clone());
             (imap, smtp) = (imap.with_token(token.clone()), smtp.with_token(token));
@@ -3830,7 +3891,7 @@ impl BeaverApp {
                 })
             };
             let imap = said(imap.check().await);
-            Event::Checked(editing, tested, imap, said(smtp.check().await))
+            Event::Checked(editing, Box::new(tested), imap, said(smtp.check().await))
         });
     }
 
@@ -3940,7 +4001,7 @@ impl BeaverApp {
                     ui.end_row();
                     login_rows(ui, &mut form);
                 });
-                server_sections(ui, &mut form);
+                server_sections(ui, &t, &mut form);
                 ui.add_space(8.0);
                 test = check_rows(ui, &t, &form);
             });
@@ -5063,7 +5124,7 @@ mod tests {
     #[test]
     fn a_test_result_stands_only_for_the_form_it_tested() {
         let mut form = filled();
-        let tested = (form.build().unwrap(), form.password.clone());
+        let tested = (form.build().unwrap(), form.password.clone(), String::new());
         form.check = Some(Check { tested, answers: Some((Ok(()), Err("bad".into()))) });
         assert!(form.current_check().is_some());
         form.imap_port = "993".into();
@@ -5071,6 +5132,20 @@ mod tests {
         form.imap_port = "143".into();
         form.password = "other".into();
         assert!(form.current_check().is_none(), "another password either");
+    }
+
+    #[test]
+    fn the_outgoing_server_may_have_its_own_login() {
+        let mut form = filled();
+        assert_eq!(form.build().unwrap().smtp_login(), "ada@example.org", "the same login by default");
+        form.smtp_own = true;
+        assert!(form.build().is_err(), "its user is needed then");
+        form.smtp_user = " relay-ada ".into();
+        let account = form.build().unwrap();
+        assert_eq!((account.smtp_user.as_deref(), account.smtp_login(), account.user.as_str()), (Some("relay-ada"), "relay-ada", "ada@example.org"));
+        assert_eq!(NewAccount::editing(7, &account).build().unwrap(), account, "kept through an edit");
+        form.oauth = Some(OAuthProvider::Google);
+        assert_eq!(form.build().unwrap().smtp_user, None, "a provider's sign-in covers both servers");
     }
 
     fn filled() -> NewAccount {

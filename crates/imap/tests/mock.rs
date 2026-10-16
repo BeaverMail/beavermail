@@ -69,7 +69,7 @@ async fn start_opts(move_works: bool, attachment: bool, idle: bool) -> Mock {
         }
     });
     let server = Server { host: "127.0.0.1".into(), port, tls: Tls::None };
-    let account = Account { name: "mock".into(), user: "u".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true, keep: beavermail_core::Keep::default(), signature: String::new(), oauth: None };
+    let account = Account { name: "mock".into(), user: "u".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true, keep: beavermail_core::Keep::default(), signature: String::new(), oauth: None, smtp_user: None };
     let store = Arc::new(Store::in_memory().unwrap());
     let files = Arc::new(Vault::in_memory());
     Mock { source: ImapSource::new(&account, "p".into(), store.clone(), files.clone()), account, store, files, log }
