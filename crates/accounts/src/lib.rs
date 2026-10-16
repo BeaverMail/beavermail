@@ -4,6 +4,8 @@
 //! passwords live only in the system credential store (Keychain, Credential Manager,
 //! Secret Service), keyed by [`Account::key`]. A password is never written to the file.
 
+pub mod oauth;
+
 use std::path::PathBuf;
 
 use beavermail_core::{Account, Settings};
@@ -112,7 +114,7 @@ mod tests {
     fn account(user: &str) -> Account {
         let imap = Server { host: "mail.example.org".into(), port: 143, tls: Tls::StartTls };
         let smtp = Server { host: "mail.example.org".into(), port: 465, tls: Tls::Tls };
-        Account { name: "Work".into(), user: user.into(), email: user.into(), imap, smtp, save_sent: true, keep: beavermail_core::Keep::default(), signature: String::new() }
+        Account { name: "Work".into(), user: user.into(), email: user.into(), imap, smtp, save_sent: true, keep: beavermail_core::Keep::default(), signature: String::new(), oauth: None }
     }
 
     #[test]

@@ -467,11 +467,16 @@ dependencies = [
 name = "beavermail-accounts"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "beavermail-core",
  "directories",
+ "getrandom 0.3.4",
  "keyring",
  "serde",
+ "serde_json",
+ "sha2",
  "toml",
+ "ureq",
 ]
 
 [[package]]

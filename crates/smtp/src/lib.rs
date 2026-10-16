@@ -5,7 +5,7 @@
 use beavermail_core::{Account, MailError, MailSender, Outgoing, Server, Tls};
 use lettre::message::header::{ContentType, Header, HeaderName, HeaderValue};
 use lettre::message::{Attachment, Mailbox, MultiPart, SinglePart};
-use lettre::transport::smtp::authentication::Credentials;
+use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
 pub struct SmtpSender {
@@ -14,15 +14,32 @@ pub struct SmtpSender {
     password: String,
     /// The user chose to work offline: sending answers [`MailError::Offline`], so the message waits.
     offline: std::sync::atomic::AtomicBool,
+    /// Signed in with a provider: an access token instead of the password.
+    token: Option<beavermail_core::TokenSource>,
 }
 
 impl SmtpSender {
     /// Creates the sender; the connection is opened for each message.
     pub fn new(account: &Account, password: String) -> Self {
-        Self { server: account.smtp.clone(), user: account.user.clone(), password, offline: Default::default() }
+        Self { server: account.smtp.clone(), user: account.user.clone(), password, offline: Default::default(), token: None }
     }
 
-    fn transport(&self) -> Result<AsyncSmtpTransport<Tokio1Executor>, MailError> {
+    /// Signs in with `token`'s access tokens (XOAUTH2) instead of the password.
+    pub fn with_token(mut self, token: beavermail_core::TokenSource) -> Self {
+        self.token = Some(token);
+        self
+    }
+
+    /// The transport for one message, signed in with the password or, for a provider, a fresh token.
+    async fn transport(&self) -> Result<AsyncSmtpTransport<Tokio1Executor>, MailError> {
+        let (secret, mechanisms) = match &self.token {
+            // Asked off the async threads: getting a token may ask the provider for a new one.
+            Some(token) => {
+                let token = token.clone();
+                (tokio::task::spawn_blocking(move || token()).await.map_err(backend)??, Some(vec![Mechanism::Xoauth2]))
+            }
+            None => (self.password.clone(), None),
+        };
         let Server { host, port, tls } = &self.server;
         let builder = match tls {
             Tls::None => Ok(AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(host)),
@@ -30,7 +47,12 @@ impl SmtpSender {
             Tls::Tls => AsyncSmtpTransport::<Tokio1Executor>::relay(host),
         }
         .map_err(backend)?;
-        Ok(builder.port(*port).credentials(Credentials::new(self.user.clone(), self.password.clone())).build())
+        let builder = builder.port(*port).credentials(Credentials::new(self.user.clone(), secret));
+        Ok(match mechanisms {
+            Some(mechanisms) => builder.authentication(mechanisms),
+            None => builder,
+        }
+        .build())
     }
 }
 
@@ -258,7 +280,7 @@ impl MailSender for SmtpSender {
         let (id, date) = (new_message_id(&message.from), std::time::SystemTime::now());
         let email = build_with(&message, &id, date, false)?;
         let raw = if message.bcc.is_empty() { email.formatted() } else { build_with(&message, &id, date, true)?.formatted() };
-        match self.transport()?.send(email).await {
+        match self.transport().await?.send(email).await {
             Ok(_) => Ok(raw),
             Err(e) if e.status().is_some_and(|code| code.to_string() == "535") => Err(MailError::Auth(e.to_string())),
             // What is left once the server's answers, TLS and the message itself are ruled out: no connection.

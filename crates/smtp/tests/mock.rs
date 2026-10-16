@@ -25,9 +25,12 @@ async fn start(good_password: &'static str, password: &str) -> (SmtpSender, Arc<
             tokio::spawn(serve(socket, served.clone(), good_password));
         }
     });
+    (SmtpSender::new(&account(port), password.into()), transcript)
+}
+
+fn account(port: u16) -> Account {
     let server = Server { host: "127.0.0.1".into(), port, tls: Tls::None };
-    let account = Account { name: "mock".into(), user: "me@example.com".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true, keep: beavermail_core::Keep::default(), signature: String::new() };
-    (SmtpSender::new(&account, password.into()), transcript)
+    Account { name: "mock".into(), user: "me@example.com".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true, keep: beavermail_core::Keep::default(), signature: String::new(), oauth: None }
 }
 
 async fn serve(socket: TcpStream, transcript: Arc<Mutex<Transcript>>, good_password: &'static str) {
@@ -50,11 +53,14 @@ async fn serve(socket: TcpStream, transcript: Arc<Mutex<Transcript>>, good_passw
         transcript.lock().unwrap().commands.push(line.clone());
         let verb = line.to_ascii_uppercase();
         let reply: &[u8] = if verb.starts_with("EHLO") {
-            b"250-mock\r\n250 AUTH PLAIN LOGIN\r\n"
+            b"250-mock\r\n250 AUTH PLAIN LOGIN XOAUTH2\r\n"
         } else if verb.starts_with("AUTH PLAIN") {
             // "\0user\0password" in base64 is hard to compare by eye, so the secret is checked decoded.
             let encoded = line.rsplit(' ').next().unwrap_or("");
             if decode(encoded).ends_with(good_password) { b"235 ok\r\n" } else { b"535 5.7.8 bad credentials\r\n" }
+        } else if verb.starts_with("AUTH XOAUTH2") {
+            let encoded = line.rsplit(' ').next().unwrap_or("");
+            if decode(encoded) == format!("user=me@example.com\x01auth=Bearer {good_password}\x01\x01") { b"235 ok\r\n" } else { b"535 5.7.8 bad token\r\n" }
         } else if verb.starts_with("DATA") {
             in_data = true;
             b"354 go on\r\n"
@@ -125,6 +131,16 @@ async fn a_blind_copy_is_delivered_but_shown_only_in_the_senders_copy() {
 }
 
 #[tokio::test]
+async fn a_provider_account_signs_in_with_an_access_token() {
+    let (sender, transcript) = start("access-1", "not the password").await;
+    let sender = sender.with_token(Arc::new(|| Ok("access-1".to_owned())));
+    sender.send(message()).await.unwrap();
+    assert!(transcript.lock().unwrap().commands.iter().any(|c| c.starts_with("AUTH XOAUTH2")));
+    let failing = SmtpSender::new(&Account { oauth: Some(beavermail_core::OAuthProvider::Google), ..account(1) }, String::new()).with_token(Arc::new(|| Err(MailError::Auth("sign in again".into()))));
+    assert!(matches!(failing.send(message()).await.unwrap_err(), MailError::Auth(_)), "no token: the server is never asked");
+}
+
+#[tokio::test]
 async fn a_wrong_password_is_an_auth_error() {
     let (sender, _) = start("secret", "wrong").await;
     let error = sender.send(message()).await.unwrap_err();
@@ -134,9 +150,7 @@ async fn a_wrong_password_is_an_auth_error() {
 #[tokio::test]
 async fn an_unreachable_server_is_offline_so_the_message_can_wait() {
     // Nothing listens on port 1.
-    let server = Server { host: "127.0.0.1".into(), port: 1, tls: Tls::None };
-    let account = Account { name: "mock".into(), user: "me@example.com".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true, keep: beavermail_core::Keep::default(), signature: String::new() };
-    let error = SmtpSender::new(&account, "secret".into()).send(message()).await.unwrap_err();
+    let error = SmtpSender::new(&account(1), "secret".into()).send(message()).await.unwrap_err();
     assert!(matches!(error, MailError::Offline(_)), "{error:?}");
 }
 

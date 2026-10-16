@@ -15,6 +15,7 @@ Licensed under AGPL-3.0-only (see [LICENSE](LICENSE)).
 
 ## Status
 
+- Sign in with Google or Microsoft (OAuth2, no password stored), or any IMAP account.
 - Several IMAP accounts, with All inboxes (each account's mail marked by its colour); send, reply, forward over SMTP with a copy in Sent.
 - Local archive: SQLCipher index plus encrypted message files; background sync, IDLE, full-text search; works offline (read, search, draft; sending and changes wait in an Outbox until the server answers); "Work offline" in the status bar stops all network use.
 - Archive and Move to Trash wait 10 s before reaching the server: Undo (Ctrl+Z) takes them back.
@@ -39,3 +40,5 @@ cargo run -p beavermail
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+"Sign in with Google/Microsoft" shows only when the build has the app's client IDs: set `BEAVERMAIL_GOOGLE_CLIENT_ID`, `BEAVERMAIL_GOOGLE_CLIENT_SECRET` and `BEAVERMAIL_MICROSOFT_CLIENT_ID` when building.

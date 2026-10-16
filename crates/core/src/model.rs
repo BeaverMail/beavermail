@@ -168,6 +168,27 @@ pub struct Account {
     /// Text added under new messages, replies and forwards; empty for none.
     #[serde(default)]
     pub signature: String,
+    /// Signed in with this provider (OAuth 2.0) instead of a password: the secret kept for the
+    /// account is then its refresh token.
+    #[serde(default)]
+    pub oauth: Option<OAuthProvider>,
+}
+
+/// Who an account signs in with, when it is not a password.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OAuthProvider {
+    Google,
+    Microsoft,
+}
+
+impl OAuthProvider {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Google => "Google",
+            Self::Microsoft => "Microsoft",
+        }
+    }
 }
 
 /// How much mail is kept on this computer. Headers and flags are always synchronised.

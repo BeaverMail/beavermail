@@ -67,6 +67,8 @@ struct Config {
     password: String,
     /// The user chose to work offline: no connection is opened, and an open one is dropped.
     offline: std::sync::atomic::AtomicBool,
+    /// Signed in with a provider: an access token instead of the password.
+    token: Option<beavermail_core::TokenSource>,
 }
 
 impl ImapSource {
@@ -91,12 +93,18 @@ impl ImapSource {
 
     /// Creates the source over the shared archive; the connection is opened on first use.
     pub fn new(account: &Account, password: String, store: Arc<Store>, files: Arc<Vault>) -> Self {
-        let config = Config { server: account.imap.clone(), user: account.user.clone(), password, offline: Default::default() };
+        let config = Config { server: account.imap.clone(), user: account.user.clone(), password, offline: Default::default(), token: None };
         Self { config, poll_interval: std::time::Duration::from_secs(180), account: account.key(), store, files, state: Mutex::new(State::default()) }
     }
 
     /// Changes how often a server without IDLE is polled (3 minutes by default).
     #[must_use]
+    /// Signs in with `token`'s access tokens (XOAUTH2) instead of the password.
+    pub fn with_token(mut self, token: beavermail_core::TokenSource) -> Self {
+        self.config.token = Some(token);
+        self
+    }
+
     pub fn with_poll_interval(mut self, interval: std::time::Duration) -> Self {
         self.poll_interval = interval;
         self
@@ -141,7 +149,7 @@ async fn connect(c: &Config) -> Result<Session<Stream>, MailError> {
     }
     let Server { host, port, tls: mode } = &c.server;
     let tcp = TcpStream::connect((host.as_str(), *port)).await.map_err(|e| MailError::Offline(e.to_string()))?;
-    let client = match mode {
+    let mut client = match mode {
         Tls::None => Client::new(Box::new(tcp) as Stream),
         Tls::Tls => Client::new(tls(tcp, host).await?),
         Tls::StartTls => {
@@ -151,7 +159,38 @@ async fn connect(c: &Config) -> Result<Session<Stream>, MailError> {
             Client::new(tls(plain.into_inner(), host).await?)
         }
     };
-    client.login(&c.user, &c.password).await.map_err(|(e, _)| MailError::Auth(e.to_string()))
+    if *mode != Tls::StartTls {
+        // LOGIN skips the greeting, but AUTHENTICATE would take it for the server's challenge and wait.
+        client.read_response().await.map_err(backend)?;
+    }
+    match &c.token {
+        // Asked off the async threads: getting a token may ask the provider for a new one.
+        Some(token) => {
+            let token = token.clone();
+            let access = tokio::task::spawn_blocking(move || token()).await.map_err(backend)??;
+            client.authenticate("XOAUTH2", XOAuth2 { user: c.user.clone(), token: access, answered: false }).await.map_err(|(e, _)| MailError::Auth(e.to_string()))
+        }
+        None => client.login(&c.user, &c.password).await.map_err(|(e, _)| MailError::Auth(e.to_string())),
+    }
+}
+
+/// The XOAUTH2 answer to the server's challenge. If the server refuses the token it sends a second
+/// challenge with the reason, which an empty answer closes, so the refusal comes back as an error.
+struct XOAuth2 {
+    user: String,
+    token: String,
+    answered: bool,
+}
+
+impl async_imap::Authenticator for XOAuth2 {
+    type Response = String;
+
+    fn process(&mut self, _challenge: &[u8]) -> String {
+        if std::mem::replace(&mut self.answered, true) {
+            return String::new();
+        }
+        format!("user={}\x01auth=Bearer {}\x01\x01", self.user, self.token)
+    }
 }
 
 impl State {

@@ -26,7 +26,7 @@ mod unsubscribe;
 mod views;
 
 use beavermail_accounts as store;
-use beavermail_core::{Account, DisplayMode, Hit, Keep, MailError, MailSender, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Progress, Role, Server, Settings, SyncReport, Tls};
+use beavermail_core::{OAuthProvider, Account, DisplayMode, Hit, Keep, MailError, MailSender, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Progress, Role, Server, Settings, SyncReport, Tls};
 use beavermail_imap::ImapSource;
 use beavermail_smtp::{SmtpSender, render_draft};
 use beavermail_store::Store;
@@ -76,6 +76,29 @@ enum Event {
     FileStored(String, std::path::PathBuf, Result<(), String>),
     /// A one-click unsubscribe ended: (who, result).
     Unsubscribed(String, Result<(), String>),
+    /// A sign-in with a provider ended: (its cancel flag, which tells it from an earlier one, result).
+    SignedIn(Arc<std::sync::atomic::AtomicBool>, Result<store::oauth::Grant, String>),
+}
+
+/// A sign-in with a provider waiting for the user in the browser.
+struct SignIn {
+    provider: OAuthProvider,
+    /// The account page it is for; `None` for the Add account dialog.
+    editing: Option<u64>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl SignIn {
+    fn stop(&self) {
+        self.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// What the user pressed on an account's page in Settings.
+enum PageAction {
+    Remove,
+    SignIn(OAuthProvider),
+    CancelSignIn,
 }
 
 enum VaultOutcome {
@@ -312,6 +335,8 @@ struct NewAccount {
     save_sent: bool,
     keep: Keep,
     signature: String,
+    /// Signed in with a provider: kept through an edit, so the account stays an OAuth one.
+    oauth: Option<OAuthProvider>,
     error: Option<String>,
     /// Focus the first field on the first frame only.
     focus_first: bool,
@@ -334,6 +359,7 @@ impl Default for NewAccount {
             save_sent: true,
             keep: Keep::default(),
             signature: String::new(),
+            oauth: None,
             error: None,
             focus_first: true,
         }
@@ -358,6 +384,7 @@ impl NewAccount {
             save_sent: account.save_sent,
             keep: account.keep,
             signature: account.signature.clone(),
+            oauth: account.oauth,
             focus_first: true,
             ..Self::default()
         }
@@ -372,6 +399,25 @@ impl NewAccount {
     fn ready(&self) -> bool {
         let password = self.editing.is_some() || !self.password.is_empty();
         !self.user.trim().is_empty() && !self.imap_host.trim().is_empty() && password
+    }
+
+    /// The form for the account `grant` signed in to, with the provider's servers.
+    fn signed_in(provider: OAuthProvider, grant: store::oauth::Grant) -> Self {
+        let (imap, smtp) = store::oauth::servers(provider);
+        Self {
+            user: grant.email.clone(),
+            email: grant.email,
+            password: grant.refresh_token,
+            imap_host: imap.host,
+            imap_port: imap.port.to_string(),
+            imap_tls: imap.tls,
+            smtp_host: smtp.host,
+            smtp_port: smtp.port.to_string(),
+            smtp_tls: smtp.tls,
+            save_sent: false, // both providers file sent mail themselves
+            oauth: Some(provider),
+            ..Self::default()
+        }
     }
 
     fn build(&self) -> Result<Account, String> {
@@ -396,6 +442,7 @@ impl NewAccount {
             save_sent: self.save_sent,
             keep: self.keep,
             signature: self.signature.trim_end().to_owned(),
+            oauth: self.oauth,
         })
     }
 }
@@ -506,8 +553,9 @@ fn section_title(ui: &mut egui::Ui, text: &str) {
     ui.add_space(2.0);
 }
 
-/// One account's page in Settings; returns whether Remove account was pressed.
-fn account_page(ui: &mut egui::Ui, t: &theme::Tokens, form: &mut NewAccount) -> bool {
+/// One account's page in Settings. `waiting`: a sign-in for it is open in the browser.
+fn account_page(ui: &mut egui::Ui, t: &theme::Tokens, form: &mut NewAccount, waiting: bool) -> Option<PageAction> {
+    let mut action = None;
     let hint = |ui: &mut egui::Ui, text: &str| ui.label(RichText::new(text).size(13.0).color(t.text_dim));
     form_grid(ui, "account_identity", |ui| {
         ui.label("Name");
@@ -541,18 +589,38 @@ fn account_page(ui: &mut egui::Ui, t: &theme::Tokens, form: &mut NewAccount) -> 
     views::switch_row(ui, t, &mut form.save_sent, "Keep a copy of sent messages in Sent", "Turn off for providers that already do it, such as Gmail and Microsoft 365.");
 
     section_title(ui, "Connection");
-    hint(ui, "Saving a change here reconnects the account. A different user or server downloads its mail again.");
-    ui.add_space(4.0);
-    form_grid(ui, "account_login", |ui| login_rows(ui, form));
-    server_sections(ui, form);
+    match form.oauth {
+        Some(provider) if waiting => {
+            hint(ui, &format!("Finish signing in to {} in your browser.", provider.name()));
+            ui.add_space(4.0);
+            if ui.button("Cancel sign-in").clicked() {
+                action = Some(PageAction::CancelSignIn);
+            }
+        }
+        Some(provider) => {
+            hint(ui, &format!("Signed in with {} as {}. Sign in again if the account stops connecting.", provider.name(), form.user));
+            ui.add_space(4.0);
+            if ui.button("Sign in again…").clicked() {
+                action = Some(PageAction::SignIn(provider));
+            }
+        }
+        None => {
+            hint(ui, "Saving a change here reconnects the account. A different user or server downloads its mail again.");
+            ui.add_space(4.0);
+            form_grid(ui, "account_login", |ui| login_rows(ui, form));
+            server_sections(ui, form);
+        }
+    }
 
     section_title(ui, "Remove account");
     hint(ui, "Deletes the mail downloaded to this computer and the saved password. Nothing changes on the server.");
     ui.add_space(4.0);
     let remove = egui::Button::new(RichText::new("Remove account…").color(t.danger)).stroke(egui::Stroke::new(1.0, t.danger));
-    let pressed = ui.add(remove).clicked();
+    if ui.add(remove).clicked() {
+        action = Some(PageAction::Remove);
+    }
     ui.add_space(8.0);
-    pressed
+    action
 }
 
 /// The mark for what was typed in "Add a trusted sender": an address, or `@domain` for its whole
@@ -667,6 +735,8 @@ struct BeaverApp {
     settings_page: SettingsPage,
     /// The account page being edited in Settings; nothing is saved until Save changes.
     account_edit: Option<NewAccount>,
+    /// A sign-in with a provider, from Add account or an account's page, until it ends.
+    signing_in: Option<SignIn>,
     /// Where the user asked to go from an account page with unsaved changes (`None`: close Settings),
     /// until they choose to discard them.
     settings_leave: Option<Option<SettingsPage>>,
@@ -808,6 +878,7 @@ impl BeaverApp {
             show_settings: false,
             settings_page: SettingsPage::default(),
             account_edit: None,
+            signing_in: None,
             settings_leave: None,
             confirm_remove: None,
             confirm_unsubscribe: None,
@@ -886,8 +957,13 @@ impl BeaverApp {
         self.next_serial += 1;
         let (source, sender, error) = match store::password(&account) {
             Ok(password) => {
-                let sender = Arc::new(SmtpSender::new(&account, password.clone()));
-                (Some(Arc::new(ImapSource::new(&account, password, self.archive.clone(), self.vault.clone()))), Some(sender), None)
+                let (mut sender, mut source) = (SmtpSender::new(&account, password.clone()), ImapSource::new(&account, password, self.archive.clone(), self.vault.clone()));
+                if let Some(provider) = account.oauth {
+                    // The stored secret is the provider's refresh token; the servers get access tokens.
+                    let token = store::oauth::token_source(provider, account.clone());
+                    (sender, source) = (sender.with_token(token.clone()), source.with_token(token));
+                }
+                (Some(Arc::new(source)), Some(Arc::new(sender)), None)
             }
             Err(e) => (None, None, Some(e)),
         };
@@ -2226,7 +2302,8 @@ impl BeaverApp {
         let mut unlock_again = false;
         // Where the user asked to go: another page, or `None` to close Settings.
         let mut goto: Option<Option<SettingsPage>> = None;
-        let (mut save, mut discard, mut add, mut remove) = (false, false, false, false);
+        let (mut save, mut discard, mut add) = (false, false, false);
+        let mut page_action = None;
         let (mode, locked, job) = (self.vault.mode(), self.vault.is_locked(), self.vault_job.clone());
         // The same height on every page, so the window does not jump when the page changes.
         let height = (ctx.content_rect().height() - 120.0).clamp(380.0, 640.0);
@@ -2303,7 +2380,8 @@ impl BeaverApp {
                         match self.settings_page {
                             SettingsPage::Account(_) => {
                                 if let Some(form) = &mut self.account_edit {
-                                    remove = account_page(ui, t, form);
+                                    let waiting = self.signing_in.as_ref().is_some_and(|s| s.editing.is_some() && s.editing == form.editing);
+                                    page_action = account_page(ui, t, form, waiting);
                                 }
                             }
                             SettingsPage::Reading => {
@@ -2499,8 +2577,11 @@ impl BeaverApp {
                 Err(e) => self.account_edit = Some(NewAccount { error: Some(e), ..form }),
             }
         }
-        if remove && let SettingsPage::Account(serial) = self.settings_page {
-            self.confirm_remove = Some(serial);
+        match (page_action, self.settings_page) {
+            (Some(PageAction::Remove), SettingsPage::Account(serial)) => self.confirm_remove = Some(serial),
+            (Some(PageAction::SignIn(provider)), SettingsPage::Account(serial)) => self.sign_in(provider, Some(serial)),
+            (Some(PageAction::CancelSignIn), _) => self.cancel_sign_in(),
+            _ => {}
         }
         if add {
             self.form = Some(NewAccount::default());
@@ -2523,6 +2604,9 @@ impl BeaverApp {
     /// Goes to another settings page, or closes Settings with `None`, dropping any unsaved account changes.
     fn leave_settings_page(&mut self, target: Option<SettingsPage>) {
         self.account_edit = None;
+        if self.signing_in.as_ref().is_some_and(|s| s.editing.is_some()) {
+            self.cancel_sign_in();
+        }
         match target {
             Some(page) => self.settings_page = page,
             None => self.show_settings = false,
@@ -3482,6 +3566,7 @@ impl BeaverApp {
                     }
                 }
             }
+            Event::SignedIn(cancel, result) => self.signed_in(cancel, result),
             Event::Unsubscribed(who, result) => match result {
                 Ok(()) => self.notice = Some((format!("Unsubscribed from {who}. Mail already on its way may still arrive."), std::time::Instant::now())),
                 Err(e) => self.error = Some(format!("Could not unsubscribe from {who}: {e}. Try the unsubscribe link in the message.")),
@@ -3634,16 +3719,97 @@ impl BeaverApp {
         }
     }
 
+    /// Opens the provider's sign-in in the browser and waits for it in the background; `editing`: for
+    /// that account's page, else for Add account.
+    fn sign_in(&mut self, provider: OAuthProvider, editing: Option<u64>) {
+        self.cancel_sign_in();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.signing_in = Some(SignIn { provider, editing, cancel: cancel.clone() });
+        self.spawn(async move {
+            let flag = cancel.clone();
+            let open = |url: &str| opener::open_browser(url).map_err(|e| format!("could not open the browser: {e}"));
+            let result = tokio::task::spawn_blocking(move || store::oauth::authorize(provider, open, &flag)).await.unwrap_or_else(|e| Err(e.to_string()));
+            Event::SignedIn(cancel, result)
+        });
+    }
+
+    fn cancel_sign_in(&mut self) {
+        if let Some(sign_in) = self.signing_in.take() {
+            sign_in.stop();
+        }
+    }
+
+    /// A sign-in ended: Add account adds the account; an account's page keeps the new token until Save changes.
+    fn signed_in(&mut self, cancel: Arc<std::sync::atomic::AtomicBool>, result: Result<store::oauth::Grant, String>) {
+        let Some(sign_in) = self.signing_in.take_if(|s| Arc::ptr_eq(&s.cancel, &cancel)) else { return }; // cancelled, or replaced by a newer one
+        let form = match sign_in.editing {
+            None => self.form.as_mut(),
+            Some(serial) => self.account_edit.as_mut().filter(|f| f.editing == Some(serial)),
+        };
+        let Some(form) = form else { return }; // its dialog or page was closed
+        let grant = match result {
+            Ok(grant) => grant,
+            Err(e) => return form.error = Some(e),
+        };
+        if form.editing.is_some() {
+            if !grant.email.eq_ignore_ascii_case(&form.user) {
+                return form.error = Some(format!("You signed in as {}, but this account is {}.", grant.email, form.user));
+            }
+            form.password = grant.refresh_token;
+            form.error = None;
+            return;
+        }
+        let filled = NewAccount { name: std::mem::take(&mut form.name), ..NewAccount::signed_in(sign_in.provider, grant) };
+        let result = self.save_account(&filled);
+        let Some(form) = self.form.as_mut() else { return };
+        form.name = filled.name;
+        match result {
+            Ok(serial) => {
+                self.form = None;
+                if self.show_settings {
+                    self.settings_page = SettingsPage::Account(serial);
+                }
+            }
+            Err(e) => form.error = Some(e),
+        }
+    }
+
     /// The Add account dialog; an existing account is changed on its page in Settings.
     fn account_form(&mut self, ctx: &egui::Context) {
         let Some(mut form) = self.form.take() else { return };
         let t = theme::Tokens::get(ctx);
         let (mut submit, mut cancel) = (false, false);
+        let (mut start, mut stop) = (None, false);
+        let waiting = self.signing_in.as_ref().filter(|s| s.editing.is_none()).map(|s| s.provider);
         let ready = form.ready();
         let modal = egui::Modal::new(egui::Id::new("add_account")).show(ctx, |ui| {
             ui.set_width(FORM_WIDTH);
             ui.heading("Add account");
-            ui.label(RichText::new("Connect an existing mailbox over IMAP and SMTP.").color(t.text_dim));
+            if let Some(provider) = waiting {
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(format!("Finish signing in to {} in your browser.", provider.name()));
+                });
+                ui.add_space(12.0);
+                ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
+                    stop = ui.button("Cancel").clicked();
+                });
+                return;
+            }
+            let providers: Vec<OAuthProvider> = [OAuthProvider::Google, OAuthProvider::Microsoft].into_iter().filter(|p| store::oauth::available(*p)).collect();
+            if !providers.is_empty() {
+                ui.add_space(8.0);
+                for provider in providers {
+                    if ui.add_sized([ui.available_width(), theme::CONTROL_H], egui::Button::new(format!("Sign in with {}", provider.name()))).clicked() {
+                        start = Some(provider);
+                    }
+                }
+                ui.add_space(12.0);
+                ui.label(RichText::new("Or connect any other mailbox over IMAP and SMTP.").color(t.text_dim));
+            } else {
+                ui.label(RichText::new("Connect an existing mailbox over IMAP and SMTP.").color(t.text_dim));
+            }
             ui.add_space(8.0);
             // Scrolls on a short window, so the buttons below stay in reach.
             egui::ScrollArea::vertical().max_height((ctx.content_rect().height() - 240.0).max(160.0)).show(ui, |ui| {
@@ -3675,6 +3841,13 @@ impl BeaverApp {
             });
         });
         let mut open = !(cancel || modal.should_close());
+        if stop || (!open && waiting.is_some()) {
+            self.cancel_sign_in();
+        }
+        if let Some(provider) = start {
+            form.error = None;
+            self.sign_in(provider, None);
+        }
         if submit {
             match self.save_account(&form) {
                 Ok(serial) => {
@@ -4744,6 +4917,15 @@ mod tests {
         assert_eq!(range(&ids, MessageId(4), MessageId(2)), Some(vec![MessageId(4), MessageId(2), MessageId(3)]));
         assert_eq!(range(&ids, MessageId(3), MessageId(3)), Some(vec![MessageId(3)]));
         assert_eq!(range(&ids, MessageId(9), MessageId(3)), None, "an anchor no longer listed");
+    }
+
+    #[test]
+    fn a_sign_in_fills_the_providers_servers() {
+        let grant = store::oauth::Grant { email: "ada@gmail.com".into(), name: None, refresh_token: "r".into() };
+        let account = NewAccount::signed_in(OAuthProvider::Google, grant).build().unwrap();
+        assert_eq!((account.user.as_str(), account.address(), account.imap.host.as_str(), account.smtp.port), ("ada@gmail.com", "ada@gmail.com", "imap.gmail.com", 587));
+        assert_eq!(account.oauth, Some(OAuthProvider::Google));
+        assert!(!account.save_sent, "the provider files sent mail itself");
     }
 
     fn filled() -> NewAccount {

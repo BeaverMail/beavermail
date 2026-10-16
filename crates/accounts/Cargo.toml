@@ -18,3 +18,9 @@ directories = "6"
 keyring = "4"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
+# Signing in with Google and Microsoft (oauth.rs): HTTP to the token endpoints, PKCE.
+ureq.workspace = true
+serde_json = "1"
+sha2 = "0.11"
+base64 = "0.22"
+getrandom = "0.3"
