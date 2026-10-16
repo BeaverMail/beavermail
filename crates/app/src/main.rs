@@ -2323,7 +2323,7 @@ impl BeaverApp {
                                 ui.add_space(12.0);
                                 let about = "One row per conversation, with your replies from Sent. Archive, Delete and Mark as read act on all of it.";
                                 changed |= views::switch_row(ui, t, &mut self.settings.threads, "Group messages into conversations", about).changed();
-                                let about = "Off: the list takes the whole width and a message opens in its place; Esc or the arrow goes back.";
+                                let about = "Off: the list takes the whole width. A click selects a message, Enter opens it in the list's place (Esc or the arrow goes back), a double click in a tab.";
                                 changed |= views::switch_row(ui, t, &mut self.settings.reading_pane, "Show the message beside the list", about).changed();
                                 ui.add_space(12.0);
             if !self.settings.remote_senders.is_empty() {
@@ -4136,7 +4136,11 @@ impl BeaverApp {
             self.pick_range(id);
         }
         if let Some((serial, hit, pin)) = clicked_hit {
-            self.open_hit(serial, &hit, pin);
+            if pin || self.settings.reading_pane {
+                self.open_hit(serial, &hit, pin);
+            } else {
+                self.message = Some(hit.message.id); // selected, as in the folder's list
+            }
         }
         if let Some(id) = open_draft {
             self.open_draft(&id);
@@ -4608,8 +4612,10 @@ impl eframe::App for BeaverApp {
         let (opened, add_from_list) = if self.in_tab || self.full_preview { (None, false) } else { self.message_list(ui, &t) };
         add |= add_from_list;
 
+        // A click shows the message beside the list; without that pane it only selects, so a double
+        // click can still open a tab (opening in the list's place would take the list away mid-click).
         if let Some(id) = opened {
-            self.select_message(id);
+            self.move_to(id);
         }
         if let Some((id, what)) = action {
             self.request(id, what);
