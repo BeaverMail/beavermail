@@ -19,7 +19,7 @@ Licensed under AGPL-3.0-only (see [LICENSE](LICENSE)).
 - Several IMAP accounts, with All inboxes (each account's mail marked by its colour); send, reply, forward over SMTP with a copy in Sent.
 - Local archive: SQLCipher index plus encrypted message files; background sync, IDLE, full-text search; works offline (read, search, draft; sending and changes wait in an Outbox until the server answers); "Work offline" in the status bar stops all network use.
 - Archive and Move to Trash wait 10 s before reaching the server: Undo (Ctrl+Z) takes them back.
-- Reader: plain text, simplified HTML or original HTML (Blitz); nothing remote loads unless allowed, and tracking pixels never do (the bar lists them).
+- Reader: plain text, simplified HTML or original HTML (Blitz); nothing remote loads unless allowed, and tracking pixels never do (the bar lists them); links open and copy without redirects or tracking parameters.
 - Sender checks (server authentication results, look-alike names and domains, misleading links, risky attachments).
 - Spam: mail from new senders that fails a check is held as "Suspicious"; a classifier learns from what you mark; trust or block a sender, and review both lists in Settings.
 - Unsubscribe from mailing lists (one-click for verified senders, else an email or the sender's page) and block a sender.

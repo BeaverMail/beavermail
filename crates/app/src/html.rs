@@ -442,18 +442,59 @@ pub fn looks_misleading(text: &str, url: &str) -> bool {
     named && !url.to_ascii_lowercase().starts_with("mailto:") && !crate::sender::same_site(&host(text), &host(url))
 }
 
-/// The link without known tracking parameters.
-pub fn clean_url(url: &str) -> String {
-    const TRACKING: [&str; 17] = [
-        "fbclid", "gclid", "dclid", "msclkid", "yclid", "mc_eid", "mc_cid", "mkt_tok", "igshid", "_hsenc", "_hsmi", "hsctatracking", "vero_id", "oly_enc_id", "oly_anon_id", "s_cid", "ref_src",
+/// Where a known redirect sends the reader, taken out of the link so it goes there directly; `None`
+/// for any other link. Only services that carry the target in the link itself are known.
+pub fn unwrap_redirect(url: &str) -> Option<String> {
+    let parsed = blitz_traits::net::Url::parse(url).ok()?;
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    let host = host.strip_prefix("www.").unwrap_or(&host);
+    let path = parsed.path();
+    let param = |names: &[&str]| parsed.query_pairs().find(|(k, _)| names.contains(&k.as_ref())).map(|(_, v)| v.into_owned());
+    let target = match host {
+        "google.com" if path == "/url" => param(&["q", "url"]),
+        "youtube.com" if path == "/redirect" => param(&["q"]),
+        "l.facebook.com" | "lm.facebook.com" | "l.instagram.com" => param(&["u"]),
+        "linkedin.com" if path.starts_with("/redir/") => param(&["url"]),
+        "out.reddit.com" | "slack-redir.net" => param(&["url"]),
+        "steamcommunity.com" if path.starts_with("/linkfilter") => param(&["url", "u"]),
+        h if h.ends_with(".safelinks.protection.outlook.com") => param(&["url"]),
+        // Proofpoint's third version keeps the address between "__" marks.
+        "urldefense.com" if path.starts_with("/v3/__") => url.split_once("/v3/__").and_then(|(_, rest)| rest.split_once("__")).map(|(target, _)| target.to_owned()),
+        _ => None,
+    }?;
+    let lower = target.to_ascii_lowercase();
+    (lower.starts_with("https://") || lower.starts_with("http://")).then_some(target)
+}
+
+/// The link going straight where it leads (out of known redirects), without known tracking
+/// parameters nor those the user named in `extra` (separated by spaces or commas; one ending in `*`
+/// removes every parameter that starts so).
+pub fn clean_url(url: &str, extra: &str) -> String {
+    let mut url = url.to_owned();
+    // A redirect may wrap another; a few unwrappings are plenty.
+    for _ in 0..3 {
+        match unwrap_redirect(&url) {
+            Some(target) => url = target,
+            None => break,
+        }
+    }
+    strip_tracking(&url, extra)
+}
+
+fn strip_tracking(url: &str, extra: &str) -> String {
+    const TRACKING: [&str; 25] = [
+        "fbclid", "gclid", "dclid", "gbraid", "wbraid", "msclkid", "yclid", "twclid", "ttclid", "li_fat_id", "srsltid", "_gl", "mc_eid", "mc_cid", "mkt_tok", "igshid", "_hsenc", "_hsmi", "hsctatracking",
+        "vero_id", "oly_enc_id", "oly_anon_id", "s_cid", "ref_src", "epik",
     ];
+    let extra: Vec<String> = extra.split([',', ' ', '\n']).map(|w| w.trim().to_ascii_lowercase()).filter(|w| !w.is_empty()).collect();
+    let named = |key: &str| extra.iter().any(|w| w.strip_suffix('*').map_or(w == key, |prefix| key.starts_with(prefix)));
     let (before_fragment, fragment) = url.split_once('#').map_or((url, None), |(a, b)| (a, Some(b)));
     let Some((base, query)) = before_fragment.split_once('?') else { return url.to_owned() };
     let kept: Vec<&str> = query
         .split('&')
         .filter(|pair| {
             let key = pair.split('=').next().unwrap_or("").to_ascii_lowercase();
-            !(key.starts_with("utm_") || TRACKING.contains(&key.as_str()))
+            !(key.starts_with("utm_") || TRACKING.contains(&key.as_str()) || named(&key))
         })
         .collect();
     let mut out = base.to_owned();
@@ -565,9 +606,27 @@ mod tests {
 
     #[test]
     fn tracking_parameters_are_removed_and_the_rest_kept() {
-        assert_eq!(clean_url("https://x.example/p?id=7&utm_source=n&fbclid=abc#top"), "https://x.example/p?id=7#top");
-        assert_eq!(clean_url("https://x.example/p?utm_medium=a&gclid=b"), "https://x.example/p");
-        assert_eq!(clean_url("https://x.example/p"), "https://x.example/p");
+        assert_eq!(clean_url("https://x.example/p?id=7&utm_source=n&fbclid=abc#top", ""), "https://x.example/p?id=7#top");
+        assert_eq!(clean_url("https://x.example/p?utm_medium=a&gclid=b", ""), "https://x.example/p");
+        assert_eq!(clean_url("https://x.example/p?id=7&ref=mail&trk_x=1&trk_y=2", "ref, trk_*"), "https://x.example/p?id=7", "the user's own");
+        assert_eq!(clean_url("https://x.example/p?reference=1", "ref"), "https://x.example/p?reference=1", "a name, not a start");
+    }
+
+    #[test]
+    fn known_redirects_go_straight_to_their_target() {
+        let wrapped = [
+            "https://www.google.com/url?q=https%3A%2F%2Fshop.example%2Fa%3Fid%3D1%26utm_source%3Dx&sa=D",
+            "https://eur01.safelinks.protection.outlook.com/?url=https%3A%2F%2Fshop.example%2Fa%3Fid%3D1&data=05%7C01&reserved=0",
+            "https://l.facebook.com/l.php?u=https%3A%2F%2Fshop.example%2Fa%3Fid%3D1%26fbclid%3Dz&h=AT0",
+            "https://urldefense.com/v3/__https://shop.example/a?id=1__;!!abc$",
+        ];
+        for url in wrapped {
+            assert_eq!(clean_url(url, ""), "https://shop.example/a?id=1", "{url}");
+        }
+        assert_eq!(unwrap_redirect("https://www.google.com/search?q=https%3A%2F%2Fx.example"), None, "a search, not a redirect");
+        assert_eq!(unwrap_redirect("https://www.google.com/url?q=javascript%3Aalert(1)"), None, "only web addresses");
+        assert_eq!(unwrap_redirect("https://shop.example/out?url=https%3A%2F%2Fevil.example"), None, "unknown services are left as they are");
+        assert_eq!(clean_url("https://x.example/p", ""), "https://x.example/p");
     }
 
     #[test]

@@ -123,6 +123,15 @@ async fn delivers_to_every_recipient() {
 }
 
 #[tokio::test]
+async fn mail_goes_out_under_the_senders_name() {
+    let (sender, transcript) = start("secret", "secret").await;
+    let raw = String::from_utf8(sender.send(Outgoing { from: "\"Ada Lovelace\" <me@example.com>".into(), ..message() }).await.unwrap()).unwrap();
+    let from = raw.lines().find(|l| l.starts_with("From: ")).unwrap();
+    assert!(from.contains("Ada Lovelace") && from.ends_with("<me@example.com>"), "{from}");
+    assert!(transcript.lock().unwrap().commands.iter().any(|c| c.starts_with("MAIL FROM:<me@example.com>")));
+}
+
+#[tokio::test]
 async fn a_blind_copy_is_delivered_but_shown_only_in_the_senders_copy() {
     let (sender, transcript) = start("secret", "secret").await;
     let mut with_bcc = message();

@@ -361,8 +361,12 @@ pub fn findings(known: &Known, name: &str, address: &str, body: &MessageBody, se
             })
             .collect();
         // A link to the sender's own domain is its click tracking, not a disguise.
-        if let Some((text, url)) = links.iter().find(|(text, url)| html::looks_misleading(text, url) && !sender::same_site(&html::host(url), &from)) {
-            add(Level::Danger, format!("A link shows {} but opens {}", text.trim(), html::host(url)));
+        // By where each link really leads: through a known redirect, to its target.
+        if let Some((text, url)) = links.iter().find(|(text, url)| {
+            let target = html::clean_url(url, "");
+            html::looks_misleading(text, &target) && !sender::same_site(&html::host(&target), &from)
+        }) {
+            add(Level::Danger, format!("A link shows {} but opens {}", text.trim(), html::host(&html::clean_url(url, ""))));
         }
         if let Some(host) = links.iter().map(|(_, url)| html::host(url)).find(|h| h.parse::<std::net::IpAddr>().is_ok() || h.starts_with('[')) {
             add(Level::Danger, format!("A link opens {host}, a bare network address instead of a site"));
@@ -775,6 +779,9 @@ mod tests {
         assert!(all.contains(&"A link shows www.bank.com but opens evil.io"), "{all:?}");
         let tracked = MessageBody { html: Some(r#"<a href="https://lmj.shop.net/c">www.shop.com</a>"#.into()), ..MessageBody::default() };
         assert!(findings(&known, "Shop", "news@shop.net", &tracked, "").is_empty(), "the sender's own tracking domain");
+        let redirected = |to: &str| MessageBody { html: Some(format!(r#"<a href="https://www.google.com/url?q={to}">www.bank.com</a>"#)), ..MessageBody::default() };
+        assert!(findings(&known, "Shop", "news@shop.com", &redirected("https%3A%2F%2Fbank.com%2Flogin"), "").is_empty(), "through a redirect to the site it names");
+        assert_eq!(texts(&findings(&known, "Shop", "news@shop.com", &redirected("https%3A%2F%2Fevil.io%2Fx"), "")), ["A link shows www.bank.com but opens evil.io"], "named by where it really leads");
         assert!(all.contains(&"A link opens 192.168.1.4, a bare network address instead of a site"));
         assert!(all.contains(&"Replies would go to desk.shop@gmail.com, not to shop.com"), "only the public mailbox counts");
         let same = MessageBody { reply_to: vec!["noreply@orange.es".into()], ..MessageBody::default() };

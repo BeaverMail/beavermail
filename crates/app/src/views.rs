@@ -596,24 +596,72 @@ fn runs_ui(ui: &mut Ui, t: &Tokens, runs: &[Run], size: f32, color: Color32, mon
                     ui.label(rich);
                 }
                 Run::Link { text, url } => {
-                    let misleading = html::looks_misleading(text, url);
+                    let link = LinkInfo::new(ui.ctx(), text, url);
                     let shown = if text.is_empty() { url } else { text };
-                    let tint = if misleading { t.danger } else { t.accent };
-                    let clean = html::clean_url(url);
-                    let tip = if misleading {
-                        format!("Careful: the text names another site.\nThis link goes to {}\n{clean}", html::host(url))
-                    } else {
-                        clean.clone()
-                    };
-                    let response = ui.add(egui::Link::new(egui::RichText::new(shown).size(size).color(tint))).on_hover_text(tip);
+                    let tint = if link.misleading { t.danger } else { t.accent };
+                    let response = ui.add(egui::Link::new(egui::RichText::new(shown).size(size).color(tint))).on_hover_text(&link.tip);
                     if response.clicked() {
-                        clicked = Some(clean);
+                        clicked = Some(link.clean.clone());
+                    }
+                    if let Some(open) = link_menu(&response, &link.clean) {
+                        clicked = Some(open);
                     }
                 }
             }
         }
     });
     clicked
+}
+
+/// Where the extra link parameters to remove (Settings > Reading) are kept for the frame.
+fn link_params_id() -> egui::Id {
+    egui::Id::new("link_params")
+}
+
+/// Tells the links drawn from now on which parameters the user also wants removed.
+pub fn set_link_params(ctx: &egui::Context, params: &str) {
+    ctx.data_mut(|d| d.insert_temp(link_params_id(), params.to_owned()));
+}
+
+/// A link as the reader shows it before it is followed.
+pub struct LinkInfo {
+    /// What it opens: straight to its target (out of a known redirect), without tracking parameters.
+    pub clean: String,
+    /// Its text names another site than the one it really goes to.
+    pub misleading: bool,
+    /// Where it really goes, said on hover.
+    pub tip: String,
+}
+
+impl LinkInfo {
+    pub fn new(ctx: &egui::Context, text: &str, url: &str) -> Self {
+        let clean = html::clean_url(url, &ctx.data(|d| d.get_temp::<String>(link_params_id())).unwrap_or_default());
+        // Judged by the real target: a redirect's own host says nothing about where the link leads.
+        let misleading = html::looks_misleading(text, &clean);
+        let mut tip = String::new();
+        if misleading {
+            tip += &format!("Careful: the text names another site.\nThis link goes to {}\n", html::host(&clean));
+        }
+        if clean.split(['?', '#']).next() != url.split(['?', '#']).next() {
+            tip += &format!("Opens directly, without passing through {}\n", html::host(url));
+        }
+        tip += &clean;
+        Self { clean, misleading, tip }
+    }
+}
+
+/// "Open link" and "Copy link" on a right click, both with the cleaned link; returns it when opened.
+pub fn link_menu(response: &Response, clean: &str) -> Option<String> {
+    let mut open = None;
+    response.context_menu(|ui| {
+        if ui.button("Open link").clicked() {
+            open = Some(clean.to_owned());
+        }
+        if ui.button("Copy link").on_hover_text("Copied without tracking parameters").clicked() {
+            ui.ctx().copy_text(clean.to_owned());
+        }
+    });
+    open
 }
 
 /// A message body as blocks. Returns the link the user clicked, already cleaned of tracking parameters.

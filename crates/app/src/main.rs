@@ -221,6 +221,8 @@ struct SidebarOutcome {
     all: bool,
     /// "Scheduled" was clicked.
     scheduled: bool,
+    /// The suspicious mail of every account, under All inboxes, was clicked.
+    all_suspicious: bool,
 }
 
 /// The open message's body, already reduced to blocks for both display modes.
@@ -444,6 +446,7 @@ impl NewAccount {
             smtp_host: smtp.host,
             smtp_port: smtp.port.to_string(),
             smtp_tls: smtp.tls,
+            name: grant.name.unwrap_or_default(),
             save_sent: false, // both providers file sent mail themselves
             oauth: Some(provider),
             ..Self::default()
@@ -469,7 +472,7 @@ impl NewAccount {
             user => Some(user.to_owned()),
         };
         Ok(Account {
-            name: if self.name.trim().is_empty() { user.to_owned() } else { self.name.trim().to_owned() },
+            name: self.name.trim().to_owned(),
             user: user.to_owned(),
             email: email.to_owned(),
             imap: Server { host: imap_host.to_owned(), port: port(&self.imap_port, "IMAP")?, tls: self.imap_tls },
@@ -594,8 +597,8 @@ fn account_page(ui: &mut egui::Ui, t: &theme::Tokens, form: &mut NewAccount, wai
     let mut action = None;
     let hint = |ui: &mut egui::Ui, text: &str| ui.label(RichText::new(text).size(13.0).color(t.text_dim));
     form_grid(ui, "account_identity", |ui| {
-        ui.label("Name");
-        ui.add(field(&mut form.name).hint_text("Shown in the sidebar"));
+        ui.label("Your name");
+        ui.add(field(&mut form.name).hint_text("What recipients see beside your address"));
         ui.end_row();
         ui.label("Email");
         ui.add(field(&mut form.email).hint_text("Address mail is sent from"));
@@ -909,8 +912,11 @@ struct BeaverApp {
     in_tab: bool,
     /// Where the checks put each message of the Inbox being shown; empty until they have run.
     screening: std::collections::HashMap<MessageId, screen::Screened>,
-    /// The selected account's suspicious mail is shown instead of its Inbox.
+    /// The selected account's suspicious mail is shown instead of its Inbox (in All inboxes, every account's).
     show_suspicious: bool,
+    /// How much mail each account (by serial) held as suspicious when its Inbox was last checked, so
+    /// the count shows while another folder is open.
+    held_counts: std::collections::HashMap<u64, u32>,
     /// The spam checks are running over the Inbox being shown.
     checking: bool,
 }
@@ -1011,6 +1017,7 @@ impl BeaverApp {
             in_tab: false,
             screening: std::collections::HashMap::new(),
             show_suspicious: false,
+            held_counts: Default::default(),
             checking: false,
         };
         app.error = archive_error.or(vault_error);
@@ -1634,6 +1641,9 @@ impl BeaverApp {
             let total = inboxes.iter().map(|m| m.total).sum::<u32>().max(self.messages.len() as u32);
             let unread: u32 = inboxes.iter().map(|m| m.unread).sum();
             let held = self.held();
+            if self.show_suspicious {
+                return Some(format!("Suspicious, every account  ·  {held} held  ·  nothing moved on the server"));
+            }
             let mut parts = vec!["All inboxes".to_owned(), format!("{} message{}", views::thousands(total), if total == 1 { "" } else { "s" })];
             if unread > 0 {
                 parts.push(format!("{} unread", views::thousands(unread)));
@@ -1977,7 +1987,7 @@ impl BeaverApp {
         let Some(view) = self.view(compose.from) else { return false };
         let (account, sender, source) = (view.account.clone(), view.sender.clone(), view.source.clone());
         let Some(sender) = sender else { return false };
-        let mut message = compose.outgoing(account.address(), self.settings.rich_outgoing);
+        let mut message = compose.outgoing(&account.sender(), self.settings.rich_outgoing);
         let (files, vault, id) = (compose.file_list(), self.vault.clone(), compose.id.clone());
         self.spawn(async move {
             // The copies are read now, off the window's thread, as they can be large.
@@ -2441,7 +2451,7 @@ impl BeaverApp {
                     egui::ScrollArea::vertical().id_salt("settings_accounts").show(ui, |ui| {
                         for view in &self.accounts {
                             let page = SettingsPage::Account(view.serial);
-                            let row = views::settings_row(ui, t, &view.account.name, None, self.settings_page == page).on_hover_text(view.account.address());
+                            let row = views::settings_row(ui, t, view.account.address(), None, self.settings_page == page);
                             if row.clicked() && self.settings_page != page {
                                 goto = Some(Some(page));
                             }
@@ -2460,11 +2470,12 @@ impl BeaverApp {
                         Some(account) => {
                             ui.horizontal(|ui| {
                                 let (rect, _) = ui.allocate_exact_size(vec2(views::AVATAR, views::AVATAR), egui::Sense::hover());
-                                views::avatar(ui, t, &account.name, rect.center(), views::AVATAR);
+                                views::avatar(ui, t, account.address(), rect.center(), views::AVATAR);
                                 ui.vertical(|ui| {
                                     ui.spacing_mut().item_spacing.y = 2.0;
-                                    ui.label(RichText::new(&account.name).heading());
-                                    ui.label(RichText::new(account.address()).color(t.text_dim));
+                                    ui.label(RichText::new(account.address()).heading());
+                                    let sent_as = account.sender_name().map_or("Sent with the address alone".to_owned(), |name| format!("Sent as {name}"));
+                                    ui.label(RichText::new(sent_as).color(t.text_dim));
                                 });
                             });
                         }
@@ -2504,6 +2515,12 @@ impl BeaverApp {
                                 changed |= views::switch_row(ui, t, &mut self.settings.threads, "Group messages into conversations", about).changed();
                                 let about = "Off: the list takes the whole width. A click selects a message, Enter opens it in the list's place (Esc or the arrow goes back), a double click in a tab.";
                                 changed |= views::switch_row(ui, t, &mut self.settings.reading_pane, "Show the message beside the list", about).changed();
+                                section_title(ui, "Links");
+                                hint(ui, "A link opens straight where it leads, without the redirects of Google, Outlook, Facebook and others, and without known tracking parameters (utm_…, fbclid, gclid and more). Right-click a link to copy it clean.");
+                                ui.add_space(4.0);
+                                ui.label("Also remove these parameters");
+                                changed |= ui.add(field(&mut self.settings.link_params).hint_text("ref, src, trk_*")).changed();
+                                hint(ui, "Separated by commas or spaces; a name ending in * removes every parameter that starts so.");
                                 ui.add_space(12.0);
             if !self.settings.remote_senders.is_empty() {
                 ui.label(RichText::new("Senders that may load remote content").family(theme::bold()));
@@ -2718,7 +2735,7 @@ impl BeaverApp {
     /// Asks before an account page with unsaved changes is left.
     fn leave_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
         let Some(target) = self.settings_leave else { return };
-        let name = self.account_edit.as_ref().and_then(|f| self.view(f.editing?)).map(|v| v.account.name.clone()).unwrap_or_default();
+        let name = self.account_edit.as_ref().and_then(|f| self.view(f.editing?)).map(|v| v.account.address().to_owned()).unwrap_or_default();
         let (mut confirm, mut cancel) = (false, false);
         let modal = egui::Modal::new(egui::Id::new("settings_leave")).show(ctx, |ui| {
             ui.set_width(FORM_WIDTH * 0.8);
@@ -2747,7 +2764,7 @@ impl BeaverApp {
             order.sort_by_key(|&i| (views::folder_rank(view.mailboxes[i].role), view.mailboxes[i].name.clone()));
             for i in order {
                 let mailbox = &view.mailboxes[i];
-                entries.push((Entry::Folder(view.serial, i), format!("Go to {} › {}", view.account.name, views::folder_title(&mailbox.name, mailbox.role)), String::new()));
+                entries.push((Entry::Folder(view.serial, i), format!("Go to {} › {}", view.account.address(), views::folder_title(&mailbox.name, mailbox.role)), String::new()));
             }
         }
         entries.retain(|(_, label, _)| Command::matches(label, &palette.query));
@@ -2902,7 +2919,7 @@ impl BeaverApp {
     /// Confirms removing an account: what was downloaded and the saved password go with it.
     fn remove_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
         let Some(serial) = self.confirm_remove else { return };
-        let Some(name) = self.view(serial).map(|v| v.account.name.clone()) else {
+        let Some(name) = self.view(serial).map(|v| v.account.address().to_owned()) else {
             self.confirm_remove = None;
             return;
         };
@@ -3113,7 +3130,7 @@ impl BeaverApp {
     fn push_draft(&mut self, compose: &mut compose::Compose) {
         let Some(view) = self.view(compose.from) else { return };
         let Some(source) = view.source.clone() else { return };
-        let message = compose.outgoing(view.account.address(), self.settings.rich_outgoing);
+        let message = compose.outgoing(&view.account.sender(), self.settings.rich_outgoing);
         let (files, vault, id, snapshot, serial) = (compose.file_list(), self.vault.clone(), compose.id.clone(), compose.snapshot(), compose.from);
         compose.pushing = true;
         self.spawn(async move {
@@ -3935,7 +3952,11 @@ impl BeaverApp {
             form.error = None;
             return;
         }
-        let filled = NewAccount { name: std::mem::take(&mut form.name), ..NewAccount::signed_in(sign_in.provider, grant) };
+        // A name typed in the dialog wins over the one the provider has.
+        let mut filled = NewAccount::signed_in(sign_in.provider, grant);
+        if !form.name.trim().is_empty() {
+            filled.name = std::mem::take(&mut form.name);
+        }
         let result = self.save_account(&filled);
         let Some(form) = self.form.as_mut() else { return };
         form.name = filled.name;
@@ -3990,8 +4011,8 @@ impl BeaverApp {
             // Scrolls on a short window, so the buttons below stay in reach.
             egui::ScrollArea::vertical().max_height((ctx.content_rect().height() - 240.0).max(160.0)).show(ui, |ui| {
                 form_grid(ui, "account_form", |ui| {
-                    ui.label("Name");
-                    let name = ui.add(field(&mut form.name).hint_text("Optional"));
+                    ui.label("Your name");
+                    let name = ui.add(field(&mut form.name).hint_text("What recipients see beside your address"));
                     if std::mem::take(&mut form.focus_first) {
                         name.request_focus();
                     }
@@ -4099,8 +4120,8 @@ impl BeaverApp {
                     ui.add(egui::Spinner::new().size(12.0));
                     ui.label(dim(if activity.is_empty() { "Syncing…".to_owned() } else { format!("{activity}…") }));
                 } else if self.accounts.iter().any(|v| v.offline.is_some()) {
-                    let names: Vec<&str> = self.accounts.iter().filter(|v| v.offline.is_some()).map(|v| v.account.name.as_str()).collect();
-                    let why: Vec<String> = self.accounts.iter().filter_map(|v| Some(format!("{}: {}", v.account.name, v.offline.as_ref()?))).collect();
+                    let names: Vec<&str> = self.accounts.iter().filter(|v| v.offline.is_some()).map(|v| v.account.address()).collect();
+                    let why: Vec<String> = self.accounts.iter().filter_map(|v| Some(format!("{}: {}", v.account.address(), v.offline.as_ref()?))).collect();
                     let who = if names.len() == self.accounts.len() { String::new() } else { format!(" ({})", names.join(", ")) };
                     let mut waiting = String::new();
                     if self.outbox > 0 {
@@ -4215,16 +4236,19 @@ impl BeaverApp {
     /// Accounts and their folders. Returns (folder chosen, account to remove, account to edit, add-account clicked).
     fn sidebar(&mut self, ui: &mut egui::Ui, t: &theme::Tokens) -> SidebarOutcome {
         let (mut chosen, mut removed, mut edit, mut add, mut suspicious, mut recheck, mut empty) = (None, None, None, false, None, None, None);
-        let (mut all, mut scheduled) = (false, false);
+        let (mut all, mut scheduled, mut all_suspicious) = (false, false, false);
         let mut fold = None;
-        // shortcut: only the Inboxes being shown have verdicts, so only their suspicious mail shows a count;
-        // check every account in the background (during sync) to count them all.
-        let mut held_of: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
-        for (id, _) in self.screening.iter().filter(|(_, s)| s.place == screen::Place::Spam) {
+        // shortcut: only the Inboxes being shown have verdicts; the others keep the count of their last
+        // check (All inboxes, shown at start, checks every one). Checking every account in the background
+        // during sync would keep them all current.
+        let mut held_now: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+        for (id, screened) in &self.screening {
             if let Some(serial) = self.origin.get(id) {
-                *held_of.entry(*serial).or_default() += 1;
+                *held_now.entry(*serial).or_default() += u32::from(screened.place == screen::Place::Spam);
             }
         }
+        self.held_counts.extend(held_now);
+        let held_of = self.held_counts.clone();
         let frame = egui::Frame::new().fill(t.bg).inner_margin(egui::Margin::same(12));
         egui::Panel::left("accounts").frame(frame).default_size(260.0).size_range(210.0..=340.0).show(ui, |ui| {
             let can_send = !self.senders().is_empty();
@@ -4247,7 +4271,12 @@ impl BeaverApp {
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                         if self.accounts.len() >= 2 {
                             let unread = self.accounts.iter().filter_map(|v| v.mailboxes.iter().find(|m| m.role == Role::Inbox)).map(|m| m.unread).sum();
-                            all = views::folder_row(ui, t, "All inboxes", Role::Inbox, unread, self.unified).on_hover_text("The Inbox of every account, newest first").clicked();
+                            all = views::folder_row(ui, t, "All inboxes", Role::Inbox, unread, self.unified && !self.show_suspicious).on_hover_text("The Inbox of every account, newest first").clicked();
+                            if self.settings.hold_suspicious {
+                                let held = self.accounts.iter().filter_map(|v| held_of.get(&v.serial)).sum();
+                                let row = views::suspicious_row(ui, t, held, self.unified && self.show_suspicious);
+                                all_suspicious = row.on_hover_text("Mail from new senders that failed a check, every account's, held apart from the Inboxes").clicked();
+                            }
                         }
                         if !self.scheduled.is_empty() {
                             let row = views::icon_row(ui, t, "Scheduled", Icon::Calendar, self.scheduled.len() as u32, self.show_scheduled);
@@ -4263,7 +4292,7 @@ impl BeaverApp {
                             if self.accounts.len() >= 2 {
                                 title.append("● ", 0.0, egui::TextFormat::simple(egui::FontId::proportional(13.0), theme::account_color(at)));
                             }
-                            title.append(&view.account.name, 0.0, egui::TextFormat::simple(egui::FontId::proportional(15.0), t.text));
+                            title.append(view.account.address(), 0.0, egui::TextFormat::simple(egui::FontId::proportional(15.0), t.text));
                             // Seen with the account folded too: why its mail is not coming.
                             let small = |color| egui::TextFormat::simple(egui::FontId::proportional(12.5), color);
                             if view.error.is_some() {
@@ -4331,7 +4360,7 @@ impl BeaverApp {
             }
             self.save_settings();
         }
-        SidebarOutcome { chosen, suspicious, recheck, empty, removed, edit, add, all, scheduled }
+        SidebarOutcome { chosen, suspicious, recheck, empty, removed, edit, add, all, scheduled, all_suspicious }
     }
 
     /// Search, refresh and the message list. Returns the message the user clicked and whether to add an account.
@@ -4837,6 +4866,7 @@ impl eframe::App for BeaverApp {
         while let Ok(event) = self.rx.try_recv() {
             self.apply(event);
         }
+        views::set_link_params(ui.ctx(), &self.settings.link_params);
         // Closing the app with a message being written asks first, as Discard does. One being sent, or
         // waiting out Undo send, is kept as a draft on the way out without asking.
         if ui.ctx().input(|i| i.viewport().close_requested())
@@ -4877,11 +4907,17 @@ impl eframe::App for BeaverApp {
                 _ => {}
             }
         }
-        let SidebarOutcome { chosen, suspicious, recheck, empty, removed, edit, mut add, all, scheduled } =
+        let SidebarOutcome { chosen, suspicious, recheck, empty, removed, edit, mut add, all, scheduled, all_suspicious } =
             if self.in_tab { SidebarOutcome::default() } else { self.sidebar(ui, &t) };
         if all {
             self.show_suspicious = false;
             self.show_all_inboxes();
+        }
+        if all_suspicious {
+            if !self.unified {
+                self.show_all_inboxes();
+            }
+            self.show_suspicious = true;
         }
         if scheduled {
             self.show_scheduled_list();

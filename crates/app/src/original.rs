@@ -54,6 +54,8 @@ pub struct Page {
     net: Option<Arc<Net>>,
     seen: usize,
     drawn: Instant,
+    /// The link last right-clicked, cleaned, for its menu.
+    menu_link: Option<String>,
     ctx: egui::Context,
 }
 
@@ -74,7 +76,7 @@ impl Page {
         };
         let mut doc = HtmlDocument::from_html(html, config);
         let (texture, size) = draw(ctx, &mut doc, pixels, scale);
-        Some(Self { doc, texture, width, scale, size, net, seen: 0, drawn: Instant::now(), ctx: ctx.clone() })
+        Some(Self { doc, texture, width, scale, size, net, seen: 0, drawn: Instant::now(), menu_link: None, ctx: ctx.clone() })
     }
 
     /// Whether this was drawn for about this width (a few points of difference are not worth a redraw)
@@ -101,27 +103,32 @@ impl Page {
         (self.texture, self.size) = draw(&self.ctx, &mut self.doc, pixels(self.width, self.scale), self.scale);
     }
 
-    /// Draws the page on a white sheet; returns the link under a click, if any.
+    /// Draws the page on a white sheet; returns the link to open, cleaned, after a click or "Open link".
+    /// A link says on hover where it really goes, and is flagged when its text names another site.
     pub fn show(&mut self, ui: &mut egui::Ui) -> Option<String> {
         self.refresh();
         let (rect, response) = ui.allocate_exact_size(self.size, egui::Sense::click());
         ui.painter().rect_filled(rect, 0.0, egui::Color32::WHITE);
         ui.painter().image(self.texture.id(), rect, egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), egui::Color32::WHITE);
-        let at = response.interact_pointer_pos().or(response.hover_pos())? - rect.min;
-        let href = self.link_at(at);
-        if href.is_some() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        let link = response.interact_pointer_pos().or(response.hover_pos()).and_then(|at| self.link_at(at - rect.min)).map(|(text, href)| crate::views::LinkInfo::new(ui.ctx(), &text, &href));
+        // The menu stays open after the pointer leaves the link: it keeps the one right-clicked.
+        if response.secondary_clicked() {
+            self.menu_link = link.as_ref().map(|l| l.clean.clone());
         }
-        if response.clicked() { href } else { None }
+        let opened = self.menu_link.as_deref().and_then(|clean| crate::views::link_menu(&response, clean));
+        let link = link?;
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        let response = response.on_hover_text(&link.tip);
+        if response.clicked() { Some(link.clean) } else { opened }
     }
 
-    /// The target of the link at `at` (points from the page's top left).
-    pub fn link_at(&self, at: Vec2) -> Option<String> {
+    /// The text and target of the link at `at` (points from the page's top left).
+    pub fn link_at(&self, at: Vec2) -> Option<(String, String)> {
         let mut id = self.doc.element_from_point(at.x, at.y)?;
         loop {
             let node = self.doc.get_node(id)?;
             if let Some(href) = node.element_data().filter(|e| &*e.name.local == "a").and_then(|e| e.attr(blitz_dom::local_name!("href"))) {
-                return Some(href.to_owned());
+                return Some((node.text_content(), href.to_owned()));
             }
             id = node.parent?;
         }
@@ -140,7 +147,7 @@ mod tests {
         for scale in [1.0, 2.0] {
             let page = Page::new(&ctx, HTML, 400.0, scale, false, &[]).unwrap();
             assert!(page.size.x > 399.0 && page.size.y > 40.0 && page.size.y < 400.0, "{:?}", page.size);
-            assert_eq!(page.link_at(Vec2::new(20.0, 20.0)).as_deref(), Some("https://a.example/x"), "scale {scale}");
+            assert_eq!(page.link_at(Vec2::new(20.0, 20.0)).map(|(_, href)| href).as_deref(), Some("https://a.example/x"), "scale {scale}");
             assert_eq!(page.link_at(Vec2::new(20.0, 90.0)), None, "scale {scale}");
         }
     }

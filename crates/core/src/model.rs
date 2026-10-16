@@ -150,7 +150,8 @@ pub struct Server {
 /// A mail account's settings. The password is a secret and is never part of this type.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Account {
-    /// Label shown in the UI.
+    /// The user's name as recipients see it beside the address, in From; may be empty. The account
+    /// itself is shown by its address.
     pub name: String,
     /// Login name, for IMAP and, unless `smtp_user` says otherwise, SMTP. Often, but not always, the email address.
     pub user: String,
@@ -254,6 +255,22 @@ impl Account {
         if self.email.trim().is_empty() { &self.user } else { self.email.trim() }
     }
 
+    /// The name recipients see beside the address: none when `name` is empty or only an address or
+    /// the login (what earlier versions filled in when it was left empty).
+    pub fn sender_name(&self) -> Option<&str> {
+        let name = self.name.trim();
+        (!name.is_empty() && !name.contains('@') && !name.eq_ignore_ascii_case(self.user.trim())).then_some(name)
+    }
+
+    /// The From of messages sent from this account: "\"Ada Lovelace\" <ada@example.org>", or the address alone.
+    pub fn sender(&self) -> String {
+        match self.sender_name() {
+            // Quoted, so a comma or a dot in the name stays part of it; quotes inside would end it early.
+            Some(name) => format!("\"{}\" <{}>", name.replace(['"', '\\'], ""), self.address()),
+            None => self.address().to_owned(),
+        }
+    }
+
     /// The login for the outgoing server.
     pub fn smtp_login(&self) -> &str {
         self.smtp_user.as_deref().unwrap_or(&self.user)
@@ -344,6 +361,10 @@ pub struct Settings {
     /// Accounts (by [`Account::key`]) folded in the sidebar, so they stay folded at the next start.
     #[serde(default)]
     pub folded: std::collections::BTreeSet<String>,
+    /// Link parameters removed before a link is opened or copied, besides the known tracking ones:
+    /// names separated by spaces or commas; one ending in `*` removes every parameter starting so.
+    #[serde(default)]
+    pub link_params: String,
 }
 
 fn yes() -> bool {
@@ -356,7 +377,7 @@ fn undo_secs() -> u32 {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { display: DisplayMode::default(), sender_display: Default::default(), rich_outgoing: true, undo_send_secs: undo_secs(), remote_senders: Default::default(), hold_suspicious: true, marked: Default::default(), threads: true, reading_pane: true, folded: Default::default() }
+        Self { display: DisplayMode::default(), sender_display: Default::default(), rich_outgoing: true, undo_send_secs: undo_secs(), remote_senders: Default::default(), hold_suspicious: true, marked: Default::default(), threads: true, reading_pane: true, folded: Default::default(), link_params: String::new() }
     }
 }
 
@@ -419,6 +440,18 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mail_goes_out_under_the_users_name_unless_it_is_only_the_login() {
+        let server = Server { host: "imap.x.org".into(), port: 993, tls: Tls::Tls };
+        let account = |name: &str| Account { name: name.into(), user: "ada".into(), email: "ada@x.org".into(), imap: server.clone(), smtp: server.clone(), save_sent: true, keep: Keep::default(), signature: String::new(), oauth: None, smtp_user: None };
+        assert_eq!(account("Ada Lovelace").sender(), "\"Ada Lovelace\" <ada@x.org>");
+        assert_eq!(account("Lovelace, Ada").sender(), "\"Lovelace, Ada\" <ada@x.org>", "quoted: the comma is part of the name");
+        assert_eq!(account("Ada \"the\" Countess").sender(), "\"Ada the Countess\" <ada@x.org>");
+        for none in ["", "  ", "ada@x.org", "ADA"] {
+            assert_eq!(account(none).sender(), "ada@x.org", "{none:?}: what older versions filled in, or nothing");
+        }
+    }
 
     #[test]
     fn sender_overrides_beat_the_default_and_clear_themselves() {
