@@ -906,6 +906,8 @@ struct BeaverApp {
     confirm_forget_marks: bool,
     /// What is typed in "Add a trusted sender".
     trust_input: String,
+    /// What is typed to find a sender marked as spam, in Settings.
+    spam_query: String,
     /// The compose field last typed in: Esc takes the focus away, and Keep editing gives it back.
     compose_focus: Option<egui::Id>,
     refocus: u8,
@@ -1029,6 +1031,7 @@ impl BeaverApp {
             list_view: (0.0, 0.0),
             confirm_forget_marks: false,
             trust_input: String::new(),
+            spam_query: String::new(),
             compose_focus: None,
             refocus: 0,
             downloads_paused: false,
@@ -2625,6 +2628,11 @@ impl BeaverApp {
                                         (changed, rescreen) = (true, true);
                                     }
                                 });
+                                // Spam marks only grow, so they are found by a search, never listed whole.
+                                let marked_spam = self.settings.marked.values().filter(|v| !**v).count();
+                                let query = self.spam_query.trim().to_lowercase();
+                                let found: Vec<String> = self.settings.marked.iter().filter(|(k, v)| !**v && !query.is_empty() && k.contains(&query)).map(|(k, _)| k.clone()).collect();
+                                const SHOWN: usize = 10;
                                 for (title, trusted, empty) in [
                                     ("", true, "None yet. Choose Trust on a message from a new sender, or add one here."),
                                     ("Marked as spam", false, "None. Spam or Block sender on a message puts its sender here."),
@@ -2632,9 +2640,18 @@ impl BeaverApp {
                                     if !title.is_empty() {
                                         section_title(ui, title);
                                     }
-                                    let keys: Vec<String> = self.settings.marked.iter().filter(|(_, v)| **v == trusted).map(|(k, _)| k.clone()).collect();
-                                    if keys.is_empty() {
+                                    let keys: Vec<String> = if trusted { self.settings.marked.iter().filter(|(_, v)| **v).map(|(k, _)| k.clone()).collect() } else { found.iter().take(SHOWN).cloned().collect() };
+                                    if trusted && keys.is_empty() || !trusted && marked_spam == 0 {
                                         hint(ui, empty);
+                                    } else if !trusted {
+                                        hint(ui, &format!("{} marked, senders and domains. Search for one to take its mark off.", views::thousands(marked_spam as u32)));
+                                        ui.add_space(4.0);
+                                        ui.add(sized_field(&mut self.spam_query, FIELD_WIDTH).hint_text("Search an address or domain"));
+                                        if !query.is_empty() && found.is_empty() {
+                                            hint(ui, "No marked sender matches.");
+                                        } else if found.len() > SHOWN {
+                                            hint(ui, &format!("{} more match: type more of the address.", found.len() - SHOWN));
+                                        }
                                     }
                                     for key in keys {
                                         ui.horizontal(|ui| {
