@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// A release build on Windows opens no console window beside the app (a debug build keeps it, for its output).
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 //! BeaverMail desktop shell: accounts with their folders, a message list and a reader.
 //! Accounts come from `accounts.toml` and the system credential store (see

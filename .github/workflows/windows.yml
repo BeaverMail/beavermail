@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# The Windows build, on a real Windows machine: started by hand (Actions > Windows build > Run
+# workflow) or by a version tag. The .exe comes out as the run's artifact.
+name: Windows build
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        # The sign-in buttons appear only with the app's client IDs, kept as repository secrets; without
+        # them the build works and has no Google or Microsoft sign-in.
+        env:
+          BEAVERMAIL_GOOGLE_CLIENT_ID: ${{ secrets.BEAVERMAIL_GOOGLE_CLIENT_ID }}
+          BEAVERMAIL_GOOGLE_CLIENT_SECRET: ${{ secrets.BEAVERMAIL_GOOGLE_CLIENT_SECRET }}
+          BEAVERMAIL_MICROSOFT_CLIENT_ID: ${{ secrets.BEAVERMAIL_MICROSOFT_CLIENT_ID }}
+        run: cargo build --release -p beavermail
+      # Uploaded before the tests, so a test that fails only on Windows still leaves the build to try.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: beavermail-windows-x64
+          path: target/release/beavermail.exe
+      - name: Test
+        run: cargo test --workspace --release
