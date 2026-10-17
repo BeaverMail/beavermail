@@ -5627,7 +5627,10 @@ fn main() -> eframe::Result {
         }
         return Ok(());
     }
-    let options = eframe::NativeOptions {
+    // Without a console (a Windows release build), a failure would close the app without a word: it is
+    // shown in a dialog and kept in a log file.
+    std::panic::set_hook(Box::new(|info| report(&format!("BeaverMail stopped because of an error:\n\n{info}"))));
+    let options = || eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_title("BeaverMail").with_inner_size([1280.0, 800.0]),
         // With vsync, Mesa's Wayland swap blocks the UI thread until the compositor sends a frame
         // callback, which it withholds for hidden windows; the compositor then reports the app as
@@ -5635,18 +5638,46 @@ fn main() -> eframe::Result {
         glow_options: eframe::egui_glow::GlowConfiguration { vsync: false, ..Default::default() },
         ..Default::default()
     };
-    eframe::run_native(
-        "BeaverMail",
-        options,
-        Box::new(|cc| {
-            egui_extras::install_image_loaders(&cc.egui_ctx);
-            theme::apply(&cc.egui_ctx);
-            // egui's 0.3 s is quicker than the systems' (0.4 to 0.5 s), and it is timed by frame, so a slow
-            // frame after the first click could split a double click in two.
-            cc.egui_ctx.options_mut(|o| o.input_options.max_double_click_delay = 0.5);
-            Ok(Box::new(BeaverApp::new(cc.egui_ctx.clone())))
-        }),
-    )
+    let start = |options: eframe::NativeOptions| {
+        eframe::run_native(
+            "BeaverMail",
+            options,
+            Box::new(|cc| {
+                egui_extras::install_image_loaders(&cc.egui_ctx);
+                theme::apply(&cc.egui_ctx);
+                // egui's 0.3 s is quicker than the systems' (0.4 to 0.5 s), and it is timed by frame, so a slow
+                // frame after the first click could split a double click in two.
+                cc.egui_ctx.options_mut(|o| o.input_options.max_double_click_delay = 0.5);
+                Ok(Box::new(BeaverApp::new(cc.egui_ctx.clone())))
+            }),
+        )
+    };
+    // Windows: Direct3D first (also in software, without a graphics driver), OpenGL if that fails.
+    #[cfg(windows)]
+    let result = start(eframe::NativeOptions { renderer: eframe::Renderer::Wgpu, ..options() }).or_else(|_| start(options()));
+    #[cfg(not(windows))]
+    let result = start(options());
+    if let Err(e) = &result {
+        report(&format!("BeaverMail could not open its window:\n\n{e}\n\nThe graphics driver may lack OpenGL 2 (a virtual machine or a remote desktop often does)."));
+    }
+    result
+}
+
+/// Tells the user why the app stopped: on standard error, in `beavermail-error.log` in the app's data
+/// folder, and in a dialog, which is the only one of the three seen without a console.
+fn report(text: &str) {
+    eprintln!("{text}");
+    let log = store::data_dir().map(|dir| dir.join("beavermail-error.log"));
+    let saved = log.as_ref().ok().and_then(|path| {
+        std::fs::create_dir_all(path.parent()?).ok()?;
+        std::fs::write(path, format!("{}\n{text}\n", chrono::Local::now())).ok()?;
+        Some(path.display().to_string())
+    });
+    let text = match saved {
+        Some(path) => format!("{text}\n\nAlso written to {path}"),
+        None => text.to_owned(),
+    };
+    rfd::MessageDialog::new().set_level(rfd::MessageLevel::Error).set_title("BeaverMail").set_description(&text).show();
 }
 
 /// The messages from `anchor` to `to` in list order `ids`, `anchor` first (where the next range starts).

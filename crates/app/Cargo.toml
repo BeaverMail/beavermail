@@ -37,3 +37,8 @@ beavermail-vault.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread"] }
 # Times on this computer's clock for "send later"; already in the tree through the store.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# Windows draws through Direct3D (wgpu), which a machine without a graphics driver still has in
+# software; its OpenGL is 1.1, too old for the OpenGL renderer the other systems use.
+[target.'cfg(windows)'.dependencies]
+eframe = { workspace = true, features = ["wgpu"] }
