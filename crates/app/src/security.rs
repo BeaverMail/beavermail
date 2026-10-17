@@ -152,7 +152,7 @@ pub fn unlock_prompt(ctx: &egui::Context, t: &Tokens, form: &mut Form, busy: boo
             if ui.button("Not now").clicked() {
                 request = Some(Request::Skip);
             }
-            if ui.small_button("Forgot passphrase…").clicked() {
+            if ui.button("Forgot passphrase…").clicked() {
                 form.confirm_reset = true;
             }
         });

@@ -489,6 +489,13 @@ impl NewAccount {
     }
 }
 
+/// The parts of the app the rail at the window's left edge switches between.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Section {
+    Mail,
+    Contacts,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 enum SettingsPage {
     #[default]
@@ -496,13 +503,12 @@ enum SettingsPage {
     Writing,
     Spam,
     Storage,
-    Contacts,
     /// One account's page, by serial.
     Account(u64),
 }
 
 impl SettingsPage {
-    const ALL: [Self; 5] = [Self::Reading, Self::Writing, Self::Spam, Self::Contacts, Self::Storage];
+    const ALL: [Self; 4] = [Self::Reading, Self::Writing, Self::Spam, Self::Storage];
 
     fn title(self) -> &'static str {
         match self {
@@ -510,7 +516,6 @@ impl SettingsPage {
             Self::Writing => "Writing",
             Self::Spam => "Suspicious mail",
             Self::Storage => "Stored mail",
-            Self::Contacts => "Contacts",
             Self::Account(_) => "Account",
         }
     }
@@ -521,7 +526,6 @@ impl SettingsPage {
             Self::Writing => Some(Icon::Pencil),
             Self::Spam => Some(Icon::Spam),
             Self::Storage => Some(Icon::Lock),
-            Self::Contacts => Some(Icon::Mail),
             Self::Account(_) => None,
         }
     }
@@ -532,7 +536,6 @@ impl SettingsPage {
             Self::Writing => "How messages you write are composed and sent.",
             Self::Spam => "Mail from people you know is never held. Nothing moves on the server.",
             Self::Storage => "How downloaded messages are kept on this computer.",
-            Self::Contacts => "The people you keep, with their name and notes. They stay on this computer, and come first when you write.",
             Self::Account(_) => "",
         }
     }
@@ -836,11 +839,15 @@ struct BeaverApp {
     account_edit: Option<NewAccount>,
     /// A sign-in with a provider, from Add account or an account's page, until it ends.
     signing_in: Option<SignIn>,
+    /// What the window shows, as picked in the rail at its left edge.
+    section: Section,
     /// A person's card, open over everything else.
     card: Option<card::Card>,
-    /// The saved contacts for Settings > Contacts, read when that page is drawn after a change.
+    /// The card open in the Contacts section.
+    contact_pane: Option<card::Card>,
+    /// The saved contacts for the Contacts section, read when it is drawn after a change.
     address_book: Option<Vec<beavermail_store::Contact>>,
-    /// What is typed in Settings > Contacts: a search, and an address to add.
+    /// What is typed in the Contacts section: a search, and an address to add.
     contact_query: String,
     new_contact: String,
     /// Everyone written to, to suggest in a message's address fields; read again for each new message.
@@ -991,7 +998,9 @@ impl BeaverApp {
             account_edit: None,
             signing_in: None,
             contacts: Default::default(),
+            section: Section::Mail,
             card: None,
+            contact_pane: None,
             address_book: None,
             contact_query: String::new(),
             new_contact: String::new(),
@@ -2438,7 +2447,6 @@ impl BeaverApp {
         let mut goto: Option<Option<SettingsPage>> = None;
         let (mut save, mut discard, mut add) = (false, false, false);
         let mut page_action = None;
-        let mut open_contact: Option<String> = None;
         let (mode, locked, job) = (self.vault.mode(), self.vault.is_locked(), self.vault_job.clone());
         // The same height on every page, so the window does not jump when the page changes.
         let height = (ctx.content_rect().height() - 120.0).clamp(380.0, 640.0);
@@ -2537,7 +2545,7 @@ impl BeaverApp {
                                 ui.add_space(12.0);
                                 let about = "One row per conversation, with your replies from Sent. Archive, Delete and Mark as read act on all of it.";
                                 changed |= views::switch_row(ui, t, &mut self.settings.threads, "Group messages into conversations", about).changed();
-                                let about = "Off: the list takes the whole width. A click selects a message, Enter opens it in the list's place (Esc or the arrow goes back), a double click in a tab.";
+                                let about = "Off: the list takes the whole width. A click selects a message; Enter or a double click opens it in a tab.";
                                 changed |= views::switch_row(ui, t, &mut self.settings.reading_pane, "Show the message beside the list", about).changed();
                                 section_title(ui, "Links");
                                 hint(ui, "A link opens straight where it leads, without the redirects of Google, Outlook, Facebook and others, and without known tracking parameters (utm_…, fbclid, gclid and more). Right-click a link to copy it clean.");
@@ -2553,7 +2561,7 @@ impl BeaverApp {
                     ui.horizontal(|ui| {
                         ui.label(address);
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.small_button("Remove").clicked() {
+                            if ui.button("Remove").clicked() {
                                 forget = Some(address.clone());
                             }
                         });
@@ -2572,7 +2580,7 @@ impl BeaverApp {
                         let label = match mode { DisplayMode::Original => "Original HTML", DisplayMode::Simplified => "Simplified HTML", DisplayMode::Plain => "Plain text" };
                         ui.label(format!("{address}  ·  {label}"));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.small_button("Remove").clicked() {
+                            if ui.button("Remove").clicked() {
                                 forget = Some(address.clone());
                             }
                         });
@@ -2636,7 +2644,7 @@ impl BeaverApp {
                                             };
                                             ui.label(shown);
                                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                                if ui.small_button("Remove").clicked() {
+                                                if ui.button("Remove").clicked() {
                                                     self.settings.set_mark(&key, None);
                                                     (changed, rescreen) = (true, true);
                                                 }
@@ -2667,44 +2675,6 @@ impl BeaverApp {
                                             self.confirm_forget_marks = false;
                                         }
                                     });
-                                }
-                            }
-                            SettingsPage::Contacts => {
-                                let archive = self.archive.clone();
-                                let book = self.address_book.get_or_insert_with(|| archive.saved_contacts().unwrap_or_default());
-                                ui.horizontal(|ui| {
-                                    let valid = beavermail_smtp::valid_address(&self.new_contact);
-                                    let typed = ui.add(sized_field(&mut self.new_contact, FIELD_WIDTH).hint_text("name@example.com"));
-                                    let add = ui.add_enabled(valid, egui::Button::new("Add contact…")).on_disabled_hover_text("Type an address first");
-                                    if valid && (add.clicked() || (typed.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))) {
-                                        open_contact = Some(std::mem::take(&mut self.new_contact));
-                                    }
-                                });
-                                if book.is_empty() {
-                                    ui.add_space(8.0);
-                                    hint(ui, "No contacts yet. Add one above, or click a sender's name in a message to open their card and save them.");
-                                } else {
-                                    ui.add_space(8.0);
-                                    ui.add(sized_field(&mut self.contact_query, FIELD_WIDTH).hint_text("Search contacts"));
-                                    ui.add_space(6.0);
-                                    ui.spacing_mut().item_spacing.y = 2.0;
-                                    let query = self.contact_query.trim();
-                                    let mut shown = 0;
-                                    for contact in book.iter().filter(|c| query.is_empty() || c.matches(query)) {
-                                        shown += 1;
-                                        let mut job = egui::text::LayoutJob::default();
-                                        if !contact.name.is_empty() {
-                                            job.append(&contact.name, 0.0, egui::TextFormat::simple(egui::FontId::proportional(15.0), t.text));
-                                        }
-                                        job.append(&contact.address, if contact.name.is_empty() { 0.0 } else { 10.0 }, egui::TextFormat::simple(egui::FontId::proportional(13.0), t.text_dim));
-                                        let row = egui::Button::selectable(false, job).truncate().min_size(vec2(ui.available_width(), 32.0));
-                                        if ui.add(row).on_hover_text("Open their card").clicked() {
-                                            open_contact = Some(contact.address.clone());
-                                        }
-                                    }
-                                    if shown == 0 {
-                                        hint(ui, "No contact matches.");
-                                    }
                                 }
                             }
                             SettingsPage::Storage => {
@@ -2756,9 +2726,6 @@ impl BeaverApp {
                 }
                 Err(e) => self.account_edit = Some(NewAccount { error: Some(e), ..form }),
             }
-        }
-        if let Some(address) = open_contact {
-            self.open_card(&address, "");
         }
         match (page_action, self.settings_page) {
             (Some(PageAction::Remove), SettingsPage::Account(serial)) => self.confirm_remove = Some(serial),
@@ -2901,6 +2868,7 @@ impl BeaverApp {
             match *entry {
                 Entry::Run(command) => self.run(command),
                 Entry::Folder(serial, index) => {
+                    self.section = Section::Mail;
                     self.show_suspicious = false;
                     self.select_mailbox(serial, index);
                 }
@@ -2984,9 +2952,14 @@ impl BeaverApp {
     /// Opens the card of `address`; `name` is how the message showing it names them, for someone the
     /// archive does not know yet.
     fn open_card(&mut self, address: &str, name: &str) {
+        self.card = self.load_card(address, name);
+    }
+
+    /// Someone's card as the archive knows them, with their latest conversations.
+    fn load_card(&self, address: &str, name: &str) -> Option<card::Card> {
         let address = address.trim().to_lowercase();
         if address.is_empty() {
-            return;
+            return None;
         }
         let data = self.archive.contact_card(&address).ok().flatten().unwrap_or_else(|| beavermail_store::ContactCard {
             name: if name.contains('@') { String::new() } else { name.trim().to_owned() },
@@ -2995,13 +2968,24 @@ impl BeaverApp {
         });
         let keys: Vec<(String, u64)> = self.accounts.iter().map(|v| (v.account.key(), v.serial)).collect();
         let recent = self.archive.messages_with(&address, 12).unwrap_or_default().into_iter().filter_map(|(key, hit)| Some((keys.iter().find(|(k, _)| *k == key)?.1, hit))).collect();
-        self.card = Some(card::Card::new(data, recent));
+        Some(card::Card::new(data, recent))
     }
 
     fn card_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
         let Some(card) = self.card.as_mut() else { return };
-        let Some(action) = card::show(ctx, t, card) else { return };
+        if let Some(action) = card::show(ctx, t, card) {
+            self.card_action(action, false);
+        }
+    }
+
+    /// Does what was asked on a card: the dialog's, or (`inline`) the one in the Contacts section.
+    fn card_action(&mut self, action: card::CardAction, inline: bool) {
+        let Some(card) = (if inline { self.contact_pane.as_ref() } else { self.card.as_ref() }) else { return };
         let (address, name, notes) = (card.data.address.clone(), card.name.clone(), card.notes.clone());
+        let reload = |app: &mut Self| {
+            let fresh = app.load_card(&address, &name);
+            *(if inline { &mut app.contact_pane } else { &mut app.card }) = fresh;
+        };
         match action {
             card::CardAction::Save => {
                 if let Err(e) = self.archive.save_contact(&address, &name, &notes) {
@@ -3010,7 +2994,7 @@ impl BeaverApp {
                 }
                 self.address_book = None;
                 self.notice = Some((format!("{} is in your contacts", if name.trim().is_empty() { &address } else { name.trim() }), std::time::Instant::now()));
-                self.open_card(&address, &name);
+                reload(self);
             }
             card::CardAction::Remove => {
                 if let Err(e) = self.archive.unsave_contact(&address) {
@@ -3018,10 +3002,12 @@ impl BeaverApp {
                     return;
                 }
                 self.address_book = None;
-                self.open_card(&address, &name);
+                reload(self);
             }
             card::CardAction::Write => {
-                self.card = None;
+                if !inline {
+                    self.card = None;
+                }
                 let to = compose::list_item(name.trim(), &address);
                 self.new_message_to(&format!("{to}, "));
             }
@@ -3029,6 +3015,7 @@ impl BeaverApp {
                 let Some((serial, hit)) = card.recent.get(i).cloned() else { return };
                 self.card = None;
                 self.show_settings = false;
+                self.section = Section::Mail;
                 self.open_hit(serial, &hit, false);
             }
             card::CardAction::Close => self.card = None,
@@ -3297,7 +3284,7 @@ impl BeaverApp {
             }
             return;
         }
-        if typing {
+        if typing || self.section != Section::Mail {
             return;
         }
         let key = |k| ctx.input(|i| i.key_pressed(k));
@@ -3357,8 +3344,12 @@ impl BeaverApp {
             Some(id) => Ok(id),
         };
         let some = || if many || self.message.is_some() { Ok(()) } else { Err("Open or pick a message first") };
+        // Out of Mail the list and the reader are not on screen: what acts on them waits.
+        if self.section != Section::Mail && !matches!(command, Command::Palette | Command::NewMessage | Command::Settings | Command::Mail | Command::Contacts | Command::WorkOffline | Command::WorkOnline) {
+            return Err("Go to Mail first");
+        }
         match command {
-            Command::Palette | Command::Search | Command::Settings => Ok(()),
+            Command::Palette | Command::Search | Command::Settings | Command::Mail | Command::Contacts => Ok(()),
             Command::NewMessage if self.senders().is_empty() => Err("Add an account to send mail"),
             Command::NewMessage => Ok(()),
             Command::Reply | Command::ReplyAll | Command::Forward => one().and(if self.body.is_some() { Ok(()) } else { Err("The message is still loading") }),
@@ -3439,9 +3430,8 @@ impl BeaverApp {
             }
             Command::BlockSender => self.confirm_block = self.message,
             Command::OpenInTab => {
-                // Without the reading pane, Enter on a selected message opens it in the list's place.
                 if let Some(id) = self.message {
-                    if self.settings.reading_pane || self.full_preview { self.open_message(id, true) } else { self.show_listed(id) }
+                    self.open_message(id, true);
                 }
             }
             Command::CloseTab => {
@@ -3465,6 +3455,8 @@ impl BeaverApp {
             }
             Command::WorkOffline => self.set_work_offline(true),
             Command::WorkOnline => self.set_work_offline(false),
+            Command::Mail => self.section = Section::Mail,
+            Command::Contacts => self.section = Section::Contacts,
         }
     }
 
@@ -4344,12 +4336,101 @@ impl BeaverApp {
             ui.horizontal(|ui| {
                 ui.colored_label(t.danger, error);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.small_button("Dismiss").clicked() {
+                    if ui.button("Dismiss").clicked() {
                         self.error = None;
                     }
                 });
             });
         });
+    }
+
+    /// The rail at the window's left edge: Mail and Contacts, each a part of the app of its own.
+    fn rail(&mut self, ui: &mut egui::Ui, t: &theme::Tokens) {
+        let frame = egui::Frame::new().fill(t.bg).inner_margin(egui::Margin::symmetric(8, 12));
+        egui::Panel::left("rail").frame(frame).resizable(false).exact_size(theme::CONTROL_H + 12.0).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 8.0;
+            for (section, icon, command) in [(Section::Mail, Icon::Mail, Command::Mail), (Section::Contacts, Icon::Users, Command::Contacts)] {
+                let on = self.section == section;
+                let name = if section == Section::Mail { "Mail" } else { "Contacts" };
+                let button = icons::button(ui, t, icon, name, true, on);
+                button.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, on, name));
+                if button.clicked() && !on {
+                    self.run(command);
+                }
+            }
+        });
+    }
+
+    /// The Contacts section: the address book on the left, the card of the one picked beside it.
+    fn contacts_view(&mut self, ui: &mut egui::Ui, t: &theme::Tokens) {
+        let archive = self.archive.clone();
+        let book = self.address_book.get_or_insert_with(|| archive.saved_contacts().unwrap_or_default()).clone();
+        let open = self.contact_pane.as_ref().map(|c| c.data.address.clone());
+        let mut pick = None;
+        let frame = egui::Frame::new().fill(t.bg).inner_margin(egui::Margin::same(12));
+        egui::Panel::left("contact_list").frame(frame).default_size(300.0).size_range(240.0..=420.0).show(ui, |ui| {
+            ui.label(RichText::new("Contacts").size(theme::SUBTITLE).family(theme::bold()));
+            ui.label(RichText::new("The people you keep. They stay on this computer.").size(13.0).color(t.text_dim));
+            ui.add_space(10.0);
+            let width = ui.available_width();
+            ui.horizontal(|ui| {
+                let valid = beavermail_smtp::valid_address(&self.new_contact);
+                let typed = ui.add(sized_field(&mut self.new_contact, (width - 70.0).max(120.0)).hint_text("Add: name@example.com"));
+                let add = ui.add_enabled(valid, egui::Button::new("Add")).on_disabled_hover_text("Type an address first");
+                if valid && (add.clicked() || (typed.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))) {
+                    pick = Some(std::mem::take(&mut self.new_contact));
+                }
+            });
+            if book.is_empty() {
+                ui.add_space(12.0);
+                ui.add(egui::Label::new(RichText::new("No contacts yet. Add an address above, or click a sender's name in a message and save them.").size(13.0).color(t.text_dim)).wrap());
+                return;
+            }
+            ui.add_space(6.0);
+            ui.add(sized_field(&mut self.contact_query, width).hint_text("Search contacts"));
+            ui.add_space(8.0);
+            let query = self.contact_query.trim();
+            let found: Vec<&beavermail_store::Contact> = book.iter().filter(|c| query.is_empty() || c.matches(query)).collect();
+            if found.is_empty() {
+                ui.label(RichText::new("No contact matches.").size(13.0).color(t.text_dim));
+            }
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                for contact in found {
+                    // The name on the first line, the address under it; an unnamed contact is its address.
+                    let mut job = egui::text::LayoutJob::default();
+                    let (first, second) = if contact.name.is_empty() { (contact.address.as_str(), "") } else { (contact.name.as_str(), contact.address.as_str()) };
+                    job.append(first, 0.0, egui::TextFormat::simple(egui::FontId::proportional(15.0), t.text));
+                    if !second.is_empty() {
+                        job.append(&format!("\n{second}"), 0.0, egui::TextFormat::simple(egui::FontId::proportional(13.0), t.text_dim));
+                    }
+                    let here = open.as_deref() == Some(contact.address.as_str());
+                    let row = egui::Button::selectable(here, job).truncate().min_size(vec2(ui.available_width(), 48.0));
+                    if ui.add(row).clicked() && !here {
+                        pick = Some(contact.address.clone());
+                    }
+                }
+            });
+        });
+        let mut action = None;
+        let frame = egui::Frame::new().fill(t.surface).inner_margin(egui::Margin::same(28));
+        egui::CentralPanel::default().frame(frame).show(ui, |ui| match self.contact_pane.as_mut() {
+            Some(card) => {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    ui.set_max_width(560.0);
+                    action = card::body(ui, t, card, false);
+                });
+            }
+            None => {
+                views::empty_state(ui, t, "No contact open", "Pick someone on the left to see their card, notes and conversations.", None);
+            }
+        });
+        if let Some(address) = pick {
+            self.contact_pane = self.load_card(&address, "");
+        }
+        if let Some(action) = action {
+            self.card_action(action, true);
+        }
     }
 
     /// Accounts and their folders. Returns (folder chosen, account to remove, account to edit, add-account clicked).
@@ -4797,7 +4878,7 @@ impl BeaverApp {
                                 let hidden = if whole || conversation.len() <= 6 { 0 } else { conversation.len() - 5 };
                                 ui.horizontal(|ui| {
                                     ui.label(RichText::new(format!("{} messages in this conversation", conversation.len())).size(13.0).color(t.text_dim));
-                                    if hidden > 0 && ui.small_button(format!("Show {hidden} earlier")).clicked() {
+                                    if hidden > 0 && ui.button(format!("Show {hidden} earlier")).clicked() {
                                         expand = true;
                                     }
                                 });
@@ -4853,6 +4934,15 @@ impl BeaverApp {
                                     ui.label(RichText::new(&finding.text).size(13.0).color(color));
                                 });
                             }
+                            // In every view, though only the original could load them: the user sees who tracks.
+                            if let Some(line) = views::trackers_line(&body.trackers) {
+                                ui.add_space(6.0);
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.add(Icon::Ban.image(icons::SIZE, t.text_dim));
+                                    ui.label(RichText::new(line).size(13.0).color(t.text_dim))
+                                        .on_hover_text("Images that only tell the sender you opened this message. They are never loaded, even when you load the others.");
+                                });
+                            }
                             if body.findings.is_empty() && authenticity == sender::Authenticity::Verified {
                                 ui.add_space(6.0);
                                 ui.label(RichText::new(format!("Sender domain verified by your server: {}", sender::domain(&message.address))).size(13.0).color(t.text_dim));
@@ -4887,7 +4977,7 @@ impl BeaverApp {
                                     ui.label(RichText::new(format!("{} attachment{}", body.data.attachments.len(), if many { "s" } else { "" })).size(13.0).color(t.text_dim));
                                     if many {
                                         let label = if selected_files.is_empty() { "Save all…".to_owned() } else { format!("Save selected ({})…", selected_files.len()) };
-                                        if ui.small_button(label).clicked() {
+                                        if ui.button(label).clicked() {
                                             save_many = true;
                                         }
                                     }
@@ -4912,7 +5002,7 @@ impl BeaverApp {
                                             chosen_mode = Some(value);
                                         }
                                     }
-                                    if mode != stored && !message.address.is_empty() && ui.small_button("Always for this sender").clicked() {
+                                    if mode != stored && !message.address.is_empty() && ui.button("Always for this sender").clicked() {
                                         remember = Some(mode);
                                     }
                                 });
@@ -4929,7 +5019,7 @@ impl BeaverApp {
                                     body.original = original::Page::new(ui.ctx(), source, width, scale, remote, &body.trackers);
                                 }
                                 if body.has_remote {
-                                    match views::remote_bar(ui, t, remote, if suspicious { "" } else { &message.address }, &body.trackers) {
+                                    match views::remote_bar(ui, t, remote, if suspicious { "" } else { &message.address }) {
                                         Some(views::Remote::Once) => body.remote = true,
                                         Some(views::Remote::Always) => allow_sender = Some(true),
                                         Some(views::Remote::Block) => {
@@ -5015,11 +5105,16 @@ impl eframe::App for BeaverApp {
         let t = theme::Tokens::get(ui.ctx());
         self.error_banner(ui, &t);
         self.status_bar(ui, &t);
+        self.rail(ui, &t);
+        let contacts = self.section == Section::Contacts;
+        if contacts {
+            self.contacts_view(ui, &t);
+        }
 
         if self.in_tab && self.open_tab().is_none() {
             self.show_mail(); // its tab went with its folder or account
         }
-        if self.tabs.iter().any(|t| t.pinned) {
+        if !contacts && self.tabs.iter().any(|t| t.pinned) {
             let mut event = None;
             let bar = egui::Frame::new().fill(t.bg).inner_margin(egui::Margin { left: 8, right: 8, top: 6, bottom: 0 });
             egui::Panel::top("tabs").frame(bar).show(ui, |ui| {
@@ -5033,7 +5128,7 @@ impl eframe::App for BeaverApp {
             }
         }
         let SidebarOutcome { chosen, suspicious, recheck, empty, removed, edit, mut add, all, scheduled, all_suspicious } =
-            if self.in_tab { SidebarOutcome::default() } else { self.sidebar(ui, &t) };
+            if self.in_tab || contacts { SidebarOutcome::default() } else { self.sidebar(ui, &t) };
         if all {
             self.show_suspicious = false;
             self.show_all_inboxes();
@@ -5081,7 +5176,7 @@ impl eframe::App for BeaverApp {
             self.full_preview = false;
         }
         // Without the reading pane and with no message in its place, there is no reader to draw.
-        let shows_reader = self.in_tab || self.full_preview || self.settings.reading_pane;
+        let shows_reader = !contacts && (self.in_tab || self.full_preview || self.settings.reading_pane);
         let ReaderOutcome { action, url, mode, remember, attachment, save_many, allow_sender, mark, bulk, unsubscribe, block, switch, expand, back, trust, card } =
             if shows_reader { self.reader(ui, &t) } else { ReaderOutcome::default() };
         if let Some((address, name)) = card {
@@ -5139,7 +5234,7 @@ impl eframe::App for BeaverApp {
             self.view_mode = None;
             self.save_settings();
         }
-        let (opened, add_from_list) = if self.in_tab || self.full_preview { (None, false) } else { self.message_list(ui, &t) };
+        let (opened, add_from_list) = if self.in_tab || self.full_preview || contacts { (None, false) } else { self.message_list(ui, &t) };
         add |= add_from_list;
 
         // A click shows the message beside the list; without that pane it only selects, so a double

@@ -57,75 +57,82 @@ impl Card {
     }
 }
 
-/// Shows the card; returns what the user asked for.
+/// Shows the card over everything else; returns what the user asked for.
 pub fn show(ctx: &egui::Context, t: &Tokens, card: &mut Card) -> Option<CardAction> {
     let mut action = None;
     let modal = egui::Modal::new(egui::Id::new("contact_card")).show(ctx, |ui| {
         ui.set_width(crate::FORM_WIDTH);
-        ui.horizontal(|ui| {
-            let (rect, _) = ui.allocate_exact_size(vec2(views::AVATAR, views::AVATAR), egui::Sense::hover());
-            let shown = if card.data.name.is_empty() { &card.data.address } else { &card.data.name };
-            views::avatar(ui, t, shown, rect.center(), views::AVATAR);
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 2.0;
-                ui.label(RichText::new(shown).heading());
-                if !card.data.name.is_empty() {
-                    ui.label(RichText::new(&card.data.address).color(t.text_dim));
-                }
-            });
-        });
-        ui.add_space(6.0);
-        ui.add(egui::Label::new(RichText::new(card.standing()).size(13.0).color(t.text_dim)).wrap());
-        ui.add_space(10.0);
-        crate::form_grid(ui, "card_fields", |ui| {
-            ui.label("Name");
-            ui.add(crate::field(&mut card.name).hint_text("As you call them"));
-            ui.end_row();
-        });
-        ui.add_space(8.0);
-        ui.label("Notes");
-        ui.add(egui::TextEdit::multiline(&mut card.notes).id_salt("card_notes").desired_rows(3).desired_width(f32::INFINITY).margin(egui::Margin::same(12)).hint_text("Only on this computer"));
-        if !card.recent.is_empty() {
-            ui.add_space(10.0);
-            ui.label(RichText::new("Latest conversations").family(theme::bold()));
-            ui.spacing_mut().item_spacing.y = 2.0;
-            egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
-                for (i, (_, hit)) in card.recent.iter().enumerate() {
-                    if views::thread_row(ui, t, &hit.message, false).on_hover_text("Open this message").clicked() {
-                        action = Some(CardAction::Open(i));
-                    }
-                }
-            });
-        }
-        ui.add_space(10.0);
-        // What to do with them on a row of its own: with Save and Close beside, four buttons do not fit.
-        ui.horizontal(|ui| {
-            if ui.button("Write message").clicked() {
-                action = Some(CardAction::Write);
-            }
-            if ui.button("Copy address").clicked() {
-                ui.ctx().copy_text(card.data.address.clone());
-            }
-            if card.data.saved && ui.button(RichText::new("Remove").color(t.danger)).on_hover_text("Take them out of your contacts; they stay a suggestion if you wrote to them").clicked() {
-                action = Some(CardAction::Remove);
-            }
-        });
-        ui.add_space(4.0);
-        ui.separator();
-        ui.add_space(4.0);
-        ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
-            let (label, enabled) = if card.data.saved { ("Save", card.edited()) } else { ("Save to contacts", true) };
-            if ui.add_enabled(enabled, egui::Button::new(RichText::new(label).color(t.on_accent)).fill(t.accent)).clicked() {
-                action = Some(CardAction::Save);
-            }
-            if ui.button("Close").clicked() {
-                action = Some(CardAction::Close);
-            }
-        });
+        action = body(ui, t, card, true);
     });
     if modal.should_close() && action.is_none() {
         action = Some(CardAction::Close);
     }
+    action
+}
+
+/// The card's content, in a dialog (`closable`, with Close) or in the Contacts section.
+pub fn body(ui: &mut egui::Ui, t: &Tokens, card: &mut Card, closable: bool) -> Option<CardAction> {
+    let mut action = None;
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(vec2(views::AVATAR, views::AVATAR), egui::Sense::hover());
+        let shown = if card.data.name.is_empty() { &card.data.address } else { &card.data.name };
+        views::avatar(ui, t, shown, rect.center(), views::AVATAR);
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.label(RichText::new(shown).heading());
+            if !card.data.name.is_empty() {
+                ui.label(RichText::new(&card.data.address).color(t.text_dim));
+            }
+        });
+    });
+    ui.add_space(6.0);
+    ui.add(egui::Label::new(RichText::new(card.standing()).size(13.0).color(t.text_dim)).wrap());
+    ui.add_space(10.0);
+    crate::form_grid(ui, "card_fields", |ui| {
+        ui.label("Name");
+        ui.add(crate::field(&mut card.name).hint_text("As you call them"));
+        ui.end_row();
+    });
+    ui.add_space(8.0);
+    ui.label("Notes");
+    ui.add(egui::TextEdit::multiline(&mut card.notes).id_salt("card_notes").desired_rows(3).desired_width(f32::INFINITY).margin(egui::Margin::same(12)).hint_text("Only on this computer"));
+    if !card.recent.is_empty() {
+        ui.add_space(10.0);
+        ui.label(RichText::new("Latest conversations").family(theme::bold()));
+        ui.spacing_mut().item_spacing.y = 2.0;
+        egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+            for (i, (_, hit)) in card.recent.iter().enumerate() {
+                if views::thread_row(ui, t, &hit.message, false).on_hover_text("Open this message").clicked() {
+                    action = Some(CardAction::Open(i));
+                }
+            }
+        });
+    }
+    ui.add_space(10.0);
+    // What to do with them on a row of its own: with Save and Close beside, four buttons do not fit.
+    ui.horizontal(|ui| {
+        if ui.button("Write message").clicked() {
+            action = Some(CardAction::Write);
+        }
+        if ui.button("Copy address").clicked() {
+            ui.ctx().copy_text(card.data.address.clone());
+        }
+        if card.data.saved && ui.button(RichText::new("Remove").color(t.danger)).on_hover_text("Take them out of your contacts; they stay a suggestion if you wrote to them").clicked() {
+            action = Some(CardAction::Remove);
+        }
+    });
+    ui.add_space(4.0);
+    ui.separator();
+    ui.add_space(4.0);
+    ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
+        let (label, enabled) = if card.data.saved { ("Save", card.edited()) } else { ("Save to contacts", true) };
+        if ui.add_enabled(enabled, egui::Button::new(RichText::new(label).color(t.on_accent)).fill(t.accent)).clicked() {
+            action = Some(CardAction::Save);
+        }
+        if closable && ui.button("Close").clicked() {
+            action = Some(CardAction::Close);
+        }
+    });
     action
 }
 

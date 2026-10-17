@@ -487,33 +487,29 @@ pub enum Remote {
     Block,
 }
 
+/// "2 trackers blocked: list-manage.com, mailchimp.com" for the images that only report the message
+/// was opened (never loaded, whatever is allowed): who would have been told, once each.
+pub fn trackers_line(trackers: &[String]) -> Option<String> {
+    let mut hosts: Vec<String> = trackers.iter().filter_map(|u| blitz_traits::net::Url::parse(u).ok()?.host_str().map(str::to_owned)).collect();
+    hosts.sort();
+    hosts.dedup();
+    let n = trackers.len();
+    (n > 0).then(|| format!("{n} tracker{} blocked: {}", if n == 1 { "" } else { "s" }, hosts.join(", ")))
+}
+
 /// The bar above a message shown as designed: says what is blocked or loaded and offers the choice.
-/// `trackers`: the images that only report the message was opened, which stay blocked either way.
-pub fn remote_bar(ui: &mut Ui, t: &Tokens, loaded: bool, sender: &str, trackers: &[String]) -> Option<Remote> {
+pub fn remote_bar(ui: &mut Ui, t: &Tokens, loaded: bool, sender: &str) -> Option<Remote> {
     let mut choice = None;
     egui::Frame::new().fill(t.input).stroke(egui::Stroke::new(1.0, t.border)).corner_radius(egui::CornerRadius::same(crate::theme::CONTROL_RADIUS)).inner_margin(egui::Margin::symmetric(12, 10)).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        // Who would have been told: the hosts of the trackers, once each.
-        let mut hosts: Vec<String> = trackers.iter().filter_map(|u| blitz_traits::net::Url::parse(u).ok()?.host_str().map(str::to_owned)).collect();
-        hosts.dedup();
-        let blocked = match trackers.len() {
-            0 => None,
-            n => Some(format!("{n} tracker{} blocked{}: {}", if n == 1 { "" } else { "s" }, if loaded { "" } else { ", also when images load" }, hosts.join(", "))),
-        };
         if loaded {
             ui.label(egui::RichText::new("Images and styles from the internet are loaded. The sender can see that you opened this message.").size(13.0).color(t.text_dim));
-            if let Some(blocked) = &blocked {
-                ui.label(egui::RichText::new(blocked).size(13.0).color(t.text_dim));
-            }
-            if ui.small_button("Block again").clicked() {
+            if ui.button("Block again").clicked() {
                 choice = Some(Remote::Block);
             }
         } else {
             ui.label(egui::RichText::new("Images and styles from the internet are blocked.").size(13.5).color(t.text));
             ui.label(egui::RichText::new("Loading them tells the sender you opened this message, and shows your network address.").size(13.0).color(t.text_dim));
-            if let Some(blocked) = &blocked {
-                ui.label(egui::RichText::new(blocked).size(13.0).color(t.text_dim));
-            }
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
                 if primary_button(ui, t, "Load for this message", true).clicked() {
@@ -795,10 +791,10 @@ pub fn attachment_chip(ui: &mut Ui, t: &Tokens, file: &Attachment, ticked: Optio
                     chosen = Some(ChipAction::Open);
                 }
                 ui.label(egui::RichText::new(crate::attachments::human_size(file.size)).size(13.0).color(t.text_dim));
-                if ui.small_button("Open").clicked() {
+                if ui.button("Open").clicked() {
                     chosen = Some(ChipAction::Open);
                 }
-                if ui.small_button("Save as…").clicked() {
+                if ui.button("Save as…").clicked() {
                     chosen = Some(ChipAction::SaveAs);
                 }
             });
@@ -896,7 +892,15 @@ pub fn thousands(n: u32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::thousands;
+    use super::{thousands, trackers_line};
+
+    #[test]
+    fn trackers_name_each_host_once() {
+        let urls: Vec<String> = ["https://b.example/o.gif", "https://a.example/1", "https://b.example/o2.gif"].map(String::from).to_vec();
+        assert_eq!(trackers_line(&urls).as_deref(), Some("3 trackers blocked: a.example, b.example"));
+        assert_eq!(trackers_line(&urls[..1]).as_deref(), Some("1 tracker blocked: b.example"));
+        assert_eq!(trackers_line(&[]), None);
+    }
 
     #[test]
     fn ages_read_naturally() {

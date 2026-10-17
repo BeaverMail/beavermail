@@ -29,6 +29,7 @@ pub enum Icon {
     Spam,
     Star,
     Trash,
+    Users,
     X,
 }
 
@@ -58,6 +59,7 @@ impl Icon {
             Self::Spam => egui::include_image!("../assets/icons/triangle-alert.svg"),
             Self::Star => egui::include_image!("../assets/icons/star.svg"),
             Self::Trash => egui::include_image!("../assets/icons/trash-2.svg"),
+            Self::Users => egui::include_image!("../assets/icons/users.svg"),
             Self::X => egui::include_image!("../assets/icons/x.svg"),
         }
     }
