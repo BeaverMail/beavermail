@@ -132,6 +132,19 @@ async fn mail_goes_out_under_the_senders_name() {
 }
 
 #[tokio::test]
+async fn an_encrypted_message_reaches_the_server_sealed_with_the_key_handed_out() {
+    let (sender, transcript) = start("secret", "secret").await;
+    let (me, ada) = (beavermail_crypto::generate("Me", "me@example.com").unwrap(), beavermail_crypto::generate("Ada", "ada@example.com").unwrap());
+    let mine = beavermail_crypto::public_key(&me).unwrap();
+    let seal = beavermail_core::Seal::OpenPgp { secret: me.clone(), to: vec![mine.clone(), beavermail_crypto::public_key(&ada).unwrap()], bcc: Vec::new() };
+    let sent = sender.send(Outgoing { autocrypt: Some(mine), seal: Some(seal), ..message() }).await.unwrap();
+    let t = transcript.lock().unwrap();
+    assert!(t.data.contains("multipart/encrypted") && t.data.contains("Autocrypt: addr=me@example.com") && t.data.contains("Subject: Lunch"), "{}", t.data);
+    assert!(!t.data.contains("See you at noon"), "the text is sealed");
+    assert!(matches!(beavermail_crypto::decrypt(&sent, &[me], &[]), Some(beavermail_crypto::Opened::Message(..))), "the copy for Sent opens with the sender's own key");
+}
+
+#[tokio::test]
 async fn a_blind_copy_is_delivered_but_shown_only_in_the_senders_copy() {
     let (sender, transcript) = start("secret", "secret").await;
     let mut with_bcc = message();

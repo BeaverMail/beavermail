@@ -439,8 +439,9 @@ impl Vault {
         match &self.backing {
             Backing::Disk(dir) => {
                 let mut found = Vec::new();
-                // Everything the vault holds: downloaded mail and drafts with their attachments.
-                let mut pending = vec![dir.join("mail"), dir.join("drafts")];
+                // Everything the vault holds: downloaded mail, drafts with their attachments, and the
+                // user's own encryption keys.
+                let mut pending = vec![dir.join("mail"), dir.join("drafts"), dir.join("keyring")];
                 while let Some(folder) = pending.pop() {
                     let Ok(entries) = std::fs::read_dir(&folder) else { continue };
                     for entry in entries.flatten() {
@@ -568,6 +569,8 @@ impl Vault {
     /// The mail is still on the server and is downloaded again.
     pub fn reset(&self) -> Result<(), MailError> {
         self.remove_dir(Path::new("mail"))?;
+        // Encrypted with the forgotten key, the user's own keys cannot be read either.
+        self.remove_dir(Path::new("keyring"))?;
         if let Ok(file) = self.read_keys() {
             for slot in file.slots.iter().filter(|s| s.kind == "credential-store") {
                 self.credentials.remove(&slot.id)?;
@@ -870,6 +873,21 @@ mod tests {
         let again = open(&dir, &store);
         assert!(!again.is_locked());
         assert_eq!(again.read(&path).unwrap().as_deref(), Some(&b"Subject: steady"[..]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_users_own_keys_follow_the_protection_on_and_off() {
+        let dir = temp_dir("keyring");
+        let store = Shared::default();
+        let vault = open(&dir, &store);
+        let key = Path::new("keyring").join("openpgp").join("ada@example.org.key");
+        vault.write(&key, b"secret key").unwrap();
+        vault.set_mode(Mode::Off, None, NOP).unwrap();
+        assert_eq!(on_disk(&dir, &key), b"secret key", "stored plain once protection is off");
+        vault.set_mode(Mode::System, None, NOP).unwrap();
+        assert_ne!(on_disk(&dir, &key), b"secret key", "and encrypted again");
+        assert_eq!(open(&dir, &store).read(&key).unwrap().as_deref(), Some(&b"secret key"[..]));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

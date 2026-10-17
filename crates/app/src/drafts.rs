@@ -31,6 +31,9 @@ pub struct DraftData {
     /// With `queued`: not before this moment (seconds since the Unix epoch), "send later".
     #[serde(default)]
     pub send_at: Option<i64>,
+    /// The user chose to send it encrypted (`Some(true)`) or not; `None`: encrypted when it can be.
+    #[serde(default)]
+    pub encrypt: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

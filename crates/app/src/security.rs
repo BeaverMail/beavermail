@@ -119,7 +119,7 @@ pub fn unlock_prompt(ctx: &egui::Context, t: &Tokens, form: &mut Form, busy: boo
         ui.set_width(380.0);
         if form.confirm_reset {
             ui.heading("Delete stored mail?");
-            ui.label(RichText::new("This removes every message stored on this device and starts again with a key kept by the system. Your mail is still on the server and is downloaded again.").color(t.text_dim));
+            ui.label(RichText::new("This removes every message stored on this device and starts again with a key kept by the system. Your mail is still on the server and is downloaded again. Your encryption keys and certificates go too: without a backup, encrypted mail can no longer be read.").color(t.text_dim));
             ui.add_space(12.0);
             ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
                 if ui.add(egui::Button::new(RichText::new("Delete stored mail").color(t.on_accent)).fill(t.danger)).clicked() {

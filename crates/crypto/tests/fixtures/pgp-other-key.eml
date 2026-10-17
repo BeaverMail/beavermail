@@ -1,0 +1,26 @@
+From: Ada Lovelace <ada@example.org>
+To: Bob <bob@example.org>
+Subject: Lunch
+Date: Fri, 16 Oct 2026 10:00:00 +0000
+Message-ID: <pgp@example.org>
+Autocrypt: addr=ada@example.org; keydata=mDMEatNRZBYJKwYBBAHaRw8BAQdAqRzKWDy+ZTIy4h/hbZcN63+IDGyt1L2EnQd/AK5GBf60HkFkYSBMb3ZlbGFjZSA8YWRhQGV4YW1wbGUub3JnPoiQBBMWCgA4FiEErcjCc+aU803D0kpIGth+WKdAHA4FAmrTUWQCGwMFCwkIBwIGFQoJCAsCBBYCAwECHgECF4AACgkQGth+WKdAHA7ChwD9Fatu+MnF5xF9EzY3p7a396FgjIUvh7p2J1+fig4sHEUA/3k8jrgC9c/GFEv7j0+otF90glvoqm7inQguNTc8SQYE
+MIME-Version: 1.0
+Content-Type: multipart/signed; micalg=pgp-sha256; protocol="application/pgp-signature"; boundary="boundary42"
+
+--boundary42
+Content-Type: text/plain; charset=utf-8
+
+See you at noon.
+
+--boundary42
+Content-Type: application/pgp-signature; name="signature.asc"
+
+-----BEGIN PGP SIGNATURE-----
+
+iIYEABYIAC4WIQSlW7IfkKVNVMpEikl5ksPAkOsNgAUCatNRZBAcZXZlQGV4YW1w
+bGUub3JnAAoJEHmSw8CQ6w2AAxcBAK2O/cIgP+nwbeWhGYbZzVvRl+WPPC8gAoBH
+Agw3B2huAPwNIf6FQx9CqKU8acJlsrwL9w7RXNQVxUzdALfu4zzvBw==
+=xHIO
+-----END PGP SIGNATURE-----
+
+--boundary42--

@@ -109,6 +109,51 @@ pub struct MessageBody {
     /// `List-Unsubscribe-Post: List-Unsubscribe=One-Click` (RFC 8058): an `https` link takes a POST, with no
     /// page to visit. Anyone can write the header, so it counts only for a sender the server verified.
     pub one_click: bool,
+    /// The message is signed, and what its signature says.
+    pub signature: Option<Signature>,
+    /// The message was encrypted, and what became of it. Opened, the text and attachments above are
+    /// the decrypted ones, which are never stored nor indexed.
+    pub encryption: Option<Encryption>,
+}
+
+/// What became of an encrypted message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Encryption {
+    /// Decrypted with one of the user's keys.
+    Opened(SignedWith),
+    /// None of the user's keys opens it.
+    NoKey(SignedWith),
+    Failed(SignedWith, String),
+}
+
+/// How a message was signed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignedWith {
+    Smime,
+    OpenPgp,
+}
+
+/// What a signature says about the message carrying it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SignatureCheck {
+    /// It holds: made by `signer` (an address), vouched for by `by` (an authority, or a key).
+    Valid { signer: String, by: String },
+    /// It holds, but was made by someone other than the sender.
+    NotSender { signer: String },
+    /// It holds only with a key the message brought, while the sender used another key before.
+    KeyChanged { signer: String },
+    /// Made with a key not known here; `key` is its id.
+    UnknownKey { key: String },
+    /// The message was changed after it was signed.
+    Changed,
+    /// It cannot vouch for anyone: why.
+    Untrusted(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Signature {
+    pub kind: SignedWith,
+    pub check: SignatureCheck,
 }
 
 /// One `Authentication-Results` header: the server that wrote it and the checks it reports.
@@ -176,6 +221,21 @@ pub struct Account {
     /// The outgoing server's own login, when it is not the incoming one's; its password is kept apart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub smtp_user: Option<String>,
+}
+
+/// "Ada Lovelace <ada@x.org>" as an item of an address list: the name quoted when it has a character
+/// that would cut it short (a comma, a colon, parentheses, an @…), the address alone when there is no
+/// name or the name is the address.
+pub fn address_text(name: &str, address: &str) -> String {
+    let (name, address) = (name.trim(), address.trim());
+    if name.is_empty() || name.eq_ignore_ascii_case(address) {
+        return address.to_owned();
+    }
+    if name.contains(['(', ')', '<', '>', '[', ']', ':', ';', '@', '\\', ',', '.', '"']) {
+        format!("\"{}\" <{address}>", name.replace(['"', '\\'], ""))
+    } else {
+        format!("{name} <{address}>")
+    }
 }
 
 /// Who an account signs in with, when it is not a password.
@@ -309,6 +369,19 @@ pub struct Outgoing {
     pub attachments: Vec<OutgoingFile>,
     /// `body` is Markdown: it is sent as is for the plain-text part, plus a rendered HTML part.
     pub rich: bool,
+    /// The sender's OpenPGP public key, handed out in an `Autocrypt:` header.
+    pub autocrypt: Option<Vec<u8>>,
+    /// Encrypt with OpenPGP before sending.
+    pub seal: Option<Seal>,
+}
+
+/// How to encrypt a message, signed inside by the sender, who also gets a copy they can read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Seal {
+    /// With the sender's OpenPGP secret key; to the keys of To and Cc, and of Bcc without naming them.
+    OpenPgp { secret: Vec<u8>, to: Vec<Vec<u8>>, bcc: Vec<Vec<u8>> },
+    /// With the sender's certificate and key (as kept); to every recipient's certificate.
+    Smime { own: Vec<u8>, to: Vec<Vec<u8>> },
 }
 
 /// How an incoming message is shown.

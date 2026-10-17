@@ -75,6 +75,12 @@ pub struct Compose {
     pub contacts: std::sync::Arc<Vec<Contact>>,
     /// An address field shows suggestions: Esc closes them, not the window.
     pub suggesting: bool,
+    /// Send it encrypted (OpenPGP).
+    pub encrypt: bool,
+    /// `encrypt` follows whether it can be (every recipient's key known) until the user sets it.
+    pub encrypt_auto: bool,
+    /// Whether it can be encrypted, or why not; worked out by the app, which knows the keys.
+    pub can_encrypt: Result<(), String>,
 }
 
 pub enum Outcome {
@@ -213,6 +219,9 @@ impl Compose {
             caret_top: false,
             contacts: Default::default(),
             suggesting: false,
+            encrypt: false,
+            encrypt_auto: true,
+            can_encrypt: Err(String::new()),
         }
         .settled()
     }
@@ -310,6 +319,7 @@ impl Compose {
             updated,
             queued: false,
             send_at: None,
+            encrypt: (!self.encrypt_auto).then_some(self.encrypt),
         }
     }
 
@@ -331,6 +341,8 @@ impl Compose {
             in_reply_to: draft.in_reply_to,
             references: draft.references,
             files: draft.files.into_iter().map(|f| AttachedFile { name: f.name, size: f.size, vault: f.path, ready: true }).collect(),
+            encrypt: draft.encrypt.unwrap_or(false),
+            encrypt_auto: draft.encrypt.is_none(),
             id: draft.id,
             next_file: 1000, // above any slot number the draft used before
             focus_to: false,
@@ -475,6 +487,11 @@ impl Compose {
         self.files.iter().map(|f| (f.vault.clone(), f.name.clone())).collect()
     }
 
+    /// Every recipient's address (lower case), with whether it is a blind copy.
+    pub fn recipients(&self) -> Vec<(String, bool)> {
+        [(&self.to, false), (&self.cc, false), (&self.bcc, true)].into_iter().flat_map(|(list, blind)| addresses(list).into_iter().map(move |a| (address_of(&a), blind))).collect()
+    }
+
     pub fn outgoing(&self, from_address: &str, rich: bool) -> Outgoing {
         Outgoing {
             from: from_address.to_owned(),
@@ -487,7 +504,28 @@ impl Compose {
             references: self.references.clone(),
             attachments: Vec::new(), // read from `files` when the message is sent
             rich,
+            autocrypt: None, // the app adds the keys, which it keeps
+            seal: None,
         }
+    }
+}
+
+/// "Encrypt", on when the message will go encrypted; off and saying why when it cannot.
+fn encrypt_toggle(ui: &mut Ui, t: &Tokens, compose: &mut Compose) {
+    let possible = compose.can_encrypt.is_ok();
+    let on = compose.encrypt && possible;
+    let tip = match &compose.can_encrypt {
+        Ok(()) if on => "Encrypted: only the recipients can read it. Click to send it unencrypted".to_owned(),
+        Ok(()) => "Every recipient's key is known: click to encrypt".to_owned(),
+        Err(why) if why.is_empty() => "Add the recipients first".to_owned(),
+        Err(why) => why.clone(),
+    };
+    let color = if on { t.accent } else { t.text_dim };
+    let response = ui.add_enabled(possible, egui::Button::selectable(on, (Icon::Lock.image(14.0, color), RichText::new(if on { "Encrypted" } else { "Encrypt" }).color(color))).sense(NO_TAB));
+    let response = if possible { response.on_hover_text(tip) } else { response.on_disabled_hover_text(tip) };
+    if response.clicked() {
+        compose.encrypt = !on;
+        compose.encrypt_auto = false;
     }
 }
 
@@ -511,11 +549,9 @@ pub fn usable(paths: impl IntoIterator<Item = std::path::PathBuf>) -> Vec<(std::
 
 /// "Name <address>" for a message's sender.
 fn sender(message: &MessageSummary) -> String {
-    match (message.from.trim(), message.address.trim()) {
-        ("", address) => address.to_owned(),
-        (name, "") => name.to_owned(),
-        (name, address) if name == address => address.to_owned(),
-        (name, address) => format!("{name} <{address}>"),
+    match message.address.trim() {
+        "" => message.from.trim().to_owned(),
+        address => beavermail_core::address_text(&message.from, address),
     }
 }
 
@@ -614,14 +650,6 @@ fn suggestions<'a>(contacts: &'a [Contact], typed: &str, taken: &[String]) -> Ve
     contacts.iter().filter(|c| c.matches(typed) && !taken.contains(&c.address)).take(6).collect()
 }
 
-/// A contact as a list item: "Ada Lovelace <ada@x.org>", the name quoted when it has a comma or the like.
-pub fn list_item(name: &str, address: &str) -> String {
-    match name {
-        "" => address.to_owned(),
-        name if name.contains([',', ';', '"', '<', '>', '@', '(', ')']) => format!("\"{}\" <{address}>", name.replace('"', "")),
-        name => format!("{name} <{address}>"),
-    }
-}
 
 /// An address field as chips, one per address finished (a comma, Enter, or leaving the field), red
 /// when it cannot be sent to; what is being typed follows them, with the `contacts` it may mean below
@@ -738,7 +766,7 @@ fn recipients(ui: &mut Ui, t: &Tokens, id: egui::Id, text: &mut String, hint: &s
     let filter = egui::EventFilter { tab: !typing.trim().is_empty(), horizontal_arrows: true, vertical_arrows: true, escape: !found.is_empty() };
     ui.memory_mut(|m| m.set_focus_lock_filter(id, filter));
     if let Some(i) = picked {
-        typing = list_item(&found[i].name, &found[i].address);
+        typing = beavermail_core::address_text(&found[i].name, &found[i].address);
         done.push(std::mem::take(&mut typing));
         field.request_focus();
     }
@@ -937,6 +965,7 @@ pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &
                             ui.selectable_value(&mut compose.from, *serial, address);
                         }
                     });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| encrypt_toggle(ui, t, compose));
                 });
                 ui.separator();
                 // Cc and Bcc are asked for beside To, or with their keys; one in use stays shown.
@@ -1278,9 +1307,9 @@ mod tests {
         assert_eq!(found("navy", &[]), ["grace@navy.mil"]);
         assert_eq!(found("ada", &["Ada <ADA@x.org>".into()]), ["adam@y.org"], "already in the list");
         assert!(found("  ", &[]).is_empty() && found("zed", &[]).is_empty());
-        assert_eq!(list_item("Ada Lovelace", "ada@x.org"), "Ada Lovelace <ada@x.org>");
-        assert_eq!(list_item("Doe, John", "john@x.org"), "\"Doe, John\" <john@x.org>");
-        assert_eq!(list_item("", "adam@y.org"), "adam@y.org");
+        assert_eq!(beavermail_core::address_text("Ada Lovelace", "ada@x.org"), "Ada Lovelace <ada@x.org>");
+        assert_eq!(beavermail_core::address_text("Doe, John", "john@x.org"), "\"Doe, John\" <john@x.org>");
+        assert_eq!(beavermail_core::address_text("", "adam@y.org"), "adam@y.org");
     }
 
     #[test]

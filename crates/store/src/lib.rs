@@ -588,6 +588,22 @@ fn migrate(conn: &Connection) -> Result<(), MailError> {
         if version < 15 {
             conn.execute_batch("ALTER TABLE contacts ADD COLUMN notes TEXT NOT NULL DEFAULT ''; PRAGMA user_version = 15;").map_err(db)?;
         }
+        // Version 16: the OpenPGP key each sender was first seen with, to check their signatures.
+        if version < 16 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS peer_keys (address TEXT PRIMARY KEY, key BLOB NOT NULL, first_seen INTEGER NOT NULL);
+                 PRAGMA user_version = 16;",
+            )
+            .map_err(db)?;
+        }
+        // Version 17: the S/MIME certificate each sender last signed with, to encrypt to them.
+        if version < 17 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS peer_certs (address TEXT PRIMARY KEY, cert BLOB NOT NULL, seen INTEGER NOT NULL);
+                 PRAGMA user_version = 17;",
+            )
+            .map_err(db)?;
+        }
     Ok(())
 }
 
@@ -1016,6 +1032,34 @@ impl Store {
             .map_err(db)?;
         let rows = stmt.query_map([account], |r| Ok(Contact { name: r.get(0)?, address: r.get(1)?, folded: r.get(2)? })).map_err(db)?;
         rows.collect::<Result<_, _>>().map_err(db)
+    }
+
+    /// The OpenPGP key `address` was first seen with, to check what they sign.
+    pub fn peer_key(&self, address: &str) -> Result<Option<Vec<u8>>, MailError> {
+        self.conn().query_row("SELECT key FROM peer_keys WHERE address = ?1", [address.trim().to_lowercase()], |r| r.get(0)).optional().map_err(db)
+    }
+
+    /// Keeps `key` for `address` unless one is kept already: the first key seen is the one trusted, so
+    /// a message bringing another cannot replace it.
+    pub fn learn_peer_key(&self, address: &str, key: &[u8], at: i64) -> Result<(), MailError> {
+        self.conn()
+            .execute("INSERT OR IGNORE INTO peer_keys (address, key, first_seen) VALUES (?1, ?2, ?3)", params![address.trim().to_lowercase(), key, at])
+            .map(|_| ())
+            .map_err(db)
+    }
+
+    /// The S/MIME certificate `address` last signed with.
+    pub fn peer_cert(&self, address: &str) -> Result<Option<Vec<u8>>, MailError> {
+        self.conn().query_row("SELECT cert FROM peer_certs WHERE address = ?1", [address.trim().to_lowercase()], |r| r.get(0)).optional().map_err(db)
+    }
+
+    /// Keeps the certificate a valid signature from `address` was made with. Unlike an OpenPGP key it
+    /// replaces the one before: an authority vouched for it, and certificates are renewed.
+    pub fn learn_peer_cert(&self, address: &str, cert: &[u8], at: i64) -> Result<(), MailError> {
+        self.conn()
+            .execute("INSERT OR REPLACE INTO peer_certs (address, cert, seen) VALUES (?1, ?2, ?3)", params![address.trim().to_lowercase(), cert, at])
+            .map(|_| ())
+            .map_err(db)
     }
 
     /// Someone's card: as the address book or mail knows them; `None` for someone never written to nor saved.
@@ -1488,6 +1532,23 @@ mod tests {
         store.unsave_contact("bob@y.org").unwrap();
         let card = store.contact_card("bob@y.org").unwrap().unwrap();
         assert!(!card.saved && card.notes.is_empty(), "back to a suggestion: written to");
+    }
+
+    #[test]
+    fn the_latest_certificate_a_sender_signed_with_is_kept() {
+        let store = store();
+        store.learn_peer_cert("Ada@X.org", b"old", 1).unwrap();
+        store.learn_peer_cert("ada@x.org", b"renewed", 2).unwrap();
+        assert_eq!(store.peer_cert("ada@x.org").unwrap().as_deref(), Some(&b"renewed"[..]), "an authority vouched for both: the newer one wins");
+    }
+
+    #[test]
+    fn the_first_key_seen_for_a_sender_stays() {
+        let store = store();
+        assert_eq!(store.peer_key("ada@x.org").unwrap(), None);
+        store.learn_peer_key("Ada@X.org", b"first", 1).unwrap();
+        store.learn_peer_key("ada@x.org", b"second", 2).unwrap();
+        assert_eq!(store.peer_key("ada@x.org").unwrap().as_deref(), Some(&b"first"[..]), "a later message cannot replace it");
     }
 
     #[test]

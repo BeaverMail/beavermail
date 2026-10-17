@@ -12,6 +12,7 @@ mod card;
 mod commands;
 mod compose;
 mod drafts;
+mod encryption;
 mod original;
 mod remote;
 mod screen;
@@ -81,6 +82,8 @@ enum Event {
     SignedIn(Arc<std::sync::atomic::AtomicBool>, Result<store::oauth::Grant, String>),
     /// A "Test connection" ended: (the form it is for, what was tested, IMAP's answer, SMTP's answer).
     Checked(Option<u64>, Box<(Account, String, String)>, Result<(), String>, Result<(), String>),
+    /// A key file was picked to import for this address (`None`: the dialog was cancelled).
+    KeyFile(String, Option<(String, Vec<u8>)>),
     /// Everyone the user has written to, for the address fields.
     Contacts(Result<Vec<beavermail_store::Contact>, MailError>),
 }
@@ -305,6 +308,8 @@ struct ReaderOutcome {
     trust: Option<MessageId>,
     /// The sender's name was clicked: open their card, as (address, name).
     card: Option<(String, String)>,
+    /// "Try again" on a message that could not be opened.
+    retry: bool,
 }
 
 struct AccountView {
@@ -502,13 +507,14 @@ enum SettingsPage {
     Reading,
     Writing,
     Spam,
+    Encryption,
     Storage,
     /// One account's page, by serial.
     Account(u64),
 }
 
 impl SettingsPage {
-    const ALL: [Self; 4] = [Self::Reading, Self::Writing, Self::Spam, Self::Storage];
+    const ALL: [Self; 5] = [Self::Reading, Self::Writing, Self::Spam, Self::Encryption, Self::Storage];
 
     fn title(self) -> &'static str {
         match self {
@@ -516,6 +522,7 @@ impl SettingsPage {
             Self::Writing => "Writing",
             Self::Spam => "Suspicious mail",
             Self::Storage => "Stored mail",
+            Self::Encryption => "Encryption",
             Self::Account(_) => "Account",
         }
     }
@@ -526,6 +533,7 @@ impl SettingsPage {
             Self::Writing => Some(Icon::Pencil),
             Self::Spam => Some(Icon::Spam),
             Self::Storage => Some(Icon::Lock),
+            Self::Encryption => Some(Icon::Key),
             Self::Account(_) => None,
         }
     }
@@ -536,6 +544,7 @@ impl SettingsPage {
             Self::Writing => "How messages you write are composed and sent.",
             Self::Spam => "Mail from people you know is never held. Nothing moves on the server.",
             Self::Storage => "How downloaded messages are kept on this computer.",
+            Self::Encryption => "Your keys, to read encrypted mail and to send it encrypted.",
             Self::Account(_) => "",
         }
     }
@@ -676,6 +685,20 @@ fn account_page(ui: &mut egui::Ui, t: &theme::Tokens, form: &mut NewAccount, wai
     }
     ui.add_space(8.0);
     action
+}
+
+/// A key file read as an OpenPGP key, or (`certificate`) an S/MIME `.p12`, unlocked with `password`.
+fn import_file(file: &[u8], certificate: bool, password: Option<&str>) -> Result<Vec<u8>, beavermail_crypto::ImportError> {
+    if certificate { beavermail_crypto::import_certificate(file, password) } else { beavermail_crypto::import(file, password) }
+}
+
+/// Why a key file could not be used, for the user.
+fn import_error(e: &beavermail_crypto::ImportError) -> &'static str {
+    match e {
+        beavermail_crypto::ImportError::NotASecretKey => "This file has no secret key: it may be someone's public key, or not a key at all.",
+        beavermail_crypto::ImportError::NeedsPassword => "This key is protected: it needs its password.",
+        beavermail_crypto::ImportError::WrongPassword => "That password does not open this key.",
+    }
 }
 
 /// The mark for what was typed in "Add a trusted sender": an address, or `@domain` for its whole
@@ -841,8 +864,18 @@ struct BeaverApp {
     signing_in: Option<SignIn>,
     /// What the window shows, as picked in the rail at its left edge.
     section: Section,
+    /// Settings > Encryption's dialogs.
+    key_dialogs: encryption::Dialogs,
+    /// The user's own keys and certificates, by their place in the vault, read when first asked for.
+    key_files: std::collections::HashMap<std::path::PathBuf, Option<Vec<u8>>>,
+    /// Whether the open message can be encrypted, for which sender and recipients (a hash of them).
+    encryption_checked: Option<(u64, Result<(), String>)>,
     /// A person's card, open over everything else.
     card: Option<card::Card>,
+    /// The message whose text could not be loaded, and why: shown in the reader in place of a spinner.
+    body_failed: Option<(MessageId, String)>,
+    /// Reply, reply all or forward asked for a message whose text was not loaded yet.
+    answer_when_open: Option<(MessageId, Action)>,
     /// The card open in the Contacts section.
     contact_pane: Option<card::Card>,
     /// The saved contacts for the Contacts section, read when it is drawn after a change.
@@ -1001,8 +1034,13 @@ impl BeaverApp {
             signing_in: None,
             contacts: Default::default(),
             section: Section::Mail,
+            key_dialogs: Default::default(),
+            key_files: Default::default(),
+            encryption_checked: None,
             card: None,
             contact_pane: None,
+            answer_when_open: None,
+            body_failed: None,
             address_book: None,
             contact_query: String::new(),
             new_contact: String::new(),
@@ -1334,7 +1372,8 @@ impl BeaverApp {
                 self.tabs.len() - 1
             }
         };
-        if self.active() != Some(at) {
+        // Also when it is the active one but its text is not there (only selected, or failed before).
+        if self.active() != Some(at) || self.body.is_none() {
             self.activate(at);
         }
         // Without the reading pane, a message opens in the list's place.
@@ -1353,9 +1392,14 @@ impl BeaverApp {
     /// switching is quick without keeping every open message in memory.
     fn activate(&mut self, at: usize) {
         let Some(tab) = self.tabs.get(at) else { return };
-        let (serial, id) = (tab.serial, tab.message.id);
-        let Some(view) = self.view(serial) else { return };
-        let Some(source) = view.source.clone() else { return };
+        let (serial, id, pinned) = (tab.serial, tab.message.id, tab.pinned);
+        self.body_failed = None;
+        let Some((view, source)) = self.view(serial).and_then(|v| Some((v, v.source.clone()?))) else {
+            // Never a reader waiting for nothing: an account without a connection says so.
+            (self.in_tab, self.message, self.body) = (pinned, Some(id), None);
+            self.body_failed = Some((id, "Its account is not connected. Check its password in Settings.".into()));
+            return;
+        };
         let (account, message) = (view.account.clone(), tab.message.clone());
         let own: Vec<String> = self.accounts.iter().map(|v| v.account.address().to_owned()).collect();
         let (archive, settings, wanted) = (self.archive.clone(), self.settings.clone(), self.wanted.clone());
@@ -1490,7 +1534,10 @@ impl BeaverApp {
         if self.settings.reading_pane || self.full_preview {
             self.show_listed(id);
         } else {
+            // Only selected: nothing of it is loaded, and the text of the one before is not its text.
             self.message = Some(id);
+            self.body = None;
+            self.body_failed = None;
         }
     }
 
@@ -2018,11 +2065,22 @@ impl BeaverApp {
     }
 
     /// Sends `compose`'s message from its account in the background; false when the account cannot send.
-    fn send_message(&self, compose: &compose::Compose) -> bool {
+    fn send_message(&mut self, compose: &compose::Compose) -> bool {
         let Some(view) = self.view(compose.from) else { return false };
         let (account, sender, source) = (view.account.clone(), view.sender.clone(), view.source.clone());
         let Some(sender) = sender else { return false };
         let mut message = compose.outgoing(&account.sender(), self.settings.rich_outgoing);
+        // With a key, it goes out with each message, so people's programs learn it (Autocrypt).
+        message.autocrypt = self.own_key(account.address()).and_then(|secret| beavermail_crypto::public_key(&secret));
+        match (compose.encrypt_auto, compose.encrypt, self.seal_keys(compose)) {
+            // Asked to encrypt but it cannot be: never sent in the clear instead.
+            (false, true, Err(why)) => {
+                self.error = Some(format!("Not sent: it cannot be encrypted. {why}"));
+                return false;
+            }
+            (true, _, Ok(seal)) | (false, true, Ok(seal)) => message.seal = Some(seal),
+            _ => {}
+        }
         let (files, vault, id) = (compose.file_list(), self.vault.clone(), compose.id.clone());
         self.spawn(async move {
             // The copies are read now, off the window's thread, as they can be large.
@@ -2146,6 +2204,7 @@ impl BeaverApp {
         // Esc is Discard (asked first when there is text), unless it is meant for a menu or the question itself.
         let esc = !self.confirm_discard && !compose.sending && !compose.picking && !compose.suggesting && !egui::Popup::is_any_open(ctx) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         compose.contacts = self.contacts.clone();
+        self.check_encryption(&mut compose);
         let outcome = if esc { compose::Outcome::Discard } else { compose::window(ctx, t, &mut compose, &senders, self.settings.rich_outgoing) };
         if compose.from != compose.sig_from {
             let signature = self.view(compose.from).map(|v| v.account.signature.clone()).unwrap_or_default();
@@ -2427,6 +2486,17 @@ impl BeaverApp {
         if !self.show_settings {
             return;
         }
+        // The page of keys reads them here: the vault is not read while the window draws.
+        let key_ids: Vec<encryption::Keys> = if self.settings_page == SettingsPage::Encryption {
+            let addresses: Vec<String> = self.accounts.iter().map(|v| v.account.address().to_lowercase()).collect();
+            addresses
+                .into_iter()
+                .map(|a| encryption::Keys { openpgp: self.own_key(&a).and_then(|k| beavermail_crypto::short_id(&k)), smime: self.own_certificate(&a).and_then(|c| beavermail_crypto::certificate_info(&c)), address: a })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut key_action = None;
         // An account page edits a copy of the account; the page of a removed account falls back to the first page.
         if let SettingsPage::Account(serial) = self.settings_page {
             match self.view(serial) {
@@ -2694,6 +2764,9 @@ impl BeaverApp {
                                     });
                                 }
                             }
+                            SettingsPage::Encryption => {
+                                key_action = encryption::page(ui, t, &key_ids);
+                            }
                             SettingsPage::Storage => {
                                 vault_request = security::section(ui, t, &mut self.security, mode, locked, job.as_deref());
                                 if locked && ui.button("Unlock…").clicked() {
@@ -2743,6 +2816,9 @@ impl BeaverApp {
                 }
                 Err(e) => self.account_edit = Some(NewAccount { error: Some(e), ..form }),
             }
+        }
+        if let Some(action) = key_action {
+            self.key_action(action);
         }
         match (page_action, self.settings_page) {
             (Some(PageAction::Remove), SettingsPage::Account(serial)) => self.confirm_remove = Some(serial),
@@ -2966,6 +3042,163 @@ impl BeaverApp {
         }
     }
 
+    /// Whether the message can go encrypted, worked out again when its sender or recipients change;
+    /// while the user has not chosen, it is encrypted whenever it can be.
+    fn check_encryption(&mut self, compose: &mut compose::Compose) {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (compose.from, compose.recipients()).hash(&mut hasher);
+        let state = hasher.finish();
+        if self.encryption_checked.as_ref().is_none_or(|(s, _)| *s != state) {
+            let can = self.seal_keys(compose).map(|_| ());
+            self.encryption_checked = Some((state, can));
+        }
+        if let Some((_, can)) = &self.encryption_checked {
+            compose.can_encrypt = can.clone();
+            if compose.encrypt_auto {
+                compose.encrypt = can.is_ok();
+            }
+        }
+    }
+
+    /// The keys to encrypt the message with: the sender's own (signs it, and keeps a readable copy) and
+    /// every recipient's, or why it cannot be encrypted.
+    fn seal_keys(&mut self, compose: &compose::Compose) -> Result<beavermail_core::Seal, String> {
+        let address = self.view(compose.from).map(|v| v.account.address().to_lowercase()).ok_or("The sending account is gone")?;
+        let recipients = compose.recipients();
+        if recipients.is_empty() {
+            return Err(String::new());
+        }
+        let others: Vec<(String, bool)> = recipients.into_iter().filter(|(r, _)| *r != address).collect();
+        // OpenPGP first, the way most people who encrypt write; S/MIME when everyone has a certificate.
+        let openpgp = (|| {
+            let secret = self.own_key(&address).ok_or_else(|| format!("Turn on encryption for {address} in Settings > Encryption first"))?;
+            let own = beavermail_crypto::public_key(&secret).ok_or("Your key could not be read")?;
+            let (mut to, mut bcc) = (vec![own], Vec::new());
+            for (recipient, blind) in &others {
+                let key = self.archive.peer_key(recipient).ok().flatten().ok_or_else(|| format!("No key for {recipient} yet. It comes with their mail, once they use a program that encrypts."))?;
+                if *blind { bcc.push(key) } else { to.push(key) }
+            }
+            Ok(beavermail_core::Seal::OpenPgp { secret, to, bcc })
+        })();
+        if openpgp.is_ok() {
+            return openpgp;
+        }
+        let smime = (|| {
+            let own = self.own_certificate(&address).ok_or(())?;
+            let to = others.iter().map(|(r, _)| self.archive.peer_cert(r).ok().flatten().ok_or(())).collect::<Result<Vec<_>, ()>>()?;
+            Ok::<_, ()>(beavermail_core::Seal::Smime { own, to })
+        })();
+        smime.or(openpgp)
+    }
+
+    /// Encryption to the user alone, for a draft kept on the server: with their OpenPGP key, else their certificate.
+    fn seal_to_self(&mut self, address: &str) -> Option<beavermail_core::Seal> {
+        if let Some(secret) = self.own_key(address) {
+            let public = beavermail_crypto::public_key(&secret)?;
+            return Some(beavermail_core::Seal::OpenPgp { secret, to: vec![public], bcc: Vec::new() });
+        }
+        self.own_certificate(address).map(|own| beavermail_core::Seal::Smime { own, to: Vec::new() })
+    }
+
+    /// A key or certificate of the user's, read from the vault once.
+    fn key_file(&mut self, path: std::path::PathBuf) -> Option<Vec<u8>> {
+        if !self.key_files.contains_key(&path) {
+            let data = self.vault.read(&path).ok().flatten();
+            self.key_files.insert(path.clone(), data);
+        }
+        self.key_files.get(&path).cloned().flatten()
+    }
+
+    /// The address's own OpenPGP key.
+    fn own_key(&mut self, address: &str) -> Option<Vec<u8>> {
+        self.key_file(beavermail_crypto::key_path(address))
+    }
+
+    /// The address's own S/MIME certificate with its key.
+    fn own_certificate(&mut self, address: &str) -> Option<Vec<u8>> {
+        self.key_file(beavermail_crypto::certificate_path(address))
+    }
+
+    /// Keeps the address's own OpenPGP key, or (`certificate`) its S/MIME certificate, in the vault. A
+    /// key's public half is also the key its own messages are checked with.
+    fn keep_key(&mut self, address: &str, certificate: bool, data: Vec<u8>) {
+        let address = address.trim().to_lowercase();
+        let path = if certificate { beavermail_crypto::certificate_path(&address) } else { beavermail_crypto::key_path(&address) };
+        if let Err(e) = self.vault.write(&path, &data) {
+            self.error = Some(format!("Could not keep the key: {e}"));
+            return;
+        }
+        if let Some(public) = beavermail_crypto::public_key(&data).filter(|_| !certificate) {
+            let now = chrono::Local::now().timestamp();
+            let _ = self.archive.learn_peer_key(&address, &public, now);
+        }
+        self.key_files.insert(path, Some(data));
+        self.encryption_checked = None;
+        self.key_dialogs.unlock = None;
+        let told = if certificate { "Your certificate is imported" } else { "Your key is ready" };
+        self.notice = Some((told.to_owned(), std::time::Instant::now()));
+    }
+
+    fn key_action(&mut self, action: encryption::KeyAction) {
+        use encryption::KeyAction as A;
+        match action {
+            A::TurnOn(address) => {
+                let name = self.accounts.iter().find(|v| v.account.address().eq_ignore_ascii_case(&address)).and_then(|v| v.account.sender_name().map(str::to_owned)).unwrap_or_default();
+                match beavermail_crypto::generate(&name, &address) {
+                    Ok(secret) => {
+                        self.keep_key(&address, false, secret);
+                        // Right away, while it is on the user's mind: a key only here is lost with the computer.
+                        self.key_dialogs.backup = Some(encryption::Backup::new(address));
+                    }
+                    Err(e) => self.error = Some(format!("Could not make a key: {e}")),
+                }
+            }
+            A::Import(address) => self.spawn(async move {
+                let file = match rfd::AsyncFileDialog::new().set_title("Import a key or certificate").add_filter("OpenPGP key or S/MIME certificate", &["asc", "key", "gpg", "pgp", "p12", "pfx"]).pick_file().await {
+                    Some(file) => Some((file.file_name(), file.read().await)),
+                    None => None,
+                };
+                Event::KeyFile(address, file)
+            }),
+            A::Unlock(address, password) => {
+                let Some(unlock) = self.key_dialogs.unlock.as_mut() else { return };
+                let certificate = unlock.certificate;
+                match import_file(&unlock.file, certificate, Some(&password)) {
+                    Ok(data) => self.keep_key(&address, certificate, data),
+                    Err(e) => unlock.error = Some(import_error(&e).to_owned()),
+                }
+            }
+            A::AskBackup(address) => self.key_dialogs.backup = Some(encryption::Backup::new(address)),
+            A::SaveBackup(address, code) => {
+                let Some(secret) = self.own_key(&address) else { return };
+                let backup = match beavermail_crypto::export(&secret, &code) {
+                    Ok(backup) => backup,
+                    Err(e) => return self.error = Some(format!("Could not back up the key: {e}")),
+                };
+                let name = format!("{}-key-backup.asc", address.replace('@', "-at-"));
+                self.spawn(async move {
+                    let Some(target) = rfd::AsyncFileDialog::new().set_title("Save the key backup").set_file_name(&name).save_file().await else { return Event::Saved(Ok(None)) };
+                    let path = target.path().to_path_buf();
+                    match std::fs::write(&path, backup) {
+                        Ok(()) => Event::Saved(Ok(Some(format!("Key backup saved to {}", path.display())))),
+                        Err(e) => Event::Saved(Err(format!("{}: {e}", path.display()))),
+                    }
+                });
+            }
+            A::AskRemove(address, certificate) => self.key_dialogs.remove = Some((address, certificate)),
+            A::Remove(address, certificate) => {
+                let path = if certificate { beavermail_crypto::certificate_path(&address) } else { beavermail_crypto::key_path(&address) };
+                match self.vault.remove(&path) {
+                    Ok(()) => self.notice = Some((if certificate { "The certificate is removed from this computer" } else { "The key is removed from this computer" }.to_owned(), std::time::Instant::now())),
+                    Err(e) => self.error = Some(format!("Could not remove it: {e}")),
+                }
+                self.key_files.remove(&path);
+                self.encryption_checked = None;
+            }
+        }
+    }
+
     /// Opens the card of `address`; `name` is how the message showing it names them, for someone the
     /// archive does not know yet.
     fn open_card(&mut self, address: &str, name: &str) {
@@ -3025,7 +3258,7 @@ impl BeaverApp {
                 if !inline {
                     self.card = None;
                 }
-                let to = compose::list_item(name.trim(), &address);
+                let to = beavermail_core::address_text(name.trim(), &address);
                 self.new_message_to(&format!("{to}, "));
             }
             card::CardAction::Open(i) => {
@@ -3254,6 +3487,10 @@ impl BeaverApp {
         let Some(view) = self.view(compose.from) else { return };
         let Some(source) = view.source.clone() else { return };
         let message = compose.outgoing(&view.account.sender(), self.settings.rich_outgoing);
+        // A message meant to go encrypted is not left readable on the server as a draft: it is
+        // encrypted to the user's own key.
+        let address = view.account.address().to_owned();
+        let to_self = if compose.encrypt { self.seal_to_self(&address) } else { None };
         let (files, vault, id, snapshot, serial) = (compose.file_list(), self.vault.clone(), compose.id.clone(), compose.snapshot(), compose.from);
         compose.pushing = true;
         self.spawn(async move {
@@ -3261,7 +3498,11 @@ impl BeaverApp {
                 let (id, mut message) = (id.clone(), message);
                 move || -> Result<Vec<u8>, String> {
                     message.attachments = attachments::read_files(&vault, &files)?;
-                    render_draft(&message, &id).map_err(|e| e.to_string())
+                    let raw = render_draft(&message, &id).map_err(|e| e.to_string())?;
+                    match &to_self {
+                        Some(seal) => beavermail_crypto::seal(&raw, seal),
+                        None => Ok(raw),
+                    }
                 }
             })
             .await;
@@ -3369,7 +3610,8 @@ impl BeaverApp {
             Command::Palette | Command::Search | Command::Settings | Command::Mail | Command::Contacts => Ok(()),
             Command::NewMessage if self.senders().is_empty() => Err("Add an account to send mail"),
             Command::NewMessage => Ok(()),
-            Command::Reply | Command::ReplyAll | Command::Forward => one().and(if self.body.is_some() { Ok(()) } else { Err("The message is still loading") }),
+            // A message only selected, or still loading, is answered once its text is there.
+            Command::Reply | Command::ReplyAll | Command::Forward => one().map(|_| ()),
             Command::Archive | Command::Trash | Command::ToggleRead => some(),
             Command::Undo => if self.pending.is_some() { Ok(()) } else { Err("Nothing to undo") },
             Command::Spam => {
@@ -3423,8 +3665,15 @@ impl BeaverApp {
             Command::Palette => self.palette = Some(Palette::default()),
             Command::NewMessage => self.new_message(),
             Command::Reply | Command::ReplyAll | Command::Forward => {
-                if let Some(id) = self.message {
+                let Some(id) = self.message else { return };
+                if self.body.is_some() && self.open_tab().is_some() {
                     self.request(id, answer(command));
+                } else {
+                    // Only selected (no reading pane) or still loading: it opens, and the answer follows its text.
+                    self.answer_when_open = Some((id, answer(command)));
+                    if self.open_tab().is_none() {
+                        self.show_listed(id);
+                    }
                 }
             }
             Command::Archive => self.request_all(targets, Action::Archive),
@@ -3753,13 +4002,20 @@ impl BeaverApp {
             }
             Event::Body(serial, id, result) if self.message == Some(id) && self.open_tab().is_some_and(|t| t.serial == serial) =>
             {
+                // An answer asked for before the text was there goes with this message only.
+                let answer = self.answer_when_open.take().filter(|(want, _)| *want == id);
                 match result {
-                    Ok(prepared) => self.body = Some(OpenBody::new(*prepared)),
+                    Ok(prepared) => {
+                        self.body = Some(OpenBody::new(*prepared));
+                        if let Some((id, action)) = answer {
+                            self.request(id, action);
+                        }
+                    }
                     Err(MailError::Offline(why)) => {
                         self.went_offline(serial, why);
-                        self.error = Some("This message is not stored on this computer. It opens once the server can be reached.".into());
+                        self.body_failed = Some((id, "It is not stored on this computer, and the server cannot be reached. It opens once it can.".into()));
                     }
-                    Err(e) => self.error = Some(e.to_string()),
+                    Err(e) => self.body_failed = Some((id, e.to_string())),
                 }
             }
             // No connection: the change waits and is made when the server answers again.
@@ -3833,6 +4089,15 @@ impl BeaverApp {
                     check.answers = Some((imap, smtp));
                 }
             }
+            Event::KeyFile(address, Some((name, file))) => {
+                let certificate = [".p12", ".pfx"].iter().any(|e| name.to_lowercase().ends_with(e));
+                match import_file(&file, certificate, None) {
+                    Ok(data) => self.keep_key(&address, certificate, data),
+                    Err(beavermail_crypto::ImportError::NeedsPassword) => self.key_dialogs.unlock = Some(encryption::Unlock { address, file, certificate, password: String::new(), error: None }),
+                    Err(e) => self.error = Some(import_error(&e).to_owned()),
+                }
+            }
+            Event::KeyFile(_, None) => {}
             Event::Contacts(Ok(contacts)) => self.contacts = Arc::new(contacts),
             Event::Contacts(Err(_)) => {} // the fields only miss their suggestions
             Event::Unsubscribed(who, result) => match result {
@@ -4781,7 +5046,7 @@ impl BeaverApp {
         let mut allow_sender = None;
         let mut mark = None;
         let mut suspicious = false;
-        let (mut leave, mut block, mut trust, mut card) = (None, None, None, None);
+        let (mut leave, mut block, mut trust, mut card, mut retry) = (None, None, None, None, false);
         let scroll = self.reader_scroll.take();
         let (mut switch, mut expand) = (None, false);
         // The open message's conversation, oldest first, when the list shows conversations.
@@ -4869,9 +5134,16 @@ impl BeaverApp {
             ui.add_space(6.0);
             ui.separator();
             match &mut self.body {
-                None => {
-                    ui.centered_and_justified(|ui| ui.spinner());
-                }
+                None => match self.body_failed.as_ref().filter(|(failed, _)| *failed == message.id) {
+                    Some((_, why)) => {
+                        if views::empty_state(ui, t, "This message could not be opened", why, Some("Try again")) {
+                            retry = true;
+                        }
+                    }
+                    None => {
+                        ui.centered_and_justified(|ui| ui.spinner());
+                    }
+                },
                 Some(body) => {
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                         if let Some(scroll) = scroll {
@@ -4943,22 +5215,23 @@ impl BeaverApp {
                             }
                             ui.painter().galley(pos2(left, rect.top() + 3.0), name, t.text);
                             ui.painter().galley(pos2(left, rect.top() + 23.0), date, t.text_dim);
+                            ui.add_space(4.0);
                             for finding in &body.findings {
                                 let color = if finding.level == screen::Level::Danger { t.danger } else { t.text_dim };
-                                ui.add_space(6.0);
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.add(Icon::Spam.image(icons::SIZE, color));
-                                    ui.label(RichText::new(&finding.text).size(13.0).color(color));
-                                });
+                                views::note(ui, Icon::Spam, color, &finding.text, "");
+                            }
+                            // One line when all is well (the details on hover); each problem on a line of its own.
+                            for (text, tip, tone) in views::security_notes(body.data.encryption.as_ref(), body.data.signature.as_ref()) {
+                                let (icon, color) = match tone {
+                                    views::Tone::Good => (Icon::Lock, t.accent),
+                                    views::Tone::Quiet => (Icon::Lock, t.text_dim),
+                                    views::Tone::Warning => (Icon::Spam, t.danger),
+                                };
+                                views::note(ui, icon, color, &text, &tip);
                             }
                             // In every view, though only the original could load them: the user sees who tracks.
                             if let Some(line) = views::trackers_line(&body.trackers) {
-                                ui.add_space(6.0);
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.add(Icon::Ban.image(icons::SIZE, t.text_dim));
-                                    ui.label(RichText::new(line).size(13.0).color(t.text_dim))
-                                        .on_hover_text("Images that only tell the sender you opened this message. They are never loaded, even when you load the others.");
-                                });
+                                views::note(ui, Icon::Ban, t.text_dim, &line, "Images that only tell the sender you opened this message. They are never loaded, even when you load the others.");
                             }
                             if body.findings.is_empty() && authenticity == sender::Authenticity::Verified {
                                 ui.add_space(6.0);
@@ -5073,7 +5346,7 @@ impl BeaverApp {
                 pane_ring(ui, t, reader.response.rect);
             }
         }
-        ReaderOutcome { action, url, mode: chosen_mode, remember, attachment, save_many, allow_sender, mark, bulk, unsubscribe: leave, block, switch, expand, back, trust, card }
+        ReaderOutcome { action, url, mode: chosen_mode, remember, attachment, save_many, allow_sender, mark, bulk, unsubscribe: leave, block, switch, expand, back, trust, card, retry }
     }
 }
 
@@ -5194,8 +5467,11 @@ impl eframe::App for BeaverApp {
         }
         // Without the reading pane and with no message in its place, there is no reader to draw.
         let shows_reader = !contacts && (self.in_tab || self.full_preview || self.settings.reading_pane);
-        let ReaderOutcome { action, url, mode, remember, attachment, save_many, allow_sender, mark, bulk, unsubscribe, block, switch, expand, back, trust, card } =
+        let ReaderOutcome { action, url, mode, remember, attachment, save_many, allow_sender, mark, bulk, unsubscribe, block, switch, expand, back, trust, card, retry } =
             if shows_reader { self.reader(ui, &t) } else { ReaderOutcome::default() };
+        if retry && let Some(at) = self.active() {
+            self.activate(at);
+        }
         if let Some((address, name)) = card {
             self.open_card(&address, &name);
         }
@@ -5271,6 +5547,9 @@ impl eframe::App for BeaverApp {
         self.account_form(ui.ctx());
         self.remove_dialog(ui.ctx(), &t);
         self.card_dialog(ui.ctx(), &t);
+        if let Some(action) = encryption::dialogs(ui.ctx(), &t, &mut self.key_dialogs) {
+            self.key_action(action);
+        }
         self.unsubscribe_dialog(ui.ctx(), &t);
         self.palette_window(ui.ctx(), &t);
         self.toast(ui.ctx(), &t);

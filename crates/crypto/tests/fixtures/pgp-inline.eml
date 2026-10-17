@@ -1,0 +1,18 @@
+From: Ada Lovelace <ada@example.org>
+To: Bob <bob@example.org>
+Subject: Lunch
+Autocrypt: addr=ada@example.org; keydata=mDMEatNRZBYJKwYBBAHaRw8BAQdAqRzKWDy+ZTIy4h/hbZcN63+IDGyt1L2EnQd/AK5GBf60HkFkYSBMb3ZlbGFjZSA8YWRhQGV4YW1wbGUub3JnPoiQBBMWCgA4FiEErcjCc+aU803D0kpIGth+WKdAHA4FAmrTUWQCGwMFCwkIBwIGFQoJCAsCBBYCAwECHgECF4AACgkQGth+WKdAHA7ChwD9Fatu+MnF5xF9EzY3p7a396FgjIUvh7p2J1+fig4sHEUA/3k8jrgC9c/GFEv7j0+otF90glvoqm7inQguNTc8SQYE
+Content-Type: text/plain; charset=utf-8
+
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA512
+
+See you at noon.
+
+-----BEGIN PGP SIGNATURE-----
+
+iIYEARYKAC4WIQStyMJz5pTzTcPSSkga2H5Yp0AcDgUCatNRZBAcYWRhQGV4YW1w
+bGUub3JnAAoJEBrYflinQBwOEPQBAMWec3x4oMxjJDhyCXA51iQsKIRofEKDG5VG
+cFmz2cT6AQDCrcri3892RD2PRZKrl4YN9Wvw63zwU3X3QVTV7fFZBg==
+=FKxg
+-----END PGP SIGNATURE-----

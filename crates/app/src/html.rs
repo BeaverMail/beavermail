@@ -66,6 +66,8 @@ struct Walker {
     pre: bool,
     /// The block being gathered continues a list item after a line break.
     continued: bool,
+    /// How many quotes the walker is inside: their paragraphs are quoted text.
+    quoted: u8,
 }
 
 /// Whether showing the message as designed would fetch anything: an image, style or font on a server.
@@ -153,7 +155,7 @@ pub fn blocks(html: &str) -> Vec<Block> {
     }
     let html = &html[..end];
     let document = Html::parse_document(html);
-    let mut walker = Walker { blocks: Vec::new(), runs: Vec::new(), kind: Kind::Para, depth: 0, marker: None, lists: Vec::new(), pre: false, continued: false };
+    let mut walker = Walker { blocks: Vec::new(), runs: Vec::new(), kind: Kind::Para, depth: 0, marker: None, lists: Vec::new(), pre: false, continued: false, quoted: 0 };
     walker.element(document.root_element(), &Style::default());
     walker.flush();
     walker.blocks
@@ -169,8 +171,10 @@ impl Walker {
         if runs.is_empty() && self.kind != Kind::Rule && marker.is_none() {
             return;
         }
+        // A paragraph inside a quote (as Markdown and most mail write them) is shown as quoted.
+        let kind = if self.quoted > 0 && matches!(self.kind, Kind::Para | Kind::Line) { Kind::Quote } else { self.kind };
         if self.blocks.len() < MAX_BLOCKS {
-            self.blocks.push(Block { kind: self.kind, depth: self.depth, marker, continued: std::mem::take(&mut self.continued), runs, rows: Vec::new() });
+            self.blocks.push(Block { kind, depth: self.depth, marker, continued: std::mem::take(&mut self.continued), runs, rows: Vec::new() });
         }
     }
 
@@ -197,7 +201,7 @@ impl Walker {
             return;
         }
         let mut style = style.clone();
-        let (outer_kind, outer_depth, outer_pre) = (self.kind, self.depth, self.pre);
+        let (outer_kind, outer_depth, outer_pre, outer_quoted) = (self.kind, self.depth, self.pre, self.quoted);
         if name == "table"
             && let Some((header, rows)) = data_table(el, &style)
         {
@@ -216,6 +220,7 @@ impl Walker {
             }
             "blockquote" => {
                 self.depth += 1;
+                self.quoted += 1;
                 self.start(Kind::Quote);
             }
             "pre" => {
@@ -294,6 +299,7 @@ impl Walker {
         self.kind = outer_kind;
         self.depth = outer_depth;
         self.pre = outer_pre;
+        self.quoted = outer_quoted;
         if matches!(name, "td" | "th" | "br") {
             self.kind = Kind::Line;
         }
@@ -338,7 +344,7 @@ fn data_table(table: ElementRef<'_>, style: &Style) -> Option<(bool, Vec<Vec<Vec
 /// A cell's content on one line: its paragraphs and lines joined by spaces.
 fn cell_runs(cell: ElementRef<'_>, style: &Style) -> Vec<Run> {
     let style = Style { bold: style.bold || cell.value().name() == "th", ..style.clone() };
-    let mut walker = Walker { blocks: Vec::new(), runs: Vec::new(), kind: Kind::Line, depth: 0, marker: None, lists: Vec::new(), pre: false, continued: false };
+    let mut walker = Walker { blocks: Vec::new(), runs: Vec::new(), kind: Kind::Line, depth: 0, marker: None, lists: Vec::new(), pre: false, continued: false, quoted: 0 };
     walker.element(cell, &style);
     walker.flush();
     let mut runs = Vec::new();
@@ -512,6 +518,14 @@ fn strip_tracking(url: &str, extra: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paragraphs_in_a_quote_are_quoted_at_their_depth() {
+        // As Markdown writes a reply: a quote of paragraphs, one quote inside another.
+        let html = beavermail_smtp::markdown_html("Thanks!\n\nOn Mon, Ada wrote:\n> Hello there\n>\n> > older quote\n\nBye");
+        let shown: Vec<(Kind, u8)> = blocks(&html).iter().map(|b| (b.kind, b.depth)).collect();
+        assert_eq!(shown, [(Kind::Para, 0), (Kind::Para, 0), (Kind::Quote, 1), (Kind::Quote, 2), (Kind::Para, 0)], "{html}");
+    }
 
     #[test]
     fn a_broken_paragraph_has_its_room_after_its_last_line() {

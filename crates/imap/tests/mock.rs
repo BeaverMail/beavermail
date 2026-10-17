@@ -28,6 +28,8 @@ struct Mock {
     store: Arc<Store>,
     files: Arc<Vault>,
     log: Arc<Mutex<Vec<String>>>,
+    /// The message the server sends when asked for one.
+    message: Arc<Mutex<String>>,
 }
 
 impl Mock {
@@ -62,20 +64,21 @@ async fn start_opts(move_works: bool, attachment: bool, idle: bool) -> Mock {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let log = Arc::new(Mutex::new(Vec::new()));
-    let served = log.clone();
+    let message = Arc::new(Mutex::new(MESSAGE.to_owned()));
+    let (served, text) = (log.clone(), message.clone());
     tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
-            tokio::spawn(serve(socket, served.clone(), move_works, attachment, idle));
+            tokio::spawn(serve(socket, served.clone(), move_works, attachment, idle, text.clone()));
         }
     });
     let server = Server { host: "127.0.0.1".into(), port, tls: Tls::None };
     let account = Account { name: "mock".into(), user: "u".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true, keep: beavermail_core::Keep::default(), signature: String::new(), oauth: None, smtp_user: None };
     let store = Arc::new(Store::in_memory().unwrap());
     let files = Arc::new(Vault::in_memory());
-    Mock { source: ImapSource::new(&account, "p".into(), store.clone(), files.clone()), account, store, files, log }
+    Mock { source: ImapSource::new(&account, "p".into(), store.clone(), files.clone()), account, store, files, log, message }
 }
 
-async fn serve(socket: TcpStream, log: Arc<Mutex<Vec<String>>>, move_works: bool, attachment: bool, idle: bool) {
+async fn serve(socket: TcpStream, log: Arc<Mutex<Vec<String>>>, move_works: bool, attachment: bool, idle: bool, message: Arc<Mutex<String>>) {
     let (read, mut write) = socket.into_split();
     let mut read = BufReader::new(read);
     let _ = write.write_all(b"* OK ready\r\n").await;
@@ -133,8 +136,9 @@ async fn serve(socket: TcpStream, log: Arc<Mutex<Vec<String>>>, move_works: bool
         } else if verb.starts_with("SELECT") || verb.starts_with("EXAMINE") {
             format!("* 1 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 1] ok\r\n{tag} OK [READ-WRITE] done\r\n")
         } else if verb.contains("BODY.PEEK[]") {
-            let n = MESSAGE.len();
-            format!("* 1 FETCH (UID 5 BODY[] {{{n}}}\r\n{MESSAGE})\r\n{tag} OK done\r\n")
+            let message = message.lock().unwrap().clone();
+            let n = message.len();
+            format!("* 1 FETCH (UID 5 BODY[] {{{n}}}\r\n{message})\r\n{tag} OK done\r\n")
         } else if verb.contains("FETCH") && verb.contains("HEADER") {
             let n = HEADER.len();
             let structure = match (verb.contains("BODYSTRUCTURE"), attachment) {
@@ -335,6 +339,38 @@ async fn a_check_signs_in_and_out_and_says_why_a_server_cannot_be_reached() {
     account.imap.host = "no-such-host.invalid".into();
     let error = ImapSource::new(&account, "p".into(), mock.store.clone(), mock.files.clone()).check().await.unwrap_err();
     assert!(matches!(&error, MailError::Offline(why) if why.contains("could not be found")), "{error:?}");
+}
+
+#[tokio::test]
+async fn an_encrypted_message_opens_with_the_accounts_key_and_its_text_is_not_indexed() {
+    let mock = start(true).await;
+    let (mine, ada) = (beavermail_crypto::generate("", "u").unwrap(), beavermail_crypto::generate("Ada", "ada@example.com").unwrap());
+    let plain = "From: Ada <ada@example.com>\r\nTo: u\r\nSubject: Hello\r\nContent-Type: text/plain\r\n\r\nThe launch code is zebra.\r\n";
+    let sealed = beavermail_crypto::encrypt(plain.as_bytes(), &ada, &[beavermail_crypto::public_key(&mine).unwrap()], &[]).unwrap();
+    *mock.message.lock().unwrap() = String::from_utf8(sealed).unwrap();
+    let id = message_in(&mock, "INBOX").await;
+    // Without the key: said so, nothing shown.
+    let locked = mock.source.body(id).await.unwrap();
+    assert_eq!(locked.encryption, Some(beavermail_core::Encryption::NoKey(beavermail_core::SignedWith::OpenPgp)));
+    assert!(locked.text.is_empty() && locked.attachments.is_empty());
+    mock.files.write(&beavermail_crypto::key_path("u"), &mine).unwrap();
+    let opened = mock.source.body(id).await.unwrap();
+    assert_eq!(opened.encryption, Some(beavermail_core::Encryption::Opened(beavermail_core::SignedWith::OpenPgp)));
+    assert!(opened.text.contains("The launch code is zebra."), "{}", opened.text);
+    assert!(mock.store.search(&mock.account.key(), "zebra", 10).unwrap().is_empty(), "what was decrypted is never indexed");
+}
+
+#[tokio::test]
+async fn an_smime_encrypted_message_opens_with_the_accounts_certificate() {
+    let mock = start(true).await;
+    let fixtures = format!("{}/../crypto/tests/fixtures", env!("CARGO_MANIFEST_DIR"));
+    let certificate = beavermail_crypto::import_certificate(&std::fs::read(format!("{fixtures}/ada.p12")).unwrap(), Some("p12pass")).unwrap();
+    *mock.message.lock().unwrap() = String::from_utf8(std::fs::read(format!("{fixtures}/smime-encrypted-aes256.eml")).unwrap()).unwrap();
+    let id = message_in(&mock, "INBOX").await;
+    mock.files.write(&beavermail_crypto::certificate_path("u"), &certificate).unwrap();
+    let opened = mock.source.body(id).await.unwrap();
+    assert_eq!(opened.encryption, Some(beavermail_core::Encryption::Opened(beavermail_core::SignedWith::Smime)));
+    assert!(opened.text.contains("See you at noon."), "{}", opened.text);
 }
 
 #[tokio::test]

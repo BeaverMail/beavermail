@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+
+[package]
+name = "beavermail-crypto"
+description = "Signed and encrypted mail for BeaverMail: S/MIME and OpenPGP"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+beavermail-core.workspace = true
+mail-parser = "0.11"
+cms = { version = "0.2", features = ["builder"] }
+x509-cert = "0.2"
+der = "0.7"
+pgp = "0.16"
+ring = "0.17"
+rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = "1"
+rustls-native-certs = "0.8"
+base64 = "0.22"
+rand = "0.8"
+smallvec = "1"
+p12-keystore = "0.2"
+rsa = { version = "0.9", features = ["sha2"] }
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+des = "0.8"
+aes-gcm = "0.10"
+sha2 = "0.10"
+sha1 = "0.10"
+signature = "2"

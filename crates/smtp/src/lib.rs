@@ -108,6 +108,18 @@ fn build(message: &Outgoing) -> Result<Message, MailError> {
 
 /// As [`build`], with its Message-ID and date given, so the copy kept in Sent can be the same message.
 /// `keep_bcc`: the Bcc header stays (the sender's copy); without it only the envelope carries them.
+/// The message as it goes out: with the sender's key in an Autocrypt header, and encrypted when asked.
+fn protect(message: &Outgoing, raw: Vec<u8>) -> Result<Vec<u8>, MailError> {
+    let raw = match &message.autocrypt {
+        Some(public) => beavermail_crypto::add_autocrypt(&raw, address(&message.from)?.email.as_ref(), public),
+        None => raw,
+    };
+    match &message.seal {
+        Some(seal) => beavermail_crypto::seal(&raw, seal).map_err(|e| backend(format!("could not encrypt the message: {e}"))),
+        None => Ok(raw),
+    }
+}
+
 fn build_with(message: &Outgoing, id: &str, date: std::time::SystemTime, keep_bcc: bool) -> Result<Message, MailError> {
     let mut builder = Message::builder().from(address(&message.from)?).subject(message.subject.clone());
     if message.to.is_empty() && message.cc.is_empty() && message.bcc.is_empty() {
@@ -297,15 +309,26 @@ impl MailSender for SmtpSender {
         // What the recipients get has no Bcc header; the copy for Sent, otherwise the same, keeps it.
         let (id, date) = (new_message_id(&message.from), std::time::SystemTime::now());
         let email = build_with(&message, &id, date, false)?;
-        let raw = if message.bcc.is_empty() { email.formatted() } else { build_with(&message, &id, date, true)?.formatted() };
-        self.transport().await?.send(email).await.map_err(smtp_error)?;
-        Ok(raw)
+        let sent = if message.bcc.is_empty() { email.formatted() } else { build_with(&message, &id, date, true)?.formatted() };
+        let (outgoing, sent) = (protect(&message, email.formatted())?, protect(&message, sent)?);
+        self.transport().await?.send_raw(email.envelope(), &outgoing).await.map_err(smtp_error)?;
+        Ok(sent)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_name_with_any_character_makes_an_address_mail_can_go_to() {
+        for name in ["Porkbun Support Dept.", "Doe, John", "Ada (work)", "Ada: Lovelace", "info@x.org", "José \"Pepe\" Müller", "O'Brien"] {
+            let item = beavermail_core::address_text(name, "someone@example.org");
+            assert!(valid_address(&item), "{name:?} gave {item:?}");
+        }
+        assert_eq!(beavermail_core::address_text("Ada", "ada@x.org"), "Ada <ada@x.org>", "a plain name stays plain");
+        assert_eq!(beavermail_core::address_text("ADA@x.org", "ada@x.org"), "ada@x.org", "the name is the address");
+    }
 
     #[test]
     fn an_address_needs_a_domain_with_a_dot() {

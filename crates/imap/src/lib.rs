@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use async_imap::types::{Fetch, Flag, NameAttribute};
 use async_imap::{Client, Session};
-use beavermail_core::{AuthCheck, AuthResult, Account, Attachment, Hit, Keep, MailError, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Progress, Role, Server, SyncReport, Tls};
+use beavermail_core::{AuthCheck, AuthResult, Account, Attachment, Encryption, Hit, Keep, MailError, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Progress, Role, Server, SignedWith, SyncReport, Tls};
 use beavermail_store::{Header, Location, Store};
 use beavermail_vault::{Vault, folder_path, message_path};
 use futures::TryStreamExt;
@@ -54,6 +54,8 @@ pub struct ImapSource {
     poll_interval: std::time::Duration,
     /// Identity of the account in the archive.
     account: String,
+    /// The address mail comes to, whose own key opens what is encrypted to it.
+    address: String,
     store: Arc<Store>,
     /// Where the downloaded messages live, encrypted.
     files: Arc<Vault>,
@@ -94,7 +96,7 @@ impl ImapSource {
     /// Creates the source over the shared archive; the connection is opened on first use.
     pub fn new(account: &Account, password: String, store: Arc<Store>, files: Arc<Vault>) -> Self {
         let config = Config { server: account.imap.clone(), user: account.user.clone(), password, offline: Default::default(), token: None };
-        Self { config, poll_interval: std::time::Duration::from_secs(180), account: account.key(), store, files, state: Mutex::new(State::default()) }
+        Self { config, poll_interval: std::time::Duration::from_secs(180), account: account.key(), address: account.address().to_lowercase(), store, files, state: Mutex::new(State::default()) }
     }
 
     /// Changes how often a server without IDLE is polled (3 minutes by default).
@@ -103,6 +105,65 @@ impl ImapSource {
     pub fn with_token(mut self, token: beavermail_core::TokenSource) -> Self {
         self.config.token = Some(token);
         self
+    }
+
+    /// The body of a message as the reader shows it: decrypted with the account's own key when it is
+    /// encrypted, with what its signature says, checked against the key its sender was first seen with.
+    /// A key the message announces (Autocrypt) is kept when none is yet.
+    fn read(&self, raw: &[u8]) -> Result<MessageBody, MailError> {
+        let known: Vec<Vec<u8>> = beavermail_crypto::sender_of(raw).and_then(|from| self.store.peer_key(&from).ok().flatten()).into_iter().collect();
+        if known.is_empty()
+            && let Some((address, key)) = beavermail_crypto::autocrypt_key(raw)
+        {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+            let _ = self.store.learn_peer_key(&address, &key, now); // not keeping it only means checking with it again next time
+        }
+        let (opened, kind) = match beavermail_crypto::decrypt(raw, &self.own_keys(), &known) {
+            Some(opened) => (Some(opened), SignedWith::OpenPgp),
+            None => (beavermail_crypto::decrypt_smime(raw, &self.own_certificates()), SignedWith::Smime),
+        };
+        let mut body = match opened {
+            None => self.signed(raw, raw, None, &known)?,
+            Some(beavermail_crypto::Opened::Message(plain, inside)) => MessageBody { encryption: Some(Encryption::Opened(kind)), ..self.signed(raw, &plain, inside, &known)? },
+            Some(beavermail_crypto::Opened::NoKey) => MessageBody { encryption: Some(Encryption::NoKey(kind)), ..parse_body(raw)? },
+            Some(beavermail_crypto::Opened::Failed(why)) => MessageBody { encryption: Some(Encryption::Failed(kind, why)), ..parse_body(raw)? },
+        };
+        if matches!(body.encryption, Some(Encryption::NoKey(_) | Encryption::Failed(..))) {
+            body.attachments.clear(); // only the sealed data, of no use to open
+        }
+        Ok(body)
+    }
+
+    /// The body of `message` (the decrypted form of `raw`, or `raw` itself) with what its signature says:
+    /// `inside`, a signature the decryption already checked, or one in the message, which may wrap its
+    /// content (S/MIME in one piece). The certificate of a valid S/MIME signature is kept, to encrypt to
+    /// its owner later.
+    fn signed(&self, raw: &[u8], message: &[u8], inside: Option<beavermail_core::Signature>, known: &[Vec<u8>]) -> Result<MessageBody, MailError> {
+        let roots = beavermail_crypto::system_roots();
+        let (shown, signature) = match inside {
+            Some(signature) => (message.to_vec(), Some(signature)),
+            None => match beavermail_crypto::unwrap_signed(message, roots) {
+                Some((content, signature)) => (content, Some(signature)),
+                None => (message.to_vec(), beavermail_crypto::verify(message, known, roots)),
+            },
+        };
+        if let Some(beavermail_core::Signature { kind: SignedWith::Smime, check: beavermail_core::SignatureCheck::Valid { signer, .. } }) = &signature
+            && let Some(cert) = beavermail_crypto::signer_certificate(message).or_else(|| beavermail_crypto::signer_certificate(raw))
+        {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+            let _ = self.store.learn_peer_cert(signer, &cert, now);
+        }
+        Ok(MessageBody { signature, ..parse_body(&shown)? })
+    }
+
+    /// The account's own S/MIME certificate, from the vault.
+    fn own_certificates(&self) -> Vec<Vec<u8>> {
+        self.files.read(&beavermail_crypto::certificate_path(&self.address)).ok().flatten().into_iter().collect()
+    }
+
+    /// The account's own OpenPGP key, from the vault; none when encryption is not set up (or the vault is locked).
+    fn own_keys(&self) -> Vec<Vec<u8>> {
+        self.files.read(&beavermail_crypto::key_path(&self.address)).ok().flatten().into_iter().collect()
     }
 
     /// Signs in and out on a connection of its own, touching nothing: whether the server, its TLS and
@@ -350,8 +411,7 @@ fn addresses(header: Option<&mail_parser::Address<'_>>) -> Vec<String> {
         .into_iter()
         .flat_map(|h| h.iter())
         .filter_map(|a| match (a.name(), a.address()) {
-            (Some(name), Some(address)) => Some(format!("{name} <{address}>")),
-            (None, Some(address)) => Some(address.to_owned()),
+            (name, Some(address)) => Some(beavermail_core::address_text(name.unwrap_or_default(), address)),
             _ => None,
         })
         .collect()
@@ -670,9 +730,11 @@ fn attachment_data(raw: &[u8], index: u32) -> Result<(String, Vec<u8>), MailErro
 /// The text, recipients and threading headers of a complete message.
 fn parse_body(raw: &[u8]) -> Result<MessageBody, MailError> {
     let message = MessageParser::default().parse(raw).ok_or(MailError::NotFound)?;
+    // Sealed, its parts are only the encryption's version line and data: nothing to show as text.
+    let sealed = message.root_part().content_type().is_some_and(|c| c.ctype().eq_ignore_ascii_case("multipart") && c.subtype().is_some_and(|s| s.eq_ignore_ascii_case("encrypted")));
     Ok(MessageBody {
         attachments: attachments(&message),
-        text: message.body_text(0).map(|t| t.into_owned()).unwrap_or_default(),
+        text: if sealed { String::new() } else { message.body_text(0).map(|t| t.into_owned()).unwrap_or_default() },
         to: addresses(message.to()),
         cc: addresses(message.cc()),
         reply_to: addresses(message.reply_to()),
@@ -687,6 +749,8 @@ fn parse_body(raw: &[u8]) -> Result<MessageBody, MailError> {
         spam_tests: trace_headers(raw).iter().flat_map(|(n, v)| spam_tests(n, v)).collect(),
         unsubscribe: trace_headers(raw).iter().filter(|(n, _)| n == "list-unsubscribe").flat_map(|(_, v)| unsubscribe_links(v)).collect(),
         one_click: trace_headers(raw).iter().any(|(n, v)| n == "list-unsubscribe-post" && v.replace(' ', "").eq_ignore_ascii_case("List-Unsubscribe=One-Click")),
+        signature: None, // checked by the source, which knows the sender's keys
+        encryption: None,
     })
 }
 
@@ -972,16 +1036,19 @@ impl MailSource for ImapSource {
         // A file that cannot be read (damaged, written under another key, or the vault is locked) is
         // downloaded again.
         if let Some(raw) = self.files.read(&path).ok().flatten() {
-            return parse_body(&raw);
+            return self.read(&raw);
         }
         let raw = self.download(&at).await?;
-        let body = parse_body(&raw)?;
+        let body = self.read(&raw)?;
         // Not being able to keep the file (a locked vault) must not stop the message from opening.
         if self.files.write(&path, &raw).is_ok() {
-            self.store.set_preview(id, &body.text)?;
             self.store.mark_stored(&at.account, &at.folder, at.uid)?;
-            self.store.set_attachments(&at.account, &at.folder, at.uid, !body.attachments.is_empty())?;
-            self.store.index_body(id, &body.text)?;
+            // What was decrypted is never kept: an encrypted message is indexed by its subject and sender only.
+            if body.encryption.is_none() {
+                self.store.set_preview(id, &body.text)?;
+                self.store.set_attachments(&at.account, &at.folder, at.uid, !body.attachments.is_empty())?;
+                self.store.index_body(id, &body.text)?;
+            }
         }
         Ok(body)
     }
@@ -1000,7 +1067,16 @@ impl MailSource for ImapSource {
                 raw
             }
         };
-        attachment_data(&raw, index)
+        // An attachment of an encrypted message is in the decrypted content, which is where its index points.
+        let plain = match beavermail_crypto::decrypt(&raw, &self.own_keys(), &[]).or_else(|| beavermail_crypto::decrypt_smime(&raw, &self.own_certificates())) {
+            Some(beavermail_crypto::Opened::Message(plain, _)) => plain,
+            _ => raw,
+        };
+        // Signed in one piece, the attachments are inside the signature.
+        match beavermail_crypto::unwrap_signed(&plain, &[]) {
+            Some((content, _)) => attachment_data(&content, index),
+            None => attachment_data(&plain, index),
+        }
     }
 
     async fn save_draft(&self, id: &str, raw: Vec<u8>) -> Result<(), MailError> {

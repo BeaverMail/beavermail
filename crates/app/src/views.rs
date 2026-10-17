@@ -487,6 +487,90 @@ pub enum Remote {
     Block,
 }
 
+/// How a note under the sender reads: all is well, for information, or a warning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tone {
+    Good,
+    Quiet,
+    Warning,
+}
+
+/// A line under the sender: an icon and small text, as tall as the text (not a 40-point control);
+/// `tip` on hover when not empty.
+pub fn note(ui: &mut Ui, icon: Icon, color: Color32, text: &str, tip: &str) {
+    ui.scope(|ui| {
+        ui.spacing_mut().interact_size.y = 0.0;
+        ui.spacing_mut().item_spacing.y = 4.0;
+        ui.horizontal_wrapped(|ui| {
+            ui.add(icon.image(crate::icons::SIZE, color));
+            let label = ui.label(egui::RichText::new(text).size(13.0).color(color));
+            if !tip.is_empty() {
+                label.on_hover_text(tip);
+            }
+        });
+    });
+}
+
+/// What encryption and signature say, as notes: "Encrypted  ·  Signed by ada@…" in one line when both
+/// hold (the full wording on hover); a problem, or a key not known here, on a line of its own.
+pub fn security_notes(encryption: Option<&beavermail_core::Encryption>, signature: Option<&beavermail_core::Signature>) -> Vec<(String, String, Tone)> {
+    let (mut short, mut tips, mut notes) = (Vec::new(), Vec::new(), Vec::new());
+    match encryption {
+        Some(e @ beavermail_core::Encryption::Opened(_)) => {
+            short.push("Encrypted".to_owned());
+            tips.push(encryption_line(e).0);
+        }
+        Some(e) => {
+            let (line, danger) = encryption_line(e);
+            notes.push((line, String::new(), if danger { Tone::Warning } else { Tone::Quiet }));
+        }
+        None => {}
+    }
+    match signature {
+        Some(s @ beavermail_core::Signature { check: beavermail_core::SignatureCheck::Valid { signer, .. }, .. }) => {
+            short.push(format!("Signed by {signer}"));
+            tips.push(signature_line(s).0);
+        }
+        Some(s) => {
+            let (line, danger) = signature_line(s);
+            notes.push((line, String::new(), if danger { Tone::Warning } else { Tone::Quiet }));
+        }
+        None => {}
+    }
+    if !short.is_empty() {
+        notes.insert(0, (short.join("  ·  "), tips.join("\n"), Tone::Good));
+    }
+    notes
+}
+
+/// What became of an encrypted message, in one line, and whether it is a warning.
+pub fn encryption_line(encryption: &beavermail_core::Encryption) -> (String, bool) {
+    use beavermail_core::Encryption as E;
+    match encryption {
+        E::Opened(_) => ("Encrypted: only you and the other recipients can read it".to_owned(), false),
+        E::NoKey(_) => ("Encrypted for a key not on this computer. Turn on encryption or import your key in Settings > Encryption".to_owned(), false),
+        E::Failed(_, why) => (format!("Encrypted, but it could not be opened: {why}"), true),
+    }
+}
+
+/// What a message's signature says, in one line, and whether it is a warning.
+pub fn signature_line(signature: &beavermail_core::Signature) -> (String, bool) {
+    use beavermail_core::{SignatureCheck as C, SignedWith};
+    let how = match signature.kind {
+        SignedWith::Smime => "S/MIME",
+        SignedWith::OpenPgp => "OpenPGP",
+    };
+    match &signature.check {
+        C::Valid { signer, by } if signature.kind == SignedWith::Smime => (format!("Signed by {signer}  ·  certificate from {by} ({how})"), false),
+        C::Valid { signer, by } => (format!("Signed by {signer}  ·  {by} ({how})"), false),
+        C::NotSender { signer } => (format!("Signed by someone else than the sender: {signer}"), true),
+        C::KeyChanged { signer } => (format!("Signed with a different key than {signer} used before: it may not be them"), true),
+        C::UnknownKey { key } => (format!("Signed with a key not known here ({how}, {key})"), false),
+        C::Changed => ("The message was changed after it was signed".to_owned(), true),
+        C::Untrusted(why) => (format!("Signed, but the signature cannot be trusted: {why}"), true),
+    }
+}
+
 /// "2 trackers blocked: list-manage.com, mailchimp.com" for the images that only report the message
 /// was opened (never loaded, whatever is allowed): who would have been told, once each.
 pub fn trackers_line(trackers: &[String]) -> Option<String> {
@@ -892,7 +976,34 @@ pub fn thousands(n: u32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{thousands, trackers_line};
+    use super::{signature_line, thousands, trackers_line};
+
+    #[test]
+    fn encryption_and_a_good_signature_share_one_line_and_problems_get_their_own() {
+        use beavermail_core::{Encryption, Signature, SignatureCheck, SignedWith};
+        use super::{Tone, security_notes};
+        let opened = Encryption::Opened(SignedWith::OpenPgp);
+        let good = Signature { kind: SignedWith::OpenPgp, check: SignatureCheck::Valid { signer: "ada@example.org".into(), by: "key 1AD8".into() } };
+        let notes = security_notes(Some(&opened), Some(&good));
+        assert_eq!(notes.len(), 1);
+        assert_eq!((notes[0].0.as_str(), notes[0].2), ("Encrypted  ·  Signed by ada@example.org", Tone::Good));
+        assert!(notes[0].1.contains("only you and the other recipients") && notes[0].1.contains("key 1AD8"), "the details on hover");
+        let changed = Signature { kind: SignedWith::OpenPgp, check: SignatureCheck::Changed };
+        let notes = security_notes(Some(&opened), Some(&changed));
+        assert_eq!(notes.iter().map(|n| n.2).collect::<Vec<_>>(), [Tone::Good, Tone::Warning], "the problem spelled out");
+        assert_eq!(security_notes(Some(&Encryption::NoKey(SignedWith::Smime)), None)[0].2, Tone::Quiet);
+        assert!(security_notes(None, None).is_empty());
+    }
+
+    #[test]
+    fn a_signature_reads_as_one_line_and_warns_when_it_must() {
+        use beavermail_core::{Signature, SignatureCheck, SignedWith};
+        let line = |kind, check| signature_line(&Signature { kind, check });
+        assert_eq!(line(SignedWith::Smime, SignatureCheck::Valid { signer: "ada@example.org".into(), by: "Test CA".into() }), ("Signed by ada@example.org  ·  certificate from Test CA (S/MIME)".to_owned(), false));
+        assert!(line(SignedWith::OpenPgp, SignatureCheck::Changed).1);
+        assert!(line(SignedWith::OpenPgp, SignatureCheck::KeyChanged { signer: "ada@example.org".into() }).1);
+        assert!(!line(SignedWith::OpenPgp, SignatureCheck::UnknownKey { key: "AB12".into() }).1, "unknown is not a warning: most keys are");
+    }
 
     #[test]
     fn trackers_name_each_host_once() {

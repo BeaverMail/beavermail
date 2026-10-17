@@ -1,0 +1,25 @@
+From: Bob <bob@example.org>
+To: Ada <ada@example.org>
+Subject: From GnuPG
+MIME-Version: 1.0
+Content-Type: multipart/encrypted; protocol="application/pgp-encrypted"; boundary="b1"
+
+--b1
+Content-Type: application/pgp-encrypted
+
+Version: 1
+
+--b1
+Content-Type: application/octet-stream
+
+-----BEGIN PGP MESSAGE-----
+
+hF4Dg6mKs8dSraASAQdA3Pj9CpdG+NksN52kReIqqnaJnKa8y/yDhukgNjAdi0cw
+kUf2Z+7D6yPz/zeFtxpmg6SS0PtKP+YCRRjz6Icw0AeuO4g5Nm9Uhf4SHBtKu+Ig
+0ngBS/qHcfojbDIji9RMLwTRbR5YVM3pSZd5aD0CQlmjvvxwG6L1wtpNkUqYnTRp
+U6aCmVKegbSxLBjG2bXnHyEO/RPiUMmKiZ92WQG87pbZUu4VpoU5IY8xCTEH/FL5
+cv4MipBFVs0b1yFv2LW3NnVneIPy9rLzHMI=
+=t/z3
+-----END PGP MESSAGE-----
+
+--b1--

@@ -1,0 +1,20 @@
+From: Bob <bob@example.org>
+To: Ada Lovelace <ada@example.org>
+Subject: Secret lunch
+Date: Fri, 16 Oct 2026 11:00:00 +0000
+MIME-Version: 1.0
+Content-Disposition: attachment; filename="smime.p7m"
+Content-Type: application/pkcs7-mime; smime-type=enveloped-data; name="smime.p7m"
+Content-Transfer-Encoding: base64
+
+MIIB0AYJKoZIhvcNAQcDoIIBwTCCAb0CAQAxggFRMIIBTQIBADA1MB0xGzAZBgNV
+BAMMEkJlYXZlck1haWwgVGVzdCBDQQIUedm/zphNPCu8SWCvtCMK0EEqIpUwDQYJ
+KoZIhvcNAQEBBQAEggEADzLM6g3wafRaM2JEUhqZ6Lr0OJ4VKoTXvNWxu99OZfGK
+F9Rq5owf5cUkIxMi14GPv9MjRt/akggta7KZA7qfi5tlnNswTSU9e9mQ24sGOrgM
+om3W3IBbNwfqfo9lWXCj1nOHa2mtRT/ZelhsihFvpc2I1GC09n7807OplWPcZAPE
+q+csr73BSafUV1lYBd25pof2J4IwERzVGXtAfSZBokzdtCVnc2bgdEyfRReD0kgB
+RA4ipLoJSLYe1P2w3fQ75k1Pi8IAYWLhLyCju8IMY8wpNB+85vMcOoI+FboLhcRl
+LAmpeDFfwKkmPyqx+Bt33Vu2M2Q4YTeZ1OcxGydKPzBjBgkqhkiG9w0BBwEwFAYI
+KoZIhvcNAwcECBtp39rTl2l+gECJToGiEb0UZ1sSOPUwMimCQWSDl8R8uzEvMpOX
+95vo7olqk3wHmNg6e/EIxO7ZB2thFnCGvcJtenx5eBUSvy2i
+

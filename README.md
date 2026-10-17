@@ -10,6 +10,7 @@ Licensed under AGPL-3.0-only (see [LICENSE](LICENSE)).
 - `crates/vault`: the message files, their encryption and key slots.
 - `crates/imap`: IMAP backend (`ImapSource`), which keeps the archive in sync.
 - `crates/smtp`: sending (`SmtpSender`).
+- `crates/crypto`: signed and encrypted mail (S/MIME and OpenPGP).
 - `crates/accounts`: `accounts.toml` and the system credential store.
 - `crates/app`: the egui desktop shell (binary `beavermail`).
 
@@ -20,7 +21,8 @@ Licensed under AGPL-3.0-only (see [LICENSE](LICENSE)).
 - Local archive: SQLCipher index plus encrypted message files; background sync, IDLE, full-text search; works offline (read, search, draft; sending and changes wait in an Outbox until the server answers); "Work offline" in the status bar stops all network use.
 - Archive and Move to Trash wait 10 s before reaching the server: Undo (Ctrl+Z) takes them back.
 - Reader: plain text, simplified HTML or original HTML (Blitz); nothing remote loads unless allowed, and tracking pixels never do (the bar lists them); links open and copy without redirects or tracking parameters.
-- Sender checks (server authentication results, look-alike names and domains, misleading links, risky attachments).
+- Sender checks (server authentication results, look-alike names and domains, misleading links, risky attachments); S/MIME and OpenPGP signatures verified.
+- Encryption: an OpenPGP key per account in one click (or imported, or an S/MIME certificate), handed out by Autocrypt; encrypted mail opens in the reader and goes out encrypted when every recipient's key is known.
 - Spam: mail from new senders that fails a check is held as "Suspicious"; a classifier learns from what you mark; trust or block a sender, and review both lists in Settings.
 - Unsubscribe from mailing lists (one-click for verified senders, else an email or the sender's page) and block a sender.
 - Contact cards (click a sender): name, notes, your latest conversations; saved contacts in their own section, from the rail at the window's left edge.

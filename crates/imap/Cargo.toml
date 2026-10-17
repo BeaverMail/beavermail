@@ -16,6 +16,7 @@ workspace = true
 beavermail-core.workspace = true
 beavermail-store.workspace = true
 beavermail-vault.workspace = true
+beavermail-crypto.workspace = true
 async-imap = { version = "0.12", default-features = false, features = ["runtime-tokio"] }
 futures = "0.3"
 mail-parser = "0.11"
