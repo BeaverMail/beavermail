@@ -40,6 +40,39 @@ pub fn authenticity(results: &[AuthResult], server_host: &str, address: &str) ->
     Authenticity::Unknown
 }
 
+/// The account's own server's checks of a message from `address`, as the reader says them: one line
+/// ("SPF pass  ·  DKIM pass  ·  DMARC pass" when they do not verify the sender) and every check, with
+/// the domain it was about, for its hover text. `None` when that server wrote none.
+pub fn checks_line(results: &[AuthResult], server_host: &str, address: &str) -> Option<(String, String)> {
+    let from = domain(address);
+    let ours: Vec<(&str, _)> = results.iter().filter(|r| same_server(&r.server, server_host)).flat_map(|r| r.checks.iter().map(move |c| (r.server.as_str(), c))).filter(|(_, c)| matches!(c.method.as_str(), "spf" | "dkim" | "dmarc")).collect();
+    let server = ours.first()?.0;
+    let line = if authenticity(results, server_host, address) == Authenticity::Verified {
+        format!("Sender domain verified by your server: {from}")
+    } else {
+        // Per method, the check about the From domain if there is one (a message can carry several signatures).
+        let shown: Vec<String> = ["spf", "dkim", "dmarc"]
+            .iter()
+            .filter_map(|m| {
+                let of: Vec<_> = ours.iter().map(|(_, c)| c).filter(|c| c.method == *m).collect();
+                let check = of.iter().find(|c| same_site(&c.domain, &from)).or(of.first())?;
+                Some(format!("{} {}", m.to_uppercase(), check.result))
+            })
+            .collect();
+        format!("Not verified by your server: {}", shown.join("  ·  "))
+    };
+    let mut tip: Vec<String> = ours
+        .iter()
+        .map(|(_, c)| match (c.method.as_str(), c.domain.is_empty()) {
+            (_, true) => format!("{}: {}", c.method.to_uppercase(), c.result),
+            ("dkim", false) => format!("DKIM: {}, signed by {}", c.result, c.domain),
+            (m, false) => format!("{}: {}, for {}", m.to_uppercase(), c.result, c.domain),
+        })
+        .collect();
+    tip.push(format!("Checked by {server}"));
+    Some((line, tip.join("\n")))
+}
+
 /// The authserv-id names the same mail system as the account's server: the same host, or two hosts
 /// of one domain.
 fn same_server(authserv: &str, host: &str) -> bool {
@@ -188,6 +221,19 @@ mod tests {
         let failed = checks("example.org", &[("dmarc", "fail", "bank.com"), ("spf", "pass", "attacker.io")]);
         assert_eq!(authenticity(&failed, host, "x@bank.com"), Authenticity::Failed);
         assert_eq!(authenticity(&[], host, "x@bank.com"), Authenticity::Unknown);
+    }
+
+    #[test]
+    fn the_servers_checks_are_said_in_one_line_and_each_on_hover() {
+        let host = "mail.example.org";
+        let good = checks(host, &[("spf", "pass", "bank.com"), ("dkim", "pass", "bank.com"), ("dmarc", "pass", "bank.com")]);
+        let (line, tip) = checks_line(&good, host, "x@bank.com").unwrap();
+        assert_eq!(line, "Sender domain verified by your server: bank.com");
+        assert_eq!(tip, "SPF: pass, for bank.com\nDKIM: pass, signed by bank.com\nDMARC: pass, for bank.com\nChecked by mail.example.org");
+        let poor = checks(host, &[("spf", "softfail", "bank.com"), ("dkim", "pass", "mailer.io"), ("dkim", "none", "bank.com"), ("arc", "pass", "")]);
+        assert_eq!(checks_line(&poor, host, "x@bank.com").unwrap().0, "Not verified by your server: SPF softfail  ·  DKIM none");
+        assert_eq!(checks_line(&checks("mx.attacker.io", &[("dmarc", "pass", "bank.com")]), host, "x@bank.com"), None, "written by the sender");
+        assert_eq!(checks_line(&[], host, "x@bank.com"), None);
     }
 
     #[test]

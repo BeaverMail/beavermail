@@ -20,6 +20,8 @@ pub enum Command {
     Spam,
     TrustSender,
     BlockSender,
+    ViewSource,
+    FindInSource,
     OpenInTab,
     CloseTab,
     PreviousTab,
@@ -51,7 +53,7 @@ const CTRL_SHIFT: Modifiers = Modifiers::COMMAND.plus(Modifiers::SHIFT);
 
 impl Command {
     /// In the order the keys are tried (Ctrl+Shift+Tab before Ctrl+Tab) and the palette lists them.
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 28] = [
         Self::Palette,
         Self::NewMessage,
         Self::Reply,
@@ -64,6 +66,8 @@ impl Command {
         Self::Spam,
         Self::TrustSender,
         Self::BlockSender,
+        Self::ViewSource,
+        Self::FindInSource,
         Self::OpenInTab,
         Self::CloseTab,
         Self::PreviousTab,
@@ -94,6 +98,8 @@ impl Command {
             Self::Spam => "Spam",
             Self::TrustSender => "Trust sender",
             Self::BlockSender => "Block sender",
+            Self::ViewSource => "View source",
+            Self::FindInSource => "Find in source",
             Self::OpenInTab => "Open in a tab",
             Self::CloseTab => "Close tab",
             Self::PreviousTab => "Previous tab",
@@ -124,6 +130,8 @@ impl Command {
             Self::Undo => &[Trigger::Shortcut(CTRL, Key::Z, false)],
             Self::ToggleRead => &[Trigger::Key(Key::U)],
             Self::Spam => &[Trigger::Text("!")],
+            Self::ViewSource => &[Trigger::Shortcut(CTRL, Key::U, false)],
+            Self::FindInSource => &[Trigger::Shortcut(CTRL, Key::F, true)],
             Self::OpenInTab => &[Trigger::Key(Key::Enter)],
             Self::CloseTab => &[Trigger::Shortcut(CTRL, Key::W, false)],
             Self::PreviousTab => &[Trigger::Shortcut(CTRL_SHIFT, Key::Tab, false)],

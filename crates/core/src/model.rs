@@ -446,7 +446,7 @@ pub struct Settings {
     /// Show a conversation as one row in the list, its messages together in the reader.
     #[serde(default = "yes")]
     pub threads: bool,
-    /// The message shows beside the list; off, it opens in the list's place.
+    /// The message shows beside the list; off, it opens in a tab.
     #[serde(default = "yes")]
     pub reading_pane: bool,
     /// Accounts (by [`Account::key`]) folded in the sidebar, so they stay folded at the next start.

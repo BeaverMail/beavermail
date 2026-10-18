@@ -60,6 +60,8 @@ pub struct ImapSource {
     /// Where the downloaded messages live, encrypted.
     files: Arc<Vault>,
     state: Mutex<State>,
+    /// What [`Self::auth_server`] found, and whether it was learned (then it is final) and when not.
+    auth_server: std::sync::Mutex<Option<(String, Option<std::time::Instant>)>>,
 }
 
 /// What a connection needs: the account's IMAP server and its credentials.
@@ -87,6 +89,41 @@ impl ImapSource {
         self.files.read(&path)?.map(|raw| parse_body(&raw)).transpose()
     }
 
+    /// The message as the server holds it, every header and part: from this computer when stored, else
+    /// downloaded and kept.
+    pub async fn source(&self, id: MessageId) -> Result<Vec<u8>, MailError> {
+        let at = self.store.locate(id)?.ok_or(MailError::NotFound)?;
+        let path = self.file_of(&at.account, &at.folder, at.uid)?;
+        if let Some(raw) = self.files.read(&path).ok().flatten() {
+            return Ok(raw);
+        }
+        let raw = self.download(&at).await?;
+        // As for the body: failing to keep the file does not stop the message from opening.
+        if self.files.write(&path, &raw).is_ok() {
+            self.store.mark_stored(&at.account, &at.folder, at.uid)?;
+        }
+        Ok(raw)
+    }
+
+    /// The name the account's own server writes its `Authentication-Results` under (the authserv-id),
+    /// so its checks can be told from those a sender wrote: learned from the account's mail (see
+    /// [`own_auth_server`]), else the IMAP server's name. Asked again every few minutes until learned.
+    pub fn auth_server(&self) -> String {
+        let mut known = self.auth_server.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((name, asked)) = known.as_ref()
+            && asked.is_none_or(|at| at.elapsed() < std::time::Duration::from_secs(600))
+        {
+            return name.clone();
+        }
+        let rows = self.store.recent_headers(&self.account, 300).unwrap_or_default();
+        let found = match own_auth_server(&rows) {
+            Some(name) => (name, None),
+            None => (self.config.server.host.clone(), Some(std::time::Instant::now())),
+        };
+        *known = Some(found.clone());
+        found.0
+    }
+
     /// What the kept header fields say (sender, Reply-To, the server's checks), without text or
     /// attachments; `None` when they were not read yet.
     pub fn header_body(&self, id: MessageId) -> Result<Option<MessageBody>, MailError> {
@@ -96,7 +133,7 @@ impl ImapSource {
     /// Creates the source over the shared archive; the connection is opened on first use.
     pub fn new(account: &Account, password: String, store: Arc<Store>, files: Arc<Vault>) -> Self {
         let config = Config { server: account.imap.clone(), user: account.user.clone(), password, offline: Default::default(), token: None };
-        Self { config, poll_interval: std::time::Duration::from_secs(180), account: account.key(), address: account.address().to_lowercase(), store, files, state: Mutex::new(State::default()) }
+        Self { config, poll_interval: std::time::Duration::from_secs(180), account: account.key(), address: account.address().to_lowercase(), store, files, state: Mutex::new(State::default()), auth_server: std::sync::Mutex::new(None) }
     }
 
     /// Changes how often a server without IDLE is polled (3 minutes by default).
@@ -772,6 +809,29 @@ fn unsubscribe_links(value: &str) -> Vec<String> {
         .collect()
 }
 
+/// The authserv-id of the account's own server, from its latest messages as (sender, header fields):
+/// the server that receives the mail writes its `Authentication-Results` on top of any the message
+/// came with, so the name on top of nearly all of them, from many senders, is its own. A sender can
+/// write anything, but not on top, and not on everyone's mail. `None` while too few messages say.
+fn own_auth_server(rows: &[(String, Vec<u8>)]) -> Option<String> {
+    let mut seen: std::collections::HashMap<String, (usize, std::collections::HashSet<&str>)> = std::collections::HashMap::new();
+    let mut total = 0;
+    for (from, raw) in rows {
+        let Some(top) = trace_headers(raw).into_iter().find(|(n, _)| n == "authentication-results") else { continue };
+        let name = auth_result(&top.1).server;
+        total += 1;
+        // Microsoft's servers write no name: their first field is already a check.
+        if name.is_empty() || name.contains('=') {
+            continue;
+        }
+        let entry = seen.entry(name).or_default();
+        entry.0 += 1;
+        entry.1.insert(from.rsplit('@').next().unwrap_or(""));
+    }
+    let (name, (count, senders)) = seen.into_iter().max_by_key(|(_, (count, _))| *count)?;
+    (total >= 5 && count * 10 >= total * 9 && senders.len() >= 5).then_some(name)
+}
+
 /// The header lines of a message as (lower-case name, unfolded value), in order.
 fn trace_headers(raw: &[u8]) -> Vec<(String, String)> {
     let text = String::from_utf8_lossy(raw);
@@ -1061,19 +1121,7 @@ impl MailSource for ImapSource {
     }
 
     async fn attachment(&self, id: MessageId, index: u32) -> Result<(String, Vec<u8>), MailError> {
-        let at = self.store.locate(id)?.ok_or(MailError::NotFound)?;
-        let path = self.file_of(&at.account, &at.folder, at.uid)?;
-        let raw = match self.files.read(&path).ok().flatten() {
-            Some(raw) => raw,
-            None => {
-                let raw = self.download(&at).await?;
-                // As for the body: failing to keep the file does not stop the attachment from opening.
-                if self.files.write(&path, &raw).is_ok() {
-                    self.store.mark_stored(&at.account, &at.folder, at.uid)?;
-                }
-                raw
-            }
-        };
+        let raw = self.source(id).await?;
         // An attachment of an encrypted message is in the decrypted content, which is where its index points.
         let plain = match beavermail_crypto::decrypt(&raw, &self.own_keys(), &[]).or_else(|| beavermail_crypto::decrypt_smime(&raw, &self.own_certificates())) {
             Some(beavermail_crypto::Opened::Message(plain, _)) => plain,
@@ -1217,6 +1265,27 @@ mod tests {
 
     fn body_index(raw: &str, name: &str) -> u32 {
         parse_body(raw.as_bytes()).unwrap().attachments.into_iter().find(|a| a.name == name).unwrap().index
+    }
+
+    #[test]
+    fn the_accounts_own_server_is_the_name_on_top_of_nearly_all_its_mail() {
+        let mail = |from: &str, tops: &[&str]| {
+            let headers: String = tops.iter().map(|t| format!("Authentication-Results: {t}; spf=pass smtp.mailfrom={from}\r\n")).collect();
+            (from.to_owned(), format!("{headers}From: {from}\r\n\r\n").into_bytes())
+        };
+        let senders = ["a@one.com", "b@two.org", "c@three.net", "d@four.io", "e@five.de", "f@six.it", "g@seven.fr", "h@eight.es", "i@nine.nl", "j@ten.ch"];
+        // What the sender wrote sits below the receiving server's own.
+        let mut rows: Vec<_> = senders.iter().map(|s| mail(s, &["mx.google.com", "mx.sender.example"])).collect();
+        assert_eq!(own_auth_server(&rows).as_deref(), Some("mx.google.com"));
+        rows.push(mail("k@eleven.com", &["mx.attacker.io"]));
+        assert_eq!(own_auth_server(&rows).as_deref(), Some("mx.google.com"), "one message in eleven does not change it");
+        // A server that writes none: each message carries its sender's, and no name wins.
+        let none: Vec<_> = senders.iter().enumerate().map(|(i, s)| mail(s, &[&format!("mx{i}.example")])).collect();
+        assert_eq!(own_auth_server(&none), None);
+        // One sender's newsletters, however many, are not the whole mailbox.
+        let one: Vec<_> = (0..10).map(|_| mail("news@shop.com", &["mta.shop.com"])).collect();
+        assert_eq!(own_auth_server(&one), None);
+        assert_eq!(own_auth_server(&rows[..3]), None, "too few to say");
     }
 
     #[test]

@@ -326,9 +326,14 @@ pub fn findings(known: &Known, name: &str, address: &str, body: &MessageBody, se
         add(Level::Danger, format!("{} is the name of someone you know at {other}, but this comes from {address}", name.trim()));
     }
     // "PayPal" from cheap-batteries.example: a brand in the name, a domain that is not the brand's.
+    // An organisation you deal with often writes through someone else's domain (a service that sends
+    // for it), so its name counts only from a mailbox anyone can open, or from a domain
+    // that borrows a word of its own ("Acme Corp" from acme-invoices.net).
+    let words = |label: String| label.split('-').filter(|w| w.len() >= 4).map(str::to_owned).collect::<Vec<_>>();
+    let borrowed = |owns: &[String]| sender::public_mail(&from) || words(organisation_label(&from)).iter().any(|w| owns.iter().any(|o| words(o.clone()).contains(w)));
     if stranger
         && !from.is_empty()
-        && let Some(brand) = brand_in(name, known).filter(|(_, owns, ours)| !owns.contains(&organisation_label(&from)) && !(*ours && PLATFORMS.contains(&organisation_label(&from).as_str())))
+        && let Some(brand) = brand_in(name, known).filter(|(_, owns, ours)| !owns.contains(&organisation_label(&from)) && !(*ours && (PLATFORMS.contains(&organisation_label(&from).as_str()) || !borrowed(owns))))
     {
         add(Level::Danger, format!("The name says {}, but the message comes from {from}", brand.0));
     }
@@ -588,7 +593,7 @@ pub fn dry_run() -> Result<(), String> {
         let (mut inbox_count, mut new_count, mut spam_count, mut flagged, mut headers_only, mut unchecked) = (0, 0, 0, 0, 0, 0);
         let (mut verified, mut failed) = (0, 0);
         let started = std::time::Instant::now();
-        let verdicts = screen_all(&source, &known, &settings, &account.imap.host, &messages, &[]);
+        let verdicts = screen_all(&source, &known, &settings, &source.auth_server(), &messages, &[]);
         let checked = started.elapsed();
         for (m, screened) in messages.iter().zip(verdicts) {
             headers_only += usize::from(screened.verdict.is_some() && !screened.whole);
@@ -720,6 +725,7 @@ mod tests {
             assert!(findings(&known, name, address, &body, "").iter().all(|f| !f.text.starts_with("The name says")), "{name} <{address}>");
         }
         assert!(findings(&known, "Acme Corp Shop", "mailer@shopify.com", &body, "").is_empty(), "a platform sending for an organisation you know");
+        assert_eq!(texts(&findings(&known, "Acme Corp", "acme.corp.billing@gmail.com", &body, "")), ["The name says Acme Corp, but the message comes from gmail.com"], "but not a mailbox anyone can open");
         assert!(!findings(&known, "PayPal", "mailer@shopify.com", &body, "").is_empty(), "but not for a listed brand");
         for local in ["WqOAXUVzQcKNliJ", "ewtkxdrhdafnwzj", "xkcdqwrt.bob"] {
             assert!(machine_made(local), "{local}");

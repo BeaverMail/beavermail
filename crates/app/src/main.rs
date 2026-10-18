@@ -59,6 +59,10 @@ enum Event {
     /// The Sent folder of the account shown, for the user's replies in its conversations: (account, folder index shown, messages).
     SentList(u64, usize, Result<Vec<MessageSummary>, MailError>),
     Body(u64, MessageId, Result<Box<Prepared>, MailError>),
+    /// The text of a message to answer, read without opening it: (account, message, action, result).
+    Answer(u64, MessageId, Action, Result<Box<MessageBody>, MailError>),
+    /// The raw message asked for by View source.
+    Source(MessageId, Result<Vec<u8>, MailError>),
     /// The checks' verdicts on the Inbox loaded as (account, folder index).
     Screened(u64, usize, Result<std::collections::HashMap<MessageId, screen::Screened>, MailError>),
     /// A write (read flag, archive, trash) finished; the UI already showed its result.
@@ -238,6 +242,106 @@ struct SidebarOutcome {
     all_suspicious: bool,
 }
 
+/// A message as the server holds it, shown in a source tab.
+struct SourceView {
+    id: MessageId,
+    subject: String,
+    /// Its lines, once read; or why it could not be.
+    lines: Option<Result<Vec<String>, String>>,
+    size: usize,
+    /// The find bar, while open.
+    find: Option<Find>,
+}
+
+/// Finding text in a source tab.
+#[derive(Default)]
+struct Find {
+    query: String,
+    /// What `hits` were found for.
+    searched: String,
+    /// Each match as (line, start, end), in bytes of the line, in order.
+    hits: Vec<(usize, usize, usize)>,
+    /// The match shown.
+    at: usize,
+    /// Scroll to the match shown on the next frame.
+    jump: bool,
+    /// Put the keyboard in the field on the next frame.
+    focus: bool,
+}
+
+/// Fewer matches than this are all shown; past it the count says "more than".
+const MAX_HITS: usize = 10_000;
+
+/// Where `query` occurs in `lines`, ignoring the case of ASCII letters (a source is mostly ASCII, and
+/// so a match keeps the byte positions of the line it is in).
+fn find_hits(lines: &[String], query: &str) -> Vec<(usize, usize, usize)> {
+    let query = query.to_ascii_lowercase();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let mut hits = Vec::new();
+    for (at, line) in lines.iter().enumerate() {
+        let lower = line.to_ascii_lowercase();
+        let mut from = 0;
+        while let Some(start) = lower[from..].find(&query).map(|s| from + s) {
+            hits.push((at, start, start + query.len()));
+            if hits.len() >= MAX_HITS {
+                return hits;
+            }
+            from = start + query.len();
+        }
+    }
+    hits
+}
+
+/// The find bar of a source tab: the field, the count, previous and next. Enter goes to the next
+/// match, Shift+Enter (or Shift+F3) to the one before; Esc closes. Returns true to close it.
+fn find_bar(ui: &mut egui::Ui, t: &theme::Tokens, find: &mut Find, lines: &[String]) -> bool {
+    let mut close = false;
+    let mut step = 0isize;
+    ui.horizontal(|ui| {
+        let field = ui.add(sized_field(&mut find.query, 300.0).hint_text("Find in source"));
+        if std::mem::take(&mut find.focus) {
+            field.request_focus();
+        }
+        let (enter, escape, shift) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape), i.modifiers.shift));
+        if field.lost_focus() && escape {
+            close = true;
+        } else if field.lost_focus() && enter {
+            step = if shift { -1 } else { 1 };
+            field.request_focus();
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::F3)) {
+            step = if shift { -1 } else { 1 };
+        }
+        let count = match find.hits.len() {
+            _ if find.query.is_empty() => String::new(),
+            0 => "No matches".to_owned(),
+            MAX_HITS => format!("{} of more than {MAX_HITS}", find.at + 1),
+            n => format!("{} of {n}", find.at + 1),
+        };
+        ui.label(RichText::new(count).size(13.0).color(t.text_dim));
+        let some = !find.hits.is_empty();
+        if icons::button(ui, t, Icon::ChevronUp, "Previous match (Shift+Enter)", some, false).clicked() {
+            step = -1;
+        }
+        if icons::button(ui, t, Icon::ChevronDown, "Next match (Enter)", some, false).clicked() {
+            step = 1;
+        }
+        close |= icons::button(ui, t, Icon::X, "Close (Esc)", true, false).clicked();
+    });
+    if find.query != find.searched {
+        find.hits = find_hits(lines, &find.query);
+        find.searched = find.query.clone();
+        (find.at, find.jump) = (0, true);
+    } else if step != 0 && !find.hits.is_empty() {
+        let n = find.hits.len() as isize;
+        find.at = (find.at as isize + step).rem_euclid(n) as usize;
+        find.jump = true;
+    }
+    close
+}
+
 /// The open message's body, already reduced to blocks for both display modes.
 struct OpenBody {
     data: MessageBody,
@@ -317,14 +421,14 @@ struct ReaderOutcome {
     switch: Option<MessageId>,
     /// "Show earlier" was pressed in the conversation.
     expand: bool,
-    /// Back to the list, from a message shown in its place.
-    back: bool,
     /// Trust was pressed for this message's sender.
     trust: Option<MessageId>,
     /// The sender's name was clicked: open their card, as (address, name).
     card: Option<(String, String)>,
     /// "Try again" on a message that could not be opened.
     retry: bool,
+    /// View source was pressed.
+    source: bool,
 }
 
 struct AccountView {
@@ -978,8 +1082,6 @@ struct BeaverApp {
     card: Option<card::Card>,
     /// The message whose text could not be loaded, and why: shown in the reader in place of a spinner.
     body_failed: Option<(MessageId, String)>,
-    /// Reply, reply all or forward asked for a message whose text was not loaded yet.
-    answer_when_open: Option<(MessageId, Action)>,
     /// The card open in the Contacts section.
     contact_pane: Option<card::Card>,
     /// The address books (by URL) whose sync runs now, and when all were last synced.
@@ -1012,6 +1114,8 @@ struct BeaverApp {
     confirm_unsubscribe: Option<(String, unsubscribe::Method)>,
     /// Block sender was pressed on this message, until the user confirms.
     confirm_block: Option<MessageId>,
+    /// The source tab shown, or the last one.
+    source_view: Option<SourceView>,
     /// The command palette, while open.
     palette: Option<Palette>,
     /// The last Archive or Move to Trash, until it goes to the server.
@@ -1024,8 +1128,6 @@ struct BeaverApp {
     scheduled: Vec<(u64, drafts::DraftData)>,
     /// The list shows the scheduled messages instead of a folder.
     show_scheduled: bool,
-    /// Without the reading pane, the open message is shown in the list's place.
-    full_preview: bool,
     /// The user chose to work offline: nothing goes to the network until they go online again. Not
     /// remembered, so a restart is online and the app is never offline without the user knowing.
     work_offline: bool,
@@ -1161,7 +1263,6 @@ impl BeaverApp {
             confirm_book_remove: None,
             contacts_syncing: Default::default(),
             contacts_synced: None,
-            answer_when_open: None,
             body_failed: None,
             address_book: None,
             contacts_shown: None,
@@ -1173,6 +1274,7 @@ impl BeaverApp {
             confirm_remove: None,
             confirm_unsubscribe: None,
             confirm_block: None,
+            source_view: None,
             palette: None,
             pending: None,
             outbox_sending: std::collections::HashMap::new(),
@@ -1181,7 +1283,6 @@ impl BeaverApp {
             show_scheduled: false,
             offline_changes: Vec::new(),
             work_offline: false,
-            full_preview: false,
             pane: None,
             reader_scroll: None,
             list_reveal: None,
@@ -1336,7 +1437,7 @@ impl BeaverApp {
         self.send_pending();
         (self.selected, self.unified, self.show_scheduled, self.show_suspicious) = (None, false, true, false);
         self.tabs.retain(|t| t.pinned);
-        (self.in_tab, self.full_preview) = (false, false);
+        self.in_tab = false;
         self.picked.clear();
         (self.message, self.body) = (None, None);
         self.messages.clear();
@@ -1473,17 +1574,19 @@ impl BeaverApp {
 
     /// Shows message `id`: in the reading pane, or `pin`, in its tab (opened if need be).
     fn open_message(&mut self, id: MessageId, pin: bool) {
-        let listed = self.messages.iter().find(|m| m.id == id).and_then(|m| Some(tabs::Tab { serial: self.serial_of(id)?, message: m.clone(), role: self.role(), pinned: pin }));
-        let tabbed = || self.tabs.iter().find(|t| t.message.id == id).map(|t| tabs::Tab { serial: t.serial, message: t.message.clone(), role: t.role, pinned: pin });
+        let listed = self.messages.iter().find(|m| m.id == id).and_then(|m| Some(tabs::Tab { serial: self.serial_of(id)?, message: m.clone(), role: self.role(), pinned: pin, source: false }));
+        let tabbed = || self.tabs.iter().find(|t| t.message.id == id).map(|t| tabs::Tab { serial: t.serial, message: t.message.clone(), role: t.role, pinned: pin, source: false });
         if let Some(tab) = listed.or_else(tabbed) {
             self.open(tab);
         }
     }
 
     /// Shows `tab`'s message, from any folder: in the reading pane, or when pinned, in its tab.
-    fn open(&mut self, tab: tabs::Tab) {
+    fn open(&mut self, mut tab: tabs::Tab) {
         self.picked.clear();
-        let (id, unread, pinned) = (tab.message.id, tab.message.unread, tab.pinned);
+        // Without the reading pane there is nowhere else to read it.
+        tab.pinned |= !self.settings.reading_pane;
+        let (id, unread) = (tab.message.id, tab.message.unread);
         // Suspicious mail and spam are opened to judge them, not to read them.
         let judging = self.show_suspicious || tab.role == Role::Junk;
         let at = match tabs::slot(&self.tabs, id, tab.pinned) {
@@ -1501,8 +1604,6 @@ impl BeaverApp {
         if self.active() != Some(at) || self.body.is_none() {
             self.activate(at);
         }
-        // Without the reading pane, a message opens in the list's place.
-        self.full_preview = !pinned && !self.settings.reading_pane;
         // Reading a conversation reads all of it, as its row shows it unread while any message is.
         let unread_here: Vec<MessageId> = self.conversation(id).into_iter().filter(|m| *m != id && self.summary_of(*m).is_some_and(|s| s.unread)).collect();
         if !judging && unread {
@@ -1519,6 +1620,17 @@ impl BeaverApp {
         let Some(tab) = self.tabs.get(at) else { return };
         let (serial, id, pinned) = (tab.serial, tab.message.id, tab.pinned);
         self.body_failed = None;
+        if tab.source {
+            let subject = tab.message.subject.clone();
+            (self.in_tab, self.message, self.body) = (true, Some(id), None);
+            self.source_view = Some(SourceView { id, subject, lines: None, size: 0, find: None });
+            match self.view(serial).and_then(|v| v.source.clone()) {
+                Some(source) => self.spawn(async move { Event::Source(id, source.source(id).await) }),
+                None => self.source_view = Some(SourceView { id, subject: String::new(), lines: Some(Err("its account is not connected".into())), size: 0, find: None }),
+            }
+            return;
+        }
+        self.source_view = None;
         let Some((view, source)) = self.view(serial).and_then(|v| Some((v, v.source.clone()?))) else {
             // Never a reader waiting for nothing: an account without a connection says so.
             (self.in_tab, self.message, self.body) = (pinned, Some(id), None);
@@ -1546,9 +1658,10 @@ impl BeaverApp {
                 Err(e) => return Event::Body(serial, id, Err(e)),
             };
             // The checks load what the account knows and train the spam model: seconds on a big mailbox, never on the UI thread.
+            let checker = source.clone();
             let prepared = tokio::task::spawn_blocking(move || {
                 let findings = screen::Known::load(&archive, &account, &own, &settings)
-                    .map(|known| screen::findings(&known, &message.from, &message.address, &body, &account.imap.host))
+                    .map(|known| screen::findings(&known, &message.from, &message.address, &body, &checker.auth_server()))
                     .unwrap_or_default();
                 Box::new(Prepared::new(body, findings))
             });
@@ -1600,7 +1713,8 @@ impl BeaverApp {
     /// The index of the tab shown: a message tab, or the reading pane's.
     fn active(&self) -> Option<usize> {
         let id = self.message?;
-        self.tabs.iter().position(|t| t.message.id == id && t.pinned == self.in_tab)
+        let source = self.showing_source();
+        self.tabs.iter().position(|t| t.message.id == id && t.pinned == self.in_tab && t.source == source)
     }
 
     /// The tab shown.
@@ -1654,9 +1768,9 @@ impl BeaverApp {
     }
 
     /// Moves the selection to listed message `id`: shown in the reading pane, or without the pane only
-    /// selected, unless a message is already shown in the list's place.
+    /// selected (Enter or a double click opens it in a tab).
     fn move_to(&mut self, id: MessageId) {
-        if self.settings.reading_pane || self.full_preview {
+        if self.settings.reading_pane {
             self.show_listed(id);
         } else {
             // Only selected: nothing of it is loaded, and the text of the one before is not its text.
@@ -1832,7 +1946,7 @@ impl BeaverApp {
             self.messages.insert(at, message);
         }
         if let Some(id) = first {
-            self.select_message(id);
+            self.move_to(id);
         }
     }
 
@@ -1953,7 +2067,7 @@ impl BeaverApp {
         self.checking = true;
         self.spawn(async move {
             let verdicts = screen::Known::load(&archive, &account, &own, &settings).and_then(|known| {
-                let verdicts: std::collections::HashMap<MessageId, screen::Screened> = fresh.iter().map(|m| m.id).zip(screen::screen_all(&source, &known, &settings, &account.imap.host, &fresh, &held)).collect();
+                let verdicts: std::collections::HashMap<MessageId, screen::Screened> = fresh.iter().map(|m| m.id).zip(screen::screen_all(&source, &known, &settings, &source.auth_server(), &fresh, &held)).collect();
                 archive.set_verdicts(&kept(&verdicts))?;
                 Ok(verdicts)
             });
@@ -2112,7 +2226,7 @@ impl BeaverApp {
     /// Shows a search result where it is, without leaving the search: its folder need not be the one shown.
     fn open_hit(&mut self, serial: u64, hit: &Hit, pin: bool) {
         let Some(role) = self.view(serial).and_then(|v| v.mailboxes.iter().find(|m| m.name == hit.folder)).map(|m| m.role) else { return };
-        self.open(tabs::Tab { serial, message: hit.message.clone(), role, pinned: pin });
+        self.open(tabs::Tab { serial, message: hit.message.clone(), role, pinned: pin, source: false });
     }
 
     /// Asks the server again for the selected folder and its account's folder list.
@@ -3130,6 +3244,122 @@ impl BeaverApp {
         }
     }
 
+    /// Opens the source of the open message in a tab of its own, or shows the one already open.
+    fn view_source(&mut self) {
+        let Some(id) = self.message else { return };
+        let at = match self.tabs.iter().position(|t| t.source && t.message.id == id) {
+            Some(at) => at,
+            None => {
+                let (Some(serial), Some(message)) = (self.serial_of(id), self.summary_of(id).cloned()) else { return };
+                self.tabs.push(tabs::Tab { serial, message, role: self.role_of(id), pinned: true, source: true });
+                self.tabs.len() - 1
+            }
+        };
+        self.activate(at);
+    }
+
+    /// A source tab is shown.
+    fn showing_source(&self) -> bool {
+        self.in_tab && self.source_view.as_ref().is_some_and(|v| Some(v.id) == self.message)
+    }
+
+    /// The source tab: the message as the server holds it, every header and part, to read, search or
+    /// copy. The keys scroll it as they scroll a message, Left and Right along its long lines.
+    fn source_page(&mut self, ui: &mut egui::Ui, t: &theme::Tokens) {
+        let scroll = self.reader_scroll.take();
+        let typing = ui.ctx().egui_wants_keyboard_input();
+        let Some(view) = &mut self.source_view else { return };
+        let mut copy = false;
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(t.surface).inner_margin(egui::Margin::symmetric(28, 20))).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.heading(if view.subject.trim().is_empty() { "(no subject)" } else { view.subject.as_str() });
+                    let about = if view.size > 0 { format!("Message source  ·  {}", attachments::human_size(view.size as u64)) } else { "Message source".to_owned() };
+                    ui.label(RichText::new(about).size(13.0).color(t.text_dim));
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let ready = matches!(view.lines, Some(Ok(_)));
+                    copy = ui.add_enabled(ready, egui::Button::new("Copy source")).on_hover_text("Copy every header and part, as the server holds them").clicked();
+                    if ui.add_enabled(ready, egui::Button::new("Find…")).on_hover_text(Command::FindInSource.tip(ui.ctx())).clicked() {
+                        view.find.get_or_insert_with(Find::default).focus = true;
+                    }
+                });
+            });
+            ui.add_space(12.0);
+            let lines: &[String] = match &view.lines {
+                None => {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().size(14.0));
+                        ui.label(RichText::new("Loading the message…").color(t.text_dim));
+                    });
+                    return;
+                }
+                Some(Err(why)) => {
+                    ui.label(RichText::new(format!("The message could not be read: {why}")).color(t.danger));
+                    return;
+                }
+                Some(Ok(lines)) => lines,
+            };
+            if let Some(find) = &mut view.find {
+                if find_bar(ui, t, find, lines) {
+                    view.find = None;
+                }
+                ui.add_space(8.0);
+            }
+            let font = egui::FontId::monospace(13.0);
+            let (row, glyph) = ui.fonts_mut(|f| (f.row_height(&font), f.glyph_width(&font, '0')));
+            // The match to show: its line a third of the way down, its column in sight.
+            let jump = view.find.as_mut().and_then(|f| if std::mem::take(&mut f.jump) { f.hits.get(f.at).copied() } else { None });
+            let height = ui.available_height() - 16.0;
+            let hits: &[(usize, usize, usize)] = view.find.as_ref().map_or(&[], |f| &f.hits);
+            let current = view.find.as_ref().and_then(|f| f.hits.get(f.at).copied());
+            egui::Frame::new().fill(t.input).stroke(egui::Stroke::new(1.0, t.border)).corner_radius(egui::CornerRadius::same(theme::CONTROL_RADIUS)).inner_margin(egui::Margin::symmetric(12, 8)).show(ui, |ui| {
+                // Rows drawn only as they scroll into view: a message with attachments is megabytes of text.
+                // No gap between lines, set before the area works out its height from it.
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let mut area = egui::ScrollArea::both().id_salt(("source", view.id.0)).auto_shrink([false, false]);
+                if let Some((line, start, _)) = jump {
+                    let column = lines[line][..start].chars().count() as f32 * glyph;
+                    area = area.vertical_scroll_offset((line as f32 * row - height / 3.0).max(0.0)).horizontal_scroll_offset((column - 120.0).max(0.0));
+                }
+                area.show_rows(ui, row, lines.len(), |ui, range| {
+                    let page = (ui.clip_rect().height() - 48.0).max(48.0);
+                    let sideways = if typing { 0.0 } else { ui.input(|i| f32::from(u8::from(i.key_pressed(egui::Key::ArrowLeft))) - f32::from(u8::from(i.key_pressed(egui::Key::ArrowRight)))) };
+                    let down = match scroll {
+                        Some(Scroll::Lines(n)) => -48.0 * n,
+                        Some(Scroll::Pages(n)) => -page * n,
+                        Some(Scroll::Edge(end)) => if end { -1e9 } else { 1e9 },
+                        None => 0.0,
+                    };
+                    if down != 0.0 || sideways != 0.0 {
+                        ui.scroll_with_delta(vec2(sideways * 96.0, down));
+                    }
+                    let first = hits.partition_point(|h| h.0 < range.start);
+                    let mut hits = hits[first..].iter().peekable();
+                    for (at, line) in lines[range.clone()].iter().enumerate().map(|(i, l)| (range.start + i, l)) {
+                        let mut job = egui::text::LayoutJob::default();
+                        let plain = egui::TextFormat::simple(font.clone(), t.text);
+                        let mut from = 0;
+                        while let Some(&&(l, start, end)) = hits.peek().filter(|h| h.0 == at) {
+                            hits.next();
+                            job.append(&line[from..start], 0.0, plain.clone());
+                            let on = current == Some((l, start, end));
+                            let (fill, color) = if on { (t.accent, t.on_accent) } else { (t.accent.gamma_multiply(0.3), t.text) };
+                            job.append(&line[start..end], 0.0, egui::TextFormat { background: fill, ..egui::TextFormat::simple(font.clone(), color) });
+                            from = end;
+                        }
+                        job.append(&line[from..], 0.0, plain);
+                        ui.add(egui::Label::new(job).wrap_mode(egui::TextWrapMode::Extend));
+                    }
+                });
+            });
+        });
+        if copy && let Some(Ok(lines)) = &view.lines {
+            ui.ctx().copy_text(lines.join("\n"));
+            self.notice = Some(("Source copied".into(), std::time::Instant::now()));
+        }
+    }
+
     /// Confirms blocking the sender of a message: the same as marking it as spam, asked for on any message.
     fn block_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
         let Some(id) = self.confirm_block else { return };
@@ -3752,7 +3982,7 @@ impl BeaverApp {
             if action.removes() && open && self.confirm_erase.is_empty()
                 && let Some(next) = row.and_then(|r| self.listed().get(r).copied())
             {
-                self.show_listed(next);
+                self.move_to(next);
             }
         } else if matches!(action, Action::Trash) && self.role_of(id) == Role::Trash {
             self.confirm_erase = vec![id];
@@ -3813,24 +4043,40 @@ impl BeaverApp {
             None => self.picked.push(id),
         }
         if let [only] = self.picked[..] {
-            self.show_listed(only);
+            self.move_to(only);
         }
     }
 
     /// Shift+click: picks every message from the first picked (or the open one) to `id`, in list order.
     fn pick_range(&mut self, id: MessageId) {
         let ids = self.listed();
-        let Some(anchor) = self.picked.first().copied().or(self.message) else { return self.show_listed(id) };
+        let Some(anchor) = self.picked.first().copied().or(self.message) else { return self.move_to(id) };
         if let Some(range) = range(&ids, anchor, id) {
             self.picked = range;
         }
     }
 
     /// Opens a reply or a forward of the open message.
+    /// Opens a reply or a forward of message `id` with its text: the open message's, else read in the
+    /// background (from this computer when stored), without opening the message.
     fn answer(&mut self, id: MessageId, action: Action) {
-        let Some(serial) = self.open_tab().map(|t| t.serial) else { return };
-        let (Some(summary), Some(open)) = (self.summary_of(id), &self.body) else { return };
-        let body = &open.data;
+        if self.message == Some(id)
+            && let (Some(tab), Some(open)) = (self.open_tab(), &self.body)
+        {
+            let (serial, body) = (tab.serial, open.data.clone());
+            return self.answer_with(serial, id, action, &body);
+        }
+        let Some(serial) = self.serial_of(id) else { return };
+        let Some(source) = self.view(serial).and_then(|v| v.source.clone()) else {
+            self.error = Some("Its account is not connected. Check its password in Settings.".into());
+            return;
+        };
+        self.spawn(async move { Event::Answer(serial, id, action, source.body(id).await.map(Box::new)) });
+    }
+
+    /// Opens the compose window for a reply or a forward of message `id`, whose text is `body`.
+    fn answer_with(&mut self, serial: u64, id: MessageId, action: Action, body: &MessageBody) {
+        let Some(summary) = self.summary_of(id) else { return };
         let Some(view) = self.view(serial).filter(|v| v.sender.is_some()) else { return };
         let own = view.account.address();
         let key = view.account.key();
@@ -3979,13 +4225,9 @@ impl BeaverApp {
         // In a message tab the list is not on screen: no moving through it.
         let ids: Vec<MessageId> = if self.in_tab { Vec::new() } else { self.listed() };
         let pos = self.message.and_then(|id| ids.iter().position(|i| self.conversations.same(*i, id) && (self.threaded() || *i == id)));
-        let reading = self.in_tab || self.full_preview || self.pane == Some(Pane::Reader);
+        let reading = self.in_tab || self.pane == Some(Pane::Reader);
         if key(egui::Key::Escape) {
             self.picked.clear();
-            if self.full_preview {
-                self.full_preview = false; // back to the list
-                return;
-            }
             if reading && !self.in_tab {
                 self.pane = Some(Pane::List);
             }
@@ -4032,6 +4274,10 @@ impl BeaverApp {
             Some(id) => Ok(id),
         };
         let some = || if many || self.message.is_some() { Ok(()) } else { Err("Open or pick a message first") };
+        // A source tab shows text, not the message: what acts on a message is for its own tab.
+        if self.showing_source() && !matches!(command, Command::Palette | Command::NewMessage | Command::Settings | Command::Mail | Command::Contacts | Command::WorkOffline | Command::WorkOnline | Command::CloseTab | Command::PreviousTab | Command::NextTab | Command::AllInboxes | Command::FindInSource) {
+            return Err("Not in the source of a message");
+        }
         // Out of Mail the list and the reader are not on screen: what acts on them waits.
         if self.section != Section::Mail && !matches!(command, Command::Palette | Command::NewMessage | Command::Settings | Command::Mail | Command::Contacts | Command::WorkOffline | Command::WorkOnline) {
             return Err("Go to Mail first");
@@ -4069,6 +4315,8 @@ impl BeaverApp {
                     _ => Ok(()),
                 }
             }
+            Command::ViewSource => one().map(|_| ()),
+            Command::FindInSource => if self.showing_source() { Ok(()) } else { Err("Only in the source of a message") },
             Command::OpenInTab => one().and(if self.in_tab { Err("Already in a tab") } else { Ok(()) }),
             Command::CloseTab => if self.in_tab { Ok(()) } else { Err("No message tab is shown") },
             Command::PreviousTab | Command::NextTab => if self.tabs.iter().any(|t| t.pinned) { Ok(()) } else { Err("No message is open in a tab") },
@@ -4095,15 +4343,8 @@ impl BeaverApp {
             Command::Palette => self.palette = Some(Palette::default()),
             Command::NewMessage => self.new_message(),
             Command::Reply | Command::ReplyAll | Command::Forward => {
-                let Some(id) = self.message else { return };
-                if self.body.is_some() && self.open_tab().is_some() {
+                if let Some(id) = self.message {
                     self.request(id, answer(command));
-                } else {
-                    // Only selected (no reading pane) or still loading: it opens, and the answer follows its text.
-                    self.answer_when_open = Some((id, answer(command)));
-                    if self.open_tab().is_none() {
-                        self.show_listed(id);
-                    }
                 }
             }
             Command::Archive => self.request_all(targets, Action::Archive),
@@ -4125,6 +4366,12 @@ impl BeaverApp {
                 }
             }
             Command::BlockSender => self.confirm_block = self.message,
+            Command::ViewSource => self.view_source(),
+            Command::FindInSource => {
+                if let Some(view) = &mut self.source_view {
+                    view.find.get_or_insert_with(Find::default).focus = true;
+                }
+            }
             Command::OpenInTab => {
                 if let Some(id) = self.message {
                     self.open_message(id, true);
@@ -4430,17 +4677,24 @@ impl BeaverApp {
                     }
                 }
             }
+            Event::Answer(serial, id, action, result) => match result {
+                Ok(body) => self.answer_with(serial, id, action, &body),
+                Err(MailError::Offline(why)) => {
+                    self.went_offline(serial, why);
+                    self.error = Some("The message is not stored on this computer, and the server cannot be reached to answer it.".into());
+                }
+                Err(e) => self.error = Some(format!("Could not read the message to answer it: {e}")),
+            },
+            Event::Source(id, result) => {
+                if let Some(view) = self.source_view.as_mut().filter(|v| v.id == id) {
+                    view.size = result.as_ref().map_or(0, Vec::len);
+                    view.lines = Some(result.map(|raw| String::from_utf8_lossy(&raw).lines().map(str::to_owned).collect()).map_err(|e| e.to_string()));
+                }
+            }
             Event::Body(serial, id, result) if self.message == Some(id) && self.open_tab().is_some_and(|t| t.serial == serial) =>
             {
-                // An answer asked for before the text was there goes with this message only.
-                let answer = self.answer_when_open.take().filter(|(want, _)| *want == id);
                 match result {
-                    Ok(prepared) => {
-                        self.body = Some(OpenBody::new(*prepared));
-                        if let Some((id, action)) = answer {
-                            self.request(id, action);
-                        }
-                    }
+                    Ok(prepared) => self.body = Some(OpenBody::new(*prepared)),
                     Err(MailError::Offline(why)) => {
                         self.went_offline(serial, why);
                         self.body_failed = Some((id, "It is not stored on this computer, and the server cannot be reached. It opens once it can.".into()));
@@ -5543,6 +5797,10 @@ impl BeaverApp {
 
     /// The open message with its action bar. Returns the action the user chose.
     fn reader(&mut self, ui: &mut egui::Ui, t: &theme::Tokens) -> ReaderOutcome {
+        if self.showing_source() {
+            self.source_page(ui, t);
+            return ReaderOutcome::default();
+        }
         let mut action = None;
         let mut url = None;
         let mut chosen_mode = None;
@@ -5552,7 +5810,7 @@ impl BeaverApp {
         let mut allow_sender = None;
         let mut mark = None;
         let mut suspicious = false;
-        let (mut leave, mut block, mut trust, mut card, mut retry) = (None, None, None, None, false);
+        let (mut leave, mut block, mut trust, mut card, mut retry, mut source) = (None, None, None, None, false, false);
         let scroll = self.reader_scroll.take();
         let (mut switch, mut expand) = (None, false);
         // The open message's conversation, oldest first, when the list shows conversations.
@@ -5568,13 +5826,11 @@ impl BeaverApp {
         let selected_files = self.attach_selected.clone();
         // The message in the reader is its tab's: it may come from another folder than the one shown.
         let open = self.open_tab().map(|t| (t.message.clone(), t.role, t.serial));
-        let server_host = open.as_ref().and_then(|(_, _, serial)| self.view(*serial)).map(|v| v.account.imap.host.clone()).unwrap_or_default();
+        let server_host = open.as_ref().and_then(|(_, _, serial)| self.view(*serial)?.source.as_ref()).map(|s| s.auth_server()).unwrap_or_default();
         let role = open.as_ref().map_or(Role::Other, |(_, role, _)| *role);
         let current = open.map(|(message, ..)| message);
         let frame = egui::Frame::new().fill(t.surface);
         let in_tab = self.in_tab;
-        let full_preview = self.full_preview && !in_tab;
-        let mut back = false;
         let picked = if in_tab { 0 } else { self.picked.len() };
         let picked_unread = self.picked.iter().any(|id| self.summary_of(*id).is_some_and(|m| m.unread));
         let folder_role = self.picked_role();
@@ -5591,10 +5847,6 @@ impl BeaverApp {
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 ui.add_space(12.0);
-                if full_preview {
-                    back = icons::button(ui, t, Icon::ArrowLeft, "Back to the list (Esc)", true, false).clicked();
-                    ui.add_space(8.0);
-                }
                 let archived = role == Role::Archive;
                 let loaded = self.body.is_some();
                 let ctx = ui.ctx().clone();
@@ -5636,6 +5888,7 @@ impl BeaverApp {
                 if icons::button(ui, t, Icon::Ban, tip, blockable, false).clicked() {
                     block = Some(message.id);
                 }
+                source = icons::button(ui, t, Icon::FileCode, &Command::ViewSource.tip(&ctx), true, false).clicked();
             });
             ui.add_space(6.0);
             ui.separator();
@@ -5739,9 +5992,11 @@ impl BeaverApp {
                             if let Some(line) = views::trackers_line(&body.trackers) {
                                 views::note(ui, Icon::Ban, t.text_dim, &line, "Images that only tell the sender you opened this message. They are never loaded, even when you load the others.");
                             }
-                            if body.findings.is_empty() && authenticity == sender::Authenticity::Verified {
-                                ui.add_space(6.0);
-                                ui.label(RichText::new(format!("Sender domain verified by your server: {}", sender::domain(&message.address))).size(13.0).color(t.text_dim));
+                            // What the server found: a fact next to the findings, not a reassurance ("paypa1.com"
+                            // verifies too), so in the quiet colour whatever it says.
+                            if let Some((line, tip)) = sender::checks_line(&body.data.auth, &server_host, &message.address) {
+                                let icon = if authenticity == sender::Authenticity::Verified { Icon::ShieldCheck } else { Icon::Shield };
+                                views::note(ui, icon, t.text_dim, &line, &tip);
                             }
                             if let Some(choice) = correction {
                                 let key = screen::sender_key(&message.address);
@@ -5842,9 +6097,8 @@ impl BeaverApp {
                 }
             }
         };
-        // A message tab has the window to itself, a message without the reading pane the list's place;
-        // otherwise the reader is the pane on the right.
-        if in_tab || full_preview {
+        // A message tab has the window to itself; otherwise the reader is the pane on the right.
+        if in_tab {
             egui::CentralPanel::default().frame(frame).show(ui, draw);
         } else {
             let reader = egui::Panel::right("reader").frame(frame).default_size(470.0).size_range(360.0..=900.0).show(ui, draw);
@@ -5852,7 +6106,7 @@ impl BeaverApp {
                 pane_ring(ui, t, reader.response.rect);
             }
         }
-        ReaderOutcome { action, url, mode: chosen_mode, remember, attachment, save_many, allow_sender, mark, bulk, unsubscribe: leave, block, switch, expand, back, trust, card, retry }
+        ReaderOutcome { action, url, mode: chosen_mode, remember, attachment, save_many, allow_sender, mark, bulk, unsubscribe: leave, block, switch, expand, trust, card, retry, source }
     }
 }
 
@@ -5973,12 +6227,9 @@ impl eframe::App for BeaverApp {
         self.confirm_remove = removed.or(self.confirm_remove);
 
         self.handle_keys(ui.ctx());
-        if self.full_preview && (self.message.is_none() || self.settings.reading_pane) {
-            self.full_preview = false;
-        }
-        // Without the reading pane and with no message in its place, there is no reader to draw.
-        let shows_reader = !contacts && (self.in_tab || self.full_preview || self.settings.reading_pane);
-        let ReaderOutcome { action, url, mode, remember, attachment, save_many, allow_sender, mark, bulk, unsubscribe, block, switch, expand, back, trust, card, retry } =
+        // Without the reading pane only a message tab has a reader.
+        let shows_reader = !contacts && (self.in_tab || self.settings.reading_pane);
+        let ReaderOutcome { action, url, mode, remember, attachment, save_many, allow_sender, mark, bulk, unsubscribe, block, switch, expand, trust, card, retry, source } =
             if shows_reader { self.reader(ui, &t) } else { ReaderOutcome::default() };
         if retry && let Some(at) = self.active() {
             self.activate(at);
@@ -5986,7 +6237,6 @@ impl eframe::App for BeaverApp {
         if let Some((address, name)) = card {
             self.open_card(&address, &name);
         }
-        self.full_preview &= !back;
         if let Some(id) = trust {
             self.trust(id);
         }
@@ -5998,7 +6248,7 @@ impl eframe::App for BeaverApp {
         {
             let role = if self.sent.iter().any(|m| m.id == id) { Role::Sent } else { self.role() };
             let (serial, pinned) = (self.serial_of(id).unwrap_or(self.tabs[at].serial), self.tabs[at].pinned);
-            self.tabs[at] = tabs::Tab { serial, message, role, pinned };
+            self.tabs[at] = tabs::Tab { serial, message, role, pinned, source: false };
             self.activate(at);
         }
         match unsubscribe {
@@ -6011,6 +6261,9 @@ impl eframe::App for BeaverApp {
             None => {}
         }
         self.confirm_block = block.or(self.confirm_block);
+        if source {
+            self.view_source();
+        }
         if let Some(action) = bulk {
             self.request_all(self.targets(), action);
         }
@@ -6038,11 +6291,11 @@ impl eframe::App for BeaverApp {
             self.view_mode = None;
             self.save_settings();
         }
-        let (opened, add_from_list) = if self.in_tab || self.full_preview || contacts { (None, false) } else { self.message_list(ui, &t) };
+        let (opened, add_from_list) = if self.in_tab || contacts { (None, false) } else { self.message_list(ui, &t) };
         add |= add_from_list;
 
-        // A click shows the message beside the list; without that pane it only selects, so a double
-        // click can still open a tab (opening in the list's place would take the list away mid-click).
+        // A click shows the message beside the list; without that pane it only selects, and a double
+        // click opens a tab.
         if let Some(id) = opened {
             self.move_to(id);
         }
@@ -6207,6 +6460,15 @@ fn range(ids: &[MessageId], anchor: MessageId, to: MessageId) -> Option<Vec<Mess
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_in_source_ignores_case_and_keeps_each_matchs_place() {
+        let lines: Vec<String> = ["Subject: Hello", "hello HELLO", "Ünïcode hello"].iter().map(|l| (*l).to_owned()).collect();
+        assert_eq!(find_hits(&lines, "hello"), [(0, 9, 14), (1, 0, 5), (1, 6, 11), (2, 10, 15)]);
+        assert_eq!(&lines[2][10..15], "hello", "a byte position, past letters of two bytes");
+        assert!(find_hits(&lines, "").is_empty());
+        assert!(find_hits(&lines, "absent").is_empty());
+    }
 
     #[test]
     fn someone_in_two_address_books_shows_in_both_marked() {

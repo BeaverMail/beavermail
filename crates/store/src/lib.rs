@@ -1030,6 +1030,14 @@ impl Store {
             .map_err(db)
     }
 
+    /// The sender and kept header fields of an account's latest messages, newest first.
+    pub fn recent_headers(&self, account: &str, limit: usize) -> Result<Vec<(String, Vec<u8>)>, MailError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT from_addr, headers FROM messages WHERE account = ?1 AND length(headers) > 0 ORDER BY timestamp DESC LIMIT ?2").map_err(db)?;
+        let rows = stmt.query_map(params![account, limit as i64], |r| Ok((r.get(0)?, r.get(1)?))).map_err(db)?;
+        rows.collect::<Result<_, _>>().map_err(db)
+    }
+
     /// The header fields kept for a message; `None` when they were not read yet.
     pub fn headers(&self, id: MessageId) -> Result<Option<Vec<u8>>, MailError> {
         self.conn().query_row("SELECT headers FROM messages WHERE id = ?1", [id.0 as i64], |r| r.get(0)).optional().map(Option::flatten).map_err(db)
