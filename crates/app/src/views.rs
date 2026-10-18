@@ -837,6 +837,26 @@ pub fn body(ui: &mut Ui, t: &Tokens, blocks: &[Block]) -> Option<String> {
     clicked
 }
 
+/// A message body with the earlier messages it carries (from block `fold` on, see
+/// [`html::quoted_tail`]) folded behind "Show quoted text", which `shown` remembers. Returns the link clicked.
+pub fn reply_body(ui: &mut Ui, t: &Tokens, blocks: &[Block], fold: Option<usize>, shown: &mut bool) -> Option<String> {
+    let Some(at) = fold.filter(|&at| at < blocks.len()) else {
+        return body(ui, t, blocks);
+    };
+    // Each part in a scope of its own: the body's tight line spacing would shrink the button.
+    let mut clicked = ui.scope(|ui| body(ui, t, &blocks[..at])).inner;
+    ui.add_space(4.0);
+    let (label, tip) = if *shown { ("Hide quoted text", "Fold the earlier messages away again") } else { ("Show quoted text", "The earlier messages this one carries below it") };
+    if ui.button(label).on_hover_text(tip).clicked() {
+        *shown = !*shown;
+    }
+    if *shown {
+        ui.add_space(12.0);
+        clicked = ui.scope(|ui| body(ui, t, &blocks[at..])).inner.or(clicked);
+    }
+    clicked
+}
+
 /// A table of data: columns as wide as their longest cell asks, within the reader's width, a line
 /// under the header and between rows. Returns the link clicked.
 fn table(ui: &mut Ui, t: &Tokens, rows: &[Vec<Vec<Run>>], header: bool) -> Option<String> {

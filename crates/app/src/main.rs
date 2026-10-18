@@ -254,11 +254,15 @@ struct OpenBody {
     trackers: Vec<String>,
     /// What deserves a second look about the message, the most serious first.
     findings: Vec<screen::Finding>,
+    /// Where the earlier messages it carries start, in `plain` and in `simplified` (see [`html::quoted_tail`]).
+    folds: (Option<usize>, Option<usize>),
+    /// "Show quoted text" was pressed.
+    quoted: bool,
 }
 
 impl OpenBody {
     fn new(p: Prepared) -> Self {
-        Self { data: p.data, plain: p.plain, simplified: p.simplified, original: None, remote: false, has_remote: p.has_remote, trackers: p.trackers, findings: p.findings }
+        Self { data: p.data, plain: p.plain, simplified: p.simplified, original: None, remote: false, has_remote: p.has_remote, trackers: p.trackers, findings: p.findings, folds: p.folds, quoted: false }
     }
 }
 
@@ -271,6 +275,7 @@ struct Prepared {
     has_remote: bool,
     trackers: Vec<String>,
     findings: Vec<screen::Finding>,
+    folds: (Option<usize>, Option<usize>),
 }
 
 impl Prepared {
@@ -279,7 +284,8 @@ impl Prepared {
         let simplified = data.html.as_deref().map(html::blocks);
         let has_remote = data.html.as_deref().is_some_and(html::has_remote);
         let trackers = data.html.as_deref().map(html::trackers).unwrap_or_default();
-        Self { data, plain, simplified, has_remote, trackers, findings }
+        let folds = (html::quoted_tail(&plain), simplified.as_deref().and_then(html::quoted_tail));
+        Self { data, plain, simplified, has_remote, trackers, findings, folds }
     }
 }
 
@@ -5818,11 +5824,11 @@ impl BeaverApp {
                                     url = page.show(ui);
                                 }
                             } else {
-                                let blocks = match (&body.simplified, mode) {
-                                    (Some(simplified), DisplayMode::Simplified) => simplified,
-                                    _ => &body.plain,
+                                let (blocks, fold) = match (&body.simplified, mode) {
+                                    (Some(simplified), DisplayMode::Simplified) => (simplified, body.folds.1),
+                                    _ => (&body.plain, body.folds.0),
                                 };
-                                url = views::body(ui, t, blocks);
+                                url = views::reply_body(ui, t, blocks, fold, &mut body.quoted);
                             }
                             ui.add_space(28.0);
                         });

@@ -416,6 +416,51 @@ pub fn plain_blocks(text: &str) -> Vec<Block> {
     blocks
 }
 
+/// Where the earlier messages a reply carries below itself start, to fold them away: the quote at the
+/// end of the message with the line that introduces it ("On Mon, Ada wrote:"), or a header block
+/// ("From:" then "Sent:" or "Date:") as Outlook writes them unquoted. `None` when nothing is carried, or
+/// when nothing would be left to read above it. A forward's header is kept: its text is the message.
+pub fn quoted_tail(blocks: &[Block]) -> Option<usize> {
+    let text = |b: &Block| b.runs.iter().map(|r| match r { Run::Text { text, .. } | Run::Link { text, .. } => text.as_str() }).collect::<String>().trim().to_owned();
+    let empty = |b: &Block| b.kind != Kind::Rule && b.rows.is_empty() && text(b).is_empty();
+    let starts = |b: &Block, words: &[&str]| {
+        let t = text(b).to_lowercase();
+        words.iter().any(|w| t.starts_with(w))
+    };
+    // The quote at the end, up to its introduction.
+    let mut quote = None;
+    for (i, b) in blocks.iter().enumerate().rev() {
+        match b.kind {
+            Kind::Quote => quote = Some(i),
+            _ if empty(b) => {}
+            _ => break,
+        }
+    }
+    let quote = quote.map(|start| {
+        let before = blocks[..start].iter().rposition(|b| !empty(b));
+        match before {
+            Some(i) if matches!(blocks[i].kind, Kind::Para | Kind::Line) && text(&blocks[i]).ends_with(':') && text(&blocks[i]).chars().count() <= 300 => i,
+            _ => start,
+        }
+    });
+    // A header block, and the rule or "Original Message" line above it.
+    const FROM: [&str; 5] = ["from:", "da:", "de:", "von:", "van:"];
+    const DATE: [&str; 8] = ["sent:", "date:", "inviato:", "data:", "gesendet:", "datum:", "envoyé", "enviado:"];
+    let header = (1..blocks.len()).find(|&i| starts(&blocks[i], &FROM) && blocks[i + 1..].iter().filter(|b| !empty(b)).take(3).any(|b| starts(b, &DATE))).and_then(|i| {
+        let above = blocks[..i].iter().rposition(|b| !empty(b))?;
+        let line = text(&blocks[above]).to_lowercase();
+        if ["forward", "inoltrat", "weitergeleitet", "transféré", "reenviado"].iter().any(|w| line.contains(w)) {
+            return None;
+        }
+        Some(if blocks[above].kind == Kind::Rule || (line.starts_with("-----") && line.ends_with("-----")) { above } else { i })
+    });
+    let start = match (quote, header) {
+        (Some(a), Some(b)) => a.min(b),
+        (a, b) => a.or(b)?,
+    };
+    blocks[..start].iter().any(|b| !empty(b) && b.kind != Kind::Rule).then_some(start)
+}
+
 /// How many `>` levels start a line, and the rest of the line.
 fn quote_depth(line: &str) -> (u8, &str) {
     let mut depth = 0;
@@ -518,6 +563,26 @@ fn strip_tracking(url: &str, extra: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_messages_a_reply_carries_are_folded_from_their_introduction() {
+        let plain = plain_blocks("Sounds good.\n\nOn Mon, Ada wrote:\n> Hello there\n>\n>> older\n\n");
+        assert_eq!(quoted_tail(&plain), Some(2));
+        let html = blocks(r#"<p>Sounds good.</p><div class="gmail_quote"><div>On Mon, Ada &lt;ada@example.org&gt; wrote:<br></div><blockquote>Hello there</blockquote></div>"#);
+        assert_eq!(texts(&html[quoted_tail(&html).unwrap()..])[0], "On Mon, Ada <ada@example.org> wrote:");
+        let outlook = plain_blocks("Sounds good.\n\n-----Original Message-----\nFrom: Ada\nSent: Monday\nSubject: Plans\n\nHello there");
+        assert_eq!(quoted_tail(&outlook), Some(2));
+        let ruled = blocks("<p>Sounds good.</p><hr><p><b>From:</b> Ada<br><b>Sent:</b> Monday<br><b>Subject:</b> Plans</p><p>Hello there</p>");
+        assert_eq!(ruled[quoted_tail(&ruled).unwrap()].kind, Kind::Rule);
+    }
+
+    #[test]
+    fn answers_between_quotes_forwards_and_bare_quotes_stay_open() {
+        assert_eq!(quoted_tail(&plain_blocks("> Can you come?\nYes.\n> At ten?\nFine.")), None);
+        assert_eq!(quoted_tail(&plain_blocks("On Mon, Ada wrote:\n> Hello there")), None, "nothing above to read");
+        assert_eq!(quoted_tail(&plain_blocks("See below.\n\n---------- Forwarded message ---------\nFrom: Ada\nDate: Monday\n\nHello")), None);
+        assert_eq!(quoted_tail(&plain_blocks("Just text.\nFrom: the team")), None);
+    }
 
     #[test]
     fn paragraphs_in_a_quote_are_quoted_at_their_depth() {
