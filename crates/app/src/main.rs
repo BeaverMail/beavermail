@@ -2173,9 +2173,10 @@ impl BeaverApp {
         });
     }
 
-    /// Messages of the Inbox being shown that are held as suspicious.
+    /// Messages of the Inbox being shown that are held as suspicious. Counted from the messages listed,
+    /// not from the verdicts: a verdict outlives its message moved or deleted meanwhile.
     fn held(&self) -> usize {
-        self.screening.values().filter(|s| s.place == screen::Place::Spam).count()
+        self.messages.iter().filter(|m| self.screening.get(&m.id).is_some_and(|s| s.place == screen::Place::Spam)).count()
     }
 
     /// Checks the whole Inbox being shown again, after the setting or a mark was forgotten, or when
@@ -5623,8 +5624,14 @@ impl BeaverApp {
         // check (All inboxes, shown at start, checks every one). Checking every account in the background
         // during sync would keep them all current.
         let mut held_now: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
-        for (id, screened) in &self.screening {
-            if let Some(serial) = self.origin.get(id) {
+        // From the messages listed, as the list itself, so the count and the list never disagree; an
+        // Inbox checked here with nothing held any more counts zero, not its last count.
+        let checked: std::collections::HashSet<u64> = self.screening.keys().filter_map(|id| self.origin.get(id).copied()).collect();
+        for (serial, _) in self.shown().into_iter().filter(|(s, _)| self.holding() && checked.contains(s)) {
+            held_now.insert(serial, 0);
+        }
+        for m in &self.messages {
+            if let (Some(serial), Some(screened)) = (self.origin.get(&m.id), self.screening.get(&m.id)) {
                 *held_now.entry(*serial).or_default() += u32::from(screened.place == screen::Place::Spam);
             }
         }
