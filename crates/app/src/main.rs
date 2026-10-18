@@ -5290,6 +5290,12 @@ impl BeaverApp {
                                         ui.add(egui::Label::new(RichText::new(error).size(13.0).color(t.danger)).wrap());
                                     } else if let Some(why) = view.offline.as_ref().filter(|_| !self.work_offline) {
                                         ui.add(egui::Label::new(RichText::new(why).size(13.0).color(t.text_dim)).wrap());
+                                    } else if view.mailboxes.is_empty() && view.source.is_some() && !self.work_offline {
+                                        // The server's list has not come yet, and none is stored from before.
+                                        ui.horizontal(|ui| {
+                                            ui.add(egui::Spinner::new().size(12.0));
+                                            ui.label(RichText::new("Loading folders…").size(13.0).color(t.text_dim));
+                                        });
                                     }
                                     let mut order: Vec<usize> = (0..view.mailboxes.len()).collect();
                                     order.sort_by_key(|&i| (views::folder_rank(view.mailboxes[i].role), view.mailboxes[i].name.clone()));

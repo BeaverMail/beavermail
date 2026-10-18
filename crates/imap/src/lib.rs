@@ -169,7 +169,7 @@ impl ImapSource {
     /// Signs in and out on a connection of its own, touching nothing: whether the server, its TLS and
     /// the login work.
     pub async fn check(&self) -> Result<(), MailError> {
-        let mut session = tokio::time::timeout(2 * CONNECT_WAIT, connect(&self.config)).await.map_err(|_| MailError::Offline(format!("{} stopped answering", self.config.server.host)))??;
+        let mut session = connect_in_time(&self.config).await?;
         let _ = session.logout().await;
         Ok(())
     }
@@ -224,6 +224,13 @@ fn unreachable(host: &str, port: u16, e: &std::io::Error) -> MailError {
         _ if e.to_string().contains("lookup") => MailError::Offline(format!("{host} could not be found: check the server name, or the connection")),
         _ => MailError::Offline(format!("{host} could not be reached: {e}")),
     }
+}
+
+/// [`connect`], given up after a while: a server that accepts the connection and then stalls (in TLS,
+/// its greeting or the login) would otherwise hold the account's session, and every call waiting on
+/// it, for ever.
+async fn connect_in_time(c: &Config) -> Result<Session<Stream>, MailError> {
+    tokio::time::timeout(2 * CONNECT_WAIT, connect(c)).await.map_err(|_| MailError::Offline(format!("{} stopped answering", c.server.host)))?
 }
 
 async fn connect(c: &Config) -> Result<Session<Stream>, MailError> {
@@ -288,7 +295,7 @@ impl State {
             return Err(MailError::Offline("working offline".into()));
         }
         if self.session.is_none() {
-            self.session = Some(connect(config).await?);
+            self.session = Some(connect_in_time(config).await?);
         }
         Ok(self.session.as_mut().expect("just connected"))
     }
@@ -912,7 +919,7 @@ impl MailSource for ImapSource {
         use std::sync::atomic::Ordering::Relaxed;
         use std::time::Duration;
         // Its own connection: IDLE keeps one busy for as long as it runs.
-        let mut session = connect(&self.config).await?;
+        let mut session = connect_in_time(&self.config).await?;
         let idle_supported = session.capabilities().await.map_err(backend)?.has_str("IDLE");
         session.examine(mailbox).await.map_err(backend)?;
         // Some networks drop quiet connections after five minutes; IDLE is renewed before that.
