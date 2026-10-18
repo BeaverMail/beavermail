@@ -232,7 +232,7 @@ struct SidebarOutcome {
     suspicious: Option<(u64, usize)>,
     /// "Check all mail for spam" was chosen in this (account, Inbox index)'s menu.
     recheck: Option<(u64, usize)>,
-    /// "Empty Spam" was chosen in this (account, Spam folder index)'s menu.
+    /// "Empty Spam" or "Empty Trash" was chosen in this (account, folder index)'s menu.
     empty: Option<(u64, usize)>,
     removed: Option<u64>,
     edit: Option<u64>,
@@ -1086,7 +1086,7 @@ struct BeaverApp {
     picked: Vec<MessageId>,
     /// "Move all to Spam" was pressed in the suspicious view; waiting for the user to confirm.
     confirm_spam: bool,
-    /// The Spam folder (account, index) the user asked to empty, until they confirm.
+    /// The Spam or Trash folder (account, index) the user asked to empty, until they confirm.
     confirm_empty: Option<(u64, usize)>,
     /// Text of the search box; filters the loaded messages by sender and subject.
     query: String,
@@ -1247,7 +1247,8 @@ struct BeaverApp {
     show_suspicious: bool,
     /// How much mail each account (by serial) held as suspicious when its Inbox was last checked, so
     /// the count shows while another folder is open.
-    held_counts: std::collections::HashMap<u64, u32>,
+    /// (held, of which unread): the unread ones are taken off the Inbox's unread count.
+    held_counts: std::collections::HashMap<u64, (u32, u32)>,
     /// The spam checks are running over the Inbox being shown.
     checking: bool,
 }
@@ -5039,46 +5040,54 @@ impl BeaverApp {
 
     /// Erases the Spam folder (`serial`, `index`) on the server. Its messages are kept as spam
     /// examples first, so the checks do not forget what spam looks like.
-    fn empty_spam(&mut self, serial: u64, index: usize) {
+    fn empty_folder(&mut self, serial: u64, index: usize) {
         let Some(view) = self.view(serial) else { return };
-        let (Some(source), Some(folder)) = (view.source.clone(), view.mailboxes.get(index).map(|m| m.name.clone())) else { return };
+        let (Some(source), Some((folder, role))) = (view.source.clone(), view.mailboxes.get(index).map(|m| (m.name.clone(), m.role))) else { return };
         let account = view.account.key();
-        match self.archive.messages(&account, &folder) {
-            Ok(messages) => self.keep_examples(&account, &messages, true),
-            Err(e) => {
-                self.error = Some(format!("Could not read the Spam folder: {e}"));
-                return;
+        // What was in Spam stays an example of spam for the checks.
+        if role == Role::Junk {
+            match self.archive.messages(&account, &folder) {
+                Ok(messages) => self.keep_examples(&account, &messages, true),
+                Err(e) => {
+                    self.error = Some(format!("Could not read the Spam folder: {e}"));
+                    return;
+                }
             }
         }
         if self.selected == Some((serial, index)) {
             self.messages.clear();
         }
-        self.tabs.retain(|t| t.serial != serial || t.role != Role::Junk);
+        self.tabs.retain(|t| t.serial != serial || t.role != role);
         if let Some(mailbox) = self.accounts.iter_mut().find(|v| v.serial == serial).and_then(|v| v.mailboxes.get_mut(index)) {
             mailbox.total = 0;
             mailbox.unread = 0;
         }
-        self.spawn(async move { Event::Done(serial, index, None, source.empty(Role::Junk).await.map(drop)) });
+        self.spawn(async move { Event::Done(serial, index, None, source.empty(role).await.map(drop)) });
     }
 
-    /// Confirms emptying a Spam folder: nothing in it can be brought back afterwards.
+    /// Confirms emptying Spam or Trash: nothing in it can be brought back afterwards.
     fn empty_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
         let Some((serial, index)) = self.confirm_empty else { return };
+        let Some(name) = self.view(serial).and_then(|v| emptied(v.mailboxes.get(index)?.role)) else {
+            self.confirm_empty = None;
+            return;
+        };
         let count = self.view(serial).and_then(|v| Some(self.archive.messages(&v.account.key(), &v.mailboxes.get(index)?.name).ok()?.len())).unwrap_or(0);
         let (mut confirm, mut cancel) = (false, false);
         let modal = egui::Modal::new(egui::Id::new("confirm_empty")).show(ctx, |ui| {
             ui.set_width(FORM_WIDTH * 0.8);
-            ui.heading(format!("Delete {} message{} in Spam?", views::thousands(count as u32), if count == 1 { "" } else { "s" }));
-            ui.label(RichText::new("They will be erased from the server and cannot be recovered. The spam checks keep learning from them.").color(t.text_dim));
+            ui.heading(format!("Delete {} message{} in {name}?", views::thousands(count as u32), if count == 1 { "" } else { "s" }));
+            let learn = if name == "Spam" { " The spam checks keep learning from them." } else { "" };
+            ui.label(RichText::new(format!("They will be erased from the server and cannot be recovered.{learn}")).color(t.text_dim));
             ui.add_space(12.0);
             ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
-                let erase = egui::Button::new(RichText::new("Empty Spam").color(t.on_accent)).fill(t.danger);
+                let erase = egui::Button::new(RichText::new(format!("Empty {name}")).color(t.on_accent)).fill(t.danger);
                 confirm = ui.add_enabled(count > 0, erase).clicked();
                 cancel = ui.button("Cancel").clicked();
             });
         });
         if confirm {
-            self.empty_spam(serial, index);
+            self.empty_folder(serial, index);
         }
         if confirm || cancel || modal.should_close() {
             self.confirm_empty = None;
@@ -5623,20 +5632,25 @@ impl BeaverApp {
         // shortcut: only the Inboxes being shown have verdicts; the others keep the count of their last
         // check (All inboxes, shown at start, checks every one). Checking every account in the background
         // during sync would keep them all current.
-        let mut held_now: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+        let mut held_now: std::collections::HashMap<u64, (u32, u32)> = std::collections::HashMap::new();
         // From the messages listed, as the list itself, so the count and the list never disagree; an
         // Inbox checked here with nothing held any more counts zero, not its last count.
         let checked: std::collections::HashSet<u64> = self.screening.keys().filter_map(|id| self.origin.get(id).copied()).collect();
         for (serial, _) in self.shown().into_iter().filter(|(s, _)| self.holding() && checked.contains(s)) {
-            held_now.insert(serial, 0);
+            held_now.insert(serial, (0, 0));
         }
         for m in &self.messages {
             if let (Some(serial), Some(screened)) = (self.origin.get(&m.id), self.screening.get(&m.id)) {
-                *held_now.entry(*serial).or_default() += u32::from(screened.place == screen::Place::Spam);
+                let held = u32::from(screened.place == screen::Place::Spam);
+                let count = held_now.entry(*serial).or_default();
+                *count = (count.0 + held, count.1 + held * u32::from(m.unread));
             }
         }
         self.held_counts.extend(held_now);
         let held_of = self.held_counts.clone();
+        // The server counts held mail as unread in the Inbox; here it is counted under Suspicious instead.
+        let hold = self.settings.hold_suspicious;
+        let inbox_unread = |serial: u64, m: &Mailbox| if hold { m.unread.saturating_sub(held_of.get(&serial).map_or(0, |h| h.1)) } else { m.unread };
         let frame = egui::Frame::new().fill(t.bg).inner_margin(egui::Margin::same(12));
         egui::Panel::left("accounts").frame(frame).default_size(260.0).size_range(210.0..=340.0).show(ui, |ui| {
             let can_send = !self.senders().is_empty();
@@ -5651,10 +5665,10 @@ impl BeaverApp {
                 ui.with_layout(Layout::top_down(Align::Min), |ui| {
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                         if self.accounts.len() >= 2 {
-                            let unread = self.accounts.iter().filter_map(|v| v.mailboxes.iter().find(|m| m.role == Role::Inbox)).map(|m| m.unread).sum();
+                            let unread = self.accounts.iter().filter_map(|v| Some(inbox_unread(v.serial, v.mailboxes.iter().find(|m| m.role == Role::Inbox)?))).sum();
                             all = views::folder_row(ui, t, "All inboxes", Role::Inbox, unread, self.unified && !self.show_suspicious).on_hover_text("The Inbox of every account, newest first").clicked();
                             if self.settings.hold_suspicious {
-                                let held = self.accounts.iter().filter_map(|v| held_of.get(&v.serial)).sum();
+                                let held = self.accounts.iter().filter_map(|v| held_of.get(&v.serial)).map(|h| h.0).sum();
                                 let row = views::suspicious_row(ui, t, held, self.unified && self.show_suspicious);
                                 all_suspicious = row.on_hover_text("Mail from new senders that failed a check, every account's, held apart from the Inboxes").clicked();
                             }
@@ -5704,18 +5718,21 @@ impl BeaverApp {
                                         let here = self.selected == Some((view.serial, i));
                                         let holding = self.settings.hold_suspicious && mailbox.role == Role::Inbox;
                                         let tip = format!("{} message{}  ·  {} unread", views::thousands(mailbox.total), if mailbox.total == 1 { "" } else { "s" }, views::thousands(mailbox.unread));
-                                        let row = views::folder_row(ui, t, &title, mailbox.role, mailbox.unread, here && !(holding && self.show_suspicious)).on_hover_text(tip);
+                                        let unread = if mailbox.role == Role::Inbox { inbox_unread(view.serial, mailbox) } else { mailbox.unread };
+                                        let row = views::folder_row(ui, t, &title, mailbox.role, unread, here && !(holding && self.show_suspicious)).on_hover_text(tip);
                                         if row.clicked() {
                                             chosen = Some((view.serial, i));
                                         }
-                                        row.context_menu(|ui| folder_menu(ui, mailbox.role, self.settings.hold_suspicious, &mut recheck, &mut empty, (view.serial, i)));
+                                        // What emptying would erase: the messages listed here (worked out only when the menu is open).
+                                        let listed = || self.archive.messages(&view.account.key(), &mailbox.name).map_or(0, |m| m.len());
+                                        row.context_menu(|ui| folder_menu(ui, mailbox.role, (listed(), mailbox.total), self.settings.hold_suspicious, &mut recheck, &mut empty, (view.serial, i)));
                                         if holding {
-                                            let count = held_of.get(&view.serial).copied().unwrap_or(0);
+                                            let count = held_of.get(&view.serial).map_or(0, |h| h.0);
                                             let row = views::suspicious_row(ui, t, count, here && self.show_suspicious).on_hover_text("Mail from new senders that failed a check, held apart from the Inbox");
                                             if row.clicked() {
                                                 suspicious = Some((view.serial, i));
                                             }
-                                            row.context_menu(|ui| folder_menu(ui, mailbox.role, true, &mut recheck, &mut empty, (view.serial, i)));
+                                            row.context_menu(|ui| folder_menu(ui, mailbox.role, (0, mailbox.total), true, &mut recheck, &mut empty, (view.serial, i)));
                                         }
                                     }
                                 });
@@ -6546,9 +6563,27 @@ fn kept(verdicts: &std::collections::HashMap<MessageId, screen::Screened>) -> Ve
 
 /// The menu of a folder in the sidebar. Only the Inbox is checked for spam, so the check is offered
 /// there and explained elsewhere; the Spam folder can be emptied.
-fn folder_menu(ui: &mut egui::Ui, role: Role, holding: bool, recheck: &mut Option<(u64, usize)>, empty: &mut Option<(u64, usize)>, folder: (u64, usize)) {
-    if role == Role::Junk {
-        if ui.button("Empty Spam…").on_hover_text("Delete every message in Spam for good").clicked() {
+/// The name of a folder that can be emptied: Spam and Trash.
+fn emptied(role: Role) -> Option<&'static str> {
+    match role {
+        Role::Junk => Some("Spam"),
+        Role::Trash => Some("Trash"),
+        _ => None,
+    }
+}
+
+/// The right-click menu of a folder; `count`: how many of its messages are listed here, and how many
+/// the server says it holds.
+fn folder_menu(ui: &mut egui::Ui, role: Role, count: (usize, u32), holding: bool, recheck: &mut Option<(u64, usize)>, empty: &mut Option<(u64, usize)>, folder: (u64, usize)) {
+    if let Some(name) = emptied(role) {
+        // Only what is listed is erased, never mail the user has not seen.
+        let why = match count {
+            (0, 0) => format!("{name} is empty"),
+            (0, _) => format!("Open {name} first: only the messages listed there are erased"),
+            _ => String::new(),
+        };
+        let button = ui.add_enabled(why.is_empty(), egui::Button::new(format!("Empty {name}…")));
+        if button.on_hover_text(format!("Delete every message in {name} for good")).on_disabled_hover_text(why).clicked() {
             *empty = Some(folder);
             ui.close();
         }
