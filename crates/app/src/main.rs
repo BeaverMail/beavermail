@@ -59,6 +59,8 @@ enum Event {
     /// The Sent folder of the account shown, for the user's replies in its conversations: (account, folder index shown, messages).
     SentList(u64, usize, Result<Vec<MessageSummary>, MailError>),
     Body(u64, MessageId, Result<Box<Prepared>, MailError>),
+    /// The text of an open message of the conversation that is not in focus.
+    Unfolded(MessageId, Result<Box<Prepared>, MailError>),
     /// The text of a message to answer, read without opening it: (account, message, action, result).
     Answer(u64, MessageId, Action, Result<Box<MessageBody>, MailError>),
     /// The raw message asked for by View source.
@@ -342,6 +344,13 @@ fn find_bar(ui: &mut egui::Ui, t: &theme::Tokens, find: &mut Find, lines: &[Stri
     close
 }
 
+/// A message of the open conversation shown open beside the tab's own: its text, once read, or why
+/// it could not be.
+struct Unfolded {
+    id: MessageId,
+    body: Option<Result<OpenBody, String>>,
+}
+
 /// The open message's body, already reduced to blocks for both display modes.
 struct OpenBody {
     data: MessageBody,
@@ -399,16 +408,16 @@ struct ReaderOutcome {
     action: Option<(MessageId, Action)>,
     /// A link that was clicked, cleaned of tracking parameters.
     url: Option<String>,
-    /// A display mode picked for this message only.
-    mode: Option<DisplayMode>,
-    /// A display mode to remember for the sender of this message.
-    remember: Option<DisplayMode>,
-    /// An attachment to open or save: its position and what to do.
-    attachment: Option<(u32, views::ChipAction)>,
-    /// "Save all" or "Save selected" was pressed.
-    save_many: bool,
-    /// Remote content may always be loaded for the sender of this message.
-    allow_sender: Option<bool>,
+    /// A display mode picked for one message only.
+    mode: Option<(MessageId, DisplayMode)>,
+    /// A display mode to remember for a sender: (address, mode).
+    remember: Option<(String, DisplayMode)>,
+    /// An attachment of a message to open or save: its position and what to do.
+    attachment: Option<(MessageId, u32, views::ChipAction)>,
+    /// "Save all" or "Save selected" was pressed on this message.
+    save_many: Option<MessageId>,
+    /// Remote content may always (or never) be loaded for this sender: (address, allowed).
+    allow_sender: Option<(String, bool)>,
     /// The spam correction the user chose for the open message.
     mark: Option<Correction>,
     /// A command for all the messages picked in the list.
@@ -417,8 +426,10 @@ struct ReaderOutcome {
     unsubscribe: Option<(String, unsubscribe::Method)>,
     /// Block sender was pressed on this message.
     block: Option<MessageId>,
-    /// Another message of the conversation was chosen in the reader.
-    switch: Option<MessageId>,
+    /// A closed message of the conversation was opened.
+    unfold: Option<MessageId>,
+    /// An open message of the conversation was closed.
+    collapse: Option<MessageId>,
     /// "Show earlier" was pressed in the conversation.
     expand: bool,
     /// Trust was pressed for this message's sender.
@@ -427,8 +438,46 @@ struct ReaderOutcome {
     card: Option<(String, String)>,
     /// "Try again" on a message that could not be opened.
     retry: bool,
-    /// View source was pressed.
+    /// View source was chosen for this message.
+    source: Option<MessageId>,
+}
+
+/// What the user did on one open message of the reader.
+#[derive(Default)]
+struct Said {
+    answer: Option<Action>,
+    collapse: bool,
+    url: Option<String>,
+    attachment: Option<(u32, views::ChipAction)>,
+    save_many: bool,
+    mode: Option<DisplayMode>,
+    remember: Option<DisplayMode>,
+    allow_sender: Option<bool>,
+    unsubscribe: Option<(String, unsubscribe::Method)>,
+    card: Option<(String, String)>,
+    mark: Option<Correction>,
+    trust: bool,
     source: bool,
+}
+
+impl ReaderOutcome {
+    /// Adds what was done on open message `m`.
+    fn take(&mut self, m: &MessageSummary, said: Said) {
+        let id = m.id;
+        self.action = said.answer.map(|a| (id, a)).or(self.action.take());
+        self.collapse = said.collapse.then_some(id).or(self.collapse);
+        self.url = said.url.or(self.url.take());
+        self.attachment = said.attachment.map(|(index, what)| (id, index, what)).or(self.attachment);
+        self.save_many = said.save_many.then_some(id).or(self.save_many);
+        self.mode = said.mode.map(|mode| (id, mode)).or(self.mode);
+        self.remember = said.remember.map(|mode| (m.address.clone(), mode)).or(self.remember.take());
+        self.allow_sender = said.allow_sender.map(|allow| (m.address.clone(), allow)).or(self.allow_sender.take());
+        self.unsubscribe = said.unsubscribe.or(self.unsubscribe.take());
+        self.card = said.card.or(self.card.take());
+        self.mark = said.mark.or(self.mark);
+        self.trust = said.trust.then_some(id).or(self.trust);
+        self.source = said.source.then_some(id).or(self.source);
+    }
 }
 
 struct AccountView {
@@ -1149,6 +1198,11 @@ struct BeaverApp {
     conversations: threads::Conversations,
     /// The reader shows every message of the open conversation, not only the latest few.
     whole_conversation: bool,
+    /// Other messages of the open conversation shown open in the reader, beside the tab's own
+    /// (`message`), in the order they were opened.
+    unfolded: Vec<Unfolded>,
+    /// The tab's own message is closed in its conversation.
+    folded_anchor: bool,
     /// The message last asked for in the reader, so a load it no longer wants stops early.
     wanted: Arc<std::sync::atomic::AtomicU64>,
     /// A list row to bring into view after the keyboard moved to it.
@@ -1167,9 +1221,9 @@ struct BeaverApp {
     /// The user paused the background downloads.
     downloads_paused: bool,
     /// An attachment that runs code, waiting for the user to say yes to opening it.
-    confirm_open: Option<(u32, String)>,
+    confirm_open: Option<(MessageId, u32, String)>,
     /// Attachments ticked in the reader, to save together.
-    attach_selected: std::collections::BTreeSet<u32>,
+    attach_selected: std::collections::BTreeSet<(u64, u32)>,
     /// Where private copies of opened attachments go; emptied at start and exit.
     open_dir: std::path::PathBuf,
     /// Settings and prompt state for the stored-mail protection.
@@ -1181,7 +1235,7 @@ struct BeaverApp {
     /// An unlock or reset is running.
     unlocking: bool,
     /// Display mode chosen for the open message only; forgotten when another is opened.
-    view_mode: Option<DisplayMode>,
+    view_modes: std::collections::HashMap<MessageId, DisplayMode>,
     /// Open messages: the reading pane's and those in tabs; the one shown is `message`.
     tabs: Vec<tabs::Tab>,
     /// A message tab fills the window, rather than the mail (folders, list and reading pane).
@@ -1292,6 +1346,8 @@ impl BeaverApp {
             sent: Vec::new(),
             conversations: threads::Conversations::default(),
             whole_conversation: false,
+            unfolded: Vec::new(),
+            folded_anchor: false,
             list_view: (0.0, 0.0),
             confirm_forget_marks: false,
             trust_input: String::new(),
@@ -1306,7 +1362,7 @@ impl BeaverApp {
             vault_job: None,
             unlock_skipped: false,
             unlocking: false,
-            view_mode: None,
+            view_modes: std::collections::HashMap::new(),
             tabs: Vec::new(),
             in_tab: false,
             screening: std::collections::HashMap::new(),
@@ -1604,6 +1660,16 @@ impl BeaverApp {
         if self.active() != Some(at) || self.body.is_none() {
             self.activate(at);
         }
+        // Its unread messages and the latest open around it, read in a row.
+        if self.threaded() {
+            let members: Vec<MessageId> = self.conversations.members(id).iter().copied().filter(|m| self.summary_of(*m).is_some()).collect();
+            let last = members.last().copied();
+            for m in members {
+                if m != id && (Some(m) == last || self.summary_of(m).is_some_and(|s| s.unread)) {
+                    self.unfold(m);
+                }
+            }
+        }
         // Reading a conversation reads all of it, as its row shows it unread while any message is.
         let unread_here: Vec<MessageId> = self.conversation(id).into_iter().filter(|m| *m != id && self.summary_of(*m).is_some_and(|s| s.unread)).collect();
         if !judging && unread {
@@ -1612,6 +1678,48 @@ impl BeaverApp {
         if !judging {
             unread_here.into_iter().for_each(|m| self.act(m, Action::Unread(false)));
         }
+    }
+
+    /// Reads `message` of account `serial` and runs the checks on it, as a task to spawn; `None` when the
+    /// account is not connected.
+    fn read_message(&self, serial: u64, message: MessageSummary) -> Option<impl std::future::Future<Output = Result<Box<Prepared>, MailError>> + Send + 'static> {
+        let view = self.view(serial)?;
+        let (source, account) = (view.source.clone()?, view.account.clone());
+        let own: Vec<String> = self.accounts.iter().map(|v| v.account.address().to_owned()).collect();
+        let (archive, settings) = (self.archive.clone(), self.settings.clone());
+        Some(async move {
+            let body = source.body(message.id).await?;
+            // The checks load what the account knows and train the spam model: seconds on a big mailbox, never on the UI thread.
+            let prepared = tokio::task::spawn_blocking(move || {
+                let findings = screen::Known::load(&archive, &account, &own, &settings)
+                    .map(|known| screen::findings(&known, &message.from, &message.address, &body, &source.auth_server()))
+                    .unwrap_or_default();
+                Box::new(Prepared::new(body, findings))
+            });
+            prepared.await.map_err(|e| MailError::Backend(e.to_string()))
+        })
+    }
+
+    /// Opens message `id` of the open conversation in the reader, reading its text in the background.
+    fn unfold(&mut self, id: MessageId) {
+        if self.message == Some(id) {
+            self.folded_anchor = false;
+            return;
+        }
+        if self.unfolded.iter().any(|u| u.id == id) {
+            return;
+        }
+        let Some(read) = self.serial_of(id).zip(self.summary_of(id).cloned()).and_then(|(serial, m)| self.read_message(serial, m)) else { return };
+        self.unfolded.push(Unfolded { id, body: None });
+        self.spawn(async move { Event::Unfolded(id, read.await) });
+    }
+
+    /// The message an answer goes to: the latest of the conversation of `id`, as in every threaded client.
+    fn latest_of(&self, id: MessageId) -> MessageId {
+        if !self.threaded() {
+            return id;
+        }
+        self.conversations.members(id).iter().rev().copied().find(|m| self.summary_of(*m).is_some()).unwrap_or(id)
     }
 
     /// Shows tab `at` in the reader. Its message is loaded again: from this computer when stored, so
@@ -1631,20 +1739,21 @@ impl BeaverApp {
             return;
         }
         self.source_view = None;
-        let Some((view, source)) = self.view(serial).and_then(|v| Some((v, v.source.clone()?))) else {
+        let Some(read) = self.read_message(serial, tab.message.clone()) else {
             // Never a reader waiting for nothing: an account without a connection says so.
             (self.in_tab, self.message, self.body) = (pinned, Some(id), None);
             self.body_failed = Some((id, "Its account is not connected. Check its password in Settings.".into()));
             return;
         };
-        let (account, message) = (view.account.clone(), tab.message.clone());
-        let own: Vec<String> = self.accounts.iter().map(|v| v.account.address().to_owned()).collect();
-        let (archive, settings, wanted) = (self.archive.clone(), self.settings.clone(), self.wanted.clone());
-        self.in_tab = tab.pinned;
+        let wanted = self.wanted.clone();
+        self.in_tab = pinned;
         self.whole_conversation &= self.message.is_some_and(|m| self.conversations.same(m, id));
+        let conversations = &self.conversations;
+        self.unfolded.retain(|u| u.id != id && conversations.same(u.id, id));
         self.message = Some(id);
         self.body = None;
-        self.view_mode = None;
+        self.view_modes.retain(|m, _| conversations.same(*m, id));
+        self.folded_anchor = false;
         self.attach_selected.clear();
         wanted.store(id.0, std::sync::atomic::Ordering::Relaxed);
         self.spawn(async move {
@@ -1653,19 +1762,7 @@ impl BeaverApp {
             if wanted.load(std::sync::atomic::Ordering::Relaxed) != id.0 {
                 return Event::Body(serial, id, Err(MailError::NotFound)); // dropped: another message is shown now
             }
-            let body = match source.body(id).await {
-                Ok(body) => body,
-                Err(e) => return Event::Body(serial, id, Err(e)),
-            };
-            // The checks load what the account knows and train the spam model: seconds on a big mailbox, never on the UI thread.
-            let checker = source.clone();
-            let prepared = tokio::task::spawn_blocking(move || {
-                let findings = screen::Known::load(&archive, &account, &own, &settings)
-                    .map(|known| screen::findings(&known, &message.from, &message.address, &body, &checker.auth_server()))
-                    .unwrap_or_default();
-                Box::new(Prepared::new(body, findings))
-            });
-            Event::Body(serial, id, prepared.await.map_err(|e| MailError::Backend(e.to_string())))
+            Event::Body(serial, id, read.await)
         });
     }
 
@@ -2562,43 +2659,49 @@ impl BeaverApp {
     }
 
     /// What the user did to an attachment chip.
-    fn use_attachment(&mut self, index: u32, what: views::ChipAction) {
-        let name = self.body.as_ref().and_then(|b| b.data.attachments.iter().find(|a| a.index == index)).map(|a| a.name.clone());
+    /// The text of open message `id` of the reader: the one the tab is for, or another of its conversation.
+    fn body_of(&self, id: MessageId) -> Option<&OpenBody> {
+        if self.message == Some(id) {
+            return self.body.as_ref();
+        }
+        self.unfolded.iter().find(|u| u.id == id).and_then(|u| u.body.as_ref()?.as_ref().ok())
+    }
+
+    fn use_attachment(&mut self, id: MessageId, index: u32, what: views::ChipAction) {
+        let name = self.body_of(id).and_then(|b| b.data.attachments.iter().find(|a| a.index == index)).map(|a| a.name.clone());
         match what {
             views::ChipAction::Toggle => {
-                if !self.attach_selected.remove(&index) {
-                    self.attach_selected.insert(index);
+                if !self.attach_selected.remove(&(id.0, index)) {
+                    self.attach_selected.insert((id.0, index));
                 }
             }
-            views::ChipAction::SaveAs => self.save_attachments(vec![index]),
+            views::ChipAction::SaveAs => self.save_attachments(id, vec![index]),
             views::ChipAction::Open => {
                 if let Some(name) = name.filter(|n| attachments::is_risky(n)) {
-                    self.confirm_open = Some((index, name));
+                    self.confirm_open = Some((id, index, name));
                 } else {
-                    self.fetch_attachment(index);
+                    self.fetch_attachment(id, index);
                 }
             }
         }
     }
 
-    /// The ticked attachments, or all of them when none is ticked.
-    fn chosen_attachments(&self) -> Vec<u32> {
-        let all = self.body.iter().flat_map(|b| b.data.attachments.iter().map(|a| a.index));
-        if self.attach_selected.is_empty() { all.collect() } else { self.attach_selected.iter().copied().collect() }
+    /// The ticked attachments of message `id`, or all of them when none is ticked.
+    fn chosen_attachments(&self, id: MessageId) -> Vec<u32> {
+        let ticked: Vec<u32> = self.attach_selected.iter().filter(|(m, _)| *m == id.0).map(|(_, i)| *i).collect();
+        if ticked.is_empty() { self.body_of(id).iter().flat_map(|b| b.data.attachments.iter().map(|a| a.index)).collect() } else { ticked }
     }
 
-    fn fetch_attachment(&mut self, index: u32) {
-        let (Some(serial), Some(id)) = (self.open_tab().map(|t| t.serial), self.message) else { return };
-        let Some(source) = self.view(serial).and_then(|v| v.source.clone()) else { return };
+    fn fetch_attachment(&mut self, id: MessageId, index: u32) {
+        let Some(source) = self.serial_of(id).and_then(|s| self.view(s)?.source.clone()) else { return };
         self.spawn(async move { Event::Attachment(source.attachment(id, index).await) });
     }
 
     /// Asks where to save, then saves: one attachment into a file of the user's choosing, several into
     /// a folder (names that exist get a number, nothing is overwritten).
-    fn save_attachments(&mut self, indexes: Vec<u32>) {
-        let (Some(serial), Some(id)) = (self.open_tab().map(|t| t.serial), self.message) else { return };
-        let Some(source) = self.view(serial).and_then(|v| v.source.clone()) else { return };
-        let names: Vec<(u32, String)> = indexes.iter().filter_map(|i| self.body.as_ref()?.data.attachments.iter().find(|a| a.index == *i)).map(|a| (a.index, attachments::safe_name(&a.name))).collect();
+    fn save_attachments(&mut self, id: MessageId, indexes: Vec<u32>) {
+        let Some(source) = self.serial_of(id).and_then(|s| self.view(s)?.source.clone()) else { return };
+        let names: Vec<(u32, String)> = indexes.iter().filter_map(|i| self.body_of(id)?.data.attachments.iter().find(|a| a.index == *i)).map(|a| (a.index, attachments::safe_name(&a.name))).collect();
         let Some(first) = names.first().map(|(_, n)| n.clone()) else { return };
         self.spawn(async move {
             let one = names.len() == 1;
@@ -2623,7 +2726,7 @@ impl BeaverApp {
     }
 
     fn open_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
-        let Some((index, name)) = self.confirm_open.clone() else { return };
+        let Some((id, index, name)) = self.confirm_open.clone() else { return };
         let (mut open, mut cancel) = (false, false);
         let modal = egui::Modal::new(egui::Id::new("confirm_open")).show(ctx, |ui| {
             ui.set_width(FORM_WIDTH * 0.85);
@@ -2636,16 +2739,11 @@ impl BeaverApp {
             });
         });
         if open {
-            self.fetch_attachment(index);
+            self.fetch_attachment(id, index);
         }
         if open || cancel || modal.should_close() {
             self.confirm_open = None;
         }
-    }
-
-    /// The sender's address of the open message.
-    fn current_address(&self) -> Option<String> {
-        self.open_tab().map(|t| t.message.address.clone())
     }
 
     fn save_settings(&mut self) {
@@ -3245,8 +3343,7 @@ impl BeaverApp {
     }
 
     /// Opens the source of the open message in a tab of its own, or shows the one already open.
-    fn view_source(&mut self) {
-        let Some(id) = self.message else { return };
+    fn view_source(&mut self, id: MessageId) {
         let at = match self.tabs.iter().position(|t| t.source && t.message.id == id) {
             Some(at) => at,
             None => {
@@ -4344,7 +4441,7 @@ impl BeaverApp {
             Command::NewMessage => self.new_message(),
             Command::Reply | Command::ReplyAll | Command::Forward => {
                 if let Some(id) = self.message {
-                    self.request(id, answer(command));
+                    self.request(self.latest_of(id), answer(command));
                 }
             }
             Command::Archive => self.request_all(targets, Action::Archive),
@@ -4366,7 +4463,11 @@ impl BeaverApp {
                 }
             }
             Command::BlockSender => self.confirm_block = self.message,
-            Command::ViewSource => self.view_source(),
+            Command::ViewSource => {
+                if let Some(id) = self.message {
+                    self.view_source(id);
+                }
+            }
             Command::FindInSource => {
                 if let Some(view) = &mut self.source_view {
                     view.find.get_or_insert_with(Find::default).focus = true;
@@ -4675,6 +4776,11 @@ impl BeaverApp {
                         self.screening.clear();
                         self.error = Some(format!("The spam checks could not run, so the Inbox shows all mail: {e}"));
                     }
+                }
+            }
+            Event::Unfolded(id, result) => {
+                if let Some(unfolded) = self.unfolded.iter_mut().find(|u| u.id == id) {
+                    unfolded.body = Some(result.map(|p| OpenBody::new(*p)).map_err(|e| e.to_string()));
                 }
             }
             Event::Answer(serial, id, action, result) => match result {
@@ -5801,18 +5907,8 @@ impl BeaverApp {
             self.source_page(ui, t);
             return ReaderOutcome::default();
         }
-        let mut action = None;
-        let mut url = None;
-        let mut chosen_mode = None;
-        let mut remember = None;
-        let mut attachment = None;
-        let mut save_many = false;
-        let mut allow_sender = None;
-        let mut mark = None;
-        let mut suspicious = false;
-        let (mut leave, mut block, mut trust, mut card, mut retry, mut source) = (None, None, None, None, false, false);
+        let mut out = ReaderOutcome::default();
         let scroll = self.reader_scroll.take();
-        let (mut switch, mut expand) = (None, false);
         // The open message's conversation, oldest first, when the list shows conversations.
         let conversation: Vec<MessageSummary> = match self.message.filter(|_| self.threaded()) {
             Some(id) => self.conversations.members(id).iter().filter_map(|m| self.summary_of(*m).cloned()).collect(),
@@ -5820,35 +5916,35 @@ impl BeaverApp {
         };
         let whole = self.whole_conversation;
         let work_offline = self.work_offline;
-        // The correction that makes sense; the reasons are the warnings shown just above it.
+        // The correction that makes sense for the tab's message; the reasons are the warnings shown above it.
         let correction = self.message.and_then(|id| self.correction(id)).map(|(choice, _)| choice);
-        let (settings_mode, view_mode) = (self.settings.clone(), self.view_mode);
-        let selected_files = self.attach_selected.clone();
+        let (settings, view_modes, selected_files) = (self.settings.clone(), self.view_modes.clone(), self.attach_selected.clone());
         // The message in the reader is its tab's: it may come from another folder than the one shown.
         let open = self.open_tab().map(|t| (t.message.clone(), t.role, t.serial));
         let server_host = open.as_ref().and_then(|(_, _, serial)| self.view(*serial)?.source.as_ref()).map(|s| s.auth_server()).unwrap_or_default();
         let role = open.as_ref().map_or(Role::Other, |(_, role, _)| *role);
         let current = open.map(|(message, ..)| message);
+        let folded_anchor = self.folded_anchor;
         let frame = egui::Frame::new().fill(t.surface);
         let in_tab = self.in_tab;
         let picked = if in_tab { 0 } else { self.picked.len() };
         let picked_unread = self.picked.iter().any(|id| self.summary_of(*id).is_some_and(|m| m.unread));
         let folder_role = self.picked_role();
-        let mut bulk = None;
         let draw = |ui: &mut egui::Ui| {
             if picked >= 2 {
-                bulk = views::picked_panel(ui, t, picked, picked_unread, folder_role);
+                out.bulk = views::picked_panel(ui, t, picked, picked_unread, folder_role);
                 return;
             }
             let Some(message) = current else {
                 views::empty_state(ui, t, "No message selected", "Choose a message from the list to read it. Double-click to open it in a tab.", None);
                 return;
             };
+            // Answers go to the latest message of the conversation, as in every threaded client.
+            let latest = conversation.last().map_or(message.id, |m| m.id);
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 ui.add_space(12.0);
                 let archived = role == Role::Archive;
-                let loaded = self.body.is_some();
                 let ctx = ui.ctx().clone();
                 let answers = [
                     (Icon::Reply, Command::Reply, Action::Reply),
@@ -5856,8 +5952,8 @@ impl BeaverApp {
                     (Icon::Forward, Command::Forward, Action::Forward),
                 ];
                 for (icon, command, what) in answers {
-                    if icons::button(ui, t, icon, &command.tip(&ctx), loaded, false).clicked() {
-                        action = Some((message.id, what));
+                    if icons::button(ui, t, icon, &command.tip(&ctx), true, false).clicked() {
+                        out.action = Some((latest, what));
                     }
                 }
                 ui.add_space(8.0);
@@ -5875,7 +5971,7 @@ impl BeaverApp {
                 for (icon, tip, what, enabled) in tools {
                     let tip = if !enabled { "Already in the archive" } else { tip.as_str() };
                     if icons::button(ui, t, icon, tip, enabled, false).clicked() {
-                        action = Some((message.id, what));
+                        out.action = Some((message.id, what));
                     }
                 }
                 // In Sent and Drafts the sender is the user.
@@ -5886,215 +5982,275 @@ impl BeaverApp {
                     _ => "Your own mail",
                 };
                 if icons::button(ui, t, Icon::Ban, tip, blockable, false).clicked() {
-                    block = Some(message.id);
+                    out.block = Some(message.id);
                 }
-                source = icons::button(ui, t, Icon::FileCode, &Command::ViewSource.tip(&ctx), true, false).clicked();
             });
             ui.add_space(6.0);
             ui.separator();
-            match &mut self.body {
-                None => match self.body_failed.as_ref().filter(|(failed, _)| *failed == message.id) {
-                    Some((_, why)) => {
-                        if views::empty_state(ui, t, "This message could not be opened", why, Some("Try again")) {
-                            retry = true;
-                        }
-                    }
+            let Some(body) = &mut self.body else {
+                match self.body_failed.as_ref().filter(|(failed, _)| *failed == message.id) {
+                    Some((_, why)) => out.retry = views::empty_state(ui, t, "This message could not be opened", why, Some("Try again")),
                     None => {
                         ui.centered_and_justified(|ui| ui.spinner());
                     }
-                },
-                Some(body) => {
-                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                        if let Some(scroll) = scroll {
-                            let page = (ui.clip_rect().height() - 48.0).max(48.0);
-                            // A positive delta moves the text down, that is, scrolls up; the area stops at its ends.
-                            ui.scroll_with_delta(vec2(0.0, match scroll {
-                                Scroll::Lines(n) => -48.0 * n,
-                                Scroll::Pages(n) => -page * n,
-                                Scroll::Edge(end) => if end { -1e7 } else { 1e7 },
-                            }));
-                        }
-                        // A margin, not `ui.horizontal`: horizontal layouts do not wrap text, so a long
-                        // line would widen the whole panel.
-                        egui::Frame::new().inner_margin(egui::Margin::symmetric(28, 0)).show(ui, |ui| {
-                            ui.set_max_width(ui.available_width().min(720.0));
-                            ui.add_space(20.0);
-                            ui.heading(&message.subject);
-                            ui.add_space(12.0);
-                            if conversation.len() > 1 {
-                                // The latest few, so a long conversation does not push the message out of sight.
-                                let hidden = if whole || conversation.len() <= 6 { 0 } else { conversation.len() - 5 };
-                                ui.horizontal(|ui| {
-                                    ui.label(RichText::new(format!("{} messages in this conversation", conversation.len())).size(13.0).color(t.text_dim));
-                                    if hidden > 0 && ui.button(format!("Show {hidden} earlier")).clicked() {
-                                        expand = true;
-                                    }
-                                });
-                                ui.add_space(2.0);
-                                ui.spacing_mut().item_spacing.y = 2.0;
-                                for m in conversation.iter().skip(hidden) {
-                                    if views::thread_row(ui, t, m, m.id == message.id).clicked() && m.id != message.id {
-                                        switch = Some(m.id);
-                                    }
-                                }
-                                ui.spacing_mut().item_spacing.y = 8.0;
-                                ui.add_space(14.0);
-                            }
-                            let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), views::AVATAR), egui::Sense::hover());
-                            views::avatar(ui, t, &message.from, rect.left_center() + vec2(views::AVATAR / 2.0, 0.0), views::AVATAR);
-                            let authenticity = sender::authenticity(&body.data.auth, &server_host, &message.address);
-                            suspicious = body.findings.iter().any(|f| f.level == screen::Level::Danger);
-                            // Never for spam: leaving a list it sends only tells the spammer the address is read.
-                            let way = unsubscribe::method(&body.data.unsubscribe, body.data.one_click, authenticity == sender::Authenticity::Verified)
-                                .filter(|_| role != Role::Junk && !suspicious && !work_offline);
-                            let mut text_right = rect.right();
-                            if let Some(way) = way {
-                                ui.scope_builder(egui::UiBuilder::new().max_rect(rect).layout(Layout::right_to_left(Align::Center)), |ui| {
-                                    let tip = match &way {
-                                        unsubscribe::Method::OneClick(_) => format!("Ask {} to stop sending this mail", way.host()),
-                                        unsubscribe::Method::Mail(..) => format!("Write the email {} asks for to unsubscribe", way.host()),
-                                        unsubscribe::Method::Page(_) => format!("Open the unsubscribe page of {}", way.host()),
-                                    };
-                                    let button = ui.button("Unsubscribe").on_hover_text(tip);
-                                    text_right = button.rect.left() - 12.0;
-                                    if button.clicked() {
-                                        leave = Some((message.from.clone(), way));
-                                    }
-                                });
-                            }
-                            let left = rect.left() + views::AVATAR + 12.0;
-                            let detail = if message.address.is_empty() || message.address == message.from { message.received.clone() } else { format!("{}  ·  {}", message.address, message.received) };
-                            let name = views::truncated(ui, &message.from, egui::FontId::proportional(15.5), t.text, text_right - left);
-                            let date = views::truncated(ui, &detail, egui::FontId::proportional(13.0), t.text_dim, text_right - left);
-                            // The name and the avatar open the sender's card.
-                            let who = egui::Rect::from_min_size(pos2(rect.left(), rect.top()), vec2(left - rect.left() + name.size().x, views::AVATAR));
-                            let open = ui.interact(who, ui.id().with("sender_card"), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Open their card: name, notes, your conversations");
-                            if open.clicked() {
-                                card = Some((message.address.clone(), message.from.clone()));
-                            }
-                            ui.painter().galley(pos2(left, rect.top() + 3.0), name, t.text);
-                            ui.painter().galley(pos2(left, rect.top() + 23.0), date, t.text_dim);
-                            ui.add_space(4.0);
-                            for finding in &body.findings {
-                                let color = if finding.level == screen::Level::Danger { t.danger } else { t.text_dim };
-                                views::note(ui, Icon::Spam, color, &finding.text, "");
-                            }
-                            // One line when all is well (the details on hover); each problem on a line of its own.
-                            for (text, tip, tone) in views::security_notes(body.data.encryption.as_ref(), body.data.signature.as_ref()) {
-                                let (icon, color) = match tone {
-                                    views::Tone::Good => (Icon::Lock, t.accent),
-                                    views::Tone::Quiet => (Icon::Lock, t.text_dim),
-                                    views::Tone::Warning => (Icon::Spam, t.danger),
-                                };
-                                views::note(ui, icon, color, &text, &tip);
-                            }
-                            // In every view, though only the original could load them: the user sees who tracks.
-                            if let Some(line) = views::trackers_line(&body.trackers) {
-                                views::note(ui, Icon::Ban, t.text_dim, &line, "Images that only tell the sender you opened this message. They are never loaded, even when you load the others.");
-                            }
-                            // What the server found: a fact next to the findings, not a reassurance ("paypa1.com"
-                            // verifies too), so in the quiet colour whatever it says.
-                            if let Some((line, tip)) = sender::checks_line(&body.data.auth, &server_host, &message.address) {
-                                let icon = if authenticity == sender::Authenticity::Verified { Icon::ShieldCheck } else { Icon::Shield };
-                                views::note(ui, icon, t.text_dim, &line, &tip);
-                            }
-                            if let Some(choice) = correction {
-                                let key = screen::sender_key(&message.address);
-                                let who = key.trim_start_matches('@');
-                                let (text, held, button, tip) = match choice {
-                                    Correction::NotSpam => ("Held apart from the Inbox as suspicious.".to_owned(), true, "Not spam", format!("Show mail from {who} in the Inbox from now on")),
-                                    // New means never written to, not never heard from: a newsletter can stay "new" for years.
-                                    Correction::Spam => (format!("You have never written to {}.", if key.starts_with('@') { format!("anyone at {who}") } else { who.to_owned() }), false, "Spam", format!("Move mail from {who} to the Spam folder, now and from now on")),
-                                    Correction::OutOfSpam => ("In the Spam folder.".to_owned(), true, "Not spam", format!("Move it back to the Inbox, and keep mail from {who} there from now on")),
-                                };
-                                ui.add_space(10.0);
-                                // A new sender in the Inbox can be trusted from here, before anything goes wrong.
-                                let trust_tip = format!("Mail from {who} always reaches the Inbox, unless your server says it is forged");
-                                let offer = (choice == Correction::Spam).then_some(trust_tip.as_str());
-                                match views::mark_bar(ui, t, &text, held, button, &tip, offer) {
-                                    Some(views::Mark::Correct) => mark = Some(choice),
-                                    Some(views::Mark::Trust) => trust = Some(message.id),
-                                    None => {}
-                                }
-                            }
-                            if !body.data.to.is_empty() {
-                                ui.add_space(6.0);
-                                ui.add(egui::Label::new(RichText::new(format!("To: {}", body.data.to.join(", "))).size(13.0).color(t.text_dim)).truncate());
-                            }
-                            if !body.data.attachments.is_empty() {
-                                ui.add_space(10.0);
-                                let many = body.data.attachments.len() > 1;
-                                ui.horizontal(|ui| {
-                                    ui.label(RichText::new(format!("{} attachment{}", body.data.attachments.len(), if many { "s" } else { "" })).size(13.0).color(t.text_dim));
-                                    if many {
-                                        let label = if selected_files.is_empty() { "Save all…".to_owned() } else { format!("Save selected ({})…", selected_files.len()) };
-                                        if ui.button(label).clicked() {
-                                            save_many = true;
-                                        }
-                                    }
-                                });
-                                ui.add_space(2.0);
-                                ui.horizontal_wrapped(|ui| {
-                                    for file in &body.data.attachments {
-                                        if let Some(what) = views::attachment_chip(ui, t, file, many.then(|| selected_files.contains(&file.index))) {
-                                            attachment = Some((file.index, what));
-                                        }
-                                    }
-                                });
-                            }
-                            let stored = settings_mode.mode_for(&message.address);
-                            let mode = view_mode.unwrap_or(stored);
-                            if body.simplified.is_some() {
-                                ui.add_space(10.0);
-                                ui.horizontal(|ui| {
-                                    ui.label(RichText::new("Show as").size(13.0).color(t.text_dim));
-                                    for (label, value) in [("Text", DisplayMode::Plain), ("Simplified", DisplayMode::Simplified), ("Original", DisplayMode::Original)] {
-                                        if ui.selectable_label(mode == value, label).clicked() {
-                                            chosen_mode = Some(value);
-                                        }
-                                    }
-                                    if mode != stored && !message.address.is_empty() && ui.button("Always for this sender").clicked() {
-                                        remember = Some(mode);
-                                    }
-                                });
-                            }
-                            ui.add_space(16.0);
-                            ui.separator();
-                            ui.add_space(16.0);
-                            if let (Some(source), DisplayMode::Original) = (&body.data.html, mode) {
-                                let (width, scale) = (ui.available_width(), ui.ctx().pixels_per_point());
-                                // A permission given to a sender never applies to a message that fails the server's checks.
-                                // Working offline nothing is fetched, whatever was allowed.
-                                let remote = !work_offline && (body.remote || (settings_mode.allows_remote(&message.address) && !suspicious));
-                                if !body.original.as_ref().is_some_and(|p| p.fits(width, scale, remote)) {
-                                    body.original = original::Page::new(ui.ctx(), source, width, scale, remote, &body.trackers);
-                                }
-                                if body.has_remote {
-                                    match views::remote_bar(ui, t, remote, if suspicious { "" } else { &message.address }) {
-                                        Some(views::Remote::Once) => body.remote = true,
-                                        Some(views::Remote::Always) => allow_sender = Some(true),
-                                        Some(views::Remote::Block) => {
-                                            body.remote = false;
-                                            allow_sender = Some(false);
-                                        }
-                                        None => {}
-                                    }
-                                    ui.add_space(8.0);
-                                }
-                                if let Some(page) = &mut body.original {
-                                    url = page.show(ui);
-                                }
-                            } else {
-                                let (blocks, fold) = match (&body.simplified, mode) {
-                                    (Some(simplified), DisplayMode::Simplified) => (simplified, body.folds.1),
-                                    _ => (&body.plain, body.folds.0),
-                                };
-                                url = views::reply_body(ui, t, blocks, fold, &mut body.quoted);
-                            }
-                            ui.add_space(28.0);
-                        });
-                    });
                 }
+                return;
+            };
+            // One open message: who wrote it, what deserves a look, its attachments and its text. Every
+            // open message of a conversation is drawn alike; `foldable`: its header closes it.
+            let section = |ui: &mut egui::Ui, m: &MessageSummary, body: &mut OpenBody, anchor: bool, foldable: bool| -> Said {
+                let mut said = Said::default();
+                egui::Frame::new().stroke(egui::Stroke::new(1.0, t.border)).corner_radius(egui::CornerRadius::same(10)).inner_margin(egui::Margin::same(16)).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    let sense = if foldable { egui::Sense::click() } else { egui::Sense::hover() };
+                    let (rect, header) = ui.allocate_exact_size(vec2(ui.available_width(), views::AVATAR), sense);
+                    views::avatar(ui, t, &m.from, rect.left_center() + vec2(views::AVATAR / 2.0, 0.0), views::AVATAR);
+                    let authenticity = sender::authenticity(&body.data.auth, &server_host, &m.address);
+                    let suspicious = body.findings.iter().any(|f| f.level == screen::Level::Danger);
+                    // Never for spam: leaving a list it sends only tells the spammer the address is read.
+                    let way = unsubscribe::method(&body.data.unsubscribe, body.data.one_click, authenticity == sender::Authenticity::Verified)
+                        .filter(|_| role != Role::Junk && !suspicious && !work_offline);
+                    let mut text_right = rect.right();
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(rect).layout(Layout::right_to_left(Align::Center)), |ui| {
+                        let more = icons::button(ui, t, Icon::Ellipsis, "More: Reply all, Forward, View source", true, false);
+                        egui::Popup::menu(&more).show(|ui| {
+                            for (label, what) in [("Reply all", Action::ReplyAll), ("Forward", Action::Forward)] {
+                                if ui.button(label).clicked() {
+                                    said.answer = Some(what);
+                                }
+                            }
+                            if ui.button("View source").clicked() {
+                                said.source = true;
+                            }
+                        });
+                        if icons::button(ui, t, Icon::Reply, "Reply to this message", true, false).clicked() {
+                            said.answer = Some(Action::Reply);
+                        }
+                        text_right = ui.min_rect().left() - 12.0;
+                        if let Some(way) = way {
+                            let tip = match &way {
+                                unsubscribe::Method::OneClick(_) => format!("Ask {} to stop sending this mail", way.host()),
+                                unsubscribe::Method::Mail(..) => format!("Write the email {} asks for to unsubscribe", way.host()),
+                                unsubscribe::Method::Page(_) => format!("Open the unsubscribe page of {}", way.host()),
+                            };
+                            let button = ui.button("Unsubscribe").on_hover_text(tip);
+                            text_right = button.rect.left() - 12.0;
+                            if button.clicked() {
+                                said.unsubscribe = Some((m.from.clone(), way));
+                            }
+                        }
+                    });
+                    let left = rect.left() + views::AVATAR + 12.0;
+                    let detail = if m.address.is_empty() || m.address == m.from { m.received.clone() } else { format!("{}  ·  {}", m.address, m.received) };
+                    let name = views::truncated(ui, &m.from, egui::FontId::proportional(15.5), t.text, text_right - left);
+                    let date = views::truncated(ui, &detail, egui::FontId::proportional(13.0), t.text_dim, text_right - left);
+                    // The name and the avatar open the sender's card; the rest of the header closes the message.
+                    let who = egui::Rect::from_min_size(rect.min, vec2(left - rect.left() + name.size().x, views::AVATAR));
+                    let open = ui.interact(who, ui.id().with(("sender_card", m.id.0)), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Open their card: name, notes, your conversations");
+                    if open.clicked() {
+                        said.card = Some((m.address.clone(), m.from.clone()));
+                    }
+                    if foldable && header.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        said.collapse = true;
+                    }
+                    ui.painter().galley(pos2(left, rect.top() + 3.0), name, t.text);
+                    ui.painter().galley(pos2(left, rect.top() + 23.0), date, t.text_dim);
+                    ui.add_space(4.0);
+                    for finding in &body.findings {
+                        let color = if finding.level == screen::Level::Danger { t.danger } else { t.text_dim };
+                        views::note(ui, Icon::Spam, color, &finding.text, "");
+                    }
+                    // One line when all is well (the details on hover); each problem on a line of its own.
+                    for (text, tip, tone) in views::security_notes(body.data.encryption.as_ref(), body.data.signature.as_ref()) {
+                        let (icon, color) = match tone {
+                            views::Tone::Good => (Icon::Lock, t.accent),
+                            views::Tone::Quiet => (Icon::Lock, t.text_dim),
+                            views::Tone::Warning => (Icon::Spam, t.danger),
+                        };
+                        views::note(ui, icon, color, &text, &tip);
+                    }
+                    // In every view, though only the original could load them: the user sees who tracks.
+                    if let Some(line) = views::trackers_line(&body.trackers) {
+                        views::note(ui, Icon::Ban, t.text_dim, &line, "Images that only tell the sender you opened this message. They are never loaded, even when you load the others.");
+                    }
+                    // What the server found: a fact next to the findings, not a reassurance ("paypa1.com"
+                    // verifies too), so in the quiet colour whatever it says.
+                    if let Some((line, tip)) = sender::checks_line(&body.data.auth, &server_host, &m.address) {
+                        let icon = if authenticity == sender::Authenticity::Verified { Icon::ShieldCheck } else { Icon::Shield };
+                        views::note(ui, icon, t.text_dim, &line, &tip);
+                    }
+                    if let Some(choice) = correction.filter(|_| anchor) {
+                        let key = screen::sender_key(&m.address);
+                        let who = key.trim_start_matches('@');
+                        let (text, held, button, tip) = match choice {
+                            Correction::NotSpam => ("Held apart from the Inbox as suspicious.".to_owned(), true, "Not spam", format!("Show mail from {who} in the Inbox from now on")),
+                            // New means never written to, not never heard from: a newsletter can stay "new" for years.
+                            Correction::Spam => (format!("You have never written to {}.", if key.starts_with('@') { format!("anyone at {who}") } else { who.to_owned() }), false, "Spam", format!("Move mail from {who} to the Spam folder, now and from now on")),
+                            Correction::OutOfSpam => ("In the Spam folder.".to_owned(), true, "Not spam", format!("Move it back to the Inbox, and keep mail from {who} there from now on")),
+                        };
+                        ui.add_space(10.0);
+                        // A new sender in the Inbox can be trusted from here, before anything goes wrong.
+                        let trust_tip = format!("Mail from {who} always reaches the Inbox, unless your server says it is forged");
+                        let offer = (choice == Correction::Spam).then_some(trust_tip.as_str());
+                        match views::mark_bar(ui, t, &text, held, button, &tip, offer) {
+                            Some(views::Mark::Correct) => said.mark = Some(choice),
+                            Some(views::Mark::Trust) => said.trust = true,
+                            None => {}
+                        }
+                    }
+                    if !body.data.to.is_empty() {
+                        ui.add_space(6.0);
+                        ui.add(egui::Label::new(RichText::new(format!("To: {}", body.data.to.join(", "))).size(13.0).color(t.text_dim)).truncate());
+                    }
+                    if !body.data.attachments.is_empty() {
+                        ui.add_space(10.0);
+                        let many = body.data.attachments.len() > 1;
+                        let ticked = selected_files.iter().filter(|(id, _)| *id == m.id.0).count();
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("{} attachment{}", body.data.attachments.len(), if many { "s" } else { "" })).size(13.0).color(t.text_dim));
+                            if many {
+                                let label = if ticked == 0 { "Save all…".to_owned() } else { format!("Save selected ({ticked})…") };
+                                said.save_many = ui.button(label).clicked();
+                            }
+                        });
+                        ui.add_space(2.0);
+                        ui.horizontal_wrapped(|ui| {
+                            for file in &body.data.attachments {
+                                if let Some(what) = views::attachment_chip(ui, t, file, many.then(|| selected_files.contains(&(m.id.0, file.index)))) {
+                                    said.attachment = Some((file.index, what));
+                                }
+                            }
+                        });
+                    }
+                    let stored = settings.mode_for(&m.address);
+                    let mode = view_modes.get(&m.id).copied().unwrap_or(stored);
+                    if body.simplified.is_some() {
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Show as").size(13.0).color(t.text_dim));
+                            for (label, value) in [("Text", DisplayMode::Plain), ("Simplified", DisplayMode::Simplified), ("Original", DisplayMode::Original)] {
+                                if ui.selectable_label(mode == value, label).clicked() {
+                                    said.mode = Some(value);
+                                }
+                            }
+                            if mode != stored && !m.address.is_empty() && ui.button("Always for this sender").clicked() {
+                                said.remember = Some(mode);
+                            }
+                        });
+                    }
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.add_space(12.0);
+                    if let (Some(source), DisplayMode::Original) = (&body.data.html, mode) {
+                        let (width, scale) = (ui.available_width(), ui.ctx().pixels_per_point());
+                        // A permission given to a sender never applies to a message that fails the server's checks.
+                        // Working offline nothing is fetched, whatever was allowed.
+                        let remote = !work_offline && (body.remote || (settings.allows_remote(&m.address) && !suspicious));
+                        if !body.original.as_ref().is_some_and(|p| p.fits(width, scale, remote)) {
+                            body.original = original::Page::new(ui.ctx(), source, width, scale, remote, &body.trackers);
+                        }
+                        if body.has_remote {
+                            match views::remote_bar(ui, t, remote, if suspicious { "" } else { &m.address }) {
+                                Some(views::Remote::Once) => body.remote = true,
+                                Some(views::Remote::Always) => said.allow_sender = Some(true),
+                                Some(views::Remote::Block) => {
+                                    body.remote = false;
+                                    said.allow_sender = Some(false);
+                                }
+                                None => {}
+                            }
+                            ui.add_space(8.0);
+                        }
+                        if let Some(page) = &mut body.original {
+                            said.url = page.show(ui);
+                        }
+                    } else {
+                        let (blocks, fold) = match (&body.simplified, mode) {
+                            (Some(simplified), DisplayMode::Simplified) => (simplified, body.folds.1),
+                            _ => (&body.plain, body.folds.0),
+                        };
+                        said.url = views::reply_body(ui, t, blocks, fold, &mut body.quoted);
+                    }
+                });
+                said
+            };
+            let mut heard: Vec<(MessageSummary, Said)> = Vec::new();
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                if let Some(scroll) = scroll {
+                    let page = (ui.clip_rect().height() - 48.0).max(48.0);
+                    // A positive delta moves the text down, that is, scrolls up; the area stops at its ends.
+                    ui.scroll_with_delta(vec2(0.0, match scroll {
+                        Scroll::Lines(n) => -48.0 * n,
+                        Scroll::Pages(n) => -page * n,
+                        Scroll::Edge(end) => if end { -1e7 } else { 1e7 },
+                    }));
+                }
+                // A margin, not `ui.horizontal`: horizontal layouts do not wrap text, so a long
+                // line would widen the whole panel.
+                egui::Frame::new().inner_margin(egui::Margin::symmetric(28, 0)).show(ui, |ui| {
+                    ui.set_max_width(ui.available_width().min(760.0));
+                    ui.add_space(20.0);
+                    ui.heading(&message.subject);
+                    ui.add_space(12.0);
+                    if conversation.len() > 1 {
+                        let open: Vec<MessageId> = (!folded_anchor).then_some(message.id).into_iter().chain(self.unfolded.iter().map(|u| u.id)).collect();
+                        // The latest few closed ones, so a long conversation does not push the open ones out of sight.
+                        let shown_from = if whole || conversation.len() <= 6 { 0 } else { conversation.len() - 5 };
+                        let hidden = conversation[..shown_from].iter().filter(|m| !open.contains(&m.id)).count();
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("{} messages in this conversation", conversation.len())).size(13.0).color(t.text_dim));
+                            if hidden > 0 && ui.button(format!("Show {hidden} earlier")).clicked() {
+                                out.expand = true;
+                            }
+                        });
+                        ui.add_space(8.0);
+                        for (i, m) in conversation.iter().enumerate() {
+                            if m.id == message.id && !folded_anchor {
+                                heard.push((m.clone(), section(ui, m, body, true, true)));
+                                ui.add_space(10.0);
+                            } else if let Some(unfolded) = self.unfolded.iter_mut().find(|u| u.id == m.id) {
+                                match &mut unfolded.body {
+                                    Some(Ok(other)) => heard.push((m.clone(), section(ui, m, other, false, true))),
+                                    // Still being read, or not readable: its row, with a word on why.
+                                    state => {
+                                        if views::thread_row(ui, t, m, false).on_hover_text("Close it").clicked() {
+                                            heard.push((m.clone(), Said { collapse: true, ..Said::default() }));
+                                        }
+                                        match state {
+                                            Some(Err(why)) => {
+                                                ui.label(RichText::new(format!("It could not be opened: {why}")).size(13.0).color(t.danger));
+                                            }
+                                            _ => {
+                                                ui.add(egui::Spinner::new().size(14.0));
+                                            }
+                                        }
+                                    }
+                                }
+                                ui.add_space(10.0);
+                            } else if i >= shown_from {
+                                if views::thread_row(ui, t, m, false).on_hover_text("Open it").clicked() {
+                                    out.unfold = Some(m.id);
+                                }
+                                ui.add_space(2.0);
+                            }
+                        }
+                    } else {
+                        heard.push((message.clone(), section(ui, &message, body, true, false)));
+                    }
+                    // As at the end of a conversation in every threaded client: answer its latest message.
+                    ui.add_space(16.0);
+                    ui.horizontal(|ui| {
+                        for (icon, label, what) in [(Icon::Reply, "Reply", Action::Reply), (Icon::ReplyAll, "Reply all", Action::ReplyAll), (Icon::Forward, "Forward", Action::Forward)] {
+                            if ui.add(egui::Button::image_and_text(icon.image(icons::SIZE, t.text), label)).clicked() {
+                                out.action = Some((latest, what));
+                            }
+                        }
+                    });
+                    ui.add_space(28.0);
+                });
+            });
+            for (m, said) in heard {
+                out.take(&m, said);
             }
         };
         // A message tab has the window to itself; otherwise the reader is the pane on the right.
@@ -6106,7 +6262,7 @@ impl BeaverApp {
                 pane_ring(ui, t, reader.response.rect);
             }
         }
-        ReaderOutcome { action, url, mode: chosen_mode, remember, attachment, save_many, allow_sender, mark, bulk, unsubscribe: leave, block, switch, expand, trust, card, retry, source }
+        out
     }
 }
 
@@ -6229,7 +6385,7 @@ impl eframe::App for BeaverApp {
         self.handle_keys(ui.ctx());
         // Without the reading pane only a message tab has a reader.
         let shows_reader = !contacts && (self.in_tab || self.settings.reading_pane);
-        let ReaderOutcome { action, url, mode, remember, attachment, save_many, allow_sender, mark, bulk, unsubscribe, block, switch, expand, trust, card, retry, source } =
+        let ReaderOutcome { action, url, mode, remember, attachment, save_many, allow_sender, mark, bulk, unsubscribe, block, unfold, collapse, expand, trust, card, retry, source } =
             if shows_reader { self.reader(ui, &t) } else { ReaderOutcome::default() };
         if retry && let Some(at) = self.active() {
             self.activate(at);
@@ -6241,15 +6397,15 @@ impl eframe::App for BeaverApp {
             self.trust(id);
         }
         self.whole_conversation |= expand;
-        // Another message of the conversation takes the place of the one shown, in the pane or its tab.
-        if let Some(id) = switch
-            && let Some(at) = self.active()
-            && let Some(message) = self.summary_of(id).cloned()
-        {
-            let role = if self.sent.iter().any(|m| m.id == id) { Role::Sent } else { self.role() };
-            let (serial, pinned) = (self.serial_of(id).unwrap_or(self.tabs[at].serial), self.tabs[at].pinned);
-            self.tabs[at] = tabs::Tab { serial, message, role, pinned, source: false };
-            self.activate(at);
+        if let Some(id) = unfold {
+            self.unfold(id);
+        }
+        if let Some(id) = collapse {
+            if self.message == Some(id) {
+                self.folded_anchor = true;
+            } else {
+                self.unfolded.retain(|u| u.id != id);
+            }
         }
         match unsubscribe {
             // The compose window is the question: nothing goes out until Send.
@@ -6261,8 +6417,8 @@ impl eframe::App for BeaverApp {
             None => {}
         }
         self.confirm_block = block.or(self.confirm_block);
-        if source {
-            self.view_source();
+        if let Some(id) = source {
+            self.view_source(id);
         }
         if let Some(action) = bulk {
             self.request_all(self.targets(), action);
@@ -6270,25 +6426,25 @@ impl eframe::App for BeaverApp {
         if let (Some(choice), Some(id)) = (mark, self.message) {
             self.correct(id, choice);
         }
-        if let Some((index, what)) = attachment {
-            self.use_attachment(index, what);
+        if let Some((id, index, what)) = attachment {
+            self.use_attachment(id, index, what);
         }
-        if save_many {
-            self.save_attachments(self.chosen_attachments());
+        if let Some(id) = save_many {
+            self.save_attachments(id, self.chosen_attachments(id));
         }
         if let Some(url) = url {
             ui.ctx().open_url(egui::OpenUrl::new_tab(url));
         }
-        if mode.is_some() {
-            self.view_mode = mode;
+        if let Some((id, mode)) = mode {
+            self.view_modes.insert(id, mode);
         }
-        if let (Some(allow), Some(address)) = (allow_sender, self.current_address()) {
+        if let Some((address, allow)) = allow_sender {
             self.settings.set_remote(&address, allow);
             self.save_settings();
         }
-        if let (Some(mode), Some(address)) = (remember, self.current_address()) {
+        if let Some((address, mode)) = remember {
             self.settings.set_sender_mode(&address, mode);
-            self.view_mode = None;
+            self.view_modes.clear();
             self.save_settings();
         }
         let (opened, add_from_list) = if self.in_tab || contacts { (None, false) } else { self.message_list(ui, &t) };

@@ -28,7 +28,7 @@ Licensed under AGPL-3.0-only (see [LICENSE](LICENSE)).
 - Unsubscribe from mailing lists (one-click for verified senders, else an email or the sender's page) and block a sender.
 - Contact cards (click a sender): name, notes, your latest conversations; saved contacts in their own section, from the rail at the window's left edge, synced with CardDAV address books (Fastmail, Nextcloud, iCloud…) added there, each shown on its own or all together; every field and the photo edited; only contacts you add to one go to the server.
 - Markdown compose, addresses as chips (a wrong one in red) with suggestions from everyone you wrote to, Cc and Bcc on demand (Bcc kept in your Sent copy only), drafts kept locally and on the server, attachments; undo send (configurable), send later, signatures per account.
-- Conversations: one row per thread (References, In-Reply-To, "Re:" subjects) with your replies from Sent; can be turned off.
+- Conversations: one row per thread (References, In-Reply-To, "Re:" subjects) with your replies from Sent, read in a row with several messages open and quoted text folded; can be turned off.
 - Messages open in tabs (double click); the reading pane beside the list can be turned off, and then every message opens in a tab.
 
 Keys (Ctrl+K lists every command with its key, and goes to any folder): Up/Down, Page Up/Down, Home/End, F6 (list or reader; in the reader the same keys and Space scroll), Enter, E, Delete, U, `!` (spam), C or Ctrl+N (new), R, A, F, `/`, Ctrl+U (source, Ctrl+F finds in it), Ctrl+W, Ctrl+Tab; in a new message Esc or Ctrl+Shift+D discards.
