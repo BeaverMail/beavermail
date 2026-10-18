@@ -371,7 +371,7 @@ pub fn findings(known: &Known, name: &str, address: &str, body: &MessageBody, se
         if let Some(host) = links.iter().map(|(_, url)| html::host(url)).find(|h| h.parse::<std::net::IpAddr>().is_ok() || h.starts_with('[')) {
             add(Level::Danger, format!("A link opens {host}, a bare network address instead of a site"));
         }
-        if let Some(host) = links.iter().map(|(_, url)| html::host(url)).find(|h| !h.is_ascii() || h.split('.').any(|l| l.starts_with("xn--"))) {
+        if let Some(host) = links.iter().map(|(_, url)| html::host(url)).find(|h| sender::disguised(h)) {
             add(Level::Danger, format!("A link opens {host}, written with look-alike characters"));
         }
         // A page uploaded to a storage or hosting service: free, anonymous, and on a reputable domain
@@ -494,25 +494,25 @@ fn bare(entry: &str) -> String {
     entry.rsplit_once('<').map_or(entry, |(_, a)| a.trim_end_matches('>')).trim().to_lowercase()
 }
 
-/// Two different domains that a reader would take for the same: one character apart, or equal once
-/// look-alike letters are folded ("rn" for "m", "1" for "l"). Short domains are left alone: too many
-/// real ones are one letter apart.
+/// Two different domains that a reader would take for one: written alike once look-alike characters
+/// are folded (see [`sender::skeleton`]) or one character apart, the same name under another suffix
+/// ("acme-corp.net"), or the name with a word added ("acme-corp-billing.com"). Subdomains are left out:
+/// "mail.acme-c0rp.com" is "acme-c0rp.com". Short domains are left to the name rules, too many real
+/// ones being one letter apart; two public mailboxes ("yahoo.it", "yahoo.com") are not compared by name.
 fn looks_like(known: &str, other: &str) -> bool {
-    known != other && known.len().min(other.len()) >= 6 && (skeleton(known) == skeleton(other) || one_edit(known, other))
-}
-
-fn skeleton(domain: &str) -> String {
-    domain
-        .replace("rn", "m")
-        .replace("vv", "w")
-        .replace("cl", "d")
-        .chars()
-        .map(|c| match c {
-            '0' => 'o',
-            '1' | 'i' | '|' => 'l',
-            c => c,
-        })
-        .collect()
+    let known = sender::registrable(known);
+    if known.is_empty() || sender::registrable(other) == known {
+        return false;
+    }
+    // As many labels of the other as the known one has: "bank.co.ukk" for "bank.co.uk".
+    let labels: Vec<&str> = other.split('.').collect();
+    let tail = labels[labels.len().saturating_sub(known.split('.').count())..].join(".");
+    let (k, t) = (sender::skeleton(&known), sender::skeleton(&tail));
+    if known.chars().count().min(tail.chars().count()) >= 6 && (k == t || one_edit(&k, &t)) {
+        return true;
+    }
+    let (name, theirs) = (sender::skeleton(&organisation_label(&known)), sender::skeleton(&organisation_label(other)));
+    name.chars().count() >= 4 && !(sender::public_mail(&known) && sender::public_mail(other)) && format!("-{theirs}-").contains(&format!("-{name}-"))
 }
 
 /// One character added, removed, changed, or two neighbours swapped.
@@ -755,11 +755,35 @@ mod tests {
     }
 
     #[test]
-    fn domains_one_slip_apart_look_alike_but_short_or_distant_ones_do_not() {
-        for (a, b) in [("paypal.com", "paypa1.com"), ("example.org", "exarnple.org"), ("acme-corp.com", "acme-crop.com"), ("bank.co.uk", "bank.co.ukk"), ("acme-corp.com", "acmecorp.com")] {
+    fn look_alike_domains_are_caught_but_short_distant_or_own_ones_are_not() {
+        for (a, b) in [
+            ("paypal.com", "paypa1.com"),
+            ("example.org", "exarnple.org"),
+            ("acme-corp.com", "acme-crop.com"),
+            ("bank.co.uk", "bank.co.ukk"),
+            ("acme-corp.com", "acmecorp.com"),
+            ("acme-corp.com", "mail.acme-c0rp.com"),
+            ("acme-corp.com", "acme-corp.net"),
+            ("acme-corp.com", "acme-corp.co.uk"),
+            ("acme-corp.com", "acme-corp-billing.com"),
+            ("acme-corp.com", "secure-acme-corp.com"),
+            ("mail.acme-corp.com", "acme-c0rp.com"),
+            ("paypal.com", "pаypal.com"),
+            ("paypal.com", "xn--pypal-4ve.com"),
+            ("apple.com", "аррӏе.com"),
+            ("gmail.com", "gmail-support.com"),
+        ] {
             assert!(looks_like(a, b), "{a} {b}");
         }
-        for (a, b) in [("gmx.de", "gmx.at"), ("x.org", "y.org"), ("google.com", "github.com"), ("same.com", "same.com")] {
+        for (a, b) in [
+            ("gmx.de", "gmx.at"),
+            ("x.org", "y.org"),
+            ("google.com", "github.com"),
+            ("same.com", "same.com"),
+            ("acme-corp.com", "mail.acme-corp.com"),
+            ("yahoo.com", "yahoo.it"),
+            ("acme.com", "acmeplumbing.com"),
+        ] {
             assert!(!looks_like(a, b), "{a} {b}");
         }
     }

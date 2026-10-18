@@ -70,6 +70,25 @@ pub fn public_mail(domain: &str) -> bool {
     PROVIDERS.contains(&name.split('.').next().unwrap_or(""))
 }
 
+/// A domain as people read it: punycode ("xn--…") decoded.
+pub fn readable(domain: &str) -> String {
+    idna::domain_to_unicode(domain).0
+}
+
+/// What a reader takes a domain for: look-alike characters folded into one (the Unicode UTS #39
+/// skeleton), so "paypa1.com", "pаypal.com" with a Cyrillic "а" and "xn--pypal-4ve.com" all read as
+/// "paypal.com", and "rn" reads as "m".
+pub fn skeleton(domain: &str) -> String {
+    unicode_security::skeleton(&readable(domain).to_lowercase()).collect::<String>().to_lowercase()
+}
+
+/// A domain written to pass for a Latin one: a label that mixes scripts, or whose every character
+/// reads as a Latin letter. A domain in its own script ("münchen.de", "日本.jp") is not.
+pub fn disguised(domain: &str) -> bool {
+    use unicode_security::MixedScript;
+    readable(domain).split('.').any(|label| !label.is_ascii() && (!label.is_single_script() || unicode_security::skeleton(label).all(|c| c.is_ascii())))
+}
+
 /// The part of the address after the last `@`, lower case; empty when there is none.
 pub fn domain(address: &str) -> String {
     address.rsplit_once('@').map_or(String::new(), |(_, d)| d.trim().trim_end_matches('>').to_lowercase())
@@ -81,7 +100,7 @@ pub fn warning(name: &str, address: &str) -> Option<&'static str> {
     if real.is_empty() {
         return None;
     }
-    if real.split('.').any(|label| label.starts_with("xn--")) || !real.is_ascii() {
+    if disguised(&real) {
         return Some("The sender's domain is written with look-alike characters");
     }
     let claimed = name.split(|c: char| c.is_whitespace() || "<>()[]\",;:".contains(c)).filter_map(claimed_domain).find(|d| !same_site(d, &real));
@@ -148,6 +167,10 @@ mod tests {
     fn look_alike_domains_are_flagged() {
         assert!(warning("Bank", "x@xn--pypal-4ve.com").is_some());
         assert!(warning("Bank", "x@pаypal.com").is_some(), "Cyrillic а");
+        assert!(warning("Apple", "x@аррӏе.com").is_some(), "every letter Cyrillic");
+        assert!(warning("Stadt", "x@münchen.de").is_none(), "a name in its own script");
+        assert!(warning("Stadt", "x@xn--mnchen-3ya.de").is_none());
+        assert!(warning("日本", "x@日本.jp").is_none());
     }
 
     fn checks(server: &str, list: &[(&str, &str, &str)]) -> Vec<AuthResult> {

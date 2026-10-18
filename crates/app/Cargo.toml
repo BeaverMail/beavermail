@@ -40,6 +40,10 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Contact photos: read, and made small for the card; already in the tree through the HTML renderer.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+# Domains as people read them, for the look-alike checks: punycode decoded (already in the tree through
+# url) and look-alike characters folded by Unicode's confusables (UTS #39).
+idna = "1"
+unicode-security = "0.1"
 
 # Windows draws through Direct3D (wgpu), which a machine without a graphics driver still has in
 # software; its OpenGL is 1.1, too old for the OpenGL renderer the other systems use.
