@@ -17,8 +17,12 @@
 //! file's own relative path are authenticated, so a file cannot be swapped for another or
 //! silently modified. Plain files are only accepted while a mode change is in progress.
 //!
-//! Failures never fall back to plain text: a vault whose key cannot be opened fails or stays
-//! locked. Turning encryption off is an explicit choice.
+//! A **recovery key** is one more slot: 256 random bits shown to the user once, as a code, that
+//! opens the same data key when the other slot is lost (a reinstall without the credential store, a
+//! forgotten passphrase). Rewrapping keeps it; a new data key (turning encryption on) drops it.
+//!
+//! Failures never fall back to plain text: a vault whose key cannot be opened stays locked until
+//! its passphrase or recovery key is given. Turning encryption off is an explicit choice.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -144,7 +148,7 @@ struct KeysFile {
 /// One way to unlock the data key.
 #[derive(Serialize, Deserialize, Clone)]
 struct Slot {
-    /// "credential-store" or "passphrase".
+    /// "credential-store", "passphrase" or "recovery".
     kind: String,
     id: String,
     /// Hex of nonce followed by the data key sealed with this slot's key.
@@ -243,9 +247,11 @@ impl Vault {
         match std::fs::read_to_string(&path) {
             Ok(text) => {
                 let file: KeysFile = serde_json::from_str(&text).map_err(err)?;
+                // A system key the credential store no longer has (a reinstall, another computer)
+                // leaves the vault locked, for its recovery key; never readable without one.
                 let key = match file.mode {
                     Mode::Off | Mode::Passphrase => None,
-                    Mode::System => Some(vault.unlock_system(&file)?),
+                    Mode::System => vault.unlock_system(&file).ok(),
                 };
                 *vault.write_state() = State { mode: file.mode, key, rewriting: file.rewriting };
             }
@@ -280,10 +286,56 @@ impl Vault {
         self.read_state().mode
     }
 
-    /// A passphrase vault that has not been unlocked yet: nothing can be read or written.
+    /// An encrypted vault whose key is not open: a passphrase vault not unlocked yet, or a system one
+    /// whose key the credential store lost. Nothing can be read or written.
     pub fn is_locked(&self) -> bool {
         let state = self.read_state();
-        state.mode == Mode::Passphrase && state.key.is_none()
+        state.mode != Mode::Off && state.key.is_none()
+    }
+
+    /// A recovery key can open this vault.
+    pub fn has_recovery(&self) -> bool {
+        self.read_keys().is_ok_and(|f| f.slots.iter().any(|s| s.kind == "recovery"))
+    }
+
+    /// Makes a new recovery key for the data key, replacing any earlier one, and returns it as the
+    /// code to show the user (the only time it exists outside the key file, wrapped).
+    pub fn add_recovery(&self) -> Result<String, MailError> {
+        let key = self.read_state().key.clone().ok_or_else(|| MailError::Auth(LOCKED.into()))?;
+        let code = random_key();
+        let mut file = self.read_keys()?;
+        file.slots.retain(|s| s.kind != "recovery");
+        file.slots.push(Slot { kind: "recovery".into(), id: new_id(), wrapped: wrap(&code, &key)?, salt: String::new(), kdf: None });
+        self.persist(&file)?;
+        Ok(recovery_code(&code))
+    }
+
+    /// Forgets the recovery key: the code shown before no longer opens anything.
+    pub fn remove_recovery(&self) -> Result<(), MailError> {
+        let mut file = self.read_keys()?;
+        file.slots.retain(|s| s.kind != "recovery");
+        self.persist(&file)
+    }
+
+    /// Opens a locked vault with its recovery key, then keeps it open with a new key in the
+    /// credential store (a forgotten passphrase is not asked again; a new one can be set later). A
+    /// wrong code is [`MailError::Auth`].
+    pub fn recover(&self, code: &str) -> Result<(), MailError> {
+        let file = self.read_keys()?;
+        let slot = file.slots.iter().find(|s| s.kind == "recovery").ok_or_else(|| MailError::Auth("this archive has no recovery key".into()))?;
+        let code = parse_recovery(code).ok_or_else(|| MailError::Auth("that is not a recovery key".into()))?;
+        let key = unwrap_key(&code, &slot.wrapped).map_err(|_| MailError::Auth("wrong recovery key".into()))?;
+        let lost: Vec<String> = file.slots.iter().filter(|s| s.kind == "credential-store").map(|s| s.id.clone()).collect();
+        let (_, mut fresh) = self.new_system_slot(&key)?;
+        fresh.slots.push(slot.clone());
+        fresh.rewriting = file.rewriting;
+        self.persist(&fresh)?;
+        for id in lost {
+            let _ = self.credentials.remove(&id); // entries that may be gone already
+        }
+        let mut state = self.write_state();
+        (state.mode, state.key) = (Mode::System, Some(key));
+        Ok(())
     }
 
     /// Opens a passphrase vault. A wrong passphrase is [`MailError::Auth`].
@@ -539,7 +591,7 @@ impl Vault {
             }
             (Mode::System, Mode::Passphrase) | (Mode::Passphrase, Mode::Passphrase) => {
                 let key = current_key.ok_or_else(|| MailError::Auth(LOCKED.into()))?;
-                let file = KeysFile { version: 1, mode: Mode::Passphrase, rewriting: false, slots: vec![passphrase_for(&key)?] };
+                let file = KeysFile { version: 1, mode: Mode::Passphrase, rewriting: false, slots: [vec![passphrase_for(&key)?], self.recovery_slots()].concat() };
                 self.persist(&file)?;
                 self.write_state().mode = Mode::Passphrase;
                 for id in old_system {
@@ -549,12 +601,18 @@ impl Vault {
             }
             (Mode::Passphrase, Mode::System) => {
                 let key = current_key.ok_or_else(|| MailError::Auth(LOCKED.into()))?;
-                let (_, file) = self.new_system_slot(&key)?;
+                let (_, mut file) = self.new_system_slot(&key)?;
+                file.slots.extend(self.recovery_slots());
                 self.persist(&file)?;
                 self.write_state().mode = Mode::System;
                 Ok(())
             }
         }
+    }
+
+    /// The recovery slot, kept when the data key is rewrapped for another mode.
+    fn recovery_slots(&self) -> Vec<Slot> {
+        self.read_keys().map(|f| f.slots.into_iter().filter(|s| s.kind == "recovery").collect()).unwrap_or_default()
     }
 
     fn finish_rewrite(&self) -> Result<(), MailError> {
@@ -581,6 +639,51 @@ impl Vault {
         *self.write_state() = State { mode: Mode::System, key: Some(key), rewriting: false };
         Ok(())
     }
+}
+
+/// Crockford's base32: no I, L, O or U, so nothing is misread when copied by hand.
+const BASE32: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+/// A recovery key as the user writes it down: 52 characters of base32 in groups of four.
+fn recovery_code(key: &[u8; 32]) -> String {
+    let mut bits: u64 = 0;
+    let (mut have, mut chars) = (0, String::new());
+    for byte in key {
+        bits = (bits << 8) | u64::from(*byte);
+        have += 8;
+        while have >= 5 {
+            have -= 5;
+            chars.push(char::from(BASE32[((bits >> have) & 31) as usize]));
+        }
+    }
+    if have > 0 {
+        chars.push(char::from(BASE32[((bits << (5 - have)) & 31) as usize]));
+    }
+    chars.as_bytes().chunks(4).map(|c| String::from_utf8_lossy(c).into_owned()).collect::<Vec<_>>().join("-")
+}
+
+/// The key a recovery code stands for, however it was typed: any case, with or without separators,
+/// O for 0 and I or L for 1. `None` when it is not one.
+fn parse_recovery(code: &str) -> Option<Zeroizing<[u8; 32]>> {
+    let (mut bits, mut have, mut out) = (0u64, 0, Zeroizing::new(Vec::with_capacity(33)));
+    let mut count = 0;
+    for c in code.chars().filter(|c| c.is_ascii_alphanumeric()) {
+        let c = match c.to_ascii_uppercase() {
+            'O' => '0',
+            'I' | 'L' => '1',
+            c => c,
+        };
+        let value = BASE32.iter().position(|b| char::from(*b) == c)? as u64;
+        bits = (bits << 5) | value;
+        have += 5;
+        count += 1;
+        if have >= 8 {
+            have -= 8;
+            out.push((bits >> have) as u8);
+        }
+    }
+    let key: [u8; 32] = out.get(..32)?.try_into().ok()?;
+    (count == 52).then(|| Zeroizing::new(key))
 }
 
 fn encrypt(key: &[u8; 32], path: &Path, data: &[u8]) -> Result<Vec<u8>, MailError> {
@@ -757,7 +860,9 @@ mod tests {
         open(&dir, &store).write(&path, b"kept").unwrap();
         assert_eq!(open(&dir, &store).read(&path).unwrap().as_deref(), Some(&b"kept"[..]));
         // Without the slot key in the credential store nothing opens, and nothing falls back to plain text.
-        assert!(Vault::open(&dir, Box::new(MemoryStore::default())).is_err());
+        let lost = Vault::open(&dir, Box::new(MemoryStore::default())).unwrap();
+        assert!(lost.is_locked());
+        assert!(lost.read(&path).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -923,6 +1028,64 @@ mod tests {
         assert_eq!(vault.read(&good).unwrap().as_deref(), Some(&b"fine"[..]));
         assert_eq!(vault.read(&bad).unwrap(), None, "it will be downloaded again");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_recovery_key_opens_the_mail_when_the_system_key_is_lost() {
+        let dir = temp_dir("recover-system");
+        let path = message_path("a", "INBOX", 1, 1);
+        let vault = open(&dir, &Shared::default());
+        vault.write(&path, b"kept").unwrap();
+        assert!(!vault.has_recovery());
+        let code = vault.add_recovery().unwrap();
+        assert_eq!(code.len(), 52 + 12, "13 groups of four");
+        assert!(vault.has_recovery());
+        // A reinstall: the credential store is empty.
+        let store = Shared::default();
+        let lost = open(&dir, &store);
+        assert!(lost.is_locked());
+        assert!(matches!(lost.recover("0000-0000"), Err(MailError::Auth(_))));
+        let wrong = recovery_code(&random_key());
+        assert!(matches!(lost.recover(&wrong), Err(MailError::Auth(_))));
+        lost.recover(&code.to_lowercase().replace('-', " ")).unwrap();
+        assert_eq!(lost.read(&path).unwrap().as_deref(), Some(&b"kept"[..]));
+        // Kept by the new system key from now on, and the same code still works.
+        assert!(!open(&dir, &store).is_locked());
+        assert!(open(&dir, &store).has_recovery());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_recovery_key_outlives_a_new_passphrase_and_replaces_a_forgotten_one() {
+        let dir = temp_dir("recover-passphrase");
+        let path = message_path("a", "INBOX", 1, 1);
+        let store = Shared::default();
+        let vault = open(&dir, &store);
+        vault.write(&path, b"kept").unwrap();
+        let code = vault.add_recovery().unwrap();
+        vault.set_mode(Mode::Passphrase, Some("correct horse battery"), NOP).unwrap();
+        vault.set_mode(Mode::Passphrase, Some("another passphrase"), NOP).unwrap();
+        let locked = open(&dir, &store);
+        assert!(locked.is_locked());
+        locked.recover(&code).unwrap();
+        assert_eq!(locked.mode(), Mode::System, "the forgotten passphrase is not asked again");
+        assert_eq!(open(&dir, &store).read(&path).unwrap().as_deref(), Some(&b"kept"[..]));
+        // Removed, the code opens nothing any more.
+        let vault = open(&dir, &store);
+        vault.remove_recovery().unwrap();
+        assert!(!open(&dir, &Shared::default()).recover(&code).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_recovery_code_reads_back_as_its_key() {
+        let key = random_key();
+        let code = recovery_code(&key);
+        assert!(code.chars().all(|c| c == '-' || BASE32.contains(&(c as u8))));
+        assert_eq!(*parse_recovery(&code).unwrap(), *key);
+        assert_eq!(*parse_recovery(&code.replace('0', "o").replace('1', "l")).unwrap(), *key);
+        assert!(parse_recovery(&code[..code.len() - 1]).is_none());
+        assert!(parse_recovery(&format!("{code}A")).is_none());
     }
 
     #[test]

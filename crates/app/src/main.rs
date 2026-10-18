@@ -129,6 +129,7 @@ enum VaultOutcome {
     Applied(Mode, Result<(), MailError>),
     Unlocked(Result<(), MailError>),
     Reset(Result<(), MailError>),
+    Recovered(Result<(), MailError>),
 }
 
 #[derive(Clone, Copy)]
@@ -2778,6 +2779,21 @@ impl BeaverApp {
                     ctx.request_repaint();
                 });
             }
+            security::Request::Recover(code) => {
+                self.unlocking = true;
+                self.runtime.spawn_blocking(move || {
+                    let _ = tx.send(Event::Vault(VaultOutcome::Recovered(vault.recover(&code).and_then(|()| archive.unlock(vault.derived_key("index").as_deref())))));
+                    ctx.request_repaint();
+                });
+            }
+            security::Request::CreateRecovery => match self.vault.add_recovery() {
+                Ok(code) => self.security.show_code(code),
+                Err(e) => self.error = Some(format!("Could not make a recovery key: {e}")),
+            },
+            security::Request::RemoveRecovery => match self.vault.remove_recovery() {
+                Ok(()) => self.notice = Some(("Recovery key removed".into(), std::time::Instant::now())),
+                Err(e) => self.error = Some(format!("Could not remove the recovery key: {e}")),
+            },
             security::Request::Reset => {
                 self.unlocking = true;
                 self.runtime.spawn_blocking(move || {
@@ -2786,6 +2802,15 @@ impl BeaverApp {
                 });
             }
         }
+    }
+
+    /// Saves a recovery key just made to a text file the user picks.
+    fn save_recovery(&mut self, code: String) {
+        self.spawn(async move {
+            let Some(file) = rfd::AsyncFileDialog::new().set_title("Save recovery key").set_file_name("BeaverMail recovery key.txt").save_file().await else { return Event::Saved(Ok(None)) };
+            let text = format!("BeaverMail recovery key\n\n{code}\n\nIt opens the mail stored by BeaverMail on your computer if its key or your passphrase is lost.\n");
+            Event::Saved(std::fs::write(file.path(), text).map(|()| Some(format!("Saved to {}", file.path().display()))).map_err(|e| format!("{}: {e}", file.path().display())))
+        });
     }
 
     fn apply_vault(&mut self, outcome: VaultOutcome) {
@@ -2810,6 +2835,13 @@ impl BeaverApp {
             VaultOutcome::Unlocked(Ok(())) => self.security.clear_unlock(),
             VaultOutcome::Unlocked(Err(MailError::Auth(_))) => self.security.unlock_error = Some("That passphrase does not open the stored mail.".into()),
             VaultOutcome::Unlocked(Err(e)) => self.security.unlock_error = Some(e.to_string()),
+            VaultOutcome::Recovered(Ok(())) => {
+                self.security.clear_unlock();
+                self.security.mode = None;
+                self.notice = Some(("Stored mail is open again, unlocked by this computer from now on".into(), std::time::Instant::now()));
+            }
+            VaultOutcome::Recovered(Err(MailError::Auth(_))) => self.security.unlock_error = Some("That recovery key does not open the stored mail. Check it and try again.".into()),
+            VaultOutcome::Recovered(Err(e)) => self.security.unlock_error = Some(e.to_string()),
             VaultOutcome::Reset(Ok(())) => {
                 self.security.clear_unlock();
                 self.security.mode = None;
@@ -3105,7 +3137,7 @@ impl BeaverApp {
                                 key_action = encryption::page(ui, t, &key_ids);
                             }
                             SettingsPage::Storage => {
-                                vault_request = security::section(ui, t, &mut self.security, mode, locked, job.as_deref());
+                                vault_request = security::section(ui, t, &mut self.security, mode, locked, self.vault.has_recovery(), job.as_deref());
                                 if locked && ui.button("Unlock…").clicked() {
                                     unlock_again = true;
                                 }
@@ -6481,8 +6513,11 @@ impl eframe::App for BeaverApp {
         self.palette_window(ui.ctx(), &t);
         self.toast(ui.ctx(), &t);
         self.block_dialog(ui.ctx(), &t);
+        if let Some(code) = security::recovery_dialog(ui.ctx(), &t, &mut self.security) {
+            self.save_recovery(code);
+        }
         if self.locked()
-            && let Some(request) = security::unlock_prompt(ui.ctx(), &t, &mut self.security, self.unlocking)
+            && let Some(request) = security::unlock_prompt(ui.ctx(), &t, &mut self.security, self.unlocking, self.vault.mode(), self.vault.has_recovery())
         {
             self.run_vault(request, ui.ctx());
         }
