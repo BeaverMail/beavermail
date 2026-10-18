@@ -223,6 +223,24 @@ pub struct Account {
     pub smtp_user: Option<String>,
 }
 
+/// An address book synced over CardDAV: a source of its own, apart from the mail accounts (contacts
+/// may live on another server than mail, or with no mail account at all).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddressBook {
+    /// As the server names it ("Personal", "Contacts").
+    pub name: String,
+    /// The address book's own URL (a collection).
+    pub url: String,
+    pub user: String,
+    /// Contacts added in BeaverMail go to this one.
+    #[serde(default)]
+    pub default: bool,
+    /// The server makes it and lets nobody write to it (people recently written to, its users):
+    /// read, never written, never the default.
+    #[serde(default)]
+    pub read_only: bool,
+}
+
 /// "Ada Lovelace <ada@x.org>" as an item of an address list: the name quoted when it has a character
 /// that would cut it short (a comma, a colon, parentheses, an @…), the address alone when there is no
 /// name or the name is the address.
@@ -438,6 +456,9 @@ pub struct Settings {
     /// names separated by spaces or commas; one ending in `*` removes every parameter starting so.
     #[serde(default)]
     pub link_params: String,
+    /// The address books synced over CardDAV; their passwords are in the credential store.
+    #[serde(default)]
+    pub address_books: Vec<AddressBook>,
 }
 
 fn yes() -> bool {
@@ -450,7 +471,7 @@ fn undo_secs() -> u32 {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { display: DisplayMode::default(), sender_display: Default::default(), rich_outgoing: true, undo_send_secs: undo_secs(), remote_senders: Default::default(), hold_suspicious: true, marked: Default::default(), threads: true, reading_pane: true, folded: Default::default(), link_params: String::new() }
+        Self { display: DisplayMode::default(), sender_display: Default::default(), rich_outgoing: true, undo_send_secs: undo_secs(), remote_senders: Default::default(), hold_suspicious: true, marked: Default::default(), threads: true, reading_pane: true, folded: Default::default(), link_params: String::new(), address_books: Vec::new() }
     }
 }
 

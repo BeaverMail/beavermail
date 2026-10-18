@@ -95,6 +95,28 @@ fn smtp_entry(account: &Account) -> Result<keyring::Entry, String> {
     keyring::Entry::new(SERVICE, &format!("{}#smtp", account.key())).map_err(|e| format!("credential store: {e}"))
 }
 
+/// Where an address book's password is kept: by login and server, so the books of one server share it.
+fn book_entry(book: &beavermail_core::AddressBook) -> Result<keyring::Entry, String> {
+    let host = book.url.split("://").nth(1).and_then(|r| r.split('/').next()).unwrap_or(&book.url);
+    keyring::Entry::new(SERVICE, &format!("carddav:{}@{host}", book.user)).map_err(|e| format!("credential store: {e}"))
+}
+
+pub fn book_password(book: &beavermail_core::AddressBook) -> Result<String, String> {
+    book_entry(book)?.get_password().map_err(|e| format!("credential store, address book: {e}"))
+}
+
+pub fn set_book_password(book: &beavermail_core::AddressBook, password: &str) -> Result<(), String> {
+    book_entry(book)?.set_password(password).map_err(|e| format!("credential store: {e}"))
+}
+
+/// Removes an address book's password, once no book of that server and login is left; a missing one is not an error.
+pub fn forget_book_password(book: &beavermail_core::AddressBook) -> Result<(), String> {
+    match book_entry(book)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(format!("credential store: {e}")),
+    }
+}
+
 pub fn password(account: &Account) -> Result<String, String> {
     entry(account)?.get_password().map_err(|e| format!("credential store: {e}"))
 }

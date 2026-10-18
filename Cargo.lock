@@ -538,6 +538,7 @@ dependencies = [
  "anyrender",
  "anyrender_vello_cpu",
  "beavermail-accounts",
+ "beavermail-carddav",
  "beavermail-core",
  "beavermail-crypto",
  "beavermail-imap",
@@ -551,6 +552,7 @@ dependencies = [
  "chrono",
  "eframe",
  "egui_extras",
+ "image",
  "opener",
  "rfd",
  "scraper",
@@ -573,6 +575,17 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "toml",
+ "ureq",
+]
+
+[[package]]
+name = "beavermail-carddav"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "beavermail-core",
+ "beavermail-store",
+ "roxmltree 0.20.0",
  "ureq",
 ]
 

@@ -13,11 +13,13 @@ use crate::theme::{self, CONTROL_H, CONTROL_RADIUS, Tokens};
 
 /// Fixed row height, so the list can be virtualised with `show_rows`.
 pub const MESSAGE_ROW_H: f32 = 84.0;
-const FOLDER_ROW_H: f32 = 38.0;
+pub const FOLDER_ROW_H: f32 = 38.0;
 const THREAD_ROW_H: f32 = 38.0;
 const SWITCH: egui::Vec2 = vec2(40.0, 22.0);
 pub const PALETTE_ROW_H: f32 = 36.0;
 pub const AVATAR: f32 = 40.0;
+pub const PERSON_ROW_H: f32 = 60.0;
+const PERSON_AVATAR: f32 = 34.0;
 
 fn tint(t: &Tokens) -> Color32 {
     t.accent.gamma_multiply(0.16)
@@ -280,6 +282,33 @@ pub fn thread_row(ui: &mut Ui, t: &Tokens, message: &MessageSummary, current: bo
     let line = truncated(ui, &message.preview, FontId::proportional(13.0), t.text_dim, room - name_w - 10.0);
     ui.painter().galley(pos2(left + name_w + 10.0, rect.center().y - line.size().y / 2.0), line, t.text_dim);
     response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, current, &message.from));
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A person in the Contacts list: avatar, name and a dim line under it (an address, where they are).
+/// `photo`: theirs, drawn in the avatar's place.
+pub fn person_row(ui: &mut Ui, t: &Tokens, name: &str, line: &str, photo: Option<&egui::TextureHandle>, selected: bool) -> Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), PERSON_ROW_H), Sense::click());
+    let card = rect.shrink2(vec2(8.0, 2.0));
+    row_background(ui, card, &response, selected, t);
+    let center = pos2(card.left() + 12.0 + PERSON_AVATAR / 2.0, card.center().y);
+    match photo {
+        Some(photo) => egui::Image::from_texture(photo).fit_to_exact_size(vec2(PERSON_AVATAR, PERSON_AVATAR)).corner_radius(PERSON_AVATAR / 2.0).paint_at(ui, Rect::from_center_size(center, vec2(PERSON_AVATAR, PERSON_AVATAR))),
+        None => avatar(ui, t, name, center, PERSON_AVATAR),
+    }
+    let left = card.left() + 12.0 + PERSON_AVATAR + 12.0;
+    let width = card.right() - 12.0 - left;
+    let title = truncated(ui, name, FontId::proportional(15.0), t.text, width);
+    if line.is_empty() {
+        ui.painter().galley(pos2(left, card.center().y - title.size().y / 2.0), title, t.text);
+    } else {
+        let under = truncated(ui, line, FontId::proportional(13.0), t.text_dim, width);
+        let top = card.center().y - (title.size().y + 2.0 + under.size().y) / 2.0;
+        let title_h = title.size().y;
+        ui.painter().galley(pos2(left, top), title, t.text);
+        ui.painter().galley(pos2(left, top + title_h + 2.0), under, t.text_dim);
+    }
+    response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, name));
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 

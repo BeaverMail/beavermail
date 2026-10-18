@@ -143,6 +143,66 @@ impl Contact {
     }
 }
 
+/// Where a card of an address book stands against the server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CardState {
+    /// As on the server.
+    Synced,
+    /// Changed here, not sent yet.
+    Changed,
+    /// Made here, not on the server yet.
+    New,
+    /// Deleted here, still on the server.
+    Deleted,
+}
+
+impl CardState {
+    fn from_int(n: i64) -> Self {
+        match n {
+            1 => Self::Changed,
+            2 => Self::New,
+            3 => Self::Deleted,
+            _ => Self::Synced,
+        }
+    }
+
+    fn to_int(self) -> i64 {
+        match self {
+            Self::Synced => 0,
+            Self::Changed => 1,
+            Self::New => 2,
+            Self::Deleted => 3,
+        }
+    }
+}
+
+/// A card of an address book synced over CardDAV.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredCard {
+    pub id: i64,
+    /// The address book's URL.
+    pub book: String,
+    pub href: String,
+    /// The server's version of it; empty for one not sent yet.
+    pub etag: String,
+    pub vcard: String,
+    pub name: String,
+    /// Lower case.
+    pub emails: Vec<String>,
+    pub phones: Vec<String>,
+    pub note: String,
+    pub state: CardState,
+}
+
+/// What a card shows, read from its vCard by whoever stores it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CardFields {
+    pub name: String,
+    pub emails: Vec<String>,
+    pub phones: Vec<String>,
+    pub note: String,
+}
+
 /// What the archive knows of someone, for their card.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ContactCard {
@@ -604,6 +664,27 @@ fn migrate(conn: &Connection) -> Result<(), MailError> {
             )
             .map_err(db)?;
         }
+        // Version 18: the cards of address books synced over CardDAV, with what is not on the server yet.
+        if version < 18 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS cards (
+                     id INTEGER PRIMARY KEY,
+                     book TEXT NOT NULL,
+                     href TEXT NOT NULL,
+                     etag TEXT NOT NULL DEFAULT '',
+                     vcard TEXT NOT NULL,
+                     name TEXT NOT NULL,
+                     emails TEXT NOT NULL,
+                     phones TEXT NOT NULL,
+                     note TEXT NOT NULL,
+                     folded TEXT NOT NULL,
+                     state INTEGER NOT NULL DEFAULT 0,
+                     UNIQUE (book, href)
+                 );
+                 PRAGMA user_version = 18;",
+            )
+            .map_err(db)?;
+        }
     Ok(())
 }
 
@@ -1031,7 +1112,24 @@ impl Store {
             )
             .map_err(db)?;
         let rows = stmt.query_map([account], |r| Ok(Contact { name: r.get(0)?, address: r.get(1)?, folded: r.get(2)? })).map_err(db)?;
-        rows.collect::<Result<_, _>>().map_err(db)
+        let mut contacts: Vec<Contact> = rows.collect::<Result<_, _>>().map_err(db)?;
+        drop(stmt);
+        drop(conn);
+        // The address books' people too, after those written to, by the name the address book gives.
+        let cards = self.address_book()?;
+        // A name the address book keeps wins over the one mail gave.
+        for card in cards.iter().filter(|c| !c.name.is_empty()) {
+            for contact in contacts.iter_mut().filter(|c| card.emails.contains(&c.address)) {
+                *contact = Contact::new(&card.name, &contact.address);
+            }
+        }
+        let mut seen: std::collections::HashSet<String> = contacts.iter().map(|c| c.address.clone()).collect();
+        for card in &cards {
+            for email in card.emails.iter().filter(|e| seen.insert((*e).clone())) {
+                contacts.push(Contact::new(&card.name, email));
+            }
+        }
+        Ok(contacts)
     }
 
     /// The OpenPGP key `address` was first seen with, to check what they sign.
@@ -1060,6 +1158,103 @@ impl Store {
             .execute("INSERT OR REPLACE INTO peer_certs (address, cert, seen) VALUES (?1, ?2, ?3)", params![address.trim().to_lowercase(), cert, at])
             .map(|_| ())
             .map_err(db)
+    }
+
+    /// Every card of the address book at `book`, deleted ones included (they still have to go).
+    pub fn cards(&self, book: &str) -> Result<Vec<StoredCard>, MailError> {
+        self.cards_where("WHERE book = ?1", [book])
+    }
+
+    /// The cards of every address book, as the Contacts section lists them: not deleted, by name.
+    pub fn address_book(&self) -> Result<Vec<StoredCard>, MailError> {
+        self.cards_where("WHERE state != 3 ORDER BY lower(name), id", [])
+    }
+
+    /// The address-book card that has `address` among its addresses, if one does.
+    pub fn card_with_email(&self, address: &str) -> Result<Option<StoredCard>, MailError> {
+        Ok(self.cards_where("WHERE state != 3 AND instr(char(10) || emails || char(10), char(10) || ?1 || char(10)) > 0 ORDER BY id", [address.trim().to_lowercase()])?.into_iter().next())
+    }
+
+    pub fn card(&self, id: i64) -> Result<Option<StoredCard>, MailError> {
+        Ok(self.cards_where("WHERE id = ?1", [id])?.pop())
+    }
+
+    fn cards_where<P: rusqlite::Params>(&self, filter: &str, params: P) -> Result<Vec<StoredCard>, MailError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!("SELECT id, book, href, etag, vcard, name, emails, phones, note, state FROM cards {filter}")).map_err(db)?;
+        let split = |text: String| text.split('\n').filter(|s| !s.is_empty()).map(str::to_owned).collect::<Vec<_>>();
+        let rows = stmt
+            .query_map(params, |r| {
+                Ok(StoredCard {
+                    id: r.get(0)?,
+                    book: r.get(1)?,
+                    href: r.get(2)?,
+                    etag: r.get(3)?,
+                    vcard: r.get(4)?,
+                    name: r.get(5)?,
+                    emails: split(r.get(6)?),
+                    phones: split(r.get(7)?),
+                    note: r.get(8)?,
+                    state: CardState::from_int(r.get(9)?),
+                })
+            })
+            .map_err(db)?;
+        rows.collect::<Result<_, _>>().map_err(db)
+    }
+
+    /// Keeps a card as the server has it (new, or a newer version), as synced.
+    pub fn put_card(&self, book: &str, href: &str, etag: &str, vcard: &str, fields: &CardFields) -> Result<(), MailError> {
+        self.write_card(book, href, etag, vcard, fields, CardState::Synced)
+    }
+
+    /// A card made here, to send: `href` is where it will go.
+    pub fn add_card(&self, book: &str, href: &str, vcard: &str, fields: &CardFields) -> Result<(), MailError> {
+        self.write_card(book, href, "", vcard, fields, CardState::New)
+    }
+
+    fn write_card(&self, book: &str, href: &str, etag: &str, vcard: &str, fields: &CardFields, state: CardState) -> Result<(), MailError> {
+        self.conn()
+            .execute(
+                "INSERT INTO cards (book, href, etag, vcard, name, emails, phones, note, folded, state) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT (book, href) DO UPDATE SET etag = excluded.etag, vcard = excluded.vcard, name = excluded.name, emails = excluded.emails,
+                   phones = excluded.phones, note = excluded.note, folded = excluded.folded, state = excluded.state",
+                params![book, href, etag, vcard, fields.name, fields.emails.join("\n"), fields.phones.join("\n"), fields.note, fold(&format!("{} {} {}", fields.name, fields.emails.join(" "), fields.phones.join(" "))), state.to_int()],
+            )
+            .map(|_| ())
+            .map_err(db)
+    }
+
+    /// A card changed here: its new text and what it shows, to send. One not sent yet stays new.
+    pub fn edit_card(&self, id: i64, vcard: &str, fields: &CardFields) -> Result<(), MailError> {
+        self.conn()
+            .execute(
+                "UPDATE cards SET vcard = ?2, name = ?3, emails = ?4, phones = ?5, note = ?6, folded = ?7, state = CASE WHEN state = 2 THEN 2 ELSE 1 END WHERE id = ?1",
+                params![id, vcard, fields.name, fields.emails.join("\n"), fields.phones.join("\n"), fields.note, fold(&format!("{} {} {}", fields.name, fields.emails.join(" "), fields.phones.join(" ")))],
+            )
+            .map(|_| ())
+            .map_err(db)
+    }
+
+    /// A card deleted here: one never sent goes at once, any other waits to be deleted on the server.
+    pub fn delete_card(&self, id: i64) -> Result<(), MailError> {
+        let conn = self.conn();
+        conn.execute("DELETE FROM cards WHERE id = ?1 AND state = 2", [id]).map_err(db)?;
+        conn.execute("UPDATE cards SET state = 3 WHERE id = ?1", [id]).map(|_| ()).map_err(db)
+    }
+
+    /// The card is as the server has it now, at this version.
+    pub fn card_synced(&self, id: i64, etag: &str) -> Result<(), MailError> {
+        self.conn().execute("UPDATE cards SET etag = ?2, state = 0 WHERE id = ?1", params![id, etag]).map(|_| ()).map_err(db)
+    }
+
+    /// Forgets a card: gone from the server, or its deletion done.
+    pub fn forget_card(&self, book: &str, href: &str) -> Result<(), MailError> {
+        self.conn().execute("DELETE FROM cards WHERE book = ?1 AND href = ?2", params![book, href]).map(|_| ()).map_err(db)
+    }
+
+    /// Forgets an address book's cards: its sync was turned off.
+    pub fn forget_book(&self, book: &str) -> Result<(), MailError> {
+        self.conn().execute("DELETE FROM cards WHERE book = ?1", [book]).map(|_| ()).map_err(db)
     }
 
     /// Someone's card: as the address book or mail knows them; `None` for someone never written to nor saved.
@@ -1532,6 +1727,33 @@ mod tests {
         store.unsave_contact("bob@y.org").unwrap();
         let card = store.contact_card("bob@y.org").unwrap().unwrap();
         assert!(!card.saved && card.notes.is_empty(), "back to a suggestion: written to");
+    }
+
+    #[test]
+    fn address_book_cards_wait_their_turn_and_name_the_suggestions() {
+        let store = store();
+        let fields = |name: &str, emails: &[&str], phones: &[&str]| CardFields { name: name.into(), emails: emails.iter().map(|e| (*e).to_owned()).collect(), phones: phones.iter().map(|p| (*p).to_owned()).collect(), note: String::new() };
+        store.put_card("book", "/a.vcf", "\"1\"", "A", &fields("Ada Lovelace", &["ada@x.org"], &[])).unwrap();
+        store.put_card("book", "/m.vcf", "\"2\"", "M", &fields("Mario Rossi", &[], &["+39 02 1234"])).unwrap();
+        assert_eq!(store.address_book().unwrap().iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["Ada Lovelace", "Mario Rossi"], "a phone-only card too");
+        assert_eq!(store.card_with_email("ADA@x.org").unwrap().unwrap().href, "/a.vcf");
+        assert!(store.card_with_email("da@x.org").unwrap().is_none(), "a whole address");
+        // In the suggestions, by the address book's name, even never written to.
+        assert!(store.contacts("me").unwrap().iter().any(|c| c.address == "ada@x.org" && c.name == "Ada Lovelace"));
+        // Made here: deleted at once, never having reached the server; changed after sync: waits.
+        store.add_card("book", "/n.vcf", "N", &fields("New", &["new@x.org"], &[])).unwrap();
+        let new = store.card_with_email("new@x.org").unwrap().unwrap();
+        assert_eq!(new.state, CardState::New);
+        store.delete_card(new.id).unwrap();
+        assert!(store.card(new.id).unwrap().is_none());
+        let ada = store.card_with_email("ada@x.org").unwrap().unwrap();
+        store.edit_card(ada.id, "A2", &fields("Augusta", &["ada@x.org"], &[])).unwrap();
+        assert_eq!(store.card(ada.id).unwrap().unwrap().state, CardState::Changed);
+        store.delete_card(ada.id).unwrap();
+        assert_eq!(store.card(ada.id).unwrap().unwrap().state, CardState::Deleted, "kept until the server deletes it");
+        assert!(!store.address_book().unwrap().iter().any(|c| c.id == ada.id), "but not shown");
+        store.forget_book("book").unwrap();
+        assert!(store.cards("book").unwrap().is_empty());
     }
 
     #[test]

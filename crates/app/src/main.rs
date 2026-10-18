@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 mod attachments;
+mod books;
 mod card;
 mod commands;
 mod compose;
@@ -86,6 +87,12 @@ enum Event {
     Checked(Option<u64>, Box<(Account, String, String)>, Result<(), String>, Result<(), String>),
     /// A key file was picked to import for this address (`None`: the dialog was cancelled).
     KeyFile(String, Option<(String, Vec<u8>)>),
+    /// A picture chosen for the card being edited, made small; `None` when none was chosen.
+    ContactPhoto(Option<Result<Vec<u8>, String>>),
+    /// An address book was synced: (its URL, what moved, or why not).
+    ContactsSynced(String, Result<beavermail_carddav::Synced, MailError>),
+    /// "Find address books" answered: (URL, name) of each, or why none.
+    BooksFound(Result<Vec<beavermail_carddav::Found>, String>),
     /// Everyone the user has written to, for the address fields.
     Contacts(Result<Vec<beavermail_store::Contact>, MailError>),
 }
@@ -481,6 +488,7 @@ impl NewAccount {
             "" => return Err("enter the user for the outgoing server".into()),
             user => Some(user.to_owned()),
         };
+
         Ok(Account {
             name: self.name.trim().to_owned(),
             user: user.to_owned(),
@@ -493,6 +501,69 @@ impl NewAccount {
             oauth: self.oauth,
             smtp_user,
         })
+    }
+}
+
+/// Someone in the Contacts section: a card of a synced address book (with the other address books
+/// that have one of its addresses, by URL), or a contact kept only here.
+#[derive(Clone)]
+enum Person {
+    Card(beavermail_store::StoredCard, Vec<String>),
+    Saved(beavermail_store::Contact),
+}
+
+impl Person {
+    fn name(&self) -> &str {
+        match self {
+            Self::Card(c, _) => &c.name,
+            Self::Saved(c) => &c.name,
+        }
+    }
+
+    /// The name, or an address or a phone for an unnamed one.
+    fn title(&self) -> String {
+        match self {
+            _ if !self.name().is_empty() => self.name().to_owned(),
+            Self::Card(c, _) => c.emails.first().or(c.phones.first()).cloned().unwrap_or_default(),
+            Self::Saved(c) => c.address.clone(),
+        }
+    }
+
+    /// The row's two lines: the name, then an address or a phone and, among several address books,
+    /// which one they are in (`own`, left out when one is shown) and the others that have them too.
+    fn lines(&self, books: &[beavermail_core::AddressBook], own: bool) -> (String, String) {
+        let reach = match self {
+            Self::Card(c, _) => c.emails.first().or(c.phones.first()).cloned().unwrap_or_default(),
+            Self::Saved(c) => c.address.clone(),
+        };
+        let mut second = if self.name().is_empty() { String::new() } else { reach };
+        let mut add = |part: String| {
+            if !second.is_empty() {
+                second.push_str("  ·  ");
+            }
+            second.push_str(&part);
+        };
+        let name_of = |url: &str| books.iter().find(|b| b.url == url).map(|b| books::label(b, books)).unwrap_or_default();
+        match self {
+            Self::Card(c, also) => {
+                if own && books.len() > 1 {
+                    add(name_of(&c.book));
+                }
+                if !also.is_empty() {
+                    add(format!("also in {}", also.iter().map(|u| name_of(u)).collect::<Vec<_>>().join(", ")));
+                }
+            }
+            Self::Saved(_) if own && !books.is_empty() => add("on this computer".to_owned()),
+            Self::Saved(_) => {}
+        }
+        (self.title(), second)
+    }
+
+    fn matches(&self, query: &str) -> bool {
+        match self {
+            Self::Card(c, _) => beavermail_store::Contact { name: c.name.clone(), address: c.emails.join(" "), folded: beavermail_store::fold(&format!("{} {} {}", c.name, c.emails.join(" "), c.phones.join(" "))) }.matches(query),
+            Self::Saved(c) => c.matches(query),
+        }
     }
 }
 
@@ -689,6 +760,31 @@ fn account_page(ui: &mut egui::Ui, t: &theme::Tokens, form: &mut NewAccount, wai
     action
 }
 
+/// Everyone in the Contacts section: the address books' cards, and the contacts kept only here (those
+/// no card has), by name.
+fn people(archive: &Store) -> Vec<Person> {
+    let cards = archive.address_book().unwrap_or_default();
+    // Each address, with the address books that have it: someone in two of them shows in both, marked.
+    let mut held: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+    for card in &cards {
+        for email in &card.emails {
+            let books = held.entry(email.as_str()).or_default();
+            if !books.contains(&card.book.as_str()) {
+                books.push(&card.book);
+            }
+        }
+    }
+    let also = |card: &beavermail_store::StoredCard| -> Vec<String> {
+        let mut others: Vec<String> = card.emails.iter().flat_map(|e| held[e.as_str()].iter()).filter(|b| **b != card.book).map(|b| b.to_string()).collect();
+        others.dedup();
+        others
+    };
+    let mut all: Vec<Person> = cards.iter().map(|c| Person::Card(c.clone(), also(c))).collect();
+    all.extend(archive.saved_contacts().unwrap_or_default().into_iter().filter(|c| !held.contains_key(c.address.as_str())).map(Person::Saved));
+    all.sort_by_key(|p| p.title().to_lowercase());
+    all
+}
+
 /// A key file read as an OpenPGP key, or (`certificate`) an S/MIME `.p12`, unlocked with `password`.
 fn import_file(file: &[u8], certificate: bool, password: Option<&str>) -> Result<Vec<u8>, beavermail_crypto::ImportError> {
     if certificate { beavermail_crypto::import_certificate(file, password) } else { beavermail_crypto::import(file, password) }
@@ -880,11 +976,25 @@ struct BeaverApp {
     answer_when_open: Option<(MessageId, Action)>,
     /// The card open in the Contacts section.
     contact_pane: Option<card::Card>,
+    /// The address books (by URL) whose sync runs now, and when all were last synced.
+    contacts_syncing: std::collections::HashSet<String>,
+    /// The "Add address book" dialog, and the address book waiting for "Stop syncing" to be confirmed.
+    add_book: Option<books::AddBook>,
+    confirm_book_remove: Option<String>,
+    contacts_synced: Option<std::time::Instant>,
     /// The saved contacts for the Contacts section, read when it is drawn after a change.
-    address_book: Option<Vec<beavermail_store::Contact>>,
-    /// What is typed in the Contacts section: a search, and an address to add.
+    address_book: Option<Vec<Person>>,
+    /// The address book whose contacts the Contacts section shows (by URL); `None` for all of them.
+    contacts_shown: Option<String>,
+    /// The photos of the cards shown in the Contacts list (by card id), read as their rows come into
+    /// view; read again with the list.
+    contact_photos: std::collections::HashMap<i64, Option<egui::TextureHandle>>,
+    /// The address-book card waiting for the user to confirm deleting it everywhere.
+    confirm_card_delete: Option<i64>,
+    /// After an address book's first sync: (its URL, the contacts kept only here, each ticked or not).
+    /// What is typed in the Contacts section's search, and the "New contact" dialog: (address, name).
     contact_query: String,
-    new_contact: String,
+    new_contact: Option<(String, String)>,
     /// Everyone written to, to suggest in a message's address fields; read again for each new message.
     contacts: Arc<Vec<beavermail_store::Contact>>,
     /// Where the user asked to go from an account page with unsaved changes (`None`: close Settings),
@@ -1041,11 +1151,18 @@ impl BeaverApp {
             encryption_checked: None,
             card: None,
             contact_pane: None,
+            add_book: None,
+            confirm_book_remove: None,
+            contacts_syncing: Default::default(),
+            contacts_synced: None,
             answer_when_open: None,
             body_failed: None,
             address_book: None,
+            contacts_shown: None,
+            contact_photos: std::collections::HashMap::new(),
+            confirm_card_delete: None,
             contact_query: String::new(),
-            new_contact: String::new(),
+            new_contact: None,
             settings_leave: None,
             confirm_remove: None,
             confirm_unsubscribe: None,
@@ -3112,6 +3229,135 @@ impl BeaverApp {
         self.key_files.get(&path).cloned().flatten()
     }
 
+    /// Syncs the address book at `url`, or every one, in the background; one already syncing is left
+    /// to finish.
+    fn sync_contacts(&mut self, url: Option<&str>) {
+        let books: Vec<beavermail_core::AddressBook> = self.settings.address_books.iter().filter(|b| url.is_none_or(|u| u == b.url)).cloned().collect();
+        for book in books {
+            if !self.contacts_syncing.insert(book.url.clone()) {
+                continue;
+            }
+            let password = match store::book_password(&book) {
+                Ok(password) => password,
+                Err(e) => {
+                    self.contacts_syncing.remove(&book.url);
+                    self.error = Some(format!("Address book {}: {e}", book.name));
+                    continue;
+                }
+            };
+            let archive = self.archive.clone();
+            self.spawn(async move {
+                let url = book.url.clone();
+                let result = tokio::task::spawn_blocking(move || beavermail_carddav::sync(&beavermail_carddav::Book::open(&book.url, &book.user, &password), &archive))
+                    .await
+                    .unwrap_or_else(|e| Err(MailError::Backend(e.to_string())));
+                Event::ContactsSynced(url, result)
+            });
+        }
+    }
+
+    /// Asks the server in the "Add address book" dialog for its address books.
+    fn find_books(&mut self) {
+        let Some(form) = self.add_book.as_mut() else { return };
+        let (server, user, password) = (form.server.trim().to_owned(), form.user.trim().to_owned(), form.password.clone());
+        (form.finding, form.found) = (true, None);
+        self.spawn(async move {
+            let found = tokio::task::spawn_blocking(move || beavermail_carddav::Book::discover_all(&server, &user, &password).map_err(|e| e.to_string())).await.unwrap_or_else(|e| Err(e.to_string()));
+            Event::BooksFound(found)
+        });
+    }
+
+    fn book_action(&mut self, action: books::BookAction) {
+        use books::BookAction as A;
+        match action {
+            A::Open => {
+                // The login is most often the address of a mail account.
+                let user = self.accounts.first().map(|v| &v.account).map(|a| if a.email.is_empty() { a.user.clone() } else { a.email.clone() }).unwrap_or_default();
+                self.add_book = Some(books::AddBook { user, focus_first: true, ..Default::default() });
+            }
+            A::Find => self.find_books(),
+            A::Show(url) => self.contacts_shown = url,
+            A::Fold(key) => {
+                if !self.settings.folded.remove(&key) {
+                    self.settings.folded.insert(key);
+                }
+                self.save_settings();
+            }
+            A::Add(chosen) => {
+                let Some(form) = self.add_book.take() else { return };
+                for found in chosen {
+                    // The first writable one becomes the default, if none is yet.
+                    let default = found.writable && !self.settings.address_books.iter().any(|b| b.default);
+                    let book = beavermail_core::AddressBook { name: found.name, url: found.url, user: form.user.trim().to_owned(), default, read_only: !found.writable };
+                    if let Err(e) = store::set_book_password(&book, &form.password) {
+                        self.error = Some(e);
+                        return;
+                    }
+                    self.settings.address_books.push(book);
+                }
+                self.save_settings();
+                self.sync_contacts(None);
+            }
+            A::MakeDefault(url) => {
+                for book in &mut self.settings.address_books {
+                    book.default = book.url == url;
+                }
+                self.save_settings();
+            }
+            A::AskRemove(url) => self.confirm_book_remove = Some(url),
+            A::SyncNow => {
+                self.contacts_synced = Some(std::time::Instant::now());
+                self.sync_contacts(None);
+            }
+        }
+    }
+
+    /// No longer syncs the address book at `url`: its cards leave this computer, nothing changes on the server.
+    fn remove_book(&mut self, url: &str) {
+        let Some(at) = self.settings.address_books.iter().position(|b| b.url == url) else { return };
+        let book = self.settings.address_books.remove(at);
+        if let Err(e) = self.archive.forget_book(&book.url) {
+            self.error = Some(format!("Could not forget the address book's contacts: {e}"));
+        }
+        // The password is shared by the books of one server and login: it goes with the last of them.
+        if !self.settings.address_books.iter().any(|b| b.user == book.user && books::host(&b.url) == books::host(&book.url)) {
+            let _ = store::forget_book_password(&book);
+        }
+        if book.default
+            && let Some(next) = self.settings.address_books.iter_mut().find(|b| !b.read_only)
+        {
+            next.default = true;
+        }
+        self.save_settings();
+        self.address_book = None;
+        self.contact_pane = None;
+        if self.contacts_shown.as_deref() == Some(url) {
+            self.contacts_shown = None;
+        }
+    }
+
+    fn book_remove_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
+        let Some(url) = self.confirm_book_remove.clone() else { return };
+        let name = self.settings.address_books.iter().find(|b| b.url == url).map(|b| if b.name.is_empty() { books::host(&b.url).to_owned() } else { b.name.clone() }).unwrap_or_default();
+        let (mut confirm, mut cancel) = (false, false);
+        let modal = egui::Modal::new(egui::Id::new("confirm_book_remove")).show(ctx, |ui| {
+            ui.set_width(FORM_WIDTH * 0.85);
+            ui.heading(format!("Stop syncing {name}?"));
+            ui.label(RichText::new("Its contacts leave BeaverMail. Nothing changes on the server.").color(t.text_dim));
+            ui.add_space(12.0);
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
+                confirm = ui.add(egui::Button::new(RichText::new("Stop syncing").color(t.on_accent)).fill(t.danger)).clicked();
+                cancel = ui.button("Cancel").clicked();
+            });
+        });
+        if confirm {
+            self.remove_book(&url);
+        }
+        if confirm || cancel || modal.should_close() {
+            self.confirm_book_remove = None;
+        }
+    }
+
     /// The address's own OpenPGP key.
     fn own_key(&mut self, address: &str) -> Option<Vec<u8>> {
         self.key_file(beavermail_crypto::key_path(address))
@@ -3209,6 +3455,35 @@ impl BeaverApp {
 
     /// Someone's card as the archive knows them, with their latest conversations.
     fn load_card(&self, address: &str, name: &str) -> Option<card::Card> {
+        // Someone the address book has opens as its card, with what it keeps of them.
+        match self.archive.card_with_email(address).ok().flatten() {
+            Some(stored) => self.load_book_card(stored.id),
+            None => self.load_contact(address, name),
+        }
+    }
+
+    /// A card of a synced address book: its name, notes, addresses and phones, with the conversations
+    /// with its first address.
+    fn load_book_card(&self, id: i64) -> Option<card::Card> {
+        let stored = self.archive.card(id).ok().flatten()?;
+        let first = stored.emails.first().cloned().unwrap_or_default();
+        let mut card = self.load_contact(&first, &stored.name).unwrap_or_else(|| card::Card::new(beavermail_store::ContactCard::default(), Vec::new()));
+        (card.data.name, card.data.notes, card.data.saved) = (stored.name.clone(), stored.note.clone(), true);
+        (card.name, card.notes, card.book_card) = (stored.name.clone(), stored.note.clone(), Some(id));
+        let books = &self.settings.address_books;
+        card.details = Some(beavermail_carddav::vcard::details(&stored.vcard));
+        card.read_only = books.iter().any(|b| b.url == stored.book && b.read_only);
+        card.book = books.iter().find(|b| b.url == stored.book).map(|b| books::label(b, books)).unwrap_or_default();
+        // The other address books with one of their addresses: the same person twice, kept apart.
+        let others = self.archive.address_book().unwrap_or_default().into_iter().filter(|c| c.book != stored.book && c.emails.iter().any(|e| stored.emails.contains(e)));
+        card.also_in = others.filter_map(|c| books.iter().find(|b| b.url == c.book).map(|b| books::label(b, books))).collect();
+        card.also_in.dedup();
+        card.can_add = false;
+        Some(card)
+    }
+
+    /// Someone by address, as their saved contact or as mail knows them.
+    fn load_contact(&self, address: &str, name: &str) -> Option<card::Card> {
         let address = address.trim().to_lowercase();
         if address.is_empty() {
             return None;
@@ -3220,7 +3495,9 @@ impl BeaverApp {
         });
         let keys: Vec<(String, u64)> = self.accounts.iter().map(|v| (v.account.key(), v.serial)).collect();
         let recent = self.archive.messages_with(&address, 12).unwrap_or_default().into_iter().filter_map(|(key, hit)| Some((keys.iter().find(|(k, _)| *k == key)?.1, hit))).collect();
-        Some(card::Card::new(data, recent))
+        let mut card = card::Card::new(data, recent);
+        card.can_add = self.default_book().is_some();
+        Some(card)
     }
 
     fn card_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
@@ -3233,12 +3510,35 @@ impl BeaverApp {
     /// Does what was asked on a card: the dialog's, or (`inline`) the one in the Contacts section.
     fn card_action(&mut self, action: card::CardAction, inline: bool) {
         let Some(card) = (if inline { self.contact_pane.as_ref() } else { self.card.as_ref() }) else { return };
-        let (address, name, notes) = (card.data.address.clone(), card.name.clone(), card.notes.clone());
+        let (address, name, notes, book_card, editing) = (card.data.address.clone(), card.name.clone(), card.notes.clone(), card.book_card, card.editing.clone());
         let reload = |app: &mut Self| {
-            let fresh = app.load_card(&address, &name);
+            let fresh = match book_card {
+                Some(id) => app.load_book_card(id),
+                None => app.load_card(&address, &name),
+            };
             *(if inline { &mut app.contact_pane } else { &mut app.card }) = fresh;
         };
         match action {
+            // A card of the address book: changed there, and sent at once.
+            card::CardAction::Save if book_card.is_some() => {
+                let (Some(stored), Some(editing)) = (book_card.and_then(|id| self.archive.card(id).ok().flatten()), editing) else { return };
+                let text = beavermail_carddav::vcard::apply(&stored.vcard, &editing);
+                if let Err(e) = self.archive.edit_card(stored.id, &text, &beavermail_carddav::fields(&text)) {
+                    self.error = Some(format!("Could not change the contact: {e}"));
+                    return;
+                }
+                self.address_book = None;
+                self.sync_book(&stored.book);
+                reload(self);
+            }
+            card::CardAction::Remove if book_card.is_some() => self.confirm_card_delete = book_card,
+            card::CardAction::AddToBook => {
+                if self.add_to_book(&address, &name, &notes) {
+                    reload(self);
+                }
+            }
+            // Someone not in an address book: kept on this computer only. Only "Add to address book"
+            // sends someone to the server, so no one gets there by accident.
             card::CardAction::Save => {
                 if let Err(e) = self.archive.save_contact(&address, &name, &notes) {
                     self.error = Some(format!("Could not save the contact: {e}"));
@@ -3271,6 +3571,128 @@ impl BeaverApp {
                 self.open_hit(serial, &hit, false);
             }
             card::CardAction::Close => self.card = None,
+            card::CardAction::PickPhoto => self.spawn(async move {
+                let Some(file) = rfd::AsyncFileDialog::new().set_title("Choose a photo").add_filter("Picture", &["jpg", "jpeg", "png"]).pick_file().await else { return Event::ContactPhoto(None) };
+                let bytes = file.read().await;
+                Event::ContactPhoto(Some(tokio::task::spawn_blocking(move || card::shrink(&bytes)).await.unwrap_or_else(|e| Err(e.to_string()))))
+            }),
+        }
+    }
+
+    /// Puts someone in the default address book, sent at once; false when it could not.
+    fn add_to_book(&mut self, address: &str, name: &str, notes: &str) -> bool {
+        let Some(url) = self.default_book() else { return false };
+        let uid = beavermail_carddav::new_uid();
+        let text = beavermail_carddav::vcard::new_card(&uid, name, &[address.to_owned()], notes);
+        if let Err(e) = self.archive.add_card(&url, &beavermail_carddav::new_href(&url, &uid), &text, &beavermail_carddav::fields(&text)) {
+            self.error = Some(format!("Could not add the contact to the address book: {e}"));
+            return false;
+        }
+        self.address_book = None;
+        self.sync_book(&url);
+        self.notice = Some((format!("{} is in your address book", if name.trim().is_empty() { address } else { name.trim() }), std::time::Instant::now()));
+        true
+    }
+
+    /// The address book contacts added here go to: the one shown in Contacts, else the default one;
+    /// never a read-only one.
+    fn default_book(&self) -> Option<String> {
+        let mut writable = self.settings.address_books.iter().filter(|b| !b.read_only);
+        let first = writable.clone().next();
+        let shown = writable.clone().find(|b| self.contacts_shown.as_deref() == Some(b.url.as_str()));
+        shown.or(writable.find(|b| b.default)).or(first).map(|b| b.url.clone())
+    }
+
+    /// "New contact": an address, and a name if wished; their card opens to be saved.
+    fn new_contact_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
+        let book = self.default_book();
+        let Some((address, name)) = self.new_contact.as_mut() else { return };
+        let valid = beavermail_smtp::valid_address(address);
+        let (mut add, mut cancel) = (false, false);
+        let modal = egui::Modal::new(egui::Id::new("new_contact")).show(ctx, |ui| {
+            ui.set_width(FORM_WIDTH);
+            ui.heading("New contact");
+            let about = match &book {
+                Some(url) => format!("Added to {}.", self.settings.address_books.iter().find(|b| b.url == *url).map(|b| if b.name.is_empty() { books::host(url).to_owned() } else { format!("{} on {}", b.name, books::host(url)) }).unwrap_or_default()),
+                None => "Their card opens with what you type; save it there.".to_owned(),
+            };
+            ui.label(RichText::new(about).color(t.text_dim));
+            ui.add_space(12.0);
+            form_grid(ui, "new_contact_form", |ui| {
+                ui.label("Email");
+                let email = ui.add(field(address).hint_text("name@example.com"));
+                // On opening only: once the user is in a field, it is theirs.
+                if ui.memory(|m| m.focused().is_none()) {
+                    email.request_focus();
+                }
+                ui.end_row();
+                ui.label("Name");
+                ui.add(field(name).hint_text("Optional"));
+                ui.end_row();
+            });
+            ui.add_space(12.0);
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
+                add = views::primary_button(ui, t, if book.is_some() { "Add contact" } else { "Open their card" }, valid).on_disabled_hover_text("Type an email address first").clicked() || (valid && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                cancel = ui.button("Cancel").clicked();
+            });
+        });
+        if add && let Some((address, name)) = self.new_contact.take() {
+            let address = address.trim().to_lowercase();
+            // Someone the address book already has opens as they are: never a second card.
+            if book.is_some() && self.archive.card_with_email(&address).ok().flatten().is_none() {
+                self.add_to_book(&address, name.trim(), "");
+            }
+            self.contact_pane = self.load_card(&address, &name);
+        } else if cancel || modal.should_close() {
+            self.new_contact = None;
+        }
+    }
+
+    /// Syncs the address book at `url` now, to send a change made here.
+    fn sync_book(&mut self, url: &str) {
+        self.sync_contacts(Some(url));
+    }
+
+    /// Confirms deleting an address-book card: it goes from the server, so from every device that syncs it.
+    fn card_delete_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
+        let Some(id) = self.confirm_card_delete else { return };
+        let Some(stored) = self.archive.card(id).ok().flatten() else {
+            self.confirm_card_delete = None;
+            return;
+        };
+        let who = if stored.name.is_empty() { stored.emails.first().or(stored.phones.first()).cloned().unwrap_or_default() } else { stored.name.clone() };
+        let (mut confirm, mut cancel) = (false, false);
+        let modal = egui::Modal::new(egui::Id::new("confirm_card_delete")).show(ctx, |ui| {
+            ui.set_width(FORM_WIDTH * 0.85);
+            ui.heading(format!("Delete {who} everywhere?"));
+            ui.label(RichText::new("They are deleted from your address book on the server, and from every device that syncs it.").color(t.text_dim));
+            ui.add_space(12.0);
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
+                confirm = ui.add(egui::Button::new(RichText::new("Delete everywhere").color(t.on_accent)).fill(t.danger)).clicked();
+                cancel = ui.button("Cancel").clicked();
+            });
+        });
+        if confirm {
+            match self.archive.delete_card(id) {
+                Ok(()) => {
+                    // Not left behind as a contact of this computer either.
+                    for email in &stored.emails {
+                        let _ = self.archive.unsave_contact(email);
+                    }
+                    if self.contact_pane.as_ref().is_some_and(|c| c.book_card == Some(id)) {
+                        self.contact_pane = None;
+                    }
+                    if self.card.as_ref().is_some_and(|c| c.book_card == Some(id)) {
+                        self.card = None;
+                    }
+                    self.address_book = None;
+                    self.sync_book(&stored.book);
+                }
+                Err(e) => self.error = Some(format!("Could not delete the contact: {e}")),
+            }
+        }
+        if confirm || cancel || modal.should_close() {
+            self.confirm_card_delete = None;
         }
     }
 
@@ -4100,6 +4522,41 @@ impl BeaverApp {
                 }
             }
             Event::KeyFile(_, None) => {}
+            Event::ContactPhoto(None) => {}
+            Event::ContactPhoto(Some(Ok(photo))) => {
+                for card in [self.contact_pane.as_mut(), self.card.as_mut()].into_iter().flatten() {
+                    if let Some(editing) = card.editing.as_mut() {
+                        editing.photo = Some(photo.clone());
+                    }
+                }
+            }
+            Event::ContactPhoto(Some(Err(e))) => self.error = Some(e),
+            Event::ContactsSynced(key, result) => {
+                self.contacts_syncing.remove(&key);
+                match result {
+                    Ok(_) => self.address_book = None, // read again, with what came
+                    // No connection now: the next sync tries again, with nothing to tell.
+                    Err(MailError::Offline(_)) => {}
+                    Err(e) => self.error = Some(format!("Contacts could not be synced: {e}")),
+                }
+            }
+            Event::BooksFound(found) => {
+                if let Some(form) = self.add_book.as_mut() {
+                    form.finding = false;
+                    // Ticked: the usual wish is the one address book there is, or all of them.
+                    let found = found.and_then(|books| if books.is_empty() { Err("This server has no address books for this user.".to_owned()) } else { Ok(books) });
+                    // On: the user's own address books; those the server makes (read-only) are off.
+                    form.found = Some(found.map(|books| books.into_iter().map(|b| { let on = b.writable; (b, on) }).collect()));
+                    // A single new one is the one meant: added at once, without a second step.
+                    let new: Vec<beavermail_carddav::Found> = match &form.found {
+                        Some(Ok(found)) => found.iter().filter(|(b, _)| !self.settings.address_books.iter().any(|a| a.url == b.url)).map(|(b, _)| b.clone()).collect(),
+                        _ => Vec::new(),
+                    };
+                    if matches!(&form.found, Some(Ok(found)) if found.len() == 1) && new.len() == 1 {
+                        self.book_action(books::BookAction::Add(new));
+                    }
+                }
+            }
             Event::Contacts(Ok(contacts)) => self.contacts = Arc::new(contacts),
             Event::Contacts(Err(_)) => {} // the fields only miss their suggestions
             Event::Unsubscribed(who, result) => match result {
@@ -4633,84 +5090,126 @@ impl BeaverApp {
         let frame = egui::Frame::new().fill(t.bg).inner_margin(egui::Margin::symmetric(8, 12));
         egui::Panel::left("rail").frame(frame).resizable(false).exact_size(theme::CONTROL_H + 12.0).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 8.0;
-            for (section, icon, command) in [(Section::Mail, Icon::Mail, Command::Mail), (Section::Contacts, Icon::Users, Command::Contacts)] {
-                let on = self.section == section;
-                let name = if section == Section::Mail { "Mail" } else { "Contacts" };
-                let button = icons::button(ui, t, icon, name, true, on);
-                button.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, on, name));
-                if button.clicked() && !on {
-                    self.run(command);
+            // Settings at the bottom, for every part of the app; the parts from the top.
+            ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+                if icons::button(ui, t, Icon::Settings, &Command::Settings.tip(ui.ctx()), true, self.show_settings).clicked() {
+                    self.run(Command::Settings);
                 }
-            }
+                ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                    for (section, icon, command) in [(Section::Mail, Icon::Mail, Command::Mail), (Section::Contacts, Icon::Users, Command::Contacts)] {
+                        let on = self.section == section;
+                        let name = if section == Section::Mail { "Mail" } else { "Contacts" };
+                        let button = icons::button(ui, t, icon, name, true, on);
+                        button.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, on, name));
+                        if button.clicked() && !on {
+                            self.run(command);
+                        }
+                    }
+                });
+            });
         });
     }
 
     /// The Contacts section: the address book on the left, the card of the one picked beside it.
     fn contacts_view(&mut self, ui: &mut egui::Ui, t: &theme::Tokens) {
         let archive = self.archive.clone();
-        let book = self.address_book.get_or_insert_with(|| archive.saved_contacts().unwrap_or_default()).clone();
-        let open = self.contact_pane.as_ref().map(|c| c.data.address.clone());
-        let mut pick = None;
+        if self.address_book.is_none() {
+            self.contact_photos.clear();
+        }
+        let book = self.address_book.get_or_insert_with(|| people(&archive)).clone();
+        let open = self.contact_pane.as_ref().map(|c| (c.book_card, c.data.address.clone()));
+        let mut pick: Option<Result<i64, String>> = None;
+        let mut book_action = None;
+        let mut counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        for person in book.iter() {
+            if let Person::Card(c, _) = person {
+                *counts.entry(c.book.clone()).or_default() += 1;
+            }
+        }
+        // Laid out as Mail: the sources on the left (main action on top, "Add …" at the bottom), the
+        // list in the middle, the open card on the right.
         let frame = egui::Frame::new().fill(t.bg).inner_margin(egui::Margin::same(12));
-        egui::Panel::left("contact_list").frame(frame).default_size(300.0).size_range(240.0..=420.0).show(ui, |ui| {
-            ui.label(RichText::new("Contacts").size(theme::SUBTITLE).family(theme::bold()));
-            ui.label(RichText::new("The people you keep. They stay on this computer.").size(13.0).color(t.text_dim));
-            ui.add_space(10.0);
-            let width = ui.available_width();
-            ui.horizontal(|ui| {
-                let valid = beavermail_smtp::valid_address(&self.new_contact);
-                let typed = ui.add(sized_field(&mut self.new_contact, (width - 70.0).max(120.0)).hint_text("Add: name@example.com"));
-                let add = ui.add_enabled(valid, egui::Button::new("Add")).on_disabled_hover_text("Type an address first");
-                if valid && (add.clicked() || (typed.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))) {
-                    pick = Some(std::mem::take(&mut self.new_contact));
-                }
-            });
-            if book.is_empty() {
-                ui.add_space(12.0);
-                ui.add(egui::Label::new(RichText::new("No contacts yet. Add an address above, or click a sender's name in a message and save them.").size(13.0).color(t.text_dim)).wrap());
-                return;
+        egui::Panel::left("contact_books").frame(frame).default_size(260.0).size_range(210.0..=340.0).show(ui, |ui| {
+            if views::primary_wide(ui, t, Icon::Plus, "New contact", None).on_hover_text("Add someone by their address").clicked() {
+                self.new_contact = Some((String::new(), String::new()));
             }
-            ui.add_space(6.0);
-            ui.add(sized_field(&mut self.contact_query, width).hint_text("Search contacts"));
             ui.add_space(8.0);
-            let query = self.contact_query.trim();
-            let found: Vec<&beavermail_store::Contact> = book.iter().filter(|c| query.is_empty() || c.matches(query)).collect();
-            if found.is_empty() {
-                ui.label(RichText::new("No contact matches.").size(13.0).color(t.text_dim));
-            }
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 2.0;
-                for contact in found {
-                    // The name on the first line, the address under it; an unnamed contact is its address.
-                    let mut job = egui::text::LayoutJob::default();
-                    let (first, second) = if contact.name.is_empty() { (contact.address.as_str(), "") } else { (contact.name.as_str(), contact.address.as_str()) };
-                    job.append(first, 0.0, egui::TextFormat::simple(egui::FontId::proportional(15.0), t.text));
-                    if !second.is_empty() {
-                        job.append(&format!("\n{second}"), 0.0, egui::TextFormat::simple(egui::FontId::proportional(13.0), t.text_dim));
-                    }
-                    let here = open.as_deref() == Some(contact.address.as_str());
-                    let row = egui::Button::selectable(here, job).truncate().min_size(vec2(ui.available_width(), 48.0));
-                    if ui.add(row).clicked() && !here {
-                        pick = Some(contact.address.clone());
-                    }
+            ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+                let add = egui::Button::image_and_text(Icon::Plus.image(icons::SIZE, t.text_dim), "Add address book");
+                if ui.add_sized([ui.available_width(), theme::CONTROL_H], add).on_hover_text("Sync contacts with Fastmail, Nextcloud, iCloud or another CardDAV server").clicked() {
+                    book_action = Some(books::BookAction::Open);
                 }
+                ui.add_space(4.0);
+                ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        if let Some(action) = books::section(ui, t, &self.settings.address_books, &self.contacts_syncing, self.contacts_shown.as_deref(), &counts, book.len() as u32, &self.settings.folded) {
+                            book_action = Some(action);
+                        }
+                    });
+                });
             });
         });
         let mut action = None;
         let frame = egui::Frame::new().fill(t.surface).inner_margin(egui::Margin::same(28));
-        egui::CentralPanel::default().frame(frame).show(ui, |ui| match self.contact_pane.as_mut() {
+        egui::Panel::right("contact_card").frame(frame).default_size(470.0).size_range(360.0..=900.0).show(ui, |ui| match self.contact_pane.as_mut() {
             Some(card) => {
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                    ui.set_max_width(560.0);
                     action = card::body(ui, t, card, false);
                 });
             }
             None => {
-                views::empty_state(ui, t, "No contact open", "Pick someone on the left to see their card, notes and conversations.", None);
+                views::empty_state(ui, t, "No contact open", "Pick someone in the list to see their card, notes and conversations.", None);
             }
         });
-        if let Some(address) = pick {
-            self.contact_pane = self.load_card(&address, "");
+        let frame = egui::Frame::new().fill(t.surface);
+        egui::CentralPanel::default().frame(frame).show(ui, |ui| {
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                let width = ui.available_width() - 12.0;
+                ui.add(sized_field(&mut self.contact_query, width).hint_text("Search contacts"));
+            });
+            ui.add_space(6.0);
+            let shown = self.contacts_shown.as_deref();
+            let in_view = |p: &&Person| shown.is_none_or(|url| matches!(p, Person::Card(c, _) if c.book == url));
+            let query = self.contact_query.trim();
+            let found: Vec<&Person> = book.iter().filter(in_view).filter(|p| query.is_empty() || p.matches(query)).collect();
+            if found.is_empty() {
+                let (title, about) = match (book.iter().any(|p| in_view(&p)), shown.is_some()) {
+                    (true, _) => ("No contact matches", "Try another name, address or number."),
+                    (false, true) => ("No contacts here yet", "Add one with New contact while this address book is selected."),
+                    (false, false) => ("No contacts yet", "Add one with New contact, save a sender from their card, or add an address book."),
+                };
+                views::empty_state(ui, t, title, about, None);
+                return;
+            }
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, views::PERSON_ROW_H, found.len(), |ui, rows| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                for person in &found[rows] {
+                    // In one address book, where they are goes without saying: only the others are named.
+                    let (name, line) = person.lines(&self.settings.address_books, shown.is_none());
+                    let (key, here) = match person {
+                        Person::Card(c, _) => (Ok(c.id), open.as_ref().is_some_and(|(card, _)| *card == Some(c.id))),
+                        Person::Saved(c) => (Err(c.address.clone()), open.as_ref().is_some_and(|(card, address)| card.is_none() && *address == c.address)),
+                    };
+                    let photo = match person {
+                        // Twice the size drawn, for sharp edges on a high-density screen.
+                        Person::Card(c, _) => self.contact_photos.entry(c.id).or_insert_with(|| beavermail_carddav::vcard::details(&c.vcard).photo.and_then(|bytes| card::texture(ui.ctx(), &bytes, 72))).as_ref(),
+                        Person::Saved(_) => None,
+                    };
+                    if views::person_row(ui, t, &name, &line, photo, here).clicked() && !here {
+                        pick = Some(key);
+                    }
+                }
+            });
+        });
+        if let Some(action) = book_action {
+            self.book_action(action);
+        }
+        match pick {
+            Some(Ok(id)) => self.contact_pane = self.load_book_card(id),
+            Some(Err(address)) => self.contact_pane = self.load_card(&address, ""),
+            None => {}
         }
         if let Some(action) = action {
             self.card_action(action, true);
@@ -4742,14 +5241,7 @@ impl BeaverApp {
             }
             ui.add_space(8.0);
             ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-                ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::left_to_right(Align::Center), |ui| {
-                    let width = ui.available_width() - theme::CONTROL_H;
-                    add = ui.add_sized([width, theme::CONTROL_H], egui::Button::image_and_text(Icon::Plus.image(icons::SIZE, t.text_dim), "Add account")).clicked();
-                    if icons::button(ui, t, Icon::Settings, "Settings", true, self.show_settings).clicked() {
-                        self.show_settings = true;
-                        self.security.mode = None;
-                    }
-                });
+                add = ui.add_sized([ui.available_width(), theme::CONTROL_H], egui::Button::image_and_text(Icon::Plus.image(icons::SIZE, t.text_dim), "Add account")).clicked();
                 ui.add_space(4.0);
                 ui.with_layout(Layout::top_down(Align::Min), |ui| {
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -5374,6 +5866,11 @@ impl eframe::App for BeaverApp {
             self.apply(event);
         }
         views::set_link_params(ui.ctx(), &self.settings.link_params);
+        // Address books at start, then every quarter of an hour (changes made here go at once).
+        if self.contacts_synced.is_none_or(|at| at.elapsed() > std::time::Duration::from_secs(15 * 60)) {
+            self.contacts_synced = Some(std::time::Instant::now());
+            self.sync_contacts(None);
+        }
         // Closing the app with a message being written asks first, as Discard does. One being sent, or
         // waiting out Undo send, is kept as a draft on the way out without asking.
         if ui.ctx().input(|i| i.viewport().close_requested())
@@ -5549,6 +6046,13 @@ impl eframe::App for BeaverApp {
         self.account_form(ui.ctx());
         self.remove_dialog(ui.ctx(), &t);
         self.card_dialog(ui.ctx(), &t);
+        self.card_delete_dialog(ui.ctx(), &t);
+        self.new_contact_dialog(ui.ctx(), &t);
+        self.book_remove_dialog(ui.ctx(), &t);
+        let added = self.settings.address_books.clone();
+        if let Some(action) = books::add_dialog(ui.ctx(), &t, &mut self.add_book, &added) {
+            self.book_action(action);
+        }
         if let Some(action) = encryption::dialogs(ui.ctx(), &t, &mut self.key_dialogs) {
             self.key_action(action);
         }
@@ -5691,6 +6195,24 @@ fn range(ids: &[MessageId], anchor: MessageId, to: MessageId) -> Option<Vec<Mess
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn someone_in_two_address_books_shows_in_both_marked() {
+        let store = Store::in_memory().unwrap();
+        let book = |name: &str, url: &str| beavermail_core::AddressBook { name: name.into(), url: url.into(), user: "ada".into(), default: false, read_only: false };
+        let books = [book("Contacts", "https://cloud.example.org/c/"), book("Contacts", "https://google.example.com/g/")];
+        for (b, uid) in [(&books[0], "1"), (&books[1], "2")] {
+            let text = beavermail_carddav::vcard::new_card(uid, "Bob Brown", &["bob@y.org".into()], "");
+            store.add_card(&b.url, &format!("{}{uid}.vcf", b.url), &text, &beavermail_carddav::fields(&text)).unwrap();
+        }
+        store.save_contact("dora@z.org", "Dora", "").unwrap();
+        let all = people(&store);
+        assert_eq!(all.len(), 3);
+        let lines: Vec<(String, String)> = all.iter().map(|p| p.lines(&books, true)).collect();
+        assert_eq!(lines[0], ("Bob Brown".to_owned(), "bob@y.org  ·  Contacts (cloud.example.org)  ·  also in Contacts (google.example.com)".to_owned()));
+        assert_eq!(lines[2], ("Dora".to_owned(), "dora@z.org  ·  on this computer".to_owned()));
+        assert_eq!(all[1].lines(&books, false).1, "bob@y.org  ·  also in Contacts (cloud.example.org)", "in one address book, only the others are named");
+    }
 
     #[test]
     fn a_range_runs_either_way_from_its_anchor() {

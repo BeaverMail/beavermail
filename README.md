@@ -11,6 +11,7 @@ Licensed under AGPL-3.0-only (see [LICENSE](LICENSE)).
 - `crates/imap`: IMAP backend (`ImapSource`), which keeps the archive in sync.
 - `crates/smtp`: sending (`SmtpSender`).
 - `crates/crypto`: signed and encrypted mail (S/MIME and OpenPGP).
+- `crates/carddav`: address books on a CardDAV server.
 - `crates/accounts`: `accounts.toml` and the system credential store.
 - `crates/app`: the egui desktop shell (binary `beavermail`).
 
@@ -25,7 +26,7 @@ Licensed under AGPL-3.0-only (see [LICENSE](LICENSE)).
 - Encryption: an OpenPGP key per account in one click (or imported, or an S/MIME certificate), handed out by Autocrypt; encrypted mail opens in the reader and goes out encrypted when every recipient's key is known.
 - Spam: mail from new senders that fails a check is held as "Suspicious"; a classifier learns from what you mark; trust or block a sender, and review both lists in Settings.
 - Unsubscribe from mailing lists (one-click for verified senders, else an email or the sender's page) and block a sender.
-- Contact cards (click a sender): name, notes, your latest conversations; saved contacts in their own section, from the rail at the window's left edge.
+- Contact cards (click a sender): name, notes, your latest conversations; saved contacts in their own section, from the rail at the window's left edge, synced with CardDAV address books (Fastmail, Nextcloud, iCloud…) added there, each shown on its own or all together; every field and the photo edited; only contacts you add to one go to the server.
 - Markdown compose, addresses as chips (a wrong one in red) with suggestions from everyone you wrote to, Cc and Bcc on demand (Bcc kept in your Sent copy only), drafts kept locally and on the server, attachments; undo send (configurable), send later, signatures per account.
 - Conversations: one row per thread (References, In-Reply-To, "Re:" subjects) with your replies from Sent; can be turned off.
 - Messages open in tabs (double click); the reading pane beside the list can be turned off, so a message opens in the list's place.
