@@ -132,7 +132,7 @@ enum VaultOutcome {
     Recovered(Result<(), MailError>),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 enum Action {
     Unread(bool),
     Archive,
@@ -153,6 +153,9 @@ impl Action {
         matches!(self, Self::Archive | Self::Trash | Self::Spam | Self::NotSpam | Self::Erase)
     }
 }
+
+/// Where the changes waiting for the server are kept, in the vault.
+const OFFLINE_CHANGES: &str = "offline/changes.json";
 
 /// How long an Archive or Move to Trash waits before going to the server, so Undo can take it back.
 const UNDO_SECS: u64 = 10;
@@ -243,6 +246,8 @@ struct SidebarOutcome {
     scheduled: bool,
     /// The suspicious mail of every account, under All inboxes, was clicked.
     all_suspicious: bool,
+    /// The Spam of every account, under All inboxes, was clicked.
+    all_spam: bool,
 }
 
 /// A message as the server holds it, shown in a source tab.
@@ -1182,15 +1187,18 @@ struct BeaverApp {
     /// remembered, so a restart is online and the app is never offline without the user knowing.
     work_offline: bool,
     /// Changes made while the server could not be reached, made when it answers: (account, folder
-    /// index, message, action). shortcut: kept in memory only, so closing the app drops them; keep
-    /// them in the vault, as the Outbox does, if that turns out to matter.
+    /// index, message, action). Kept in the vault too (see [`Self::save_offline`]), so closing the app
+    /// does not drop them.
     offline_changes: Vec<(u64, usize, MessageId, Action)>,
     /// The pane F6 moved the keys to; `None` until then, and again after a click in the list.
     pane: Option<Pane>,
     /// A scroll of the reader asked for from the keyboard, done when it is next drawn.
     reader_scroll: Option<Scroll>,
-    /// The Inbox of every account is shown together; `selected` is then `None`.
+    /// The Inbox of every account is shown together (or their Spam, see `unified_role`); `selected` is
+    /// then `None`.
     unified: bool,
+    /// Which folder of every account `unified` shows: the Inbox or Spam.
+    unified_role: Role,
     /// The account each listed message (and each Sent one) comes from.
     origin: std::collections::HashMap<MessageId, u64>,
     /// The Sent folder of the account shown, or of every account (empty when Sent itself is shown).
@@ -1344,6 +1352,7 @@ impl BeaverApp {
             list_reveal: None,
             wanted: Arc::default(),
             unified: false,
+            unified_role: Role::Inbox,
             origin: std::collections::HashMap::new(),
             sent: Vec::new(),
             conversations: threads::Conversations::default(),
@@ -1385,7 +1394,32 @@ impl BeaverApp {
             Err(e) => app.error = Some(e),
         }
         app.count_outbox(); // what waited from the last session shows at once
+        app.load_offline();
         app
+    }
+
+    /// Keeps the changes waiting for the server in the vault, encrypted like the mail, so they are
+    /// made after a restart too. By account and message, which outlive a run; the folder is known again
+    /// from the message.
+    fn save_offline(&mut self) {
+        let queued: Vec<(String, u64, Action)> = self.offline_changes.iter().filter_map(|(serial, _, id, action)| Some((self.view(*serial)?.account.key(), id.0, *action))).collect();
+        let path = std::path::Path::new(OFFLINE_CHANGES);
+        let saved = if queued.is_empty() { self.vault.remove(path) } else { serde_json::to_vec(&queued).map_err(|e| MailError::Backend(e.to_string())).and_then(|json| self.vault.write(path, &json)) };
+        if let Err(e) = saved {
+            self.error = Some(format!("Changes waiting for the server may be lost when the app closes: {e}"));
+        }
+    }
+
+    /// The changes a previous run left waiting for the server; they go once it answers. Read again when
+    /// the stored mail is unlocked, as a locked vault cannot be read at start.
+    fn load_offline(&mut self) {
+        if !self.offline_changes.is_empty() {
+            return;
+        }
+        let Some(json) = self.vault.read(std::path::Path::new(OFFLINE_CHANGES)).ok().flatten() else { return };
+        let queued: Vec<(String, u64, Action)> = serde_json::from_slice(&json).unwrap_or_default();
+        // A removed account's changes are dropped with it.
+        self.offline_changes = queued.into_iter().filter_map(|(key, id, action)| Some((self.accounts.iter().find(|v| v.account.key() == key)?.serial, usize::MAX, MessageId(id), action))).collect();
     }
 
     /// Runs one mail call in the background and wakes the UI with its result.
@@ -1452,6 +1486,7 @@ impl BeaverApp {
         self.send_pending(); // Undo puts mail back in the list it left
         self.selected = Some((serial, index));
         self.unified = false;
+        self.searched.clear(); // a search runs again over this folder
         self.show_scheduled = false;
         self.refresh_drafts();
         // The reading pane belonged to the list being left; tabs stay.
@@ -1470,9 +1505,15 @@ impl BeaverApp {
 
     /// Shows the Inbox of every account together, newest first.
     fn show_all_inboxes(&mut self) {
+        self.show_all(Role::Inbox);
+    }
+
+    /// Shows the folder of every account with `role` (the Inbox or Spam) together, newest first.
+    fn show_all(&mut self, role: Role) {
         self.send_pending();
         self.selected = None;
-        self.unified = true;
+        (self.unified, self.unified_role) = (true, role);
+        self.searched.clear(); // a search runs again over what is shown now
         self.show_scheduled = false;
         self.drafts.clear();
         self.tabs.retain(|t| t.pinned);
@@ -1557,7 +1598,7 @@ impl BeaverApp {
         if !self.unified {
             return self.selected.into_iter().collect();
         }
-        self.accounts.iter().filter_map(|v| Some((v.serial, v.mailboxes.iter().position(|m| m.role == Role::Inbox)?))).collect()
+        self.accounts.iter().filter_map(|v| Some((v.serial, v.mailboxes.iter().position(|m| m.role == self.unified_role)?))).collect()
     }
 
     fn shows(&self, serial: u64, index: usize) -> bool {
@@ -2059,7 +2100,8 @@ impl BeaverApp {
             if self.show_suspicious {
                 return Some(format!("Suspicious, every account  ·  {held} held  ·  nothing moved on the server"));
             }
-            let mut parts = vec!["All inboxes".to_owned(), format!("{} message{}", views::thousands(total), if total == 1 { "" } else { "s" })];
+            let label = if self.unified_role == Role::Junk { "Spam, every account" } else { "All inboxes" };
+            let mut parts = vec![label.to_owned(), format!("{} message{}", views::thousands(total), if total == 1 { "" } else { "s" })];
             if unread > 0 {
                 parts.push(format!("{} unread", views::thousands(unread)));
             }
@@ -2315,9 +2357,17 @@ impl BeaverApp {
             self.hits.clear();
             return;
         }
+        // The folder shown (every account's, in All inboxes), unless the query names one: "in:all" is everywhere.
+        let named = query.split_whitespace().any(|w| w.len() > 3 && w[..3].eq_ignore_ascii_case("in:"));
+        let shown: std::collections::HashMap<u64, String> =
+            if named || self.show_scheduled { Default::default() } else { self.shown().into_iter().filter_map(|(s, i)| Some((s, self.view(s)?.mailboxes.get(i)?.name.clone()))).collect() };
         let sources: Vec<(u64, Arc<ImapSource>)> = self.accounts.iter().filter_map(|v| Some((v.serial, v.source.clone()?))).collect();
         for (serial, source) in sources {
-            let query = query.clone();
+            let query = match shown.get(&serial) {
+                Some(folder) => format!("{query} in:\"{folder}\""),
+                None if shown.is_empty() => query.clone(),
+                None => continue,
+            };
             self.spawn(async move { Event::Found(seq, serial, source.search(&query, 200).await) });
         }
     }
@@ -2466,6 +2516,9 @@ impl BeaverApp {
         if let Some(source) = self.view(serial).and_then(|v| v.source.clone()) {
             let (now, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.offline_changes).into_iter().partition(|c| c.0 == serial);
             self.offline_changes = later;
+            if !now.is_empty() {
+                self.save_offline(); // one that fails offline again comes back through Event::Done
+            }
             for (serial, index, id, action) in now {
                 let source = source.clone();
                 self.spawn(async move { Event::Done(serial, index, Some((id, action)), perform(source, id, action).await) });
@@ -2834,10 +2887,14 @@ impl BeaverApp {
                     Err(e) => self.error = Some(e.to_string()),
                 }
             }
-            VaultOutcome::Unlocked(Ok(())) => self.security.clear_unlock(),
+            VaultOutcome::Unlocked(Ok(())) => {
+                self.security.clear_unlock();
+                self.load_offline();
+            }
             VaultOutcome::Unlocked(Err(MailError::Auth(_))) => self.security.unlock_error = Some("That passphrase does not open the stored mail.".into()),
             VaultOutcome::Unlocked(Err(e)) => self.security.unlock_error = Some(e.to_string()),
             VaultOutcome::Recovered(Ok(())) => {
+                self.load_offline();
                 self.security.clear_unlock();
                 self.security.mode = None;
                 self.notice = Some(("Stored mail is open again, unlocked by this computer from now on".into(), std::time::Instant::now()));
@@ -4092,7 +4149,7 @@ impl BeaverApp {
     /// Role of the folder being shown.
     fn role(&self) -> Role {
         if self.unified {
-            return Role::Inbox;
+            return self.unified_role;
         }
         let (serial, index) = self.selected.unzip();
         serial.zip(index).and_then(|(s, i)| self.view(s)?.mailboxes.get(i)).map_or(Role::Other, |m| m.role)
@@ -4604,7 +4661,7 @@ impl BeaverApp {
             self.body = None;
         }
         if self.unified {
-            self.show_all_inboxes(); // its mail under the new connection
+            self.show_all(self.unified_role); // its mail under the new connection
         }
         if let Some(compose) = &mut self.compose
             && compose.from == old.serial
@@ -4645,7 +4702,7 @@ impl BeaverApp {
             self.body = None;
         }
         if self.unified {
-            self.show_all_inboxes(); // without the account's mail
+            self.show_all(self.unified_role); // without the account's mail
         }
     }
 
@@ -4683,14 +4740,14 @@ impl BeaverApp {
                             view.offline = None; // the server answered
                         }
                         let inbox = view.mailboxes.iter().position(|m| m.role == Role::Inbox).unwrap_or(0);
+                        let joins = view.mailboxes.iter().position(|m| m.role == self.unified_role);
                         let moved = selected_name.and_then(|name| view.mailboxes.iter().position(|m| m.name == name));
-                        let has_inbox = view.mailboxes.iter().any(|m| m.role == Role::Inbox);
                         if self.selected.is_some_and(|(s, _)| s == serial) {
                             self.selected = moved.map(|i| (serial, i));
                         } else if self.unified {
                             // An account whose folders arrive after All inboxes was opened joins it now.
-                            if has_inbox && !self.origin.values().any(|s| *s == serial) {
-                                self.load_folder(serial, inbox);
+                            if let Some(folder) = joins.filter(|_| !self.origin.values().any(|s| *s == serial)) {
+                                self.load_folder(serial, folder);
                             }
                         } else if self.selected.is_none() && !view.mailboxes.is_empty() {
                             if self.accounts.len() >= 2 { self.show_all_inboxes() } else { self.select_mailbox(serial, inbox) }
@@ -4715,6 +4772,11 @@ impl BeaverApp {
                 }
                 match result {
                     Ok(found) => {
+                        // As the list: the Inbox without what is held as suspicious, Suspicious only that.
+                        let want = if self.show_suspicious { screen::Place::Spam } else { screen::Place::Inbox };
+                        let holding = self.holding();
+                        let fits = |h: &Hit| !holding || self.screening.get(&h.message.id).map_or(!self.show_suspicious, |s| s.place == want);
+                        let found: Vec<Hit> = found.into_iter().filter(fits).collect();
                         self.hits.extend(found.into_iter().map(|h| (serial, h)));
                         self.hits.sort_by_key(|(_, h)| std::cmp::Reverse(h.message.timestamp));
                         self.hits.truncate(300);
@@ -4846,14 +4908,21 @@ impl BeaverApp {
             Event::Done(serial, index, Some(change), Err(MailError::Offline(why))) => {
                 self.went_offline(serial, why);
                 self.offline_changes.push((serial, index, change.0, change.1));
+                self.save_offline();
             }
             Event::Done(serial, index, _, Err(e)) => {
                 self.error = Some(e.to_string());
                 // Show what the server really has.
                 if self.unified && self.shows(serial, index) {
-                    self.show_all_inboxes();
+                    self.show_all(self.unified_role);
                 } else if self.selected == Some((serial, index)) {
                     self.select_mailbox(serial, index);
+                }
+            }
+            // Emptying Spam or Trash: the server may have moved them (Gmail puts them in Trash), so its counts.
+            Event::Done(serial, _, None, Ok(())) => {
+                if let Some(source) = self.view(serial).and_then(|v| v.source.clone()) {
+                    self.spawn(async move { Event::Mailboxes(serial, source.mailboxes().await, true) });
                 }
             }
             Event::Done(..) => {}
@@ -5627,7 +5696,7 @@ impl BeaverApp {
     /// Accounts and their folders. Returns (folder chosen, account to remove, account to edit, add-account clicked).
     fn sidebar(&mut self, ui: &mut egui::Ui, t: &theme::Tokens) -> SidebarOutcome {
         let (mut chosen, mut removed, mut edit, mut add, mut suspicious, mut recheck, mut empty) = (None, None, None, false, None, None, None);
-        let (mut all, mut scheduled, mut all_suspicious) = (false, false, false);
+        let (mut all, mut scheduled, mut all_suspicious, mut all_spam) = (false, false, false, false);
         let mut fold = None;
         // shortcut: only the Inboxes being shown have verdicts; the others keep the count of their last
         // check (All inboxes, shown at start, checks every one). Checking every account in the background
@@ -5666,12 +5735,16 @@ impl BeaverApp {
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                         if self.accounts.len() >= 2 {
                             let unread = self.accounts.iter().filter_map(|v| Some(inbox_unread(v.serial, v.mailboxes.iter().find(|m| m.role == Role::Inbox)?))).sum();
-                            all = views::folder_row(ui, t, "All inboxes", Role::Inbox, unread, self.unified && !self.show_suspicious).on_hover_text("The Inbox of every account, newest first").clicked();
+                            let inboxes = self.unified && self.unified_role == Role::Inbox;
+                            all = views::folder_row(ui, t, "All inboxes", Role::Inbox, unread, inboxes && !self.show_suspicious).on_hover_text("The Inbox of every account, newest first").clicked();
                             if self.settings.hold_suspicious {
                                 let held = self.accounts.iter().filter_map(|v| held_of.get(&v.serial)).map(|h| h.0).sum();
-                                let row = views::suspicious_row(ui, t, held, self.unified && self.show_suspicious);
+                                let row = views::suspicious_row(ui, t, held, inboxes && self.show_suspicious);
                                 all_suspicious = row.on_hover_text("Mail from new senders that failed a check, every account's, held apart from the Inboxes").clicked();
                             }
+                            let spam = self.accounts.iter().filter_map(|v| v.mailboxes.iter().find(|m| m.role == Role::Junk)).map(|m| m.unread).sum();
+                            let row = views::folder_row(ui, t, "Spam", Role::Junk, spam, self.unified && self.unified_role == Role::Junk);
+                            all_spam = row.on_hover_text("The Spam folder of every account, newest first").clicked();
                         }
                         if !self.scheduled.is_empty() {
                             let row = views::icon_row(ui, t, "Scheduled", Icon::Calendar, self.scheduled.len() as u32, self.show_scheduled);
@@ -5764,7 +5837,7 @@ impl BeaverApp {
             }
             self.save_settings();
         }
-        SidebarOutcome { chosen, suspicious, recheck, empty, removed, edit, add, all, scheduled, all_suspicious }
+        SidebarOutcome { chosen, suspicious, recheck, empty, removed, edit, add, all, scheduled, all_suspicious, all_spam }
     }
 
     /// Search, refresh and the message list. Returns the message the user clicked and whether to add an account.
@@ -5788,7 +5861,7 @@ impl BeaverApp {
                 let width = ui.available_width() - theme::CONTROL_H - 20.0;
                 let focus = std::mem::take(&mut self.focus_search);
                 views::search_box(ui, t, &mut self.query, "Search mail  ( / )", width, focus)
-                    .on_hover_text(format!("Search everything stored on this computer.\nWords, \"a phrase\", from:ada, to:bob, subject:invoice, in:inbox, is:unread, has:attachment, after:2026-09-01, before:2026-10\n\nAll commands and their keys: {}", Command::Palette.keys(ui.ctx())));
+                    .on_hover_text(format!("Search the folder shown, as stored on this computer; in:all searches every folder.\nWords, \"a phrase\", from:ada, to:bob, subject:invoice, in:inbox, is:unread, has:attachment, after:2026-09-01, before:2026-10\n\nAll commands and their keys: {}", Command::Palette.keys(ui.ctx())));
                 if self.syncing > 0 {
                     ui.add_sized([theme::CONTROL_H - 4.0, theme::CONTROL_H - 4.0], egui::Spinner::new().size(16.0)).on_hover_text("Syncing…");
                 } else {
@@ -6325,16 +6398,24 @@ impl BeaverApp {
 impl eframe::App for BeaverApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // What waited for Undo is done now, or the mail would come back at the next start.
+        // One that cannot reach the server waits for the next run instead.
         if let Some(pending) = self.pending.take() {
-            let jobs: Vec<_> = pending.items.into_iter().filter_map(|(serial, _, action, m, _)| Some((self.view(serial)?.source.clone()?, m.id, action))).collect();
+            let jobs: Vec<_> = pending.items.into_iter().filter_map(|(serial, index, action, m, _)| Some((self.view(serial)?.source.clone()?, serial, index, m.id, action))).collect();
+            let mut unsent: Vec<(u64, usize, MessageId, Action)> = jobs.iter().map(|(_, serial, index, id, action)| (*serial, *index, *id, *action)).collect();
             self.runtime.block_on(async {
                 let all = async {
-                    for (source, id, action) in jobs {
-                        let _ = perform(source, id, action).await;
+                    for (source, _, _, id, action) in jobs {
+                        if !matches!(perform(source, id, action).await, Err(MailError::Offline(_))) {
+                            unsent.retain(|c| c.2 != id);
+                        }
                     }
                 };
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(10), all).await;
             });
+            if !unsent.is_empty() {
+                self.offline_changes.extend(unsent);
+                self.save_offline();
+            }
         }
         let _ = std::fs::remove_dir_all(&self.open_dir); // the decrypted copies made to open attachments
     }
@@ -6394,17 +6475,22 @@ impl eframe::App for BeaverApp {
                 _ => {}
             }
         }
-        let SidebarOutcome { chosen, suspicious, recheck, empty, removed, edit, mut add, all, scheduled, all_suspicious } =
+        let SidebarOutcome { chosen, suspicious, recheck, empty, removed, edit, mut add, all, scheduled, all_suspicious, all_spam } =
             if self.in_tab || contacts { SidebarOutcome::default() } else { self.sidebar(ui, &t) };
         if all {
             self.show_suspicious = false;
             self.show_all_inboxes();
         }
         if all_suspicious {
-            if !self.unified {
+            if !self.unified || self.unified_role != Role::Inbox {
                 self.show_all_inboxes();
             }
             self.show_suspicious = true;
+            self.searched.clear(); // the same Inboxes, another side of them
+        }
+        if all_spam {
+            self.show_suspicious = false;
+            self.show_all(Role::Junk);
         }
         if scheduled {
             self.show_scheduled_list();
@@ -6422,6 +6508,7 @@ impl eframe::App for BeaverApp {
                 self.select_mailbox(serial, index);
             }
             self.show_suspicious = true;
+            self.searched.clear();
         }
         // A full check: every message again, with who is known worked out afresh. Opening another
         // folder checks it all anyway, since its verdicts start empty.

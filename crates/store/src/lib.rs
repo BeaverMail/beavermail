@@ -414,6 +414,7 @@ impl Query {
                 Some(("after", v)) if day_start(v).is_some() => query.after = day_start(v),
                 Some(("before", v)) if day_start(v).is_some() => query.before = day_start(v),
                 Some(("subject", v)) if !v.is_empty() => query.subject.push(v.to_owned()),
+                Some(("in", v)) if v.eq_ignore_ascii_case("all") => {}
                 Some(("in", v)) if !v.is_empty() => query.folders.push(v.to_owned()),
                 Some(("is", v)) if v.eq_ignore_ascii_case("unread") => query.unread = true,
                 Some(("has", v)) if v.eq_ignore_ascii_case("attachment") => query.attachment = true,
@@ -1915,6 +1916,7 @@ mod tests {
         assert_eq!(found(&store, "is:unread"), ["Budget review"]);
         assert_eq!(found(&store, "has:attachment budget"), ["Budget review"]);
         assert_eq!(found(&store, "in:archive budget"), ["Old budget"]);
+        assert_eq!(found(&store, "in:all budget").len(), found(&store, "budget").len(), "in:all is every folder");
         assert_eq!(found(&store, "\"budget notes\""), ["Budget notes"], "a phrase stays together");
         assert!(found(&store, "from:").len() <= 3, "an empty operator is just text");
         let hits = store.search("me", "in:archive", 10).unwrap();

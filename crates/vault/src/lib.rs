@@ -491,9 +491,9 @@ impl Vault {
         match &self.backing {
             Backing::Disk(dir) => {
                 let mut found = Vec::new();
-                // Everything the vault holds: downloaded mail, drafts with their attachments, and the
-                // user's own encryption keys.
-                let mut pending = vec![dir.join("mail"), dir.join("drafts"), dir.join("keyring")];
+                // Everything the vault holds: downloaded mail, drafts with their attachments, the
+                // user's own encryption keys, and the changes waiting for the server.
+                let mut pending = vec![dir.join("mail"), dir.join("drafts"), dir.join("keyring"), dir.join("offline")];
                 while let Some(folder) = pending.pop() {
                     let Ok(entries) = std::fs::read_dir(&folder) else { continue };
                     for entry in entries.flatten() {
@@ -627,8 +627,10 @@ impl Vault {
     /// The mail is still on the server and is downloaded again.
     pub fn reset(&self) -> Result<(), MailError> {
         self.remove_dir(Path::new("mail"))?;
-        // Encrypted with the forgotten key, the user's own keys cannot be read either.
+        // Encrypted with the forgotten key, the user's own keys and the changes waiting for the server
+        // cannot be read either.
         self.remove_dir(Path::new("keyring"))?;
+        self.remove_dir(Path::new("offline"))?;
         if let Ok(file) = self.read_keys() {
             for slot in file.slots.iter().filter(|s| s.kind == "credential-store") {
                 self.credentials.remove(&slot.id)?;
@@ -1119,6 +1121,8 @@ mod tests {
         let (draft, attachment) = (Path::new("drafts/a/1.json"), Path::new("drafts/a/1/0-plan.pdf"));
         vault.write(draft, b"{\"subject\":\"private\"}").unwrap();
         vault.write(attachment, b"%PDF secret").unwrap();
+        let queued = Path::new("offline/changes.json");
+        vault.write(queued, b"[[\"me\",7,\"Trash\"]]").unwrap();
         assert!(!contains(&on_disk(&dir, draft), b"private"));
         vault.set_mode(Mode::Off, None, NOP).unwrap();
         assert_eq!(on_disk(&dir, draft), b"{\"subject\":\"private\"}", "plain after turning encryption off");
@@ -1126,6 +1130,7 @@ mod tests {
         vault.set_mode(Mode::System, None, NOP).unwrap();
         assert!(!contains(&on_disk(&dir, attachment), b"secret"), "encrypted again");
         assert_eq!(vault.read(attachment).unwrap().as_deref(), Some(&b"%PDF secret"[..]));
+        assert_eq!(vault.read(queued).unwrap().as_deref(), Some(&b"[[\"me\",7,\"Trash\"]]"[..]), "the changes waiting for the server too");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
