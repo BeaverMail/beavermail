@@ -93,10 +93,12 @@ pub fn show(ctx: &egui::Context, t: &Tokens, card: &mut Card) -> Option<CardActi
     let mut action = None;
     let modal = egui::Modal::new(egui::Id::new("contact_card")).show(ctx, |ui| {
         ui.set_width(crate::FORM_WIDTH);
-        // The whole form of an address book's card is taller than a small window.
-        egui::ScrollArea::vertical().max_height((ctx.content_rect().height() - 120.0).max(240.0)).show(ui, |ui| {
-            action = body(ui, t, card, true);
+        // The whole form of an address book's card is taller than a small window: it scrolls, and the
+        // buttons stay below it, always in reach.
+        egui::ScrollArea::vertical().max_height((ctx.content_rect().height() - 220.0).max(160.0)).show(ui, |ui| {
+            action = content(ui, t, card);
         });
+        action = actions(ui, t, card, true).or(action.take());
     });
     if modal.should_close() && action.is_none() {
         action = Some(CardAction::Close);
@@ -323,6 +325,12 @@ fn detail_rows(ui: &mut egui::Ui, t: &Tokens, d: &Details, first_email: &str) {
 
 /// The card's content, in a dialog (`closable`, with Close) or in the Contacts section.
 pub fn body(ui: &mut egui::Ui, t: &Tokens, card: &mut Card, closable: bool) -> Option<CardAction> {
+    let action = content(ui, t, card);
+    actions(ui, t, card, closable).or(action)
+}
+
+/// Who they are, the form when editing, and the latest conversations.
+fn content(ui: &mut egui::Ui, t: &Tokens, card: &mut Card) -> Option<CardAction> {
     let mut action = None;
     let shown = if card.data.name.is_empty() { card.data.address.clone() } else { card.data.name.clone() };
     ui.horizontal(|ui| {
@@ -337,25 +345,10 @@ pub fn body(ui: &mut egui::Ui, t: &Tokens, card: &mut Card, closable: bool) -> O
     });
     ui.add_space(6.0);
     ui.add(egui::Label::new(RichText::new(card.standing()).size(13.0).color(t.text_dim)).wrap());
-    // A card of an address book being edited: the whole form, then Save and Cancel.
+    // A card of an address book being edited: the whole form, then (in `actions`) Save and Cancel.
     if let Some(editing) = card.editing.as_mut() {
         ui.add_space(10.0);
-        action = edit_form(ui, t, editing);
-        let why = invalid(editing);
-        ui.add_space(10.0);
-        ui.separator();
-        ui.add_space(4.0);
-        ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
-            let changed = card.details.as_ref() != card.editing.as_ref();
-            let save = views::primary_button(ui, t, "Save", why.is_none() && changed).on_disabled_hover_text(why.unwrap_or("Nothing changed yet"));
-            if save.clicked() {
-                action = Some(CardAction::Save);
-            }
-            if ui.button("Cancel").clicked() {
-                card.editing = None;
-            }
-        });
-        return action;
+        return edit_form(ui, t, editing);
     }
     match &card.details {
         Some(details) => detail_rows(ui, t, details, &card.data.address),
@@ -388,6 +381,29 @@ pub fn body(ui: &mut egui::Ui, t: &Tokens, card: &mut Card, closable: bool) -> O
                 }
             }
         });
+    }
+    action
+}
+
+/// The card's buttons: what to do with them, then Edit or Save and Close; Save and Cancel when editing.
+fn actions(ui: &mut egui::Ui, t: &Tokens, card: &mut Card, closable: bool) -> Option<CardAction> {
+    let mut action = None;
+    if let Some(editing) = card.editing.as_ref() {
+        let why = invalid(editing);
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(4.0);
+        ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
+            let changed = card.details.as_ref() != card.editing.as_ref();
+            let save = views::primary_button(ui, t, "Save", why.is_none() && changed).on_disabled_hover_text(why.unwrap_or("Nothing changed yet"));
+            if save.clicked() {
+                action = Some(CardAction::Save);
+            }
+            if ui.button("Cancel").clicked() {
+                card.editing = None;
+            }
+        });
+        return action;
     }
     ui.add_space(10.0);
     // What to do with them on a row of its own: with Save and Close beside, four buttons do not fit.
