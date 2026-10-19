@@ -250,6 +250,43 @@ pub struct AddressBook {
     pub read_only: bool,
 }
 
+/// A calendar: one synced over CalDAV, a source of its own as address books are, or the one kept on
+/// this computer only ([`CalendarSource::LOCAL`] as its URL).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalendarSource {
+    /// As the server names it ("Work", "Family").
+    pub name: String,
+    /// The calendar's own URL (a collection).
+    pub url: String,
+    #[serde(default)]
+    pub user: String,
+    /// `#RRGGBB`, from the server or chosen here; empty for the app's own.
+    #[serde(default)]
+    pub color: String,
+    /// Its events show in the views.
+    #[serde(default = "shown")]
+    pub shown: bool,
+    /// Accepted invitations go to this one.
+    #[serde(default)]
+    pub default: bool,
+    /// Nothing can be written there (shared read-only, a subscription).
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+impl CalendarSource {
+    /// The URL that stands for the calendar on this computer.
+    pub const LOCAL: &'static str = "local:";
+
+    pub fn is_local(&self) -> bool {
+        self.url == Self::LOCAL
+    }
+}
+
+fn shown() -> bool {
+    true
+}
+
 /// "Ada Lovelace <ada@x.org>" as an item of an address list: the name quoted when it has a character
 /// that would cut it short (a comma, a colon, parentheses, an @…), the address alone when there is no
 /// name or the name is the address.
@@ -468,6 +505,9 @@ pub struct Settings {
     /// The address books synced over CardDAV; their passwords are in the credential store.
     #[serde(default)]
     pub address_books: Vec<AddressBook>,
+    /// The calendars, synced over CalDAV or on this computer; passwords in the credential store.
+    #[serde(default)]
+    pub calendars: Vec<CalendarSource>,
 }
 
 fn yes() -> bool {
@@ -480,7 +520,7 @@ fn undo_secs() -> u32 {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { display: DisplayMode::default(), sender_display: Default::default(), rich_outgoing: true, undo_send_secs: undo_secs(), remote_senders: Default::default(), hold_suspicious: true, marked: Default::default(), threads: true, reading_pane: true, folded: Default::default(), link_params: String::new(), address_books: Vec::new() }
+        Self { display: DisplayMode::default(), sender_display: Default::default(), rich_outgoing: true, undo_send_secs: undo_secs(), remote_senders: Default::default(), hold_suspicious: true, marked: Default::default(), threads: true, reading_pane: true, folded: Default::default(), link_params: String::new(), address_books: Vec::new(), calendars: Vec::new() }
     }
 }
 

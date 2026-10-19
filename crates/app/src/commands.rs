@@ -36,6 +36,7 @@ pub enum Command {
     SwitchPane,
     AllInboxes,
     Mail,
+    Calendar,
     Contacts,
     WorkOffline,
     WorkOnline,
@@ -57,7 +58,7 @@ const CTRL_SHIFT: Modifiers = Modifiers::COMMAND.plus(Modifiers::SHIFT);
 
 impl Command {
     /// In the order the keys are tried (Ctrl+Shift+Tab before Ctrl+Tab) and the palette lists them.
-    pub const ALL: [Self; 35] = [
+    pub const ALL: [Self; 36] = [
         Self::Palette,
         Self::NewMessage,
         Self::Reply,
@@ -89,6 +90,7 @@ impl Command {
         Self::SwitchPane,
         Self::AllInboxes,
         Self::Mail,
+        Self::Calendar,
         Self::Contacts,
         Self::WorkOffline,
         Self::WorkOnline,
@@ -128,6 +130,7 @@ impl Command {
             Self::SwitchPane => "Switch between list and reader",
             Self::AllInboxes => "Go to All inboxes",
             Self::Mail => "Go to Mail",
+            Self::Calendar => "Go to Calendar",
             Self::Contacts => "Go to Contacts",
             Self::WorkOffline => "Work offline",
             Self::WorkOnline => "Work online",
@@ -164,7 +167,7 @@ impl Command {
             Self::SelectAll => &[Trigger::Shortcut(CTRL, Key::A, false)],
             Self::Search => &[Trigger::Text("/")],
             Self::SwitchPane => &[Trigger::Key(Key::F6)],
-            Self::TrustSender | Self::BlockSender | Self::Refresh | Self::AllInboxes | Self::Mail | Self::Contacts | Self::WorkOffline | Self::WorkOnline | Self::Settings => &[],
+            Self::TrustSender | Self::BlockSender | Self::Refresh | Self::AllInboxes | Self::Mail | Self::Calendar | Self::Contacts | Self::WorkOffline | Self::WorkOnline | Self::Settings => &[],
         }
     }
 

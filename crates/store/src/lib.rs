@@ -212,6 +212,30 @@ pub struct StoredCard {
     pub state: CardState,
 }
 
+/// An event of a calendar (a calendar object: an event with its changed occurrences) as stored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredEvent {
+    pub id: i64,
+    /// The calendar's URL.
+    pub calendar: String,
+    pub href: String,
+    /// The server's version of it; empty for one not sent yet.
+    pub etag: String,
+    /// The iCalendar text.
+    pub ics: String,
+    pub state: CardState,
+}
+
+/// When a stored event happens, worked out by whoever stores it, so a view asks only for the events
+/// in its range: its first start, its `UID`, and when its last occurrence ends (`None`: it repeats
+/// with no end).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EventSpan {
+    pub uid: String,
+    pub first: i64,
+    pub last: Option<i64>,
+}
+
 /// What a card shows, read from its vCard by whoever stores it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CardFields {
@@ -705,6 +729,26 @@ fn migrate(conn: &Connection) -> Result<(), MailError> {
                      UNIQUE (book, href)
                  );
                  PRAGMA user_version = 18;",
+            )
+            .map_err(db)?;
+        }
+        // Version 22: calendars' events, with when they happen for the views' ranges.
+        if version < 22 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS events (
+                     id INTEGER PRIMARY KEY,
+                     calendar TEXT NOT NULL,
+                     href TEXT NOT NULL,
+                     etag TEXT NOT NULL DEFAULT '',
+                     ics TEXT NOT NULL,
+                     uid TEXT NOT NULL DEFAULT '',
+                     first INTEGER NOT NULL DEFAULT 0,
+                     last INTEGER,
+                     state INTEGER NOT NULL DEFAULT 0,
+                     UNIQUE (calendar, href)
+                 );
+                 CREATE INDEX IF NOT EXISTS events_uid ON events (uid);
+                 PRAGMA user_version = 22;",
             )
             .map_err(db)?;
         }
@@ -1308,6 +1352,53 @@ impl Store {
     /// Forgets a card: gone from the server, or its deletion done.
     pub fn forget_card(&self, book: &str, href: &str) -> Result<(), MailError> {
         self.conn().execute("DELETE FROM cards WHERE book = ?1 AND href = ?2", params![book, href]).map(|_| ()).map_err(db)
+    }
+
+    /// The events of a calendar, as stored, for its sync.
+    pub fn events(&self, calendar: &str) -> Result<Vec<StoredEvent>, MailError> {
+        self.query_events("WHERE calendar = ?1", params![calendar])
+    }
+
+    /// The events of `calendars` that may have an occurrence between `from` and `to` (seconds since
+    /// the epoch): those whose span overlaps it. Their occurrences are worked out by the caller.
+    pub fn events_between(&self, calendars: &[String], from: i64, to: i64) -> Result<Vec<StoredEvent>, MailError> {
+        let list = calendars.iter().map(|c| format!("'{}'", c.replace('\'', "''"))).collect::<Vec<_>>().join(", ");
+        self.query_events(&format!("WHERE calendar IN ({list}) AND state != 3 AND first < ?1 AND (last IS NULL OR last > ?2)"), params![to, from])
+    }
+
+    /// The stored copies of the event with this `UID`, in every calendar.
+    pub fn events_with_uid(&self, uid: &str) -> Result<Vec<StoredEvent>, MailError> {
+        self.query_events("WHERE uid = ?1 AND state != 3", params![uid])
+    }
+
+    fn query_events(&self, filter: &str, args: impl rusqlite::Params) -> Result<Vec<StoredEvent>, MailError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!("SELECT id, calendar, href, etag, ics, state FROM events {filter}")).map_err(db)?;
+        let rows = stmt
+            .query_map(args, |r| Ok(StoredEvent { id: r.get(0)?, calendar: r.get(1)?, href: r.get(2)?, etag: r.get(3)?, ics: r.get(4)?, state: CardState::from_int(r.get(5)?) }))
+            .map_err(db)?;
+        rows.collect::<Result<_, _>>().map_err(db)
+    }
+
+    /// Keeps an event as the server has it (or, for the calendar on this computer, as made here).
+    pub fn put_event(&self, calendar: &str, href: &str, etag: &str, ics: &str, span: &EventSpan) -> Result<(), MailError> {
+        self.conn()
+            .execute(
+                "INSERT INTO events (calendar, href, etag, ics, uid, first, last, state) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)
+                 ON CONFLICT (calendar, href) DO UPDATE SET etag = ?3, ics = ?4, uid = ?5, first = ?6, last = ?7, state = 0",
+                params![calendar, href, etag, ics, span.uid, span.first, span.last],
+            )
+            .map(|_| ())
+            .map_err(db)
+    }
+
+    pub fn forget_event(&self, calendar: &str, href: &str) -> Result<(), MailError> {
+        self.conn().execute("DELETE FROM events WHERE calendar = ?1 AND href = ?2", params![calendar, href]).map(|_| ()).map_err(db)
+    }
+
+    /// Forgets a calendar's events: it was removed here.
+    pub fn forget_calendar(&self, calendar: &str) -> Result<(), MailError> {
+        self.conn().execute("DELETE FROM events WHERE calendar = ?1", [calendar]).map(|_| ()).map_err(db)
     }
 
     /// Forgets an address book's cards: its sync was turned off.

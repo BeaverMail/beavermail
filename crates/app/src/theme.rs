@@ -185,6 +185,13 @@ pub fn label(keyword: &str) -> (String, Color32) {
     }
 }
 
+/// A calendar's colour as the server keeps it (`#RRGGBB`); `None` when it has none or it cannot be read.
+pub fn calendar_color(hex: &str) -> Option<Color32> {
+    let hex = hex.trim().strip_prefix('#')?;
+    let value = u32::from_str_radix(hex.get(..6)?, 16).ok()?;
+    Some(rgb(value))
+}
+
 /// The colour marking an account's mail in All inboxes and beside its name, by its place in the list.
 pub fn account_color(at: usize) -> Color32 {
     const HUES: [u32; 6] = [0x3B82F6, 0xF59E0B, 0x22A06B, 0xEC4899, 0x8B5CF6, 0x06B6D4];

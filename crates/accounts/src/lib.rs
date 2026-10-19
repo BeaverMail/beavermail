@@ -117,6 +117,28 @@ pub fn forget_book_password(book: &beavermail_core::AddressBook) -> Result<(), S
     }
 }
 
+/// A calendar's password, shared by the calendars of one server and login, as for address books.
+fn calendar_entry(calendar: &beavermail_core::CalendarSource) -> Result<keyring::Entry, String> {
+    let host = calendar.url.split("://").nth(1).and_then(|r| r.split('/').next()).unwrap_or(&calendar.url);
+    keyring::Entry::new(SERVICE, &format!("caldav:{}@{host}", calendar.user)).map_err(|e| format!("credential store: {e}"))
+}
+
+pub fn calendar_password(calendar: &beavermail_core::CalendarSource) -> Result<String, String> {
+    calendar_entry(calendar)?.get_password().map_err(|e| format!("credential store, calendar: {e}"))
+}
+
+pub fn set_calendar_password(calendar: &beavermail_core::CalendarSource, password: &str) -> Result<(), String> {
+    calendar_entry(calendar)?.set_password(password).map_err(|e| format!("credential store: {e}"))
+}
+
+/// Removes a calendar's password, once no calendar of that server and login is left.
+pub fn forget_calendar_password(calendar: &beavermail_core::CalendarSource) -> Result<(), String> {
+    match calendar_entry(calendar)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(format!("credential store: {e}")),
+    }
+}
+
 pub fn password(account: &Account) -> Result<String, String> {
     entry(account)?.get_password().map_err(|e| format!("credential store: {e}"))
 }

@@ -129,16 +129,30 @@ pub fn section(ui: &mut egui::Ui, t: &Tokens, books: &[AddressBook], syncing: &s
     action
 }
 
-/// The dialog to add address books: the server and login, then, when it has more than one, which
-/// to add. One primary action: find them, then add those ticked.
-pub fn add_dialog(ctx: &egui::Context, t: &Tokens, state: &mut Option<AddBook>, added: &[AddressBook]) -> Option<BookAction> {
+/// How the add dialog speaks of what it adds: address books, or calendars.
+pub struct Words {
+    pub id: &'static str,
+    /// "address book", "calendar".
+    pub one: &'static str,
+    pub many: &'static str,
+    pub about: &'static str,
+    /// Beside one the server makes itself, read-only.
+    pub read_only: &'static str,
+}
+
+pub const BOOKS: Words = Words { id: "add_book", one: "address book", many: "address books", about: "Sync your contacts with a CardDAV server.", read_only: "Read-only, made by the server: not your own contacts" };
+
+/// The dialog to add address books or calendars: the server and login, then, when it has more than
+/// one, which to add. One primary action: find them, then add those ticked. `added`: the URLs of
+/// those already added.
+pub fn add_dialog(ctx: &egui::Context, t: &Tokens, state: &mut Option<AddBook>, added: &[&str], words: &Words) -> Option<BookAction> {
     let form = state.as_mut()?;
     let mut action = None;
     let mut close = false;
-    let modal = egui::Modal::new(egui::Id::new("add_book")).show(ctx, |ui| {
+    let modal = egui::Modal::new(egui::Id::new(words.id)).show(ctx, |ui| {
         ui.set_width(crate::FORM_WIDTH);
-        ui.heading("Add address book");
-        ui.label(RichText::new("Sync your contacts with a CardDAV server.").color(t.text_dim));
+        ui.heading(format!("Add {}", words.one));
+        ui.label(RichText::new(words.about).color(t.text_dim));
         ui.add_space(12.0);
         let mut edited = false;
         crate::form_grid(ui, "add_book_form", |ui| {
@@ -163,13 +177,13 @@ pub fn add_dialog(ctx: &egui::Context, t: &Tokens, state: &mut Option<AddBook>, 
         match &mut form.found {
             Some(Ok(found)) => {
                 ui.add_space(8.0);
-                ui.label(RichText::new("Address books on this server").strong());
+                ui.label(RichText::new(format!("{} on this server", capital(words.many))).strong());
                 for (book, on) in found.iter_mut() {
-                    let already = added.iter().any(|b| b.url == book.url);
+                    let already = added.contains(&book.url.as_str());
                     let label = if book.name.is_empty() { book.url.clone() } else { book.name.clone() };
                     let hint = match (already, book.writable) {
                         (true, _) => "Already added",
-                        (false, false) => "Read-only, made by the server: not your own contacts",
+                        (false, false) => words.read_only,
                         (false, true) => "",
                     };
                     ui.add_enabled_ui(!already, |ui| {
@@ -189,7 +203,7 @@ pub fn add_dialog(ctx: &egui::Context, t: &Tokens, state: &mut Option<AddBook>, 
         ui.add_space(12.0);
         let ready = !form.server.trim().is_empty() && !form.user.trim().is_empty() && !form.password.is_empty();
         let chosen: Option<Vec<Found>> = match &form.found {
-            Some(Ok(found)) => Some(found.iter().filter(|(book, on)| *on && !added.iter().any(|b| b.url == book.url)).map(|(book, _)| book.clone()).collect()),
+            Some(Ok(found)) => Some(found.iter().filter(|(book, on)| *on && !added.contains(&book.url.as_str())).map(|(book, _)| book.clone()).collect()),
             _ => None,
         };
         ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
@@ -197,18 +211,18 @@ pub fn add_dialog(ctx: &egui::Context, t: &Tokens, state: &mut Option<AddBook>, 
             match &chosen {
                 Some(chosen) => {
                     let label = match chosen.len() {
-                        0 | 1 => "Add address book".to_owned(),
-                        n => format!("Add {n} address books"),
+                        0 | 1 => format!("Add {}", words.one),
+                        n => format!("Add {n} {}", words.many),
                     };
                     let can = !chosen.is_empty();
-                    if views::primary_button(ui, t, &label, can).on_disabled_hover_text("Turn on the address books to sync").clicked() || (can && enter) {
+                    if views::primary_button(ui, t, &label, can).on_disabled_hover_text(format!("Turn on the {} to sync", words.many)).clicked() || (can && enter) {
                         action = Some(BookAction::Add(chosen.clone()));
                     }
                 }
                 None => {
-                    let label = if form.finding { "Finding…" } else { "Find address books" };
+                    let label = if form.finding { "Finding…".to_owned() } else { format!("Find {}", words.many) };
                     let can = ready && !form.finding;
-                    if views::primary_button(ui, t, label, can).on_disabled_hover_text(if form.finding { "Asking the server" } else { "Server, user and password are required" }).clicked() || (can && enter) {
+                    if views::primary_button(ui, t, &label, can).on_disabled_hover_text(if form.finding { "Asking the server" } else { "Server, user and password are required" }).clicked() || (can && enter) {
                         action = Some(BookAction::Find);
                     }
                     if form.finding {
@@ -227,6 +241,12 @@ pub fn add_dialog(ctx: &egui::Context, t: &Tokens, state: &mut Option<AddBook>, 
     action
 }
 
+/// "Address books" from "address books".
+fn capital(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map(|c| c.to_uppercase().chain(chars).collect()).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,14 +256,14 @@ mod tests {
         let ctx = egui::Context::default();
         crate::theme::apply(&ctx);
         let added = [AddressBook { name: "Personal".into(), url: "https://dav.example.org/ada/personal/".into(), user: "ada".into(), default: true, read_only: false }];
-        let book = |url: &str, name: &str, writable| (Found { url: url.into(), name: name.into(), writable }, writable);
+        let book = |url: &str, name: &str, writable| (Found { url: url.into(), name: name.into(), writable, color: String::new() }, writable);
         let found = vec![book(&added[0].url, "Personal", true), book("https://dav.example.org/ada/recent/", "Recently contacted", false)];
         let mut state = Some(AddBook { server: "example.org".into(), user: "ada".into(), password: "pw".into(), finding: false, focus_first: true, found: Some(Ok(found)) });
         for _ in 0..2 {
             let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(1200.0, 900.0))), ..Default::default() };
             let mut output = ctx.run_ui(input, |ui| {
                 assert!(section(ui, &Tokens::dark(), &added, &Default::default(), None, &Default::default(), 0, &Default::default()).is_none(), "nothing pressed");
-                assert!(add_dialog(ui.ctx(), &Tokens::dark(), &mut state, &added).is_none());
+                assert!(add_dialog(ui.ctx(), &Tokens::dark(), &mut state, &[added[0].url.as_str()], &BOOKS).is_none());
             });
             output.textures_delta.clear();
         }

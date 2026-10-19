@@ -11,6 +11,8 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 
 mod attachments;
 mod books;
+mod calendars;
+mod calview;
 mod card;
 mod commands;
 mod compose;
@@ -36,6 +38,7 @@ use beavermail_imap::ImapSource;
 use beavermail_smtp::{SmtpSender, render_draft};
 use beavermail_store::Store;
 use beavermail_vault::{Mode, SystemStore, Vault};
+use chrono::Datelike;
 use eframe::egui::{self, Align, Layout, RichText, pos2, vec2};
 
 use crate::commands::Command;
@@ -97,6 +100,10 @@ enum Event {
     ContactPhoto(Option<Result<Vec<u8>, String>>),
     /// An address book was synced: (its URL, what moved, or why not).
     ContactsSynced(String, Result<beavermail_carddav::Synced, MailError>),
+    /// A calendar was synced: (its URL, how many events came, or why not).
+    CalendarsSynced(String, Result<usize, MailError>),
+    /// "Find calendars" answered.
+    CalendarsFound(Result<Vec<beavermail_carddav::Found>, String>),
     /// "Find address books" answered: (URL, name) of each, or why none.
     BooksFound(Result<Vec<beavermail_carddav::Found>, String>),
     /// Everyone the user has written to, for the address fields.
@@ -365,6 +372,9 @@ struct Unfolded {
     id: MessageId,
     body: Option<Result<OpenBody, String>>,
 }
+
+/// What occurrences were worked out for: (first day, days, the calendars shown, version).
+type CalendarKey = (chrono::NaiveDate, i64, String, u64);
 
 /// The open message's body, already reduced to blocks for both display modes.
 struct OpenBody {
@@ -746,6 +756,7 @@ impl Person {
 enum Section {
     Mail,
     Contacts,
+    Calendar,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -1216,6 +1227,22 @@ struct BeaverApp {
     conversations: threads::Conversations,
     /// The reader shows every message of the open conversation, not only the latest few.
     whole_conversation: bool,
+    /// The Calendar section: its view, the day it is around, and the month on its left.
+    calendar_view: calview::View,
+    calendar_day: chrono::NaiveDate,
+    calendar_month: chrono::NaiveDate,
+    /// Occurrences worked out for a range, by (first day, days, the calendars shown, version), the
+    /// latest few; the version moves on when events or calendars change.
+    calendar_cache: Vec<(CalendarKey, Arc<Vec<calview::Item>>)>,
+    calendar_version: u64,
+    /// The event whose details are open.
+    calendar_open: Option<calview::Item>,
+    /// The week view scrolls to the morning when it next shows a week.
+    calendar_morning: bool,
+    add_calendar: Option<books::AddBook>,
+    calendars_syncing: std::collections::HashSet<String>,
+    /// Stop syncing was asked for this calendar (by URL), until confirmed.
+    confirm_calendar_remove: Option<String>,
     /// Other messages of the open conversation shown open in the reader, beside the tab's own
     /// (`message`), in the order they were opened.
     unfolded: Vec<Unfolded>,
@@ -1366,6 +1393,16 @@ impl BeaverApp {
             sent: Vec::new(),
             conversations: threads::Conversations::default(),
             whole_conversation: false,
+            calendar_view: calview::View::default(),
+            calendar_day: chrono::Local::now().date_naive(),
+            calendar_month: chrono::Local::now().date_naive().with_day(1).unwrap_or_default(),
+            calendar_cache: Vec::new(),
+            calendar_version: 0,
+            calendar_open: None,
+            calendar_morning: true,
+            add_calendar: None,
+            calendars_syncing: Default::default(),
+            confirm_calendar_remove: None,
             unfolded: Vec::new(),
             folded_anchor: false,
             list_view: (0.0, 0.0),
@@ -3753,6 +3790,321 @@ impl BeaverApp {
         });
     }
 
+    /// Syncs the calendars (or the one at `url`) in the background; the one on this computer has no server.
+    fn sync_calendars(&mut self, url: Option<&str>) {
+        let all: Vec<beavermail_core::CalendarSource> = self.settings.calendars.iter().filter(|c| !c.is_local() && url.is_none_or(|u| u == c.url)).cloned().collect();
+        for calendar in all {
+            if !self.calendars_syncing.insert(calendar.url.clone()) {
+                continue;
+            }
+            let password = match store::calendar_password(&calendar) {
+                Ok(password) => password,
+                Err(e) => {
+                    self.calendars_syncing.remove(&calendar.url);
+                    self.error = Some(format!("Calendar {}: {e}", calendar.name));
+                    continue;
+                }
+            };
+            let archive = self.archive.clone();
+            self.spawn(async move {
+                let url = calendar.url.clone();
+                let open = beavermail_carddav::calendar::Calendar::open(&calendar.url, &calendar.user, &password);
+                let result = tokio::task::spawn_blocking(move || beavermail_carddav::calendar::sync(&open, &archive)).await.unwrap_or_else(|e| Err(MailError::Backend(e.to_string())));
+                Event::CalendarsSynced(url, result)
+            });
+        }
+    }
+
+    /// Asks the server in the "Add calendar" dialog for its calendars.
+    fn find_calendars(&mut self) {
+        let Some(form) = self.add_calendar.as_mut() else { return };
+        let (server, user, password) = (form.server.trim().to_owned(), form.user.trim().to_owned(), form.password.clone());
+        (form.finding, form.found) = (true, None);
+        self.spawn(async move {
+            let found = tokio::task::spawn_blocking(move || beavermail_carddav::calendar::Calendar::discover_all(&server, &user, &password).map_err(|e| e.to_string())).await.unwrap_or_else(|e| Err(e.to_string()));
+            Event::CalendarsFound(found)
+        });
+    }
+
+    /// The calendar on this computer is always there: invitations accepted without a server go to it.
+    fn ensure_local_calendar(&mut self) {
+        if self.settings.calendars.iter().any(beavermail_core::CalendarSource::is_local) {
+            return;
+        }
+        let default = !self.settings.calendars.iter().any(|c| c.default);
+        let local = beavermail_core::CalendarSource { name: "On this computer".into(), url: beavermail_core::CalendarSource::LOCAL.into(), user: String::new(), color: String::new(), shown: true, default, read_only: false };
+        self.settings.calendars.insert(0, local);
+        self.save_settings();
+    }
+
+    fn calendar_action(&mut self, action: calendars::CalendarAction) {
+        use calendars::CalendarAction as A;
+        match action {
+            A::Add => {
+                // Most often the server and login of a mail account: offered filled in, found on Find.
+                let account = self.accounts.first().map(|v| v.account.clone());
+                let user = account.as_ref().map(|a| if a.email.is_empty() { a.user.clone() } else { a.email.clone() }).unwrap_or_default();
+                let server = user.rsplit_once('@').map(|(_, d)| d.to_owned()).unwrap_or_default();
+                let password = account.as_ref().and_then(|a| store::password(a).ok()).unwrap_or_default();
+                self.add_calendar = Some(books::AddBook { server, user, password, focus_first: true, ..Default::default() });
+            }
+            A::Added(chosen) => {
+                let Some(form) = self.add_calendar.take() else { return };
+                for found in chosen {
+                    let calendar = beavermail_core::CalendarSource { name: found.name, url: found.url, user: form.user.trim().to_owned(), color: found.color, shown: true, default: false, read_only: !found.writable };
+                    if let Err(e) = store::set_calendar_password(&calendar, &form.password) {
+                        self.error = Some(e);
+                        return;
+                    }
+                    self.settings.calendars.push(calendar);
+                }
+                self.save_settings();
+                self.calendar_version += 1;
+                self.sync_calendars(None);
+            }
+            A::Toggle(url) => {
+                if let Some(c) = self.settings.calendars.iter_mut().find(|c| c.url == url) {
+                    c.shown = !c.shown;
+                }
+                self.save_settings();
+            }
+            A::MakeDefault(url) => {
+                for c in &mut self.settings.calendars {
+                    c.default = c.url == url;
+                }
+                self.save_settings();
+            }
+            A::SyncNow => self.sync_calendars(None),
+            A::AskRemove(url) => self.confirm_calendar_remove = Some(url),
+            A::Fold(key) => {
+                if !self.settings.folded.remove(&key) {
+                    self.settings.folded.insert(key);
+                }
+                self.save_settings();
+            }
+            A::Pick(day) => {
+                self.calendar_day = day;
+                self.calendar_morning = true;
+            }
+            A::Month(delta) => {
+                let month = self.calendar_month;
+                self.calendar_month = if delta < 0 { month - chrono::Months::new(1) } else { month + chrono::Months::new(1) };
+            }
+        }
+    }
+
+    /// No longer syncs the calendar at `url`: its events leave this computer, nothing changes on the server.
+    fn remove_calendar(&mut self, url: &str) {
+        let Some(at) = self.settings.calendars.iter().position(|c| c.url == url) else { return };
+        let calendar = self.settings.calendars.remove(at);
+        if let Err(e) = self.archive.forget_calendar(&calendar.url) {
+            self.error = Some(format!("Could not forget the calendar's events: {e}"));
+        }
+        if !self.settings.calendars.iter().any(|c| c.user == calendar.user && books::host(&c.url) == books::host(&calendar.url)) {
+            let _ = store::forget_calendar_password(&calendar);
+        }
+        if calendar.default
+            && let Some(next) = self.settings.calendars.iter_mut().find(|c| !c.read_only)
+        {
+            next.default = true;
+        }
+        self.save_settings();
+        self.calendar_version += 1;
+        self.calendar_open = None;
+    }
+
+    fn calendar_remove_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
+        let Some(url) = self.confirm_calendar_remove.clone() else { return };
+        let name = self.settings.calendars.iter().find(|c| c.url == url).map(|c| c.name.clone()).unwrap_or_default();
+        let (mut confirm, mut cancel) = (false, false);
+        let modal = egui::Modal::new(egui::Id::new("confirm_calendar_remove")).show(ctx, |ui| {
+            ui.set_width(FORM_WIDTH * 0.85);
+            ui.heading(format!("Stop syncing {name}?"));
+            ui.label(RichText::new("Its events leave BeaverMail. Nothing changes on the server.").color(t.text_dim));
+            ui.add_space(12.0);
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
+                confirm = ui.add(egui::Button::new(RichText::new("Stop syncing").color(t.on_accent)).fill(t.danger)).clicked();
+                cancel = ui.button("Cancel").clicked();
+            });
+        });
+        if confirm {
+            self.remove_calendar(&url);
+        }
+        if confirm || cancel || modal.should_close() {
+            self.confirm_calendar_remove = None;
+        }
+    }
+
+    /// The occurrences of the calendars shown in `days` days from `from`, worked out once per range
+    /// and kept while nothing changes.
+    fn calendar_items(&mut self, from: chrono::NaiveDate, days: i64) -> Arc<Vec<calview::Item>> {
+        let shown: Vec<(usize, &beavermail_core::CalendarSource)> = self.settings.calendars.iter().enumerate().filter(|(_, c)| c.shown).collect();
+        let key = (from, days, shown.iter().map(|(_, c)| c.url.as_str()).collect::<Vec<_>>().join(" "), self.calendar_version);
+        if let Some((_, items)) = self.calendar_cache.iter().find(|(k, _)| *k == key) {
+            return items.clone();
+        }
+        let (start, end) = (calview::midnight(from), calview::midnight(from + chrono::Duration::days(days)));
+        let urls: Vec<String> = shown.iter().map(|(_, c)| c.url.clone()).collect();
+        let mut items = Vec::new();
+        for stored in self.archive.events_between(&urls, start.timestamp(), end.timestamp()).unwrap_or_default() {
+            let Some((at, calendar)) = shown.iter().find(|(_, c)| c.url == stored.calendar) else { continue };
+            let color = calendars::color(calendar, *at);
+            let events = beavermail_carddav::ical::parse(&stored.ics).events;
+            items.extend(beavermail_carddav::calendar::occurrences(&events, start, end).into_iter().map(|occurrence| calview::Item { occurrence, calendar: stored.calendar.clone(), color }));
+        }
+        items.sort_by_key(|i| (i.occurrence.start, i.occurrence.end));
+        let items = Arc::new(items);
+        self.calendar_cache.retain(|(k, _)| k.3 == key.3);
+        self.calendar_cache.truncate(3);
+        self.calendar_cache.push((key, items.clone()));
+        items
+    }
+
+    /// The Calendar section, laid out as Mail: the month and the calendars on the left, the view in the
+    /// middle, an event's details on the right.
+    fn calendar_section(&mut self, ui: &mut egui::Ui, t: &theme::Tokens) {
+        self.ensure_local_calendar();
+        let today = chrono::Local::now().date_naive();
+        let day_before = self.calendar_day;
+        let typing = ui.ctx().egui_wants_keyboard_input() || egui::Popup::is_any_open(ui.ctx());
+        let mut action = None;
+        // The keys of the section: T today, left and right for the previous and next range, W, M and A for the views.
+        if !typing && self.add_calendar.is_none() && self.confirm_calendar_remove.is_none() && self.palette.is_none() && !self.show_settings {
+            let key = |k| ui.input(|i| i.key_pressed(k) && !i.modifiers.command && !i.modifiers.alt);
+            let step = match self.calendar_view {
+                calview::View::Week => 7,
+                calview::View::Month => 0,
+                calview::View::Agenda => 30,
+            };
+            let shift = |day: chrono::NaiveDate, back: bool| match (step, back) {
+                (0, false) => day + chrono::Months::new(1),
+                (0, true) => day - chrono::Months::new(1),
+                (n, false) => day + chrono::Duration::days(n),
+                (n, true) => day - chrono::Duration::days(n),
+            };
+            if key(egui::Key::T) {
+                self.calendar_day = today;
+                self.calendar_morning = true;
+            }
+            if key(egui::Key::ArrowLeft) {
+                self.calendar_day = shift(self.calendar_day, true);
+            }
+            if key(egui::Key::ArrowRight) {
+                self.calendar_day = shift(self.calendar_day, false);
+            }
+            for (k, view) in [(egui::Key::W, calview::View::Week), (egui::Key::M, calview::View::Month), (egui::Key::A, calview::View::Agenda)] {
+                if key(k) {
+                    self.calendar_view = view;
+                    self.calendar_morning = true;
+                }
+            }
+            if key(egui::Key::Escape) {
+                self.calendar_open = None;
+            }
+        }
+        let mini_from = calendars::week_start(self.calendar_month);
+        let busy: std::collections::HashSet<chrono::NaiveDate> = {
+            let items = self.calendar_items(mini_from, 42);
+            (0..42).map(|d| mini_from + chrono::Duration::days(d)).filter(|day| items.iter().any(|i| i.on(*day))).collect()
+        };
+        let frame = egui::Frame::new().fill(t.bg).inner_margin(egui::Margin::same(12));
+        egui::Panel::left("calendars").frame(frame).default_size(260.0).size_range(230.0..=340.0).show(ui, |ui| {
+            if let Some(a) = calendars::mini_month(ui, t, self.calendar_month, self.calendar_day, today, &busy) {
+                action = Some(a);
+            }
+            ui.add_space(12.0);
+            ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+                let add = egui::Button::image_and_text(Icon::Plus.image(icons::SIZE, t.text_dim), "Add calendar");
+                if ui.add_sized([ui.available_width(), theme::CONTROL_H], add).on_hover_text("See your events from a CalDAV server").clicked() {
+                    action = Some(calendars::CalendarAction::Add);
+                }
+                ui.add_space(4.0);
+                ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        if let Some(a) = calendars::section(ui, t, &self.settings.calendars, &self.calendars_syncing, &self.settings.folded) {
+                            action = Some(a);
+                        }
+                    });
+                });
+            });
+        });
+        let mut url = None;
+        if let Some(item) = self.calendar_open.clone() {
+            let name = self.settings.calendars.iter().find(|c| c.url == item.calendar).map(|c| c.name.clone()).unwrap_or_default();
+            let mut close = false;
+            let frame = egui::Frame::new().fill(t.surface).inner_margin(egui::Margin::same(24));
+            egui::Panel::right("event").frame(frame).default_size(380.0).size_range(320.0..=560.0).show(ui, |ui| {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    url = calview::details(ui, t, &item, &name, &mut close);
+                });
+            });
+            if close {
+                self.calendar_open = None;
+            }
+        }
+        let (from, days) = calview::range(self.calendar_view, self.calendar_day);
+        let items = self.calendar_items(from, days);
+        let mut view_action = None;
+        let frame = egui::Frame::new().fill(t.surface).inner_margin(egui::Margin { left: 16, right: 16, top: 12, bottom: 8 });
+        egui::CentralPanel::default().frame(frame).show(ui, |ui| {
+            let (title, week) = calview::title(self.calendar_view, self.calendar_day);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(title).size(22.0).family(theme::bold()).color(t.text));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button("Today").on_hover_text("Back to today (T)").clicked() {
+                        self.calendar_day = today;
+                        self.calendar_morning = true;
+                    }
+                    for (view, name, k) in [(calview::View::Agenda, "Agenda", "A"), (calview::View::Month, "Month", "M"), (calview::View::Week, "Week", "W")] {
+                        if ui.selectable_label(self.calendar_view == view, name).on_hover_text(format!("{name} ({k})")).clicked() {
+                            self.calendar_view = view;
+                            self.calendar_morning = true;
+                        }
+                    }
+                    ui.add_space(8.0);
+                    let step = |day: chrono::NaiveDate, view: calview::View, back: bool| match (view, back) {
+                        (calview::View::Month, false) => day + chrono::Months::new(1),
+                        (calview::View::Month, true) => day - chrono::Months::new(1),
+                        (calview::View::Week, b) => day + chrono::Duration::days(if b { -7 } else { 7 }),
+                        (calview::View::Agenda, b) => day + chrono::Duration::days(if b { -30 } else { 30 }),
+                    };
+                    if icons::button(ui, t, Icon::ChevronRight, "Next (→)", true, false).clicked() {
+                        self.calendar_day = step(self.calendar_day, self.calendar_view, false);
+                    }
+                    if icons::button(ui, t, Icon::ChevronLeft, "Previous (←)", true, false).clicked() {
+                        self.calendar_day = step(self.calendar_day, self.calendar_view, true);
+                    }
+                    if !week.is_empty() {
+                        ui.label(RichText::new(week).size(13.0).color(t.text_dim));
+                    }
+                });
+            });
+            ui.add_space(8.0);
+            view_action = match self.calendar_view {
+                calview::View::Week => calview::week(ui, t, from, &items, today, std::mem::take(&mut self.calendar_morning)),
+                calview::View::Month => calview::month(ui, t, from, self.calendar_day.month(), &items, today),
+                calview::View::Agenda => calview::agenda(ui, t, from, days, &items, today),
+            };
+        });
+        match view_action {
+            Some(calview::ViewAction::Open(at)) => self.calendar_open = items.get(at).cloned(),
+            Some(calview::ViewAction::Day(day)) => {
+                (self.calendar_day, self.calendar_view, self.calendar_morning) = (day, calview::View::Week, true);
+            }
+            None => {}
+        }
+        if let Some(a) = action {
+            self.calendar_action(a);
+        }
+        // The month on the left follows the day shown when another range is chosen.
+        if self.calendar_day != day_before {
+            self.calendar_month = self.calendar_day.with_day(1).unwrap_or(self.calendar_month);
+        }
+        if let Some(url) = url {
+            ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+        }
+    }
+
     fn book_action(&mut self, action: books::BookAction) {
         use books::BookAction as A;
         match action {
@@ -4529,11 +4881,11 @@ impl BeaverApp {
             return Err("Not in the source of a message");
         }
         // Out of Mail the list and the reader are not on screen: what acts on them waits.
-        if self.section != Section::Mail && !matches!(command, Command::Palette | Command::NewMessage | Command::Settings | Command::Mail | Command::Contacts | Command::WorkOffline | Command::WorkOnline) {
+        if self.section != Section::Mail && !matches!(command, Command::Palette | Command::NewMessage | Command::Settings | Command::Mail | Command::Contacts | Command::Calendar | Command::WorkOffline | Command::WorkOnline) {
             return Err("Go to Mail first");
         }
         match command {
-            Command::Palette | Command::Search | Command::Settings | Command::Mail | Command::Contacts => Ok(()),
+            Command::Palette | Command::Search | Command::Settings | Command::Mail | Command::Contacts | Command::Calendar => Ok(()),
             Command::NewMessage if self.senders().is_empty() => Err("Add an account to send mail"),
             Command::NewMessage => Ok(()),
             // A message only selected, or still loading, is answered once its text is there.
@@ -4669,6 +5021,10 @@ impl BeaverApp {
             Command::WorkOnline => self.set_work_offline(false),
             Command::Mail => self.section = Section::Mail,
             Command::Contacts => self.section = Section::Contacts,
+            Command::Calendar => {
+                self.section = Section::Calendar;
+                self.calendar_morning = true;
+            }
         }
     }
 
@@ -5084,6 +5440,28 @@ impl BeaverApp {
                     // No connection now: the next sync tries again, with nothing to tell.
                     Err(MailError::Offline(_)) => {}
                     Err(e) => self.error = Some(format!("Contacts could not be synced: {e}")),
+                }
+            }
+            Event::CalendarsSynced(url, result) => {
+                self.calendars_syncing.remove(&url);
+                match result {
+                    Ok(_) => self.calendar_version += 1,
+                    Err(MailError::Offline(_)) => {}
+                    Err(e) => self.error = Some(format!("A calendar could not be synced: {e}")),
+                }
+            }
+            Event::CalendarsFound(found) => {
+                if let Some(form) = self.add_calendar.as_mut() {
+                    form.finding = false;
+                    let found = found.and_then(|all| if all.is_empty() { Err("This server has no calendars of events for this user.".to_owned()) } else { Ok(all) });
+                    form.found = Some(found.map(|all| all.into_iter().map(|c| (c, true)).collect()));
+                    let new: Vec<beavermail_carddav::Found> = match &form.found {
+                        Some(Ok(found)) => found.iter().filter(|(c, _)| !self.settings.calendars.iter().any(|a| a.url == c.url)).map(|(c, _)| c.clone()).collect(),
+                        _ => Vec::new(),
+                    };
+                    if matches!(&form.found, Some(Ok(found)) if found.len() == 1) && new.len() == 1 {
+                        self.calendar_action(calendars::CalendarAction::Added(new));
+                    }
                 }
             }
             Event::BooksFound(found) => {
@@ -5650,9 +6028,8 @@ impl BeaverApp {
                     self.run(Command::Settings);
                 }
                 ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                    for (section, icon, command) in [(Section::Mail, Icon::Mail, Command::Mail), (Section::Contacts, Icon::Users, Command::Contacts)] {
+                    for (section, icon, command, name) in [(Section::Mail, Icon::Mail, Command::Mail, "Mail"), (Section::Calendar, Icon::Calendar, Command::Calendar, "Calendar"), (Section::Contacts, Icon::Users, Command::Contacts, "Contacts")] {
                         let on = self.section == section;
-                        let name = if section == Section::Mail { "Mail" } else { "Contacts" };
                         let button = icons::button(ui, t, icon, name, true, on);
                         button.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, on, name));
                         if button.clicked() && !on {
@@ -6521,6 +6898,7 @@ impl eframe::App for BeaverApp {
         if self.contacts_synced.is_none_or(|at| at.elapsed() > std::time::Duration::from_secs(15 * 60)) {
             self.contacts_synced = Some(std::time::Instant::now());
             self.sync_contacts(None);
+            self.sync_calendars(None);
         }
         // Closing the app with a message being written asks first, as Discard does. One being sent, or
         // waiting out Undo send, is kept as a draft on the way out without asking.
@@ -6546,9 +6924,12 @@ impl eframe::App for BeaverApp {
         self.error_banner(ui, &t);
         self.status_bar(ui, &t);
         self.rail(ui, &t);
-        let contacts = self.section == Section::Contacts;
-        if contacts {
-            self.contacts_view(ui, &t);
+        // Out of Mail, its tabs, folders, list and reader give the window to the section.
+        let contacts = self.section != Section::Mail;
+        match self.section {
+            Section::Contacts => self.contacts_view(ui, &t),
+            Section::Calendar => self.calendar_section(ui, &t),
+            Section::Mail => {}
         }
 
         if self.in_tab && self.open_tab().is_none() {
@@ -6705,8 +7086,17 @@ impl eframe::App for BeaverApp {
         self.card_delete_dialog(ui.ctx(), &t);
         self.new_contact_dialog(ui.ctx(), &t);
         self.book_remove_dialog(ui.ctx(), &t);
-        let added = self.settings.address_books.clone();
-        if let Some(action) = books::add_dialog(ui.ctx(), &t, &mut self.add_book, &added) {
+        self.calendar_remove_dialog(ui.ctx(), &t);
+        let added: Vec<String> = self.settings.calendars.iter().map(|c| c.url.clone()).collect();
+        if let Some(action) = books::add_dialog(ui.ctx(), &t, &mut self.add_calendar, &added.iter().map(String::as_str).collect::<Vec<_>>(), &calendars::CALENDARS) {
+            match action {
+                books::BookAction::Find => self.find_calendars(),
+                books::BookAction::Add(chosen) => self.calendar_action(calendars::CalendarAction::Added(chosen)),
+                _ => {}
+            }
+        }
+        let added: Vec<String> = self.settings.address_books.iter().map(|b| b.url.clone()).collect();
+        if let Some(action) = books::add_dialog(ui.ctx(), &t, &mut self.add_book, &added.iter().map(String::as_str).collect::<Vec<_>>(), &books::BOOKS) {
             self.book_action(action);
         }
         if let Some(action) = encryption::dialogs(ui.ctx(), &t, &mut self.key_dialogs) {

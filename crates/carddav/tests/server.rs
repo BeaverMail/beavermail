@@ -1,19 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The CardDAV client against a small local server that keeps an address book in memory, the way a
-//! real one answers: a well-known address that redirects, a principal, a home, versions per card.
+//! The CardDAV and CalDAV client against a small local server that keeps an address book and a
+//! calendar in memory, the way a real one answers: well-known addresses that redirect, a principal,
+//! homes, versions per card or event.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 
-use beavermail_carddav::{Book, Found, Written, vcard};
+use beavermail_carddav::calendar::{Calendar, occurrences, sync as sync_calendar};
+use beavermail_carddav::{Book, Found, Written, ical, vcard};
 use beavermail_core::MailError;
 
 const BOOK: &str = "/dav/books/ada/default/";
 /// One the server fills by itself, read-only.
 const RECENT: &str = "/dav/books/ada/z-app-generated--contactsinteraction--recent/";
+const CALENDAR: &str = "/dav/calendars/ada/work/";
+/// A calendar of tasks only: not one of events.
+const TASKS: &str = "/dav/calendars/ada/tasks/";
 
 #[derive(Default)]
 struct Cards {
@@ -60,7 +65,10 @@ fn start() -> (String, Arc<Mutex<Cards>>) {
 
 fn answer(cards: &Arc<Mutex<Cards>>, method: &str, path: &str, headers: &BTreeMap<String, String>, body: &str) -> String {
     let reply = |status: &str, extra: &str, text: &str| format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n{extra}\r\n{text}", text.len());
-    let multistatus = |inner: String| reply("207 Multi-Status", "Content-Type: application/xml\r\n", &format!(r#"<?xml version="1.0"?><d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav">{inner}</d:multistatus>"#));
+    let multistatus = |inner: String| {
+        let root = r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav" xmlns:cal="urn:ietf:params:xml:ns:caldav" xmlns:ical="http://apple.com/ns/ical/">"#;
+        reply("207 Multi-Status", "Content-Type: application/xml\r\n", &format!(r#"<?xml version="1.0"?>{root}{inner}</d:multistatus>"#))
+    };
     let ok = |href: &str, props: &str| format!("<d:response><d:href>{href}</d:href><d:propstat><d:prop>{props}</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>");
     // "ada:secret"
     if headers.get("authorization").map(String::as_str) != Some("Basic YWRhOnNlY3JldA==") {
@@ -68,12 +76,28 @@ fn answer(cards: &Arc<Mutex<Cards>>, method: &str, path: &str, headers: &BTreeMa
     }
     let mut state = cards.lock().unwrap();
     match (method, path) {
-        ("PROPFIND", "/.well-known/carddav") => reply("301 Moved Permanently", "Location: /dav/principals/ada/\r\n", ""),
-        ("PROPFIND", "/dav/principals/ada/") => multistatus(ok(path, "<d:current-user-principal><d:href>/dav/principals/ada/</d:href></d:current-user-principal><c:addressbook-home-set><d:href>/dav/books/ada/</d:href></c:addressbook-home-set><d:resourcetype/>")),
+        ("PROPFIND", "/.well-known/carddav" | "/.well-known/caldav") => reply("301 Moved Permanently", "Location: /dav/principals/ada/\r\n", ""),
+        ("PROPFIND", "/dav/principals/ada/") => multistatus(ok(path, "<d:current-user-principal><d:href>/dav/principals/ada/</d:href></d:current-user-principal><c:addressbook-home-set><d:href>/dav/books/ada/</d:href></c:addressbook-home-set><cal:calendar-home-set><d:href>/dav/calendars/ada/</d:href></cal:calendar-home-set><d:resourcetype/>")),
+        ("PROPFIND", "/dav/calendars/ada/") => multistatus(
+            ok(path, "<d:resourcetype><d:collection/></d:resourcetype>")
+                + &ok(CALENDAR, r##"<d:resourcetype><d:collection/><cal:calendar/></d:resourcetype><d:displayname>Work</d:displayname><ical:calendar-color>#3366FFFF</ical:calendar-color><cal:supported-calendar-component-set><cal:comp name="VEVENT"/></cal:supported-calendar-component-set>"##)
+                + &ok(TASKS, r#"<d:resourcetype><d:collection/><cal:calendar/></d:resourcetype><d:displayname>Tasks</d:displayname><cal:supported-calendar-component-set><cal:comp name="VTODO"/></cal:supported-calendar-component-set>"#),
+        ),
+        ("PROPFIND", CALENDAR) => {
+            let mut inner = ok(CALENDAR, "<d:resourcetype><d:collection/><cal:calendar/></d:resourcetype>");
+            for (href, (version, _)) in state.cards.iter().filter(|(h, _)| h.starts_with(CALENDAR)) {
+                inner += &ok(href, &format!("<d:getetag>\"{version}\"</d:getetag><d:resourcetype/>"));
+            }
+            multistatus(inner)
+        }
+        ("REPORT", CALENDAR) => {
+            let wanted: Vec<&str> = body.split("<d:href>").skip(1).filter_map(|h| h.split("</d:href>").next()).collect();
+            multistatus(wanted.iter().filter_map(|h| state.cards.get(*h).map(|(v, event)| ok(h, &format!("<d:getetag>\"{v}\"</d:getetag><cal:calendar-data>{event}</cal:calendar-data>")))).collect())
+        }
         ("PROPFIND", "/dav/books/ada/") => multistatus(ok(path, "<d:resourcetype><d:collection/></d:resourcetype>") + &ok(BOOK, "<d:resourcetype><d:collection/><c:addressbook/></d:resourcetype><d:displayname>Contacts</d:displayname><d:current-user-privilege-set><d:privilege><d:read/></d:privilege><d:privilege><d:write/></d:privilege></d:current-user-privilege-set>") + &ok(RECENT, "<d:resourcetype><d:collection/><c:addressbook/></d:resourcetype><d:displayname>Recently contacted</d:displayname><d:current-user-privilege-set><d:privilege><d:read/></d:privilege></d:current-user-privilege-set>")),
         ("PROPFIND", BOOK) => {
             let mut inner = ok(BOOK, "<d:resourcetype><d:collection/><c:addressbook/></d:resourcetype>");
-            for (href, (version, _)) in &state.cards {
+            for (href, (version, _)) in state.cards.iter().filter(|(h, _)| h.starts_with(BOOK)) {
                 inner += &ok(href, &format!("<d:getetag>\"{version}\"</d:getetag><d:resourcetype/>"));
             }
             multistatus(inner)
@@ -126,7 +150,7 @@ fn the_address_book_is_found_from_the_server_address_through_the_well_known_one(
     let book = Book::discover(&url, "ada", "secret").unwrap();
     assert_eq!(book.url, format!("{url}{BOOK}"));
     let found = Book::discover_all(&url, "ada", "secret").unwrap();
-    let book = |path: &str, name: &str, writable| Found { url: format!("{url}{path}"), name: name.to_owned(), writable };
+    let book = |path: &str, name: &str, writable| Found { url: format!("{url}{path}"), name: name.to_owned(), writable, color: String::new() };
     assert_eq!(found, [book(BOOK, "Contacts", true), book(RECENT, "Recently contacted", false)], "with the names the server gives, and what can be written");
     assert!(matches!(Book::discover(&url, "ada", "wrong"), Err(MailError::Auth(_))));
 }
@@ -206,4 +230,32 @@ fn a_sync_brings_every_card_sends_what_changed_here_and_lets_the_server_win() {
     served.lock().unwrap().cards.remove(&bob);
     beavermail_carddav::sync(&book, &store).unwrap();
     assert!(!store.address_book().unwrap().iter().any(|c| c.name == "Bob Brown"));
+}
+
+#[test]
+fn calendars_of_events_are_found_and_their_events_kept_as_the_server_has_them() {
+    let (url, state) = start();
+    let found = Calendar::discover_all(&url, "ada", "secret").unwrap();
+    assert_eq!(found, [Found { url: format!("{url}{CALENDAR}"), name: "Work".into(), writable: true, color: "#3366FF".into() }], "the tasks one is left out");
+    let event = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:review-1\r\nSUMMARY:Review\r\nDTSTART:20261012T090000Z\r\nDTEND:20261012T100000Z\r\nRRULE:FREQ=DAILY;COUNT=3\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    {
+        let mut s = state.lock().unwrap();
+        s.version += 1;
+        let v = s.version;
+        s.cards.insert(format!("{CALENDAR}review-1.ics"), (v, event.to_owned()));
+    }
+    let calendar = Calendar::open(&found[0].url, "ada", "secret");
+    let store = beavermail_store::Store::in_memory().unwrap();
+    assert_eq!(sync_calendar(&calendar, &store).unwrap(), 1);
+    assert_eq!(sync_calendar(&calendar, &store).unwrap(), 0, "nothing new the second time");
+    let day = |d: u32| chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2026, 10, d, 0, 0, 0).unwrap();
+    let stored = store.events_between(std::slice::from_ref(&calendar.url), day(13).timestamp(), day(14).timestamp()).unwrap();
+    assert_eq!(stored.len(), 1, "a repeating event is asked for in any range");
+    let on_13th = occurrences(&ical::parse(&stored[0].ics).events, day(13), day(14));
+    assert_eq!(on_13th.iter().map(|o| o.start.to_rfc3339()).collect::<Vec<_>>(), ["2026-10-13T09:00:00+00:00"]);
+    assert_eq!(store.events_with_uid("review-1").unwrap().len(), 1);
+    // Deleted on the server: gone here too.
+    state.lock().unwrap().cards.clear();
+    sync_calendar(&calendar, &store).unwrap();
+    assert!(store.events(&calendar.url).unwrap().is_empty());
 }

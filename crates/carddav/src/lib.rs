@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Address books on a CardDAV server (RFC 6352): finding them, reading their cards, and changing
-//! them without overwriting a change made meanwhile elsewhere (each card's ETag is checked).
+//! Address books on a CardDAV server (RFC 6352) and calendars on a CalDAV server (RFC 4791): finding
+//! them, reading what they hold, and changing a card without overwriting a change made meanwhile
+//! elsewhere (each card's ETag is checked). Both speak WebDAV the same way, through one [`Client`].
 
+pub mod calendar;
+pub mod ical;
 pub mod sync;
 pub mod vcard;
 
@@ -27,14 +30,30 @@ pub enum Written {
     Conflict,
 }
 
-/// An address book a server has, as found.
+/// An address book or a calendar a server has, as found.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Found {
     pub url: String,
     pub name: String,
-    /// Cards can be written there: false for those the server makes itself (such as one of people
-    /// recently written to, or the directory of a server's users).
+    /// It can be written to: false for those the server makes itself (such as an address book of
+    /// people recently written to, or the directory of a server's users) or shares read-only.
     pub writable: bool,
+    /// The colour the server keeps for a calendar (`#RRGGBB`), empty when none.
+    pub color: String,
+}
+
+/// What is looked for on a server.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    AddressBook,
+    Calendar,
+}
+
+/// Signing in to a DAV server, and the requests made there.
+#[derive(Clone, Debug)]
+struct Client {
+    user: String,
+    password: String,
 }
 
 /// One address book, and how to sign in to it.
@@ -42,17 +61,16 @@ pub struct Found {
 pub struct Book {
     /// The address book's own URL (a collection), ending in `/`.
     pub url: String,
-    user: String,
-    password: String,
+    client: Client,
 }
 
-const PROPFIND_HOME: &str = r#"<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav"><d:prop><d:current-user-principal/><c:addressbook-home-set/><d:resourcetype/><d:displayname/><d:current-user-privilege-set/></d:prop></d:propfind>"#;
+const PROPFIND_HOME: &str = r#"<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav" xmlns:cal="urn:ietf:params:xml:ns:caldav" xmlns:ical="http://apple.com/ns/ical/"><d:prop><d:current-user-principal/><c:addressbook-home-set/><cal:calendar-home-set/><d:resourcetype/><d:displayname/><d:current-user-privilege-set/><ical:calendar-color/><cal:supported-calendar-component-set/></d:prop></d:propfind>"#;
 const PROPFIND_ETAGS: &str = r#"<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:"><d:prop><d:getetag/><d:resourcetype/></d:prop></d:propfind>"#;
 
 impl Book {
     /// An address book already found, at its URL.
     pub fn open(url: &str, user: &str, password: &str) -> Self {
-        Self { url: url.to_owned(), user: user.to_owned(), password: password.to_owned() }
+        Self { url: url.to_owned(), client: Client { user: user.to_owned(), password: password.to_owned() } }
     }
 
     /// The first of the user's address books, from a server address or a domain (see [`Self::discover_all`]).
@@ -65,59 +83,17 @@ impl Book {
     /// (`https://dav.example.org/`, `example.org`): the address book itself, or the account's home,
     /// found through `/.well-known/carddav` (RFC 6764) when needed.
     pub fn discover_all(start: &str, user: &str, password: &str) -> Result<Vec<Found>, MailError> {
-        let start = start.trim();
-        let start = if start.contains("://") { start.to_owned() } else { format!("https://{start}") };
-        let probe = Self::open(&start, user, password);
-        let mut tried = Vec::new();
-        for candidate in [start.clone(), format!("{}/.well-known/carddav", origin(&start))] {
-            match probe.find_from(&candidate) {
-                Ok(found) => return Ok(found),
-                Err(MailError::Auth(e)) => return Err(MailError::Auth(e)),
-                Err(e) => tried.push(e.to_string()),
-            }
-        }
-        Err(MailError::Backend(format!("no address book found at {start}: {}", tried.join("; "))))
-    }
-
-    /// The address books reached from `url`: itself if it is one, else those of its principal's home.
-    fn find_from(&self, url: &str) -> Result<Vec<Found>, MailError> {
-        let (at, answer) = self.dav("PROPFIND", url, "0", PROPFIND_HOME)?;
-        let found = responses(&answer)?;
-        let first = found.first().ok_or_else(|| MailError::Backend("the server said nothing".into()))?;
-        if first.addressbook {
-            return Ok(vec![Found { url: absolute(&at, &first.href), name: first.name.clone().unwrap_or_default(), writable: first.writable }]);
-        }
-        let home = match &first.home {
-            Some(home) => absolute(&at, home),
-            None => {
-                let principal = first.principal.as_ref().ok_or_else(|| MailError::Backend("not a CardDAV server".into()))?;
-                let (at, answer) = self.dav("PROPFIND", &absolute(&at, principal), "0", PROPFIND_HOME)?;
-                let home = responses(&answer)?.into_iter().find_map(|r| r.home).ok_or_else(|| MailError::Backend("the account has no address book home".into()))?;
-                absolute(&at, &home)
-            }
-        };
-        let (at, answer) = self.dav("PROPFIND", &home, "1", PROPFIND_HOME)?;
-        let books: Vec<Found> = responses(&answer)?.into_iter().filter(|r| r.addressbook).map(|r| Found { url: absolute(&at, &r.href), name: r.name.unwrap_or_default(), writable: r.writable }).collect();
-        if books.is_empty() { Err(MailError::Backend("the account has no address book".into())) } else { Ok(books) }
+        Client { user: user.to_owned(), password: password.to_owned() }.discover(start, Kind::AddressBook)
     }
 
     /// The cards of the address book, with their versions.
     pub fn list(&self) -> Result<Vec<Remote>, MailError> {
-        let (_, answer) = self.dav("PROPFIND", &self.url, "1", PROPFIND_ETAGS)?;
-        let own = path(&self.url);
-        Ok(responses(&answer)?.into_iter().filter(|r| !r.collection && path(&r.href) != own).filter_map(|r| Some(Remote { etag: r.etag?, href: r.href })).collect())
+        self.client.list(&self.url)
     }
 
     /// The cards at `hrefs`, as (where and which version, vCard text), asked for in batches.
     pub fn fetch(&self, hrefs: &[String]) -> Result<Vec<(Remote, String)>, MailError> {
-        let mut out = Vec::new();
-        for batch in hrefs.chunks(100) {
-            let wanted: String = batch.iter().map(|h| format!("<d:href>{}</d:href>", xml_escape(h))).collect();
-            let body = format!(r#"<?xml version="1.0" encoding="utf-8"?><c:addressbook-multiget xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav"><d:prop><d:getetag/><c:address-data/></d:prop>{wanted}</c:addressbook-multiget>"#);
-            let (_, answer) = self.dav("REPORT", &self.url, "1", &body)?;
-            out.extend(responses(&answer)?.into_iter().filter_map(|r| Some((Remote { etag: r.etag?, href: r.href }, r.data?))));
-        }
-        Ok(out)
+        self.client.multiget(&self.url, hrefs, Kind::AddressBook)
     }
 
     /// Where a new card with this UID goes.
@@ -132,7 +108,7 @@ impl Book {
             Some(etag) => ("If-Match", etag.to_owned()),
             None => ("If-None-Match", "*".to_owned()),
         };
-        let (status, headers, _) = self.send("PUT", &absolute(&self.url, href), &[("Content-Type", "text/vcard; charset=utf-8"), (condition.0, &condition.1)], vcard)?;
+        let (status, headers, _) = self.client.send("PUT", &absolute(&self.url, href), &[("Content-Type", "text/vcard; charset=utf-8"), (condition.0, &condition.1)], vcard)?;
         match status {
             200..=299 => Ok(Written::Done(headers)),
             412 => Ok(Written::Conflict),
@@ -142,12 +118,84 @@ impl Book {
 
     /// Deletes a card if the server still has that version; one already gone counts as deleted.
     pub fn delete(&self, href: &str, etag: &str) -> Result<Written, MailError> {
-        let (status, _, _) = self.send("DELETE", &absolute(&self.url, href), &[("If-Match", etag)], "")?;
+        let (status, _, _) = self.client.send("DELETE", &absolute(&self.url, href), &[("If-Match", etag)], "")?;
         match status {
             200..=299 | 404 => Ok(Written::Done(None)),
             412 => Ok(Written::Conflict),
             _ => Err(refused(status, "delete a card")),
         }
+    }
+
+}
+
+impl Client {
+    /// Every address book or calendar of the user, from a server address or a domain: the collection
+    /// itself, or the account's home, found through `/.well-known/carddav` or `/.well-known/caldav`
+    /// (RFC 6764) when needed.
+    fn discover(&self, start: &str, kind: Kind) -> Result<Vec<Found>, MailError> {
+        let start = start.trim();
+        let start = if start.contains("://") { start.to_owned() } else { format!("https://{start}") };
+        let (well_known, what) = match kind {
+            Kind::AddressBook => ("carddav", "address book"),
+            Kind::Calendar => ("caldav", "calendar"),
+        };
+        let mut tried = Vec::new();
+        for candidate in [start.clone(), format!("{}/.well-known/{well_known}", origin(&start))] {
+            match self.find_from(&candidate, kind) {
+                Ok(found) => return Ok(found),
+                Err(MailError::Auth(e)) => return Err(MailError::Auth(e)),
+                Err(e) => tried.push(e.to_string()),
+            }
+        }
+        Err(MailError::Backend(format!("no {what} found at {start}: {}", tried.join("; "))))
+    }
+
+    /// The collections of `kind` reached from `url`: itself if it is one, else those of its
+    /// principal's home.
+    fn find_from(&self, url: &str, kind: Kind) -> Result<Vec<Found>, MailError> {
+        let what = if kind == Kind::Calendar { "calendar" } else { "address book" };
+        let is = |r: &Response| if kind == Kind::Calendar { r.calendar && r.events } else { r.addressbook };
+        let home_of = |r: &Response| if kind == Kind::Calendar { r.calendar_home.clone() } else { r.home.clone() };
+        let found = |at: &str, r: Response| Found { url: absolute(at, &r.href), name: r.name.unwrap_or_default(), writable: r.writable, color: r.color.unwrap_or_default() };
+        let (at, answer) = self.dav("PROPFIND", url, "0", PROPFIND_HOME)?;
+        let mut first = responses(&answer)?.into_iter().next().ok_or_else(|| MailError::Backend("the server said nothing".into()))?;
+        if is(&first) {
+            return Ok(vec![found(&at, first)]);
+        }
+        let home = match home_of(&first) {
+            Some(home) => absolute(&at, &home),
+            None => {
+                let principal = first.principal.take().ok_or_else(|| MailError::Backend(format!("not a server with a {what}")))?;
+                let (at, answer) = self.dav("PROPFIND", &absolute(&at, &principal), "0", PROPFIND_HOME)?;
+                let home = responses(&answer)?.iter().find_map(home_of).ok_or_else(|| MailError::Backend(format!("the account has no {what} home")))?;
+                absolute(&at, &home)
+            }
+        };
+        let (at, answer) = self.dav("PROPFIND", &home, "1", PROPFIND_HOME)?;
+        let all: Vec<Found> = responses(&answer)?.into_iter().filter(|r| is(r)).map(|r| found(&at, r)).collect();
+        if all.is_empty() { Err(MailError::Backend(format!("the account has no {what}"))) } else { Ok(all) }
+    }
+
+    /// What a collection holds, with the versions.
+    fn list(&self, url: &str) -> Result<Vec<Remote>, MailError> {
+        let (_, answer) = self.dav("PROPFIND", url, "1", PROPFIND_ETAGS)?;
+        let own = path(url);
+        Ok(responses(&answer)?.into_iter().filter(|r| !r.collection && path(&r.href) != own).filter_map(|r| Some(Remote { etag: r.etag?, href: r.href })).collect())
+    }
+
+    /// The cards or events at `hrefs`, as (where and which version, text), asked for in batches.
+    fn multiget(&self, url: &str, hrefs: &[String], kind: Kind) -> Result<Vec<(Remote, String)>, MailError> {
+        let mut out = Vec::new();
+        for batch in hrefs.chunks(100) {
+            let wanted: String = batch.iter().map(|h| format!("<d:href>{}</d:href>", xml_escape(h))).collect();
+            let body = match kind {
+                Kind::AddressBook => format!(r#"<?xml version="1.0" encoding="utf-8"?><c:addressbook-multiget xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav"><d:prop><d:getetag/><c:address-data/></d:prop>{wanted}</c:addressbook-multiget>"#),
+                Kind::Calendar => format!(r#"<?xml version="1.0" encoding="utf-8"?><c:calendar-multiget xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><d:getetag/><c:calendar-data/></d:prop>{wanted}</c:calendar-multiget>"#),
+            };
+            let (_, answer) = self.dav("REPORT", url, "1", &body)?;
+            out.extend(responses(&answer)?.into_iter().filter_map(|r| Some((Remote { etag: r.etag?, href: r.href }, r.data?))));
+        }
+        Ok(out)
     }
 
     /// A WebDAV request with an XML body; its multistatus answer and the URL that gave it (after redirects).
@@ -159,7 +207,7 @@ impl Book {
             match status {
                 207 => return Ok((url, answer)),
                 301 | 302 | 307 | 308 => url = absolute(&url, &location.ok_or_else(|| MailError::Backend("a redirect without a place".into()))?),
-                _ => return Err(refused(status, "read the address book")),
+                _ => return Err(refused(status, "answer the request")),
             }
         }
         Err(MailError::Backend("too many redirects".into()))
@@ -195,7 +243,7 @@ impl Book {
         let mut response = agent.run(request).map_err(|e| MailError::Offline(e.to_string()))?;
         let status = response.status().as_u16();
         if status == 401 || status == 403 {
-            return Err(MailError::Auth("the address book server refused the user or password".into()));
+            return Err(MailError::Auth("the server refused the user or password".into()));
         }
         let header = |name: &str| response.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_owned);
         let (location, etag) = (header("Location"), header("ETag"));
@@ -218,7 +266,7 @@ pub fn new_uid() -> String {
 }
 
 fn refused(status: u16, what: &str) -> MailError {
-    MailError::Backend(format!("the address book server would not {what} (HTTP {status})"))
+    MailError::Backend(format!("the server would not {what} (HTTP {status})"))
 }
 
 /// What one `<response>` of a multistatus says.
@@ -228,9 +276,14 @@ struct Response {
     etag: Option<String>,
     data: Option<String>,
     addressbook: bool,
+    calendar: bool,
+    /// A calendar that holds events (its supported components include `VEVENT`, or it does not say).
+    events: bool,
     collection: bool,
     principal: Option<String>,
     home: Option<String>,
+    calendar_home: Option<String>,
+    color: Option<String>,
     name: Option<String>,
     /// From the privileges the server grants (RFC 3744); writable when it does not say.
     writable: bool,
@@ -244,20 +297,25 @@ fn responses(xml: &str) -> Result<Vec<Response>, MailError> {
         .descendants()
         .filter(|n| is(n, "response"))
         .map(|r| {
-            let mut out = Response { href: r.children().find(|c| is(c, "href")).and_then(|h| h.text()).unwrap_or_default().trim().to_owned(), writable: true, ..Default::default() };
+            let mut out = Response { href: r.children().find(|c| is(c, "href")).and_then(|h| h.text()).unwrap_or_default().trim().to_owned(), writable: true, events: true, ..Default::default() };
             // A property counts only from a propstat whose status is 200 (a 404 lists what the server lacks).
             let props = r.children().filter(|c| is(c, "propstat")).filter(|p| text_of(*p, "status").is_none_or(|s| s.contains(" 200"))).filter_map(|p| p.children().find(|c| is(c, "prop")));
             for prop in props {
                 for p in prop.children().filter(|c| c.is_element()) {
                     match p.tag_name().name() {
                         "getetag" => out.etag = p.text().map(|t| t.trim().to_owned()),
-                        "address-data" => out.data = p.text().map(str::to_owned),
+                        "address-data" | "calendar-data" => out.data = p.text().map(str::to_owned),
                         "resourcetype" => {
                             out.collection = p.children().any(|c| is(&c, "collection"));
                             out.addressbook = p.children().any(|c| is(&c, "addressbook"));
+                            out.calendar = p.children().any(|c| is(&c, "calendar"));
                         }
                         "current-user-principal" => out.principal = text_of(p, "href"),
                         "addressbook-home-set" => out.home = text_of(p, "href"),
+                        "calendar-home-set" => out.calendar_home = text_of(p, "href"),
+                        // "#RRGGBB" or "#RRGGBBAA": the colour without its opacity.
+                        "calendar-color" => out.color = p.text().map(|t| t.trim().chars().take(7).collect()).filter(|t: &String| t.len() == 7 && t.starts_with('#')),
+                        "supported-calendar-component-set" => out.events = p.children().filter(|c| is(c, "comp")).any(|c| c.attribute("name") == Some("VEVENT")),
                         "current-user-privilege-set" => out.writable = p.descendants().any(|d| ["all", "write", "write-content", "bind"].iter().any(|w| is(&d, w))),
                         "displayname" => out.name = p.text().map(|t| t.trim().to_owned()).filter(|t| !t.is_empty()),
                         _ => {}

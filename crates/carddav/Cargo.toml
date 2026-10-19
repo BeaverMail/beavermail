@@ -2,7 +2,7 @@
 
 [package]
 name = "beavermail-carddav"
-description = "Address books on a CardDAV server (RFC 6352) for BeaverMail"
+description = "Address books on a CardDAV server (RFC 6352) and calendars on a CalDAV server (RFC 4791) for BeaverMail"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -18,3 +18,7 @@ beavermail-store.workspace = true
 ureq.workspace = true
 roxmltree = "0.20"
 base64 = "0.22"
+# Calendars: repeating events (RRULE, EXDATE, RDATE) and time zones by their IANA names.
+rrule = { version = "0.14", default-features = false }
+chrono-tz = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }

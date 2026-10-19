@@ -17,7 +17,7 @@ pub struct Card {
 }
 
 /// One logical line: folded lines joined (RFC 6350 3.2).
-fn unfold(text: &str) -> Vec<String> {
+pub(crate) fn unfold(text: &str) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
     for raw in text.split('\n') {
         let raw = raw.strip_suffix('\r').unwrap_or(raw);
@@ -39,7 +39,7 @@ fn property(line: &str) -> Option<(String, &str)> {
 }
 
 /// Splits at the first `:` that is not inside a quoted parameter value.
-fn split_unquoted(line: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_unquoted(line: &str) -> Option<(&str, &str)> {
     let mut quoted = false;
     for (i, c) in line.char_indices() {
         match c {
@@ -51,7 +51,7 @@ fn split_unquoted(line: &str) -> Option<(&str, &str)> {
     None
 }
 
-fn unescape(value: &str) -> String {
+pub(crate) fn unescape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     let mut chars = value.chars();
     while let Some(c) = chars.next() {
