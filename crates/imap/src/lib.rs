@@ -8,7 +8,7 @@ use std::sync::Arc;
 use async_imap::types::{Fetch, Flag, NameAttribute};
 use async_imap::{Client, Session};
 use beavermail_core::{AuthCheck, AuthResult, Account, Attachment, Encryption, Hit, Keep, MailError, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Progress, Role, Server, SignedWith, SyncReport, Tls};
-use beavermail_store::{Header, Location, Store};
+use beavermail_store::{Flags, Header, Location, Store};
 use beavermail_vault::{Vault, folder_path, message_path};
 use futures::TryStreamExt;
 use mail_parser::{MessageParser, MimeHeaders};
@@ -25,7 +25,7 @@ const BACKFILL_SPAN: u32 = 1000;
 /// Cached messages whose flags and existence are re-checked on every sync.
 const RECONCILE_WINDOW: u32 = 1000;
 /// Header fields the list and threading need; the rest of the header is not downloaded.
-const HEADER_FIELDS: &str = "BODY.PEEK[HEADER.FIELDS (FROM TO CC REPLY-TO SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES CONTENT-TYPE AUTHENTICATION-RESULTS X-SPAM-STATUS X-SPAM-FLAG X-SPAM-BAR X-SPAM-SCORE X-SPAM-REPORT)]";
+const HEADER_FIELDS: &str = "BODY.PEEK[HEADER.FIELDS (FROM TO CC REPLY-TO SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES CONTENT-TYPE X-PRIORITY IMPORTANCE AUTHENTICATION-RESULTS X-SPAM-STATUS X-SPAM-FLAG X-SPAM-BAR X-SPAM-SCORE X-SPAM-REPORT)]";
 
 trait Conn: AsyncRead + AsyncWrite + Unpin + Send + fmt::Debug {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + fmt::Debug> Conn for T {}
@@ -37,9 +37,15 @@ struct State {
 }
 
 /// What a write does to one message.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Op {
     Seen(bool),
+    /// The [`PINNED`] keyword.
+    Pinned(bool),
+    /// `\Flagged`: the star every client shows.
+    Starred(bool),
+    /// A label, as a keyword: the standard `$label1`… or one of the user's own.
+    Label(String, bool),
     Archive,
     Trash,
     /// To the folder with this role (Spam, or back to the Inbox).
@@ -62,6 +68,9 @@ pub struct ImapSource {
     state: Mutex<State>,
     /// What [`Self::auth_server`] found, and whether it was learned (then it is final) and when not.
     auth_server: std::sync::Mutex<Option<(String, Option<std::time::Instant>)>>,
+    /// Messages as (folder, uid) whose flags were changed here and are on their way to the server: a
+    /// sync meanwhile leaves them as they are.
+    writing: std::sync::Mutex<std::collections::HashSet<(String, u32)>>,
 }
 
 /// What a connection needs: the account's IMAP server and its credentials.
@@ -133,7 +142,7 @@ impl ImapSource {
     /// Creates the source over the shared archive; the connection is opened on first use.
     pub fn new(account: &Account, password: String, store: Arc<Store>, files: Arc<Vault>) -> Self {
         let config = Config { server: account.imap.clone(), user: account.user.clone(), password, offline: Default::default(), token: None };
-        Self { config, poll_interval: std::time::Duration::from_secs(180), account: account.key(), address: account.address().to_lowercase(), store, files, state: Mutex::new(State::default()), auth_server: std::sync::Mutex::new(None) }
+        Self { config, poll_interval: std::time::Duration::from_secs(180), account: account.key(), address: account.address().to_lowercase(), store, files, state: Mutex::new(State::default()), auth_server: std::sync::Mutex::new(None), writing: Default::default() }
     }
 
     /// Changes how often a server without IDLE is polled (3 minutes by default).
@@ -433,6 +442,10 @@ fn header(fetch: &Fetch) -> Option<Header> {
         received,
         timestamp,
         unread: !fetch.flags().any(|f| f == Flag::Seen),
+        pinned: fetch.flags().any(|f| matches!(f, Flag::Custom(k) if k == PINNED)),
+        starred: fetch.flags().any(|f| f == Flag::Flagged),
+        priority: priority(&message),
+        labels: labels(fetch.flags()),
         message_id: message.message_id().unwrap_or_default().to_owned(),
         in_reply_to: ids(message.in_reply_to()).join(" "),
         references: ids(message.references()).join(" "),
@@ -446,6 +459,34 @@ fn header(fetch: &Fetch) -> Option<Header> {
             carries_file,
         ),
     })
+}
+
+/// What the sender marked a message as: 1 high, -1 low, 0 neither. `X-Priority` gives 1 (highest) to 5
+/// (lowest), `Importance` high or low.
+fn priority(message: &mail_parser::Message<'_>) -> i8 {
+    let level = message.header_raw("X-Priority").and_then(|v| v.trim().chars().next()?.to_digit(10));
+    match (level, message.header_raw("Importance").map(|v| v.trim().to_ascii_lowercase())) {
+        (Some(1 | 2), _) => 1,
+        (Some(4 | 5), _) => -1,
+        (_, Some(i)) if i == "high" => 1,
+        (_, Some(i)) if i == "low" => -1,
+        _ => 0,
+    }
+}
+
+/// The labels among a message's keywords, separated by spaces: the standard ones (`$label1` to
+/// `$label5`) and the user's own, which carry no `$`. Keywords that only record what a client did
+/// (forwarded, a receipt sent, its own spam verdict) and the pin are left out.
+fn labels<'a>(flags: impl Iterator<Item = Flag<'a>>) -> String {
+    const NOT_LABELS: [&str; 5] = ["junk", "nonjunk", "notjunk", "forwarded", "phishing"];
+    flags
+        .filter_map(|f| match f {
+            Flag::Custom(k) if k.len() == 7 && k.starts_with("$label") && k.ends_with(['1', '2', '3', '4', '5']) => Some(k.into_owned()),
+            Flag::Custom(k) if !k.starts_with('$') && !k.starts_with('\\') && !NOT_LABELS.contains(&k.to_ascii_lowercase().as_str()) => Some(k.into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The To and Cc addresses, lower case, separated by spaces.
@@ -477,11 +518,11 @@ impl ImapSource {
     /// Applies `op` to one message on the server, then mirrors it in the archive.
     async fn write(&self, id: MessageId, op: Op) -> Result<(), MailError> {
         let at = self.store.locate(id)?.ok_or(MailError::NotFound)?;
-        let target = match op {
-            Op::Seen(_) | Op::Erase => None,
+        let target = match &op {
+            Op::Seen(_) | Op::Pinned(_) | Op::Starred(_) | Op::Label(..) | Op::Erase => None,
             Op::Archive => Some(self.folder_with_role(Role::Archive).await?.ok_or_else(|| backend("this account has no archive folder"))?),
             Op::Trash => Some(self.folder_with_role(Role::Trash).await?.ok_or_else(|| backend("this account has no trash folder"))?),
-            Op::Move(role) => Some(self.folder_with_role(role).await?.ok_or_else(|| backend(format!("this account has no {role:?} folder")))?),
+            Op::Move(role) => Some(self.folder_with_role(*role).await?.ok_or_else(|| backend(format!("this account has no {role:?} folder")))?),
         };
         if matches!(op, Op::Erase) && self.folder_with_role(Role::Trash).await?.as_deref() != Some(at.folder.as_str()) {
             return Err(backend("only messages in Trash can be erased"));
@@ -489,14 +530,62 @@ impl ImapSource {
         if target.as_deref() == Some(at.folder.as_str()) {
             return Err(backend(format!("the message is already in {}", at.folder)));
         }
+        // A flag is set here at once, so a list read meanwhile shows it; undone if the server refuses,
+        // kept when it cannot be reached (the change waits to be sent).
+        let flag = target.is_none() && !matches!(op, Op::Erase);
+        let key = (at.folder.clone(), at.uid);
+        if flag {
+            self.set_flag(id, &op, true)?;
+            self.writing.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key.clone());
+        }
+        let result = self.send(&at, &op, target).await;
+        if flag {
+            self.writing.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&key);
+            if result.as_ref().is_err_and(|e| !matches!(e, MailError::Offline(_))) {
+                let _ = self.set_flag(id, &op, false);
+            }
+            return result;
+        }
+        result?;
+        self.drop_files(&at.folder, &[at.uid]);
+        self.store.remove(id)
+    }
+
+    /// Mirrors a flag change in the archive (`forward`), or undoes it.
+    fn set_flag(&self, id: MessageId, op: &Op, forward: bool) -> Result<(), MailError> {
+        match op {
+            Op::Seen(seen) => self.store.set_unread(id, *seen != forward),
+            Op::Pinned(on) => self.store.set_pinned(id, *on == forward),
+            Op::Starred(on) => self.store.set_starred(id, *on == forward),
+            Op::Label(keyword, on) => self.store.set_label(id, keyword, *on == forward),
+            Op::Archive | Op::Trash | Op::Move(_) | Op::Erase => Ok(()),
+        }
+    }
+
+    /// Makes `op` on the server.
+    async fn send(&self, at: &Location, op: &Op, target: Option<String>) -> Result<(), MailError> {
         let mut state = self.state.lock().await;
         let session = state.session(&self.config).await?;
         let result = async {
-            session.select(&at.folder).await?;
+            let selected = session.select(&at.folder).await?;
             let uid = at.uid.to_string();
             match (op, target) {
                 (Op::Seen(seen), _) => {
-                    let query = if seen { "+FLAGS.SILENT (\\Seen)" } else { "-FLAGS.SILENT (\\Seen)" };
+                    let query = if *seen { "+FLAGS.SILENT (\\Seen)" } else { "-FLAGS.SILENT (\\Seen)" };
+                    session.uid_store(&uid, query).await?.try_collect::<Vec<_>>().await?;
+                }
+                (Op::Starred(on), _) => {
+                    let query = if *on { "+FLAGS.SILENT (\\Flagged)" } else { "-FLAGS.SILENT (\\Flagged)" };
+                    session.uid_store(&uid, query).await?.try_collect::<Vec<_>>().await?;
+                }
+                // A server that takes no keywords of its own keeps no pin: it stays on this computer.
+                (Op::Pinned(on), _) if takes_keywords(&selected.permanent_flags) => {
+                    let query = format!("{}FLAGS.SILENT ({PINNED})", if *on { "+" } else { "-" });
+                    session.uid_store(&uid, query).await?.try_collect::<Vec<_>>().await?;
+                }
+                // A label too stays on this computer where the server takes no keywords of its own.
+                (Op::Label(keyword, on), _) if takes_keywords(&selected.permanent_flags) => {
+                    let query = format!("{}FLAGS.SILENT ({keyword})", if *on { "+" } else { "-" });
                     session.uid_store(&uid, query).await?.try_collect::<Vec<_>>().await?;
                 }
                 (_, Some(dest)) => {
@@ -516,14 +605,7 @@ impl ImapSource {
             Ok::<(), async_imap::error::Error>(())
         }
         .await;
-        result.map_err(|e| state.failed(e))?;
-        match op {
-            Op::Seen(seen) => self.store.set_unread(id, !seen),
-            Op::Archive | Op::Trash | Op::Move(_) | Op::Erase => {
-                self.drop_files(&at.folder, &[at.uid]);
-                self.store.remove(id)
-            }
-        }
+        result.map_err(|e| state.failed(e))
     }
 
     async fn fetch_headers(session: &mut Session<Stream>, set: &str, by_uid: bool) -> Result<Vec<Header>, async_imap::error::Error> {
@@ -593,7 +675,7 @@ impl ImapSource {
             cached.floor_uid = None;
         }
         if selected.exists == 0 {
-            let all: Vec<u32> = store.flags_since(account, folder, 0)?.into_iter().map(|(u, _)| u).collect();
+            let all: Vec<u32> = store.flags_since(account, folder, 0)?.into_iter().map(|(u, ..)| u).collect();
             self.drop_files(folder, &all);
             store.remove_uids(account, folder, &all)?;
             return Ok(SyncReport::default());
@@ -672,14 +754,33 @@ impl ImapSource {
         if let Some(from) = store.nth_newest_uid(account, folder, RECONCILE_WINDOW)?.or(store.uid_range(account, folder)?.map(|(lo, _, _)| lo)) {
             let fetches: Vec<Fetch> = session.uid_fetch(format!("{from}:*"), "(UID FLAGS)").await?.try_collect().await?;
             // One flagged deleted is gone as if expunged.
-            let server: std::collections::HashMap<u32, bool> =
-                fetches.iter().filter(|f| !f.flags().any(|fl| fl == Flag::Deleted)).filter_map(|f| Some((f.uid?, !f.flags().any(|fl| fl == Flag::Seen)))).collect();
+            // Where the server keeps no keywords, the pins and labels made here stay as they are.
+            let keywords = takes_keywords(&selected.permanent_flags);
             let local = store.flags_since(account, folder, from)?;
+            let kept: std::collections::HashMap<u32, &Flags> = local.iter().map(|(uid, f)| (*uid, f)).collect();
+            let server: std::collections::HashMap<u32, Flags> = fetches
+                .iter()
+                .filter(|f| !f.flags().any(|fl| fl == Flag::Deleted))
+                .filter_map(|f| {
+                    let uid = f.uid?;
+                    let (pinned, labels) = match kept.get(&uid) {
+                        Some(here) if !keywords => (here.pinned, here.labels.clone()),
+                        _ => (f.flags().any(|fl| matches!(fl, Flag::Custom(k) if k == PINNED)), labels(f.flags())),
+                    };
+                    Some((uid, Flags { unread: !f.flags().any(|fl| fl == Flag::Seen), pinned, starred: f.flags().any(|fl| fl == Flag::Flagged), labels }))
+                })
+                .collect();
             let gone: Vec<u32> = local.iter().filter(|(uid, _)| !server.contains_key(uid)).map(|(uid, _)| *uid).collect();
-            let changed: Vec<(u32, bool)> = local.iter().filter_map(|(uid, unread)| server.get(uid).filter(|s| *s != unread).map(|s| (*uid, *s))).collect();
+            // One being written now keeps what it was set to here.
+            let writing = self.writing.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+            let changed: Vec<(u32, Flags)> = local
+                .iter()
+                .filter(|(uid, _)| !writing.contains(&(folder.to_owned(), *uid)))
+                .filter_map(|(uid, flags)| server.get(uid).filter(|s| *s != flags).map(|s| (*uid, s.clone())))
+                .collect();
             self.drop_files(folder, &gone);
             store.remove_uids(account, folder, &gone)?;
-            store.set_unread_by_uid(account, folder, &changed)?;
+            store.set_flags_by_uid(account, folder, &changed)?;
         }
 
         // One more chunk of older history.
@@ -813,6 +914,14 @@ fn unsubscribe_links(value: &str) -> Vec<String> {
         .map(|(link, _)| link.split_whitespace().collect::<String>())
         .filter(|link| ["https:", "mailto:"].iter().any(|s| link.get(..s.len()).is_some_and(|p| p.eq_ignore_ascii_case(s))))
         .collect()
+}
+
+/// The keyword a pin is kept under on the server, where it takes keywords of its own.
+const PINNED: &str = "$Pinned";
+
+/// The mailbox lets clients set keywords of their own (`\*` in its permanent flags) or knows the pin.
+fn takes_keywords(permanent: &[Flag<'_>]) -> bool {
+    permanent.iter().any(|f| matches!(f, Flag::MayCreate) || matches!(f, Flag::Custom(k) if k == PINNED))
 }
 
 /// The authserv-id of the account's own server, from its latest messages as (sender, header fields):
@@ -1203,6 +1312,22 @@ impl MailSource for ImapSource {
         self.write(id, Op::Seen(!unread)).await
     }
 
+    async fn set_label(&self, id: MessageId, keyword: &str, on: bool) -> Result<(), MailError> {
+        // A keyword is an IMAP atom: nothing that would break the command.
+        if keyword.is_empty() || keyword.chars().any(|c| c.is_whitespace() || c.is_control() || "(){%*\"\\]".contains(c)) {
+            return Err(backend(format!("not a label name: {keyword}")));
+        }
+        self.write(id, Op::Label(keyword.to_owned(), on)).await
+    }
+
+    async fn set_starred(&self, id: MessageId, starred: bool) -> Result<(), MailError> {
+        self.write(id, Op::Starred(starred)).await
+    }
+
+    async fn set_pinned(&self, id: MessageId, pinned: bool) -> Result<(), MailError> {
+        self.write(id, Op::Pinned(pinned)).await
+    }
+
     async fn archive(&self, id: MessageId) -> Result<(), MailError> {
         self.write(id, Op::Archive).await
     }
@@ -1225,7 +1350,7 @@ impl MailSource for ImapSource {
         }
         let folder = self.folder_with_role(role).await?.ok_or_else(|| backend(format!("this account has no {role:?} folder")))?;
         // Only what the user has seen listed: what arrived meanwhile is not erased unseen.
-        let listed: Vec<u32> = self.store.flags_since(&self.account, &folder, 0)?.into_iter().map(|(uid, _)| uid).collect();
+        let listed: Vec<u32> = self.store.flags_since(&self.account, &folder, 0)?.into_iter().map(|(uid, ..)| uid).collect();
         let mut state = self.state.lock().await;
         let session = state.session(&self.config).await?;
         let result = async {
@@ -1271,6 +1396,25 @@ mod tests {
 
     fn body_index(raw: &str, name: &str) -> u32 {
         parse_body(raw.as_bytes()).unwrap().attachments.into_iter().find(|a| a.name == name).unwrap().index
+    }
+
+    #[test]
+    fn the_senders_priority_and_the_labels_of_other_clients_are_read() {
+        let level = |raw: &str| priority(&MessageParser::default().parse_headers(raw.as_bytes()).unwrap());
+        assert_eq!(level("X-Priority: 1 (Highest)\r\nSubject: a\r\n\r\n"), 1);
+        assert_eq!(level("X-Priority: 5 (Lowest)\r\nSubject: a\r\n\r\n"), -1);
+        assert_eq!(level("Importance: High\r\nSubject: a\r\n\r\n"), 1);
+        assert_eq!(level("X-Priority: 3 (Normal)\r\nSubject: a\r\n\r\n"), 0);
+        assert_eq!(level("Subject: a\r\n\r\n"), 0);
+        let flags = [Flag::Seen, Flag::Custom("$label1".into()), Flag::Custom("clients".into()), Flag::Custom("$Forwarded".into()), Flag::Custom("NonJunk".into()), Flag::Custom(PINNED.into()), Flag::Custom("$label9".into())];
+        assert_eq!(labels(flags.into_iter()), "$label1 clients");
+    }
+
+    #[test]
+    fn a_pin_goes_to_the_server_only_where_it_takes_keywords_of_its_own() {
+        assert!(!takes_keywords(&[Flag::Seen, Flag::Flagged, Flag::Deleted]), "only the system flags: the pin stays here");
+        assert!(takes_keywords(&[Flag::Seen, Flag::MayCreate]));
+        assert!(takes_keywords(&[Flag::Custom(PINNED.into())]));
     }
 
     #[test]

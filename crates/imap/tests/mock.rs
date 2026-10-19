@@ -134,7 +134,7 @@ async fn serve(socket: TcpStream, log: Arc<Mutex<Vec<String>>>, move_works: bool
             let name = command.split(' ').nth(1).unwrap_or("\"INBOX\"");
             format!("* STATUS {name} (MESSAGES 1240 UNSEEN 1)\r\n{tag} OK done\r\n")
         } else if verb.starts_with("SELECT") || verb.starts_with("EXAMINE") {
-            format!("* 1 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 1] ok\r\n{tag} OK [READ-WRITE] done\r\n")
+            format!("* 1 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 1] ok\r\n* OK [PERMANENTFLAGS (\\Seen \\Flagged \\Deleted \\*)] ok\r\n{tag} OK [READ-WRITE] done\r\n")
         } else if verb.contains("BODY.PEEK[]") {
             let message = message.lock().unwrap().clone();
             let n = message.len();
@@ -210,6 +210,22 @@ async fn reading_flags_are_stored() {
     mock.source.set_unread(id, false).await.unwrap();
     mock.source.set_unread(id, true).await.unwrap();
     assert_eq!(mock.writes(), ["UID STORE 5 +FLAGS.SILENT (\\Seen)", "UID STORE 5 -FLAGS.SILENT (\\Seen)"]);
+    mock.source.set_pinned(id, true).await.unwrap();
+    assert!(mock.source.messages("INBOX").await.unwrap()[0].pinned);
+    mock.source.set_pinned(id, false).await.unwrap();
+    assert_eq!(mock.writes()[2..], ["UID STORE 5 +FLAGS.SILENT ($Pinned)", "UID STORE 5 -FLAGS.SILENT ($Pinned)"]);
+    mock.source.set_starred(id, true).await.unwrap();
+    assert!(mock.source.messages("INBOX").await.unwrap()[0].starred);
+    assert_eq!(mock.writes()[4], "UID STORE 5 +FLAGS.SILENT (\\Flagged)");
+    mock.source.set_label(id, "$label1", true).await.unwrap();
+    assert_eq!(mock.source.messages("INBOX").await.unwrap()[0].labels, ["$label1"]);
+    assert_eq!(mock.writes()[5], "UID STORE 5 +FLAGS.SILENT ($label1)");
+    assert!(mock.source.set_label(id, "two words", true).await.is_err(), "never a broken command");
+    // Set here at once, and kept while the server cannot be reached: the change waits to be sent.
+    mock.source.set_offline(true);
+    assert!(matches!(mock.source.set_starred(id, false).await, Err(MailError::Offline(_))));
+    assert!(!mock.source.messages("INBOX").await.unwrap()[0].starred);
+    mock.source.set_offline(false);
 }
 
 #[tokio::test]

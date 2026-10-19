@@ -101,6 +101,14 @@ pub struct Header {
     pub received: String,
     pub timestamp: i64,
     pub unread: bool,
+    /// The `$Pinned` keyword: kept at the top of its folder.
+    pub pinned: bool,
+    /// `\Flagged`: a star or flag from any client.
+    pub starred: bool,
+    /// 1 high, -1 low, 0 neither, as the sender marked it.
+    pub priority: i8,
+    /// Labels from other clients, separated by spaces (keywords have none).
+    pub labels: String,
     pub message_id: String,
     pub in_reply_to: String,
     /// Message-IDs separated by spaces.
@@ -112,6 +120,16 @@ pub struct Header {
     pub recipients: String,
     /// The header fields as fetched, for the checks that need no body (sender, Reply-To, the server's verdict).
     pub raw: Vec<u8>,
+}
+
+/// The flags of a cached message the server can change.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Flags {
+    pub unread: bool,
+    pub pinned: bool,
+    pub starred: bool,
+    /// Separated by spaces.
+    pub labels: String,
 }
 
 /// A message whose file has not been downloaded yet.
@@ -378,6 +396,10 @@ fn summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageSummary> {
         timestamp,
         unread: row.get::<_, i64>(7)? != 0,
         has_attachments: row.get::<_, i64>(8)? != 0,
+        pinned: row.get::<_, i64>(12)? != 0,
+        starred: row.get::<_, i64>(13)? != 0,
+        priority: row.get::<_, i64>(14)?.clamp(-1, 1) as i8,
+        labels: row.get::<_, String>(15)?.split_whitespace().map(str::to_owned).collect(),
         message_id: row.get(9)?,
         parents: {
             let (in_reply_to, refs): (String, String) = (row.get(10)?, row.get(11)?);
@@ -471,7 +493,7 @@ fn fts_term(word: &str) -> String {
 /// How much of a message's text the preview keeps.
 const PREVIEW_CHARS: usize = 1500;
 
-const SUMMARY_COLUMNS: &str = "id, CASE WHEN from_name = '' THEN from_addr ELSE from_name END, from_addr, subject, preview, received, timestamp, unread, attach, message_id, in_reply_to, refs";
+const SUMMARY_COLUMNS: &str = "id, CASE WHEN from_name = '' THEN from_addr ELSE from_name END, from_addr, subject, preview, received, timestamp, unread, attach, message_id, in_reply_to, refs, pinned, starred, priority, labels";
 
 /// The key as SQLCipher takes a raw one: `x'<hex>'`.
 fn raw_key(key: &[u8; 32]) -> String {
@@ -685,6 +707,27 @@ fn migrate(conn: &Connection) -> Result<(), MailError> {
                  PRAGMA user_version = 18;",
             )
             .map_err(db)?;
+        }
+        if version < 19 {
+            // Run again from an older version (as a test does), the column is already there.
+            let have = conn.prepare("SELECT pinned FROM messages LIMIT 0").is_ok();
+            let add = if have { "" } else { "ALTER TABLE messages ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;" };
+            conn.execute_batch(&format!("{add} PRAGMA user_version = 19;")).map_err(db)?;
+        }
+        if version < 20 {
+            // The pins of version 19 were the server's \Flagged: kept as stars, and nothing is pinned yet.
+            let have = conn.prepare("SELECT starred FROM messages LIMIT 0").is_ok();
+            let add = if have { "" } else { "ALTER TABLE messages ADD COLUMN starred INTEGER NOT NULL DEFAULT 0;" };
+            conn.execute_batch(&format!("{add} UPDATE messages SET starred = pinned, pinned = 0; PRAGMA user_version = 20;")).map_err(db)?;
+        }
+        if version < 21 {
+            let mut add = String::new();
+            for (column, kind) in [("priority", "INTEGER NOT NULL DEFAULT 0"), ("labels", "TEXT NOT NULL DEFAULT ''")] {
+                if conn.prepare(&format!("SELECT {column} FROM messages LIMIT 0")).is_err() {
+                    add += &format!("ALTER TABLE messages ADD COLUMN {column} {kind};");
+                }
+            }
+            conn.execute_batch(&format!("{add} PRAGMA user_version = 21;")).map_err(db)?;
         }
     Ok(())
 }
@@ -904,14 +947,14 @@ impl Store {
             let mut stmt = tx
                 .prepare(
                     "INSERT OR IGNORE INTO messages
-                     (account, folder, uid, from_name, from_addr, subject, received, timestamp, unread, message_id, in_reply_to, refs, size, attach, attach_known, recipients, headers)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 1, ?15, ?16)",
+                     (account, folder, uid, from_name, from_addr, subject, received, timestamp, unread, message_id, in_reply_to, refs, size, attach, attach_known, recipients, headers, pinned, starred, priority, labels)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 1, ?15, ?16, ?17, ?18, ?19, ?20)",
                 )
                 .map_err(db)?;
             for h in headers {
                 stmt.execute(params![
                     account, folder, i64::from(h.uid), h.from_name, h.from_addr, h.subject, h.received, h.timestamp, i64::from(h.unread),
-                    h.message_id, h.in_reply_to, h.references, i64::from(h.size), i64::from(h.has_attachments), h.recipients, h.raw
+                    h.message_id, h.in_reply_to, h.references, i64::from(h.size), i64::from(h.has_attachments), h.recipients, h.raw, i64::from(h.pinned), i64::from(h.starred), i64::from(h.priority), h.labels
                 ])
                 .map_err(db)?;
             }
@@ -938,20 +981,26 @@ impl Store {
     }
 
     /// The cached UIDs of a folder at or above `from`, with their unread flag.
-    pub fn flags_since(&self, account: &str, folder: &str, from: u32) -> Result<Vec<(u32, bool)>, MailError> {
+    /// The cached messages of a folder from UID `from` up, as (uid, [`Flags`]).
+    pub fn flags_since(&self, account: &str, folder: &str, from: u32) -> Result<Vec<(u32, Flags)>, MailError> {
         let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT uid, unread FROM messages WHERE account = ?1 AND folder = ?2 AND uid >= ?3").map_err(db)?;
-        let rows = stmt.query_map(params![account, folder, i64::from(from)], |r| Ok((r.get::<_, i64>(0)? as u32, r.get::<_, i64>(1)? != 0))).map_err(db)?;
+        let mut stmt = conn.prepare("SELECT uid, unread, pinned, starred, labels FROM messages WHERE account = ?1 AND folder = ?2 AND uid >= ?3").map_err(db)?;
+        let rows = stmt
+            .query_map(params![account, folder, i64::from(from)], |r| {
+                Ok((r.get::<_, i64>(0)? as u32, Flags { unread: r.get::<_, i64>(1)? != 0, pinned: r.get::<_, i64>(2)? != 0, starred: r.get::<_, i64>(3)? != 0, labels: r.get(4)? }))
+            })
+            .map_err(db)?;
         rows.collect::<Result<_, _>>().map_err(db)
     }
 
-    pub fn set_unread_by_uid(&self, account: &str, folder: &str, uids: &[(u32, bool)]) -> Result<(), MailError> {
+    /// Sets the flags of messages as the server has them, by UID.
+    pub fn set_flags_by_uid(&self, account: &str, folder: &str, uids: &[(u32, Flags)]) -> Result<(), MailError> {
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(db)?;
-        for (uid, unread) in uids {
+        for (uid, f) in uids {
             tx.execute(
-                "UPDATE messages SET unread = ?4 WHERE account = ?1 AND folder = ?2 AND uid = ?3",
-                params![account, folder, i64::from(*uid), i64::from(*unread)],
+                "UPDATE messages SET unread = ?4, pinned = ?5, starred = ?6, labels = ?7 WHERE account = ?1 AND folder = ?2 AND uid = ?3",
+                params![account, folder, i64::from(*uid), i64::from(f.unread), i64::from(f.pinned), i64::from(f.starred), f.labels],
             )
             .map_err(db)?;
         }
@@ -1321,7 +1370,7 @@ impl Store {
         );
         let mut stmt = conn.prepare(&sql).map_err(db)?;
         let rows = stmt
-            .query_map(params![address.trim().to_lowercase(), role_to_int(Role::Junk), role_to_int(Role::Trash), limit as i64], |r| Ok((r.get(13)?, Hit { message: summary(r)?, folder: r.get(12)? })))
+            .query_map(params![address.trim().to_lowercase(), role_to_int(Role::Junk), role_to_int(Role::Trash), limit as i64], |r| Ok((r.get(17)?, Hit { message: summary(r)?, folder: r.get(16)? })))
             .map_err(db)?;
         rows.collect::<Result<_, _>>().map_err(db)
     }
@@ -1414,6 +1463,25 @@ impl Store {
 
     pub fn set_unread(&self, id: MessageId, unread: bool) -> Result<(), MailError> {
         self.conn().execute("UPDATE messages SET unread = ?2 WHERE id = ?1", params![id.0 as i64, i64::from(unread)]).map(|_| ()).map_err(db)
+    }
+
+    /// Adds label `keyword` to a message, or takes it off.
+    pub fn set_label(&self, id: MessageId, keyword: &str, on: bool) -> Result<(), MailError> {
+        let conn = self.conn();
+        let labels: String = conn.query_row("SELECT labels FROM messages WHERE id = ?1", [id.0 as i64], |r| r.get(0)).optional().map_err(db)?.unwrap_or_default();
+        let mut list: Vec<&str> = labels.split_whitespace().filter(|l| *l != keyword).collect();
+        if on {
+            list.push(keyword);
+        }
+        conn.execute("UPDATE messages SET labels = ?2 WHERE id = ?1", params![id.0 as i64, list.join(" ")]).map(|_| ()).map_err(db)
+    }
+
+    pub fn set_starred(&self, id: MessageId, starred: bool) -> Result<(), MailError> {
+        self.conn().execute("UPDATE messages SET starred = ?2 WHERE id = ?1", params![id.0 as i64, i64::from(starred)]).map(|_| ()).map_err(db)
+    }
+
+    pub fn set_pinned(&self, id: MessageId, pinned: bool) -> Result<(), MailError> {
+        self.conn().execute("UPDATE messages SET pinned = ?2 WHERE id = ?1", params![id.0 as i64, i64::from(pinned)]).map(|_| ()).map_err(db)
     }
 
     pub fn remove(&self, id: MessageId) -> Result<(), MailError> {
@@ -1514,7 +1582,7 @@ impl Store {
         let sql = format!("SELECT {SUMMARY_COLUMNS}, folder FROM messages WHERE {} ORDER BY timestamp DESC LIMIT {}", conditions.join(" AND "), limit.min(1000));
         let conn = self.conn();
         let mut stmt = conn.prepare(&sql).map_err(db)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |r| Ok(Hit { message: summary(r)?, folder: r.get(12)? })).map_err(db)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |r| Ok(Hit { message: summary(r)?, folder: r.get(16)? })).map_err(db)?;
         rows.collect::<Result<_, _>>().map_err(db)
     }
 
@@ -1604,6 +1672,23 @@ mod tests {
         assert!(!store.messages("me", "INBOX").unwrap()[0].unread);
         store.remove(id).unwrap();
         assert_eq!(store.locate(id).unwrap(), None);
+    }
+
+    #[test]
+    fn a_pin_is_kept_from_the_server_and_from_the_user() {
+        let store = store();
+        store.add_headers("me", "INBOX", &[Header { pinned: true, ..header(1, "a", 1, false) }, header(2, "b", 2, false)]).unwrap();
+        let pinned = |s: &Store| s.messages("me", "INBOX").unwrap().iter().map(|m| (m.subject.clone(), m.pinned)).collect::<Vec<_>>();
+        assert_eq!(pinned(&store), [("b".to_owned(), false), ("a".to_owned(), true)]);
+        assert_eq!(store.flags_since("me", "INBOX", 0).unwrap().iter().find(|f| f.0 == 1), Some(&(1, Flags { pinned: true, ..Flags::default() })));
+        store.set_flags_by_uid("me", "INBOX", &[(1, Flags { unread: true, pinned: false, starred: true, labels: "$label1 clients".into() })]).unwrap();
+        let a = store.messages("me", "INBOX").unwrap().into_iter().find(|m| m.subject == "a").unwrap();
+        assert!(a.starred && !a.pinned && a.labels == ["$label1", "clients"]);
+        let id = store.id_of("me", "INBOX", 2).unwrap().unwrap();
+        store.set_pinned(id, true).unwrap();
+        assert_eq!(pinned(&store), [("b".to_owned(), true), ("a".to_owned(), false)]);
+        let hit = &store.search("me", "subject:b", 10).unwrap()[0];
+        assert!(hit.message.pinned && hit.folder == "INBOX", "search reads the pin and the folder in their places");
     }
 
     #[test]

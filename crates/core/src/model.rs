@@ -47,6 +47,15 @@ pub struct MessageSummary {
     /// Seconds since the Unix epoch, for ordering; 0 when the message has no valid date.
     pub timestamp: i64,
     pub unread: bool,
+    /// Pinned to the top of its folder: the `$Pinned` keyword on the server, or only here where the
+    /// server takes no keywords of its own.
+    pub pinned: bool,
+    /// Flagged on the server (`\Flagged`: a star or flag set in any client); shown, it does not reorder.
+    pub starred: bool,
+    /// What the sender marked it as: 1 high, -1 low, 0 neither (`X-Priority`, `Importance`).
+    pub priority: i8,
+    /// Its labels, as IMAP keywords: the standard `$label1`… or names of the user's own.
+    pub labels: Vec<String>,
     /// The message looks like it carries attachments (a `multipart/mixed` body).
     pub has_attachments: bool,
     /// The `Message-ID` header without angle brackets; empty when the message has none.

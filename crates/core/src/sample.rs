@@ -43,6 +43,10 @@ impl SampleSource {
                     message_id: String::new(),
                     parents: Vec::new(),
                     unread: next() % 3 == 0,
+                    pinned: false,
+                    starred: false,
+                    priority: 0,
+                    labels: Vec::new(),
                 };
                 (folder, summary, body)
             })
@@ -145,6 +149,18 @@ impl MailSource for SampleSource {
     }
 
     async fn set_unread(&self, _: MessageId, _: bool) -> Result<(), MailError> {
+        Err(read_only())
+    }
+
+    async fn set_label(&self, _: MessageId, _: &str, _: bool) -> Result<(), MailError> {
+        Err(read_only())
+    }
+
+    async fn set_starred(&self, _: MessageId, _: bool) -> Result<(), MailError> {
+        Err(read_only())
+    }
+
+    async fn set_pinned(&self, _: MessageId, _: bool) -> Result<(), MailError> {
         Err(read_only())
     }
 

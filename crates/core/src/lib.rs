@@ -98,6 +98,15 @@ pub trait MailSource {
     /// Marks a message unread (`true`) or read (`false`).
     fn set_unread(&self, id: MessageId, unread: bool) -> impl Future<Output = Result<(), MailError>> + Send;
 
+    /// Stars a message (`true`) or takes its star off: `\Flagged`, as every client shows it.
+    fn set_starred(&self, id: MessageId, starred: bool) -> impl Future<Output = Result<(), MailError>> + Send;
+
+    /// Sets label `keyword` on a message (`true`) or takes it off: an IMAP keyword on the server.
+    fn set_label(&self, id: MessageId, keyword: &str, on: bool) -> impl Future<Output = Result<(), MailError>> + Send;
+
+    /// Pins a message to the top of its folder (`true`) or unpins it.
+    fn set_pinned(&self, id: MessageId, pinned: bool) -> impl Future<Output = Result<(), MailError>> + Send;
+
     /// Moves a message to the account's archive folder.
     fn archive(&self, id: MessageId) -> impl Future<Output = Result<(), MailError>> + Send;
 

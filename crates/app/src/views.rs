@@ -340,6 +340,13 @@ pub fn message_row(ui: &mut Ui, t: &Tokens, message: &MessageSummary, selected: 
         Icon::Paperclip.image(15.0, t.text_dim).paint_at(ui, Rect::from_center_size(pos2(card.right() - 14.0 - date_w - 17.0, card.top() + 21.0), vec2(15.0, 15.0)));
     }
     let mut clip = clip;
+    // Pinned here, and starred (a flag from any client): beside the paperclip.
+    for (on, icon, color) in [(message.pinned, Icon::Pin, t.accent), (message.starred, Icon::Star, theme::role_color(Role::Starred))] {
+        if on {
+            icon.image(15.0, color).paint_at(ui, Rect::from_center_size(pos2(card.right() - 14.0 - date_w - clip - 17.0, card.top() + 21.0), vec2(15.0, 15.0)));
+            clip += 20.0;
+        }
+    }
     if count > 1 {
         let text = ui.painter().layout_no_wrap(count.to_string(), FontId::proportional(12.5), t.text_dim);
         let pill = Rect::from_center_size(pos2(0.0, card.top() + 21.0), vec2((text.size().x + 14.0).max(24.0), 20.0));
@@ -374,8 +381,31 @@ pub fn message_row(ui: &mut Ui, t: &Tokens, message: &MessageSummary, selected: 
         let shown = truncated(ui, &domain, FontId::proportional(13.0), color, (left + room - x).max(0.0));
         ui.painter().galley(pos2(x, card.top() + 13.0), shown, color);
     }
-    let subject = truncated(ui, &message.subject, FontId::new(14.5, weight), primary, width);
-    ui.painter().galley(pos2(left, card.top() + 33.0), subject, primary);
+    // The subject line: what the sender marked as high or low priority before it, labels after it.
+    let mut subject_x = left;
+    match message.priority {
+        1 => Icon::CircleAlert.image(14.0, t.danger).paint_at(ui, Rect::from_center_size(pos2(left + 7.0, card.top() + 42.0), vec2(14.0, 14.0))),
+        -1 => Icon::ArrowDown.image(14.0, t.text_dim).paint_at(ui, Rect::from_center_size(pos2(left + 7.0, card.top() + 42.0), vec2(14.0, 14.0))),
+        _ => {}
+    }
+    if message.priority != 0 {
+        subject_x += 20.0;
+    }
+    let mut chips_right = card.right() - 14.0;
+    for keyword in message.labels.iter().rev() {
+        let (name, color) = theme::label(keyword);
+        let text = ui.painter().layout_no_wrap(name, FontId::proportional(12.0), t.text_dim);
+        let pill = Rect::from_min_size(pos2(chips_right - text.size().x - 22.0, card.top() + 33.0), vec2(text.size().x + 22.0, 18.0));
+        if pill.left() < subject_x + 80.0 {
+            break; // the subject keeps room; labels that do not fit stay off the row
+        }
+        ui.painter().rect_filled(pill, CornerRadius::same(9), t.hover);
+        ui.painter().circle_filled(pos2(pill.left() + 9.0, pill.center().y), 3.5, color);
+        ui.painter().galley(pos2(pill.left() + 16.0, pill.center().y - text.size().y / 2.0), text, t.text_dim);
+        chips_right = pill.left() - 6.0;
+    }
+    let subject = truncated(ui, &message.subject, FontId::new(14.5, weight), primary, chips_right - subject_x - 6.0);
+    ui.painter().galley(pos2(subject_x, card.top() + 33.0), subject, primary);
     // In search results: which folder the message is in, so identical subjects can be told apart.
     let label = folder.map(|f| ui.painter().layout_no_wrap(folder_title(f, Role::Other), FontId::proportional(12.5), t.accent));
     let label_w = label.as_ref().map_or(0.0, |l| l.size().x + 12.0);

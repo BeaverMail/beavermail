@@ -1493,6 +1493,10 @@ mod tests {
             message_id: String::new(),
             parents: Vec::new(),
             unread: false,
+            pinned: false,
+            starred: false,
+            priority: 0,
+            labels: Vec::new(),
         };
         let body = MessageBody {
             text: "See you at noon.\n\nBring the notes.".into(),

@@ -171,6 +171,20 @@ pub fn role_color(role: Role) -> Color32 {
     }
 }
 
+/// A label's name and colour: the five standard keywords `$label1` to `$label5` with their usual names
+/// and colours; any other keyword is a label of the user's own, named as written (`_` for a space), in
+/// a neutral grey.
+pub fn label(keyword: &str) -> (String, Color32) {
+    match keyword {
+        "$label1" => ("Important".into(), rgb(0xFF3B30)),
+        "$label2" => ("Work".into(), rgb(0xFF9900)),
+        "$label3" => ("Personal".into(), rgb(0x2EA043)),
+        "$label4" => ("To Do".into(), rgb(0x4B5CFF)),
+        "$label5" => ("Later".into(), rgb(0xA855C7)),
+        other => (other.replace('_', " "), rgb(0x8E8E99)),
+    }
+}
+
 /// The colour marking an account's mail in All inboxes and beside its name, by its place in the list.
 pub fn account_color(at: usize) -> Color32 {
     const HUES: [u32; 6] = [0x3B82F6, 0xF59E0B, 0x22A06B, 0xEC4899, 0x8B5CF6, 0x06B6D4];

@@ -135,6 +135,12 @@ enum VaultOutcome {
 #[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 enum Action {
     Unread(bool),
+    /// Kept at the top of its folder (`true`), or not any more.
+    Pin(bool),
+    /// The star every client shows, on or off.
+    Star(bool),
+    /// The standard label `$label<n>`, on or off.
+    Label(u8, bool),
     Archive,
     Trash,
     /// To the server's Spam folder.
@@ -173,6 +179,9 @@ struct Pending {
 async fn perform(source: Arc<ImapSource>, id: MessageId, action: Action) -> Result<(), MailError> {
     match action {
         Action::Unread(unread) => source.set_unread(id, unread).await,
+        Action::Pin(on) => source.set_pinned(id, on).await,
+        Action::Star(on) => source.set_starred(id, on).await,
+        Action::Label(n, on) => source.set_label(id, &format!("$label{n}"), on).await,
         Action::Archive => source.archive(id).await,
         Action::Trash => source.trash(id).await,
         Action::Spam => source.move_to(id, Role::Junk).await,
@@ -1959,6 +1968,18 @@ impl BeaverApp {
                     self.messages[pos].unread = unread;
                     i32::from(unread) - i32::from(was_unread)
                 }
+                Action::Pin(on) => {
+                    self.messages[pos].pinned = on;
+                    0
+                }
+                Action::Star(on) => {
+                    self.messages[pos].starred = on;
+                    0
+                }
+                Action::Label(n, on) => {
+                    set_label(&mut self.messages[pos].labels, n, on);
+                    0
+                }
                 _ => {
                     self.messages.remove(pos);
                     -i32::from(was_unread)
@@ -1971,6 +1992,22 @@ impl BeaverApp {
         if let Action::Unread(unread) = action {
             self.tabs.iter_mut().filter(|t| t.message.id == id).for_each(|t| t.message.unread = unread);
             self.hits.iter_mut().filter(|(_, h)| h.message.id == id).for_each(|(_, h)| h.message.unread = unread);
+        }
+        if let Action::Label(n, on) = action {
+            self.tabs.iter_mut().filter(|t| t.message.id == id).for_each(|t| set_label(&mut t.message.labels, n, on));
+            self.hits.iter_mut().filter(|(_, h)| h.message.id == id).for_each(|(_, h)| set_label(&mut h.message.labels, n, on));
+        }
+        if let Action::Star(on) = action {
+            self.tabs.iter_mut().filter(|t| t.message.id == id).for_each(|t| t.message.starred = on);
+            self.hits.iter_mut().filter(|(_, h)| h.message.id == id).for_each(|(_, h)| h.message.starred = on);
+        }
+        if let Action::Pin(on) = action {
+            self.tabs.iter_mut().filter(|t| t.message.id == id).for_each(|t| t.message.pinned = on);
+            self.hits.iter_mut().filter(|(_, h)| h.message.id == id).for_each(|(_, h)| h.message.pinned = on);
+            // Pinned, it moves to the top (unpinned, back among the rest): the list follows the open one there.
+            if let Some(open) = self.message.filter(|m| self.conversations.same(*m, id)) {
+                self.list_reveal = self.listed().iter().position(|m| self.conversations.same(*m, open));
+            }
         }
         match kept {
             Some((pos, message)) => {
@@ -2169,12 +2206,33 @@ impl BeaverApp {
         let want = if self.show_suspicious { screen::Place::Spam } else { screen::Place::Inbox };
         let threaded = self.threaded();
         let mut shown = std::collections::HashSet::new();
-        self.messages
+        let mut list = self.messages
             .iter()
             .filter(|m| !ours.contains(&m.message_id))
             .filter(|m| if checked(m) { self.screening.get(&m.id).is_some_and(|s| s.place == want) } else { !self.show_suspicious })
             // Newest first, so a conversation's row is its latest message here.
             .filter(|m| !threaded || self.conversations.number(m.id).is_none_or(|n| shown.insert(n)))
+            .collect::<Vec<_>>();
+        // Pinned first; then a conversation by its latest message, the user's replies from Sent included,
+        // as threaded clients order them.
+        let latest = self.conversation_dates();
+        list.sort_by_key(|m| (!m.pinned, std::cmp::Reverse(latest.get(&m.id).map_or(m.timestamp, |l| l.0))));
+        list
+    }
+
+    /// For each conversation's row message, when threaded: the time and date text of its latest
+    /// message, from the folder or from Sent.
+    fn conversation_dates(&self) -> std::collections::HashMap<MessageId, (i64, String)> {
+        if !self.threaded() {
+            return Default::default();
+        }
+        let all: std::collections::HashMap<MessageId, &MessageSummary> = self.messages.iter().chain(&self.sent).map(|m| (m.id, m)).collect();
+        self.messages
+            .iter()
+            .filter_map(|m| {
+                let last = all.get(self.conversations.members(m.id).last()?)?;
+                Some((m.id, (last.timestamp, last.received.clone())))
+            })
             .collect()
     }
 
@@ -4480,7 +4538,7 @@ impl BeaverApp {
             Command::NewMessage => Ok(()),
             // A message only selected, or still loading, is answered once its text is there.
             Command::Reply | Command::ReplyAll | Command::Forward => one().map(|_| ()),
-            Command::Archive | Command::Trash | Command::ToggleRead => some(),
+            Command::Archive | Command::Trash | Command::ToggleRead | Command::Pin | Command::Star | Command::Label(_) => some(),
             Command::Undo => if self.pending.is_some() { Ok(()) } else { Err("Nothing to undo") },
             Command::Spam => {
                 some()?;
@@ -4545,6 +4603,21 @@ impl BeaverApp {
             Command::ToggleRead => {
                 let unread = targets.iter().any(|id| self.summary_of(*id).is_some_and(|m| m.unread));
                 self.request_all(targets, Action::Unread(!unread));
+            }
+            Command::Pin => {
+                // Pins them unless every one is pinned already.
+                let pinned = targets.iter().all(|id| self.summary_of(*id).is_some_and(|m| m.pinned));
+                self.request_all(targets, Action::Pin(!pinned));
+            }
+            Command::Star => {
+                let starred = targets.iter().all(|id| self.summary_of(*id).is_some_and(|m| m.starred));
+                self.request_all(targets, Action::Star(!starred));
+            }
+            // On unless every one has it already.
+            Command::Label(n) => {
+                let keyword = format!("$label{n}");
+                let has = targets.iter().all(|id| self.summary_of(*id).is_some_and(|m| m.labels.contains(&keyword)));
+                self.request_all(targets, Action::Label(n, !has));
             }
             Command::Spam if self.picked.len() >= 2 => self.request_all(targets, Action::Spam),
             Command::Spam => {
@@ -4923,7 +4996,7 @@ impl BeaverApp {
                     self.select_mailbox(serial, index);
                 }
             }
-            // Emptying Spam or Trash: the server may have moved them (Gmail puts them in Trash), so its counts.
+            // Emptying Spam or Trash: some servers move them to Trash instead, so the counts are asked again.
             Event::Done(serial, _, None, Ok(())) => {
                 if let Some(source) = self.view(serial).and_then(|v| v.source.clone()) {
                     self.spawn(async move { Event::Mailboxes(serial, source.mailboxes().await, true) });
@@ -5966,6 +6039,7 @@ impl BeaverApp {
             ui.spacing_mut().item_spacing.y = 0.0; // rows touch, so row `i` starts at `i` times the row height
             let area = list_area(reveal, view);
             let threaded = self.threaded();
+            let latest = self.conversation_dates();
             let shown_rows = area.show_rows(ui, views::MESSAGE_ROW_H, shown.len(), |ui, range| {
                 for message in &shown[range] {
                     let warning = self.correction(message.id).and_then(|(_, warning)| warning);
@@ -5973,7 +6047,9 @@ impl BeaverApp {
                     let (count, unread) = if threaded { (self.conversations.members(message.id).len(), self.conversations.unread(message.id)) } else { (1, message.unread) };
                     let open = self.message.is_some_and(|id| if threaded { self.conversations.same(id, message.id) } else { id == message.id });
                     let selected = if self.picked.len() >= 2 { self.picked.contains(&message.id) } else { open };
-                    let summary = MessageSummary { unread, ..(*message).clone() };
+                    // The date of the conversation's latest message, the one it is ordered by.
+                    let received = latest.get(&message.id).map_or_else(|| message.received.clone(), |l| l.1.clone());
+                    let summary = MessageSummary { unread, received, ..(*message).clone() };
                     let mark = self.origin.get(&message.id).and_then(|s| self.accounts.iter().position(|v| v.serial == *s)).filter(|_| self.unified).map(theme::account_color);
                     let row = views::message_row(ui, t, &summary, selected, None, warning, count, mark);
                     let (ctrl, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
@@ -6106,6 +6182,15 @@ impl BeaverApp {
                     if icons::button(ui, t, icon, tip, enabled, false).clicked() {
                         out.action = Some((message.id, what));
                     }
+                }
+                // Drawn pressed in while pinned.
+                let tip = format!("{} ({})", if message.pinned { "Unpin" } else { "Pin to the top of the list" }, key(Command::Pin));
+                if icons::button(ui, t, Icon::Pin, &tip, true, message.pinned).clicked() {
+                    out.action = Some((message.id, Action::Pin(!message.pinned)));
+                }
+                let tip = format!("{} ({})", if message.starred { "Remove the star" } else { "Star: a flag every mail app shows" }, key(Command::Star));
+                if icons::button(ui, t, Icon::Star, &tip, true, message.starred).clicked() {
+                    out.action = Some((message.id, Action::Star(!message.starred)));
                 }
                 // In Sent and Drafts the sender is the user.
                 let blockable = !matches!(role, Role::Junk | Role::Sent | Role::Drafts) && !message.address.is_empty();
@@ -6696,6 +6781,15 @@ fn folder_menu(ui: &mut egui::Ui, role: Role, count: (usize, u32), holding: bool
     if check.clicked() {
         *recheck = Some(folder);
         ui.close();
+    }
+}
+
+/// Puts the standard label `$label<n>` in a message's labels, or takes it out.
+fn set_label(labels: &mut Vec<String>, n: u8, on: bool) {
+    let keyword = format!("$label{n}");
+    labels.retain(|l| *l != keyword);
+    if on {
+        labels.push(keyword);
     }
 }
 

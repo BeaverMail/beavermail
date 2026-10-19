@@ -418,7 +418,7 @@ pub fn plain_blocks(text: &str) -> Vec<Block> {
 
 /// Where the earlier messages a reply carries below itself start, to fold them away: the quote at the
 /// end of the message with the line that introduces it ("On Mon, Ada wrote:"), or a header block
-/// ("From:" then "Sent:" or "Date:") as Outlook writes them unquoted. `None` when nothing is carried, or
+/// ("From:" then "Sent:" or "Date:") as some clients write them unquoted. `None` when nothing is carried, or
 /// when nothing would be left to read above it. A forward's header is kept: its text is the message.
 pub fn quoted_tail(blocks: &[Block]) -> Option<usize> {
     let text = |b: &Block| b.runs.iter().map(|r| match r { Run::Text { text, .. } | Run::Link { text, .. } => text.as_str() }).collect::<String>().trim().to_owned();
