@@ -8,7 +8,7 @@ use rrule::RRuleSet;
 use std::collections::{HashMap, HashSet};
 
 use crate::ical::{Event, When, parse};
-use crate::{Client, Found, Kind, Remote};
+use crate::{Client, Found, Kind, Remote, Written};
 use beavermail_core::MailError;
 use beavermail_store::{EventSpan, Store};
 
@@ -40,6 +40,21 @@ impl Calendar {
     /// The objects at `hrefs`, as (where and which version, iCalendar text), asked for in batches.
     pub fn fetch(&self, hrefs: &[String]) -> Result<Vec<(Remote, String)>, MailError> {
         self.client.multiget(&self.url, hrefs, Kind::Calendar)
+    }
+
+    /// Where a new event with this UID goes.
+    pub fn new_href(&self, uid: &str) -> String {
+        crate::new_href(&self.url, uid).replace(".vcf", ".ics")
+    }
+
+    /// Writes an event: a new one when `etag` is `None`, else only over that version.
+    pub fn put(&self, href: &str, ics: &str, etag: Option<&str>) -> Result<Written, MailError> {
+        self.client.put(&crate::absolute(&self.url, href), "text/calendar; charset=utf-8", ics, etag)
+    }
+
+    /// Deletes an event if the server still has that version.
+    pub fn delete(&self, href: &str, etag: &str) -> Result<Written, MailError> {
+        self.client.delete(&crate::absolute(&self.url, href), etag)
     }
 }
 

@@ -123,6 +123,8 @@ pub struct MessageBody {
     /// The message was encrypted, and what became of it. Opened, the text and attachments above are
     /// the decrypted ones, which are never stored nor indexed.
     pub encryption: Option<Encryption>,
+    /// Its calendar part (`text/calendar`, an invitation, a cancellation, an answer), as iCalendar text.
+    pub calendar: Option<String>,
 }
 
 /// What became of an encrypted message.
@@ -437,6 +439,9 @@ pub struct Outgoing {
     pub autocrypt: Option<Vec<u8>>,
     /// Encrypt with OpenPGP before sending.
     pub seal: Option<Seal>,
+    /// An iTIP message (RFC 6047) sent beside the text, as `text/calendar` with the method it says
+    /// (an answer to an invitation).
+    pub calendar: Option<String>,
 }
 
 /// How to encrypt a message, signed inside by the sender, who also gets a copy they can read.

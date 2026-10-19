@@ -102,6 +102,8 @@ enum Event {
     ContactsSynced(String, Result<beavermail_carddav::Synced, MailError>),
     /// A calendar was synced: (its URL, how many events came, or why not).
     CalendarsSynced(String, Result<usize, MailError>),
+    /// An event was written to (or deleted from) a calendar on its server, and kept here.
+    CalendarWritten(Result<(), MailError>),
     /// "Find calendars" answered.
     CalendarsFound(Result<Vec<beavermail_carddav::Found>, String>),
     /// "Find address books" answered: (URL, name) of each, or why none.
@@ -465,6 +467,8 @@ struct ReaderOutcome {
     retry: bool,
     /// View source was chosen for this message.
     source: Option<MessageId>,
+    /// A choice on the invitation a message carries.
+    invite: Option<(MessageId, calview::Invite)>,
 }
 
 /// What the user did on one open message of the reader.
@@ -483,6 +487,7 @@ struct Said {
     mark: Option<Correction>,
     trust: bool,
     source: bool,
+    invite: Option<calview::Invite>,
 }
 
 impl ReaderOutcome {
@@ -502,6 +507,7 @@ impl ReaderOutcome {
         self.mark = said.mark.or(self.mark);
         self.trust = said.trust.then_some(id).or(self.trust);
         self.source = said.source.then_some(id).or(self.source);
+        self.invite = said.invite.map(|i| (id, i)).or(self.invite.take());
     }
 }
 
@@ -2295,6 +2301,7 @@ impl BeaverApp {
         {
             self.screening.extend(kept.into_iter().filter_map(|(id, json)| Some((id, serde_json::from_str(&json).ok()?))));
         }
+        self.move_marked_spam();
         let mine = |id: &MessageId| self.origin.get(id) == Some(&serial);
         let fresh: Vec<MessageSummary> = self.messages.iter().filter(|m| mine(&m.id) && !self.screening.contains_key(&m.id)).cloned().collect();
         if fresh.is_empty() {
@@ -2313,6 +2320,15 @@ impl BeaverApp {
             });
             Event::Screened(serial, index, verdicts)
         });
+    }
+
+    /// Mail from senders the user marked as spam goes to the server's Spam folder, as the mark promised,
+    /// rather than waiting under Suspicious for a verdict already given.
+    fn move_marked_spam(&mut self) {
+        let ids: Vec<MessageId> = self.messages.iter().filter(|m| self.screening.get(&m.id).is_some_and(|s| s.place == screen::Place::Spam && self.settings.mark_of(&s.key) == Some(false))).map(|m| m.id).collect();
+        for id in ids {
+            self.act(id, Action::Spam);
+        }
     }
 
     /// Messages of the Inbox being shown that are held as suspicious. Counted from the messages listed,
@@ -3935,6 +3951,162 @@ impl BeaverApp {
         }
     }
 
+    /// What the calendars here say about the event of `ics`: whether one has it, the answer given, and
+    /// what else happens at that time.
+    fn invite_info(&mut self, ics: &str) -> (beavermail_carddav::ical::Calendar, calview::InviteInfo) {
+        let calendar = beavermail_carddav::ical::parse(ics);
+        let mut info = calview::InviteInfo::default();
+        let Some(event) = calendar.events.iter().find(|e| e.recurrence_id.is_none()).or(calendar.events.first()).cloned() else { return (calendar, info) };
+        let own: Vec<String> = self.accounts.iter().map(|v| v.account.address().to_lowercase()).collect();
+        for stored in self.archive.events_with_uid(&event.uid).unwrap_or_default() {
+            info.in_calendar = true;
+            let kept = beavermail_carddav::ical::parse(&stored.ics);
+            info.answered = kept.events.iter().flat_map(|e| &e.attendees).find(|a| own.contains(&a.email)).map(|a| a.partstat.clone()).or(info.answered);
+        }
+        if let Some(start) = event.start.as_ref().and_then(beavermail_carddav::ical::When::utc) {
+            let end = event.end.as_ref().and_then(beavermail_carddav::ical::When::utc).or_else(|| event.duration.map(|d| start + chrono::Duration::seconds(d))).unwrap_or(start);
+            let day = start.with_timezone(&chrono::Local).date_naive();
+            let days = (end - start).num_days() + 2;
+            let busy = event.start.as_ref().is_some_and(|s| !s.date_only);
+            info.conflicts = self
+                .calendar_items(day, days)
+                .iter()
+                .filter(|i| busy && !i.occurrence.all_day && i.occurrence.uid != event.uid && i.occurrence.start < end && i.occurrence.end > start)
+                .map(|i| i.occurrence.event.summary.clone())
+                .collect();
+        }
+        (calendar, info)
+    }
+
+    /// Answers the invitation message `id` carries: the answer goes to the organiser through the Outbox
+    /// (so it waits for the server if need be), and the event goes into a calendar here with it, or leaves
+    /// them on Decline; a cancellation is removed, an event sent to add is added.
+    fn answer_invitation(&mut self, id: MessageId, choice: calview::Invite) {
+        let Some(ics) = self.body_of(id).and_then(|b| b.data.calendar.clone()) else { return };
+        let Some(serial) = self.serial_of(id) else { return };
+        let Some(account) = self.view(serial).map(|v| v.account.clone()) else { return };
+        let calendar = beavermail_carddav::ical::parse(&ics);
+        let Some(event) = calendar.events.iter().find(|e| e.recurrence_id.is_none()).or(calendar.events.first()).cloned() else { return };
+        let me = account.address().to_lowercase();
+        match choice {
+            calview::Invite::Answer(partstat) => {
+                if let Some(organizer) = event.organizer.as_ref().filter(|o| !o.email.is_empty())
+                    && let Some(reply) = beavermail_carddav::ical::reply(&ics, &me, account.sender_name().unwrap_or_default(), partstat, chrono::Utc::now())
+                {
+                    let (word, verb) = match partstat {
+                        "ACCEPTED" => ("Accepted", "accepted"),
+                        "TENTATIVE" => ("Tentative", "tentatively accepted"),
+                        _ => ("Declined", "declined"),
+                    };
+                    let name = account.sender_name().map_or_else(|| me.clone(), str::to_owned);
+                    let draft = drafts::DraftData {
+                        id: drafts::new_id(),
+                        title: "Reply".into(),
+                        to: beavermail_core::address_text(&organizer.name, &organizer.email),
+                        subject: format!("{word}: {}", event.summary.trim()),
+                        body: format!("{name} has {verb} this invitation: {}", event.summary.trim()),
+                        updated: chrono::Local::now().timestamp(),
+                        queued: true,
+                        calendar: Some(reply),
+                        ..Default::default()
+                    };
+                    match drafts::save(&self.vault, &account.key(), &draft) {
+                        Ok(()) => {
+                            self.count_outbox();
+                            self.send_outbox(serial);
+                        }
+                        Err(e) => {
+                            self.error = Some(format!("Could not send the answer: {e}"));
+                            return;
+                        }
+                    }
+                }
+                if partstat == "DECLINED" {
+                    self.remove_event(&event.uid);
+                } else {
+                    self.put_event(&event.uid, beavermail_carddav::ical::with_answer(&ics, &me, partstat));
+                }
+                let said = match partstat {
+                    "ACCEPTED" => "Accepted: the organiser is told, and it is in your calendar",
+                    "TENTATIVE" => "Answered maybe: the organiser is told, and it is in your calendar as tentative",
+                    _ => "Declined: the organiser is told",
+                };
+                self.notice = Some((said.into(), std::time::Instant::now()));
+            }
+            calview::Invite::Remove => self.remove_event(&event.uid),
+            calview::Invite::Add => self.put_event(&event.uid, beavermail_carddav::ical::as_kept(&ics)),
+            calview::Invite::Open(_) => {}
+        }
+    }
+
+    /// Keeps an event in the calendar that has it already (an update), else in the default calendar
+    /// (the one on this computer when there is no other): on the server first, then here.
+    fn put_event(&mut self, uid: &str, ics: String) {
+        self.ensure_local_calendar();
+        let span = beavermail_carddav::calendar::span(&ics);
+        let (calendar, href, etag) = match self.archive.events_with_uid(uid).unwrap_or_default().into_iter().next() {
+            Some(kept) => (kept.calendar, kept.href, Some(kept.etag)),
+            None => {
+                let target = self.settings.calendars.iter().find(|c| c.default && !c.read_only).or_else(|| self.settings.calendars.iter().find(|c| c.is_local())).cloned();
+                let Some(target) = target else { return };
+                let href = if target.is_local() { format!("{uid}.ics") } else { beavermail_carddav::calendar::Calendar::open(&target.url, "", "").new_href(uid) };
+                (target.url, href, None)
+            }
+        };
+        let Some(source) = self.settings.calendars.iter().find(|c| c.url == calendar).cloned() else { return };
+        if source.is_local() {
+            if let Err(e) = self.archive.put_event(&calendar, &href, "", &ics, &span) {
+                self.error = Some(format!("Could not keep the event: {e}"));
+            }
+            self.calendar_version += 1;
+            return;
+        }
+        let password = match store::calendar_password(&source) {
+            Ok(p) => p,
+            Err(e) => return self.error = Some(format!("Calendar {}: {e}", source.name)),
+        };
+        let archive = self.archive.clone();
+        self.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let open = beavermail_carddav::calendar::Calendar::open(&source.url, &source.user, &password);
+                match open.put(&href, &ics, etag.as_deref().filter(|e| !e.is_empty()))? {
+                    // Without the server's new version, the next sync reads it again.
+                    beavermail_carddav::Written::Done(etag) => archive.put_event(&source.url, &href, &etag.unwrap_or_default(), &ics, &span),
+                    beavermail_carddav::Written::Conflict => Err(MailError::Backend("the event changed on the server meanwhile; try again after the next sync".into())),
+                }
+            })
+            .await
+            .unwrap_or_else(|e| Err(MailError::Backend(e.to_string())));
+            Event::CalendarWritten(result)
+        });
+    }
+
+    /// Takes the event with this UID out of every calendar here that has it, on the server too.
+    fn remove_event(&mut self, uid: &str) {
+        for kept in self.archive.events_with_uid(uid).unwrap_or_default() {
+            let Some(source) = self.settings.calendars.iter().find(|c| c.url == kept.calendar).cloned() else { continue };
+            if source.is_local() {
+                let _ = self.archive.forget_event(&kept.calendar, &kept.href);
+                self.calendar_version += 1;
+                continue;
+            }
+            let Ok(password) = store::calendar_password(&source) else { continue };
+            let archive = self.archive.clone();
+            self.spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    let open = beavermail_carddav::calendar::Calendar::open(&source.url, &source.user, &password);
+                    match open.delete(&kept.href, &kept.etag)? {
+                        beavermail_carddav::Written::Done(_) => archive.forget_event(&kept.calendar, &kept.href),
+                        beavermail_carddav::Written::Conflict => Err(MailError::Backend("the event changed on the server meanwhile; try again after the next sync".into())),
+                    }
+                })
+                .await
+                .unwrap_or_else(|e| Err(MailError::Backend(e.to_string())));
+                Event::CalendarWritten(result)
+            });
+        }
+    }
+
     /// The occurrences of the calendars shown in `days` days from `from`, worked out once per range
     /// and kept while nothing changes.
     fn calendar_items(&mut self, from: chrono::NaiveDate, days: i64) -> Arc<Vec<calview::Item>> {
@@ -5299,7 +5471,10 @@ impl BeaverApp {
             Event::Screened(serial, index, result) if self.shows(serial, index) => {
                 self.checking = false;
                 match result {
-                    Ok(verdicts) => self.screening.extend(verdicts),
+                    Ok(verdicts) => {
+                        self.screening.extend(verdicts);
+                        self.move_marked_spam();
+                    }
                     Err(e) => {
                         // Without verdicts the Inbox shows everything rather than hiding mail.
                         self.screening.clear();
@@ -5448,6 +5623,14 @@ impl BeaverApp {
                     Ok(_) => self.calendar_version += 1,
                     Err(MailError::Offline(_)) => {}
                     Err(e) => self.error = Some(format!("A calendar could not be synced: {e}")),
+                }
+            }
+            Event::CalendarWritten(result) => {
+                self.calendar_version += 1;
+                match result {
+                    Ok(()) => {}
+                    Err(MailError::Offline(_)) => self.error = Some("The calendar's server cannot be reached: the event is not in it yet. Answer again once online.".into()),
+                    Err(e) => self.error = Some(format!("The calendar could not be changed: {e}")),
                 }
             }
             Event::CalendarsFound(found) => {
@@ -6505,6 +6688,17 @@ impl BeaverApp {
         // The correction that makes sense for the tab's message; the reasons are the warnings shown above it.
         let correction = self.message.and_then(|id| self.correction(id)).map(|(choice, _)| choice);
         let (settings, view_modes, selected_files) = (self.settings.clone(), self.view_modes.clone(), self.attach_selected.clone());
+        // What the calendars say about the invitations of the open messages, worked out before drawing.
+        let carried: Vec<(MessageId, String)> = self
+            .message
+            .zip(self.body.as_ref())
+            .into_iter()
+            .map(|(id, b)| (id, &b.data))
+            .chain(self.unfolded.iter().filter_map(|u| Some((u.id, &u.body.as_ref()?.as_ref().ok()?.data))))
+            .filter_map(|(id, data)| Some((id, data.calendar.clone()?)))
+            .collect();
+        let invites: std::collections::HashMap<MessageId, (beavermail_carddav::ical::Calendar, calview::InviteInfo)> =
+            carried.into_iter().map(|(id, ics)| (id, self.invite_info(&ics))).collect();
         // The message in the reader is its tab's: it may come from another folder than the one shown.
         let open = self.open_tab().map(|t| (t.message.clone(), t.role, t.serial));
         let server_host = open.as_ref().and_then(|(_, _, serial)| self.view(*serial)?.source.as_ref()).map(|s| s.auth_server()).unwrap_or_default();
@@ -6693,6 +6887,11 @@ impl BeaverApp {
                             None => {}
                         }
                     }
+                    if let Some((calendar, info)) = invites.get(&m.id) {
+                        ui.add_space(10.0);
+                        let answerable = if suspicious { Err("Answering is off: this message failed the sender checks above.") } else { Ok(()) };
+                        said.invite = calview::invitation_card(ui, t, calendar, info, answerable);
+                    }
                     if !body.data.to.is_empty() || !body.data.cc.is_empty() {
                         ui.add_space(6.0);
                     }
@@ -6700,12 +6899,19 @@ impl BeaverApp {
                         // A line cut short shows every address on hover.
                         ui.add(egui::Label::new(RichText::new(format!("{label}: {}", list.join(", "))).size(13.0).color(t.text_dim)).truncate());
                     }
-                    if !body.data.attachments.is_empty() {
+                    // The calendar file of an invitation is its card above: not listed again.
+                    let files: Vec<&beavermail_core::Attachment> = body
+                        .data
+                        .attachments
+                        .iter()
+                        .filter(|f| body.data.calendar.is_none() || !(f.mime.eq_ignore_ascii_case("text/calendar") || f.name.to_lowercase().ends_with(".ics")))
+                        .collect();
+                    if !files.is_empty() {
                         ui.add_space(10.0);
-                        let many = body.data.attachments.len() > 1;
+                        let many = files.len() > 1;
                         let ticked = selected_files.iter().filter(|(id, _)| *id == m.id.0).count();
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new(format!("{} attachment{}", body.data.attachments.len(), if many { "s" } else { "" })).size(13.0).color(t.text_dim));
+                            ui.label(RichText::new(format!("{} attachment{}", files.len(), if many { "s" } else { "" })).size(13.0).color(t.text_dim));
                             if many {
                                 let label = if ticked == 0 { "Save all…".to_owned() } else { format!("Save selected ({ticked})…") };
                                 said.save_many = ui.button(label).clicked();
@@ -6713,7 +6919,7 @@ impl BeaverApp {
                         });
                         ui.add_space(2.0);
                         ui.horizontal_wrapped(|ui| {
-                            for file in &body.data.attachments {
+                            for file in &files {
                                 if let Some(what) = views::attachment_chip(ui, t, file, many.then(|| selected_files.contains(&(m.id.0, file.index)))) {
                                     said.attachment = Some((file.index, what));
                                 }
@@ -7001,7 +7207,7 @@ impl eframe::App for BeaverApp {
         self.handle_keys(ui.ctx());
         // Without the reading pane only a message tab has a reader.
         let shows_reader = !contacts && (self.in_tab || self.settings.reading_pane);
-        let ReaderOutcome { action, url, mode, remember, attachment, save_many, allow_sender, mark, bulk, unsubscribe, block, unfold, collapse, expand, trust, card, retry, source } =
+        let ReaderOutcome { action, url, mode, remember, attachment, save_many, allow_sender, mark, bulk, unsubscribe, block, unfold, collapse, expand, trust, card, retry, source, invite } =
             if shows_reader { self.reader(ui, &t) } else { ReaderOutcome::default() };
         if retry && let Some(at) = self.active() {
             self.activate(at);
@@ -7035,6 +7241,11 @@ impl eframe::App for BeaverApp {
         self.confirm_block = block.or(self.confirm_block);
         if let Some(id) = source {
             self.view_source(id);
+        }
+        match invite {
+            Some((_, calview::Invite::Open(url))) => ui.ctx().open_url(egui::OpenUrl::new_tab(url)),
+            Some((id, choice)) => self.answer_invitation(id, choice),
+            None => {}
         }
         if let Some(action) = bulk {
             self.request_all(self.targets(), action);

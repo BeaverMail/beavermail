@@ -104,26 +104,12 @@ impl Book {
     /// Writes a card: a new one when `etag` is `None` (refused if one is there already), else only if
     /// the server still has that version.
     pub fn put(&self, href: &str, vcard: &str, etag: Option<&str>) -> Result<Written, MailError> {
-        let condition = match etag {
-            Some(etag) => ("If-Match", etag.to_owned()),
-            None => ("If-None-Match", "*".to_owned()),
-        };
-        let (status, headers, _) = self.client.send("PUT", &absolute(&self.url, href), &[("Content-Type", "text/vcard; charset=utf-8"), (condition.0, &condition.1)], vcard)?;
-        match status {
-            200..=299 => Ok(Written::Done(headers)),
-            412 => Ok(Written::Conflict),
-            _ => Err(refused(status, "write a card")),
-        }
+        self.client.put(&absolute(&self.url, href), "text/vcard; charset=utf-8", vcard, etag)
     }
 
     /// Deletes a card if the server still has that version; one already gone counts as deleted.
     pub fn delete(&self, href: &str, etag: &str) -> Result<Written, MailError> {
-        let (status, _, _) = self.client.send("DELETE", &absolute(&self.url, href), &[("If-Match", etag)], "")?;
-        match status {
-            200..=299 | 404 => Ok(Written::Done(None)),
-            412 => Ok(Written::Conflict),
-            _ => Err(refused(status, "delete a card")),
-        }
+        self.client.delete(&absolute(&self.url, href), etag)
     }
 
 }
@@ -174,6 +160,31 @@ impl Client {
         let (at, answer) = self.dav("PROPFIND", &home, "1", PROPFIND_HOME)?;
         let all: Vec<Found> = responses(&answer)?.into_iter().filter(|r| is(r)).map(|r| found(&at, r)).collect();
         if all.is_empty() { Err(MailError::Backend(format!("the account has no {what}"))) } else { Ok(all) }
+    }
+
+    /// Writes a card or an event: a new one when `etag` is `None` (refused if one is there already),
+    /// else only if the server still has that version.
+    fn put(&self, url: &str, kind: &str, body: &str, etag: Option<&str>) -> Result<Written, MailError> {
+        let condition = match etag {
+            Some(etag) => ("If-Match", etag.to_owned()),
+            None => ("If-None-Match", "*".to_owned()),
+        };
+        let (status, headers, _) = self.send("PUT", url, &[("Content-Type", kind), (condition.0, &condition.1)], body)?;
+        match status {
+            200..=299 => Ok(Written::Done(headers)),
+            412 => Ok(Written::Conflict),
+            _ => Err(refused(status, "write it")),
+        }
+    }
+
+    /// Deletes a card or an event if the server still has that version; one already gone counts as deleted.
+    fn delete(&self, url: &str, etag: &str) -> Result<Written, MailError> {
+        let (status, _, _) = self.send("DELETE", url, &[("If-Match", etag)], "")?;
+        match status {
+            200..=299 | 404 => Ok(Written::Done(None)),
+            412 => Ok(Written::Conflict),
+            _ => Err(refused(status, "delete it")),
+        }
     }
 
     /// What a collection holds, with the versions.

@@ -266,6 +266,105 @@ pub fn parse(text: &str) -> Calendar {
     calendar
 }
 
+/// An answer to an invitation (iTIP `REPLY`, RFC 5546): the event's identity and times, and the one
+/// attendee answering, `me`, with `partstat` (`ACCEPTED`, `TENTATIVE` or `DECLINED`). The time zone
+/// definitions the times need come along. `None` when the text has no event.
+pub fn reply(text: &str, me: &str, name: &str, partstat: &str, now: DateTime<Utc>) -> Option<String> {
+    const KEPT: [&str; 9] = ["UID", "RECURRENCE-ID", "SEQUENCE", "DTSTART", "DTEND", "DURATION", "SUMMARY", "ORGANIZER", "LOCATION"];
+    let mut out = vec!["BEGIN:VCALENDAR".to_owned(), "VERSION:2.0".to_owned(), "PRODID:-//BeaverMail//Calendar//EN".to_owned(), "METHOD:REPLY".to_owned()];
+    let (mut open, mut events) = (Vec::<String>::new(), 0);
+    for line in unfold(text) {
+        let Some((head, _)) = split_unquoted(&line) else { continue };
+        let property = split_params(head)[0].to_ascii_uppercase();
+        let value = line.split_once(':').map(|(_, v)| v.trim().to_ascii_uppercase()).unwrap_or_default();
+        match property.as_str() {
+            "BEGIN" => open.push(value.clone()),
+            "END" => {
+                if open.last().is_some_and(|c| *c == "VEVENT") {
+                    out.push(format!("ATTENDEE;PARTSTAT={partstat}{}:mailto:{me}", if name.is_empty() { String::new() } else { format!(";CN=\"{}\"", name.replace('"', "'")) }));
+                    out.push(format!("DTSTAMP:{}", now.format("%Y%m%dT%H%M%SZ")));
+                    events += 1;
+                }
+                if open.last().is_some_and(|c| c == "VTIMEZONE" || c == "VEVENT") || open.iter().any(|c| c == "VTIMEZONE") {
+                    out.push(line.clone());
+                }
+                open.pop();
+                continue;
+            }
+            _ => {}
+        }
+        let inside = open.iter().any(|c| c == "VTIMEZONE") || (open.last().is_some_and(|c| c == "VEVENT") && KEPT.contains(&property.as_str()));
+        if inside || (property == "BEGIN" && (value == "VEVENT" || open.iter().any(|c| c == "VTIMEZONE"))) {
+            out.push(line);
+        }
+    }
+    out.push("END:VCALENDAR".to_owned());
+    (events > 0).then(|| fold(&out))
+}
+
+/// The event as a calendar keeps it, with `me` answering `partstat`: the iTIP method taken off, my
+/// attendee line with the answer (added when the invitation reached me another way, as a list).
+pub fn with_answer(text: &str, me: &str, partstat: &str) -> String {
+    let mut out = Vec::new();
+    let mut found = false;
+    let mut in_event = 0;
+    for line in unfold(text) {
+        let Some((head, value)) = split_unquoted(&line) else { continue };
+        let parts = split_params(head);
+        let property = parts[0].to_ascii_uppercase();
+        match property.as_str() {
+            "METHOD" => continue,
+            "BEGIN" if value.trim().eq_ignore_ascii_case("VEVENT") => in_event += 1,
+            "END" if value.trim().eq_ignore_ascii_case("VEVENT") => {
+                if !found {
+                    out.push(format!("ATTENDEE;PARTSTAT={partstat}:mailto:{me}"));
+                }
+                found = false;
+                in_event -= 1;
+            }
+            "ATTENDEE" if in_event > 0 && person(&[], value).email == me => {
+                found = true;
+                let params: Vec<&str> = parts[1..].iter().copied().filter(|p| !p.to_ascii_uppercase().starts_with("PARTSTAT=") && !p.to_ascii_uppercase().starts_with("RSVP=")).collect();
+                let params = params.iter().map(|p| format!(";{p}")).collect::<String>();
+                out.push(format!("ATTENDEE{params};PARTSTAT={partstat}:{value}"));
+                continue;
+            }
+            _ => {}
+        }
+        out.push(line);
+    }
+    fold(&out)
+}
+
+/// An event sent to be added (iTIP `PUBLISH`) as a calendar keeps it: without the method.
+pub fn as_kept(text: &str) -> String {
+    fold(&unfold(text).into_iter().filter(|l| !l.to_ascii_uppercase().starts_with("METHOD:")).collect::<Vec<_>>())
+}
+
+/// Lines folded at 75 octets (RFC 5545 3.1), never inside a character, ending in CRLF.
+fn fold(lines: &[String]) -> String {
+    let mut out = String::new();
+    for line in lines {
+        let mut rest = line.as_str();
+        let mut first = true;
+        while !rest.is_empty() {
+            let room = if first { 75 } else { 74 };
+            let mut cut = rest.len().min(room);
+            while !rest.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            if !first {
+                out.push(' ');
+            }
+            out.push_str(&rest[..cut]);
+            out.push_str("\r\n");
+            rest = &rest[cut..];
+            first = false;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,6 +382,25 @@ mod tests {
         assert_eq!((e.rules.as_slice(), e.exdates.len(), e.sequence), (&["RRULE:FREQ=WEEKLY;COUNT=4".to_owned()][..], 1, 2));
         // 09:00 in Rome in October is 07:00 UTC.
         assert_eq!(e.start.as_ref().and_then(When::utc).map(|t| t.to_rfc3339()), Some("2026-10-12T07:00:00+00:00".into()));
+    }
+
+    #[test]
+    fn an_answer_names_the_event_and_me_only_and_the_kept_copy_carries_it() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 1, 8, 0, 0).unwrap();
+        let reply = reply(INVITE, "bob@example.org", "Bob", "ACCEPTED", now).unwrap();
+        let read = parse(&reply);
+        assert_eq!(read.method, "REPLY");
+        let e = &read.events[0];
+        assert_eq!((e.uid.as_str(), e.sequence, e.summary.as_str()), ("plan-42@example.org", 2, "Plan review, Q4"));
+        assert_eq!(e.attendees.iter().map(|a| (a.email.as_str(), a.partstat.as_str())).collect::<Vec<_>>(), [("bob@example.org", "ACCEPTED")], "only the one answering");
+        assert!(reply.contains("BEGIN:VTIMEZONE") && reply.contains("DTSTAMP:20261001T080000Z") && !reply.contains("RRULE") && !reply.contains("VALARM"), "{reply}");
+        assert!(reply.lines().all(|l| l.len() <= 76), "folded: {reply}");
+        let kept = with_answer(INVITE, "bob@example.org", "TENTATIVE");
+        let read = parse(&kept);
+        assert_eq!((read.method.as_str(), read.events[0].attendees[0].partstat.as_str()), ("", "TENTATIVE"));
+        assert!(!kept.contains("RSVP=TRUE") && kept.contains("RRULE:FREQ=WEEKLY"), "the rest as it was: {kept}");
+        let elsewhere = parse(&with_answer(INVITE, "carl@example.org", "ACCEPTED"));
+        assert_eq!(elsewhere.events[0].attendees.len(), 2, "added when not invited by name");
     }
 
     #[test]

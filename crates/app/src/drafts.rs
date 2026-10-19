@@ -34,6 +34,9 @@ pub struct DraftData {
     /// The user chose to send it encrypted (`Some(true)`) or not; `None`: encrypted when it can be.
     #[serde(default)]
     pub encrypt: Option<bool>,
+    /// An answer to an invitation: the iTIP part it carries.
+    #[serde(default)]
+    pub calendar: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

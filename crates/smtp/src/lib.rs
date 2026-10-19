@@ -148,8 +148,15 @@ fn build_with(message: &Outgoing, id: &str, date: std::time::SystemTime, keep_bc
     with_content(builder, message)
 }
 
-/// Sets the body: plain text, or Markdown plus its HTML, with the attachments after it.
+/// Sets the body: plain text, or Markdown plus its HTML, with the attachments after it; an iTIP message
+/// as the plain text and its `text/calendar` part, as alternatives (RFC 6047).
 fn with_content(builder: lettre::message::MessageBuilder, message: &Outgoing) -> Result<Message, MailError> {
+    if let Some(calendar) = &message.calendar {
+        let method = calendar.lines().find_map(|l| l.trim().strip_prefix("METHOD:")).unwrap_or("REPLY").trim().to_owned();
+        let kind = ContentType::parse(&format!("text/calendar; method={method}; charset=utf-8")).map_err(backend)?;
+        let parts = MultiPart::alternative().singlepart(SinglePart::plain(message.body.clone())).singlepart(SinglePart::builder().header(kind).body(calendar.clone()));
+        return builder.multipart(parts).map_err(backend);
+    }
     let text = || MultiPart::alternative_plain_html(message.body.clone(), markdown_html(&message.body));
     if message.attachments.is_empty() {
         return if message.rich { builder.multipart(text()) } else { builder.body(message.body.clone()) }.map_err(backend);
@@ -362,6 +369,14 @@ mod tests {
     #[test]
     fn a_valid_message_builds() {
         assert!(build(&outgoing()).is_ok());
+    }
+
+    #[test]
+    fn an_answer_to_an_invitation_carries_its_calendar_part_beside_the_text() {
+        let mut answer = outgoing();
+        answer.calendar = Some("BEGIN:VCALENDAR\r\nMETHOD:REPLY\r\nEND:VCALENDAR\r\n".into());
+        let text = String::from_utf8(build(&answer).unwrap().formatted()).unwrap();
+        assert!(text.contains("multipart/alternative") && text.contains("text/calendar; method=REPLY"), "{text}");
     }
 
     #[test]

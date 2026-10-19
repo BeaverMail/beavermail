@@ -81,6 +81,8 @@ pub struct Compose {
     pub encrypt_auto: bool,
     /// Whether it can be encrypted, or why not; worked out by the app, which knows the keys.
     pub can_encrypt: Result<(), String>,
+    /// An answer to an invitation: its iTIP part, sent beside the text.
+    pub calendar: Option<String>,
 }
 
 pub enum Outcome {
@@ -222,6 +224,7 @@ impl Compose {
             encrypt: false,
             encrypt_auto: true,
             can_encrypt: Err(String::new()),
+            calendar: None,
         }
         .settled()
     }
@@ -320,6 +323,7 @@ impl Compose {
             queued: false,
             send_at: None,
             encrypt: (!self.encrypt_auto).then_some(self.encrypt),
+            calendar: self.calendar.clone(),
         }
     }
 
@@ -343,6 +347,7 @@ impl Compose {
             files: draft.files.into_iter().map(|f| AttachedFile { name: f.name, size: f.size, vault: f.path, ready: true }).collect(),
             encrypt: draft.encrypt.unwrap_or(false),
             encrypt_auto: draft.encrypt.is_none(),
+            calendar: draft.calendar,
             id: draft.id,
             next_file: 1000, // above any slot number the draft used before
             focus_to: false,
@@ -506,6 +511,7 @@ impl Compose {
             rich,
             autocrypt: None, // the app adds the keys, which it keeps
             seal: None,
+            calendar: self.calendar.clone(),
         }
     }
 }

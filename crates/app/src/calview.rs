@@ -141,12 +141,13 @@ pub fn week(ui: &mut egui::Ui, t: &Tokens, from: NaiveDate, items: &[Item], toda
     }
     ui.painter().hline(band.x_range(), band.bottom(), Stroke::new(1.0, t.border));
     // The hours.
-    let mut area = egui::ScrollArea::vertical().id_salt("week_hours").auto_shrink([false, false]);
-    if morning {
-        area = area.vertical_scroll_offset(8.0 * HOUR - 8.0);
-    }
-    area.show(ui, |ui| {
+    egui::ScrollArea::vertical().id_salt("week_hours").auto_shrink([false, false]).show(ui, |ui| {
         let (grid, _) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0 * HOUR), Sense::hover());
+        // To the working morning, once the grid is laid out (an offset set before would be clamped to
+        // nothing on the first frame, before the area knows how tall it is).
+        if morning {
+            ui.scroll_to_rect(Rect::from_min_size(pos2(grid.left(), grid.top() + 8.0 * HOUR - 8.0), vec2(1.0, 1.0)), Some(egui::Align::TOP));
+        }
         let painter = ui.painter();
         for hour in 0..24 {
             let y = grid.top() + hour as f32 * HOUR;
@@ -386,7 +387,12 @@ pub fn details(ui: &mut egui::Ui, t: &Tokens, item: &Item, calendar: &str, close
         }
     }
     if !event.location.is_empty() {
-        views::note(ui, Icon::MapPin, t.text_dim, &event.location, "");
+        url = place(ui, t, &event.location);
+    }
+    if let Some(call) = call_link(event)
+        && ui.button("Join call").on_hover_text(format!("Open the call on {}", crate::html::host(&call))).clicked()
+    {
+        url = Some(views::LinkInfo::new(ui.ctx(), &call, &call).clean);
     }
     ui.add_space(6.0);
     ui.horizontal(|ui| {
@@ -431,6 +437,170 @@ pub fn details(ui: &mut egui::Ui, t: &Tokens, item: &Item, calendar: &str, close
     url
 }
 
+/// When an event happens, in one line: its dates for an all-day one, else its day and hours here;
+/// "repeats" when it does.
+pub fn event_when(event: &ical::Event) -> String {
+    let Some(start) = event.start.as_ref() else { return String::new() };
+    let Some(first) = start.utc() else { return String::new() };
+    let end = event.end.as_ref().and_then(ical::When::utc).or_else(|| event.duration.map(|d| first + Duration::seconds(d)));
+    let text = if start.date_only {
+        let last = end.map_or(first, |e| (e - Duration::seconds(1)).max(first));
+        if last.date_naive() == first.date_naive() { first.format("%A %-d %B %Y").to_string() } else { format!("{} – {}", first.format("%a %-d %b"), last.format("%a %-d %b %Y")) }
+    } else {
+        let here = first.with_timezone(&Local);
+        match end.map(|e| e.with_timezone(&Local)) {
+            Some(e) if e.date_naive() == here.date_naive() => format!("{}  ·  {} – {}", here.format("%A %-d %B %Y"), here.format("%H:%M"), e.format("%H:%M")),
+            Some(e) if e > here => format!("{} – {}", here.format("%a %-d %b %H:%M"), e.format("%a %-d %b %Y %H:%M")),
+            _ => here.format("%A %-d %B %Y  ·  %H:%M").to_string(),
+        }
+    };
+    if event.rules.is_empty() { text } else { format!("{text}  ·  repeats") }
+}
+
+/// What the calendars here say about an invitation, for its card.
+#[derive(Clone, Debug, Default)]
+pub struct InviteInfo {
+    /// Events of the calendars shown at the same time.
+    pub conflicts: Vec<String>,
+    /// The answer given already, from the copy in a calendar here.
+    pub answered: Option<String>,
+    /// A calendar here has it.
+    pub in_calendar: bool,
+}
+
+/// What was chosen on an invitation's card.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Invite {
+    /// `ACCEPTED`, `TENTATIVE` or `DECLINED`.
+    Answer(&'static str),
+    Remove,
+    Add,
+    /// A link of the event (its place, or the call to join), cleaned of tracking.
+    Open(String),
+}
+
+/// Hosts of video calls: their link in an event is the call to join.
+const CALLS: [&str; 9] = ["meet.google.com", "zoom.us", "teams.microsoft.com", "teams.live.com", "whereby.com", "webex.com", "meet.jit.si", "gotomeeting.com", "facetime.apple.com"];
+
+/// The web links written in a text, as they are.
+fn links(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| c.is_whitespace() || c == '<' || c == '>').filter(|w| w.starts_with("https://") || w.starts_with("http://")).map(|w| w.trim_end_matches([',', '.', ';', ')']))
+}
+
+/// The video call of an event: a link to a call service in its place, else in its description.
+pub fn call_link(event: &ical::Event) -> Option<String> {
+    let is_call = |url: &&str| CALLS.iter().any(|h| crate::html::host(url) == *h || crate::html::host(url).ends_with(&format!(".{h}")));
+    links(&event.location).find(is_call).or_else(|| links(&event.description).find(is_call)).map(str::to_owned)
+}
+
+/// An event's place, as a link when it is one (a call, a map), with where it really leads on hover.
+/// Returns the link clicked, cleaned of tracking.
+fn place(ui: &mut egui::Ui, t: &Tokens, location: &str) -> Option<String> {
+    let Some(url) = links(location).next() else {
+        views::note(ui, Icon::MapPin, t.text_dim, location, "");
+        return None;
+    };
+    let mut clicked = None;
+    ui.horizontal(|ui| {
+        ui.add(Icon::MapPin.image(icons::SIZE, t.text_dim));
+        let link = views::LinkInfo::new(ui.ctx(), location, url);
+        let tint = if link.misleading { t.danger } else { t.accent };
+        if ui.add(egui::Link::new(RichText::new(location).size(13.0).color(tint))).on_hover_text(&link.tip).clicked() {
+            clicked = Some(link.clean);
+        }
+    });
+    clicked
+}
+
+/// The card above a message carrying a calendar part: an invitation with Accept, Maybe and Decline; a
+/// cancellation with Remove from calendar; someone's answer; an event to add. `answerable`: why not, for a
+/// message held as suspicious (no buttons then).
+pub fn invitation_card(ui: &mut egui::Ui, t: &Tokens, calendar: &ical::Calendar, info: &InviteInfo, answerable: Result<(), &str>) -> Option<Invite> {
+    let event = calendar.events.iter().find(|e| e.recurrence_id.is_none()).or(calendar.events.first())?;
+    let mut chosen = None;
+    let title = if event.summary.trim().is_empty() { "(no title)" } else { event.summary.trim() };
+    let kind = match calendar.method.as_str() {
+        "REQUEST" if info.in_calendar => "Updated invitation".to_owned(),
+        "REQUEST" => "Invitation".to_owned(),
+        "CANCEL" => "Cancelled by the organiser".to_owned(),
+        "REPLY" => {
+            let who = event.attendees.first().map(person).unwrap_or_default();
+            let answer = match event.attendees.first().map(|a| a.partstat.as_str()) {
+                Some("ACCEPTED") => "accepted",
+                Some("DECLINED") => "declined",
+                Some("TENTATIVE") => "answered maybe to",
+                _ => "answered",
+            };
+            format!("{who} {answer} your invitation")
+        }
+        _ => "Event".to_owned(),
+    };
+    egui::Frame::new().fill(t.input).stroke(Stroke::new(1.0, t.border)).corner_radius(CornerRadius::same(theme::CONTROL_RADIUS)).inner_margin(egui::Margin::same(14)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        let color = if calendar.method == "CANCEL" { t.danger } else { t.accent };
+        views::note(ui, Icon::Calendar, color, &kind, "");
+        ui.add_space(4.0);
+        ui.add(egui::Label::new(RichText::new(title).size(theme::SUBTITLE).family(theme::bold()).color(t.text)).wrap());
+        views::note(ui, Icon::Calendar, t.text_dim, &event_when(event), "");
+        if !event.location.is_empty()
+            && let Some(url) = place(ui, t, &event.location)
+        {
+            chosen = Some(Invite::Open(url));
+        }
+        if let Some(organizer) = &event.organizer {
+            let invited = if event.attendees.len() > 1 { format!("  ·  {} invited", event.attendees.len()) } else { String::new() };
+            ui.label(RichText::new(format!("Organiser: {}{invited}", person(organizer))).size(13.0).color(t.text_dim));
+        }
+        if !info.conflicts.is_empty() && calendar.method == "REQUEST" {
+            views::note(ui, Icon::Spam, t.danger, &format!("Busy then: {}", info.conflicts.join(", ")), "");
+        }
+        if let Some(answer) = &info.answered {
+            let said = match answer.as_str() {
+                "ACCEPTED" => "You accepted",
+                "DECLINED" => "You declined",
+                "TENTATIVE" => "You answered maybe",
+                _ => "In your calendar, not answered yet",
+            };
+            ui.label(RichText::new(said).size(13.0).color(t.text_dim));
+        }
+        ui.add_space(8.0);
+        match answerable {
+            Err(why) if calendar.method != "REPLY" => {
+                ui.add(egui::Label::new(RichText::new(why).size(13.0).color(t.danger)).wrap());
+            }
+            _ => {
+                ui.horizontal(|ui| {
+                    match calendar.method.as_str() {
+                        "REQUEST" => {
+                            if views::primary_button(ui, t, "Accept", true).on_hover_text("Tell the organiser, and add it to your calendar").clicked() {
+                                chosen = Some(Invite::Answer("ACCEPTED"));
+                            }
+                            if ui.button("Maybe").on_hover_text("Tell the organiser you may come; it goes in your calendar as tentative").clicked() {
+                                chosen = Some(Invite::Answer("TENTATIVE"));
+                            }
+                            if ui.button("Decline").on_hover_text("Tell the organiser you will not come").clicked() {
+                                chosen = Some(Invite::Answer("DECLINED"));
+                            }
+                        }
+                        "CANCEL" if info.in_calendar && ui.button("Remove from calendar").clicked() => chosen = Some(Invite::Remove),
+                        "PUBLISH" | "" if !info.in_calendar && views::primary_button(ui, t, "Add to calendar", true).clicked() => chosen = Some(Invite::Add),
+                        _ => {}
+                    }
+                    // The call to join, beside the answers; not on a cancelled event, nor on a message
+                    // held as suspicious (its link could be anything).
+                    if let Some(call) = call_link(event).filter(|_| calendar.method != "CANCEL") {
+                        ui.add_space(8.0);
+                        if ui.button("Join call").on_hover_text(format!("Open the call on {}", crate::html::host(&call))).clicked() {
+                            chosen = Some(Invite::Open(views::LinkInfo::new(ui.ctx(), &call, &call).clean));
+                        }
+                    }
+                });
+            }
+        }
+    });
+    chosen
+}
+
 fn person(p: &ical::Person) -> String {
     if p.name.is_empty() || p.name.eq_ignore_ascii_case(&p.email) { p.email.clone() } else { format!("{} <{}>", p.name, p.email) }
 }
@@ -472,13 +642,28 @@ mod tests {
                 assert!(agenda(ui, &t, monday, 30, &items, monday).is_none());
                 let mut close = false;
                 assert!(details(ui, &t, &items[1], "Work", &mut close).is_none() && !close);
+                let invite = ical::parse("BEGIN:VCALENDAR\nMETHOD:REQUEST\nBEGIN:VEVENT\nUID:i\nSUMMARY:Plan review\nDTSTART:20261013T090000Z\nDTEND:20261013T100000Z\nORGANIZER;CN=Ada:mailto:ada@example.org\nATTENDEE:mailto:bob@example.org\nEND:VEVENT\nEND:VCALENDAR\n");
+                let info = InviteInfo { conflicts: vec!["Standup".into()], ..Default::default() };
+                assert!(invitation_card(ui, &t, &invite, &info, Ok(())).is_none());
+                assert!(invitation_card(ui, &t, &invite, &info, Err("Answering is off")).is_none());
+                let cancel = ical::Calendar { method: "CANCEL".into(), ..invite.clone() };
+                assert!(invitation_card(ui, &t, &cancel, &InviteInfo { in_calendar: true, ..Default::default() }, Ok(())).is_none());
             });
             output.textures_delta.clear();
         }
     }
 
     #[test]
-    fn overlapping_events_share_a_day_side_by_side() {
+    fn a_call_is_found_in_the_place_or_the_description() {
+        let event = |location: &str, description: &str| ical::Event { location: location.into(), description: description.into(), ..Default::default() };
+        assert_eq!(call_link(&event("https://meet.google.com/abc-defg-hij", "")).as_deref(), Some("https://meet.google.com/abc-defg-hij"));
+        assert_eq!(call_link(&event("Room 2", "Join: <https://acme.zoom.us/j/123?pwd=x>.")).as_deref(), Some("https://acme.zoom.us/j/123?pwd=x"));
+        assert_eq!(call_link(&event("https://maps.example.org/room-2", "")), None, "a map is not a call");
+        assert_eq!(call_link(&event("", "https://evil-zoom.us.example.com/j/1")), None, "only the service's own host");
+    }
+
+    #[test]
+        fn overlapping_events_share_a_day_side_by_side() {
         let (a, b, c) = (item("2026-10-12T09:00:00Z", "2026-10-12T10:00:00Z", false), item("2026-10-12T09:30:00Z", "2026-10-12T10:30:00Z", false), item("2026-10-12T11:00:00Z", "2026-10-12T12:00:00Z", false));
         let placed = lanes(&[(0, &a, 540.0, 600.0), (1, &b, 570.0, 630.0), (2, &c, 660.0, 720.0)]);
         let shape: Vec<(usize, usize, usize)> = placed.iter().map(|p| (p.0, p.4, p.5)).collect();

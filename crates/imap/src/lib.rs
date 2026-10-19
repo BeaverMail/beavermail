@@ -902,7 +902,21 @@ fn parse_body(raw: &[u8]) -> Result<MessageBody, MailError> {
         one_click: trace_headers(raw).iter().any(|(n, v)| n == "list-unsubscribe-post" && v.replace(' ', "").eq_ignore_ascii_case("List-Unsubscribe=One-Click")),
         signature: None, // checked by the source, which knows the sender's keys
         encryption: None,
+        calendar: calendar_part(&message),
     })
+}
+
+/// The first `text/calendar` part of a message, inline or attached (`.ics`), as text.
+fn calendar_part(message: &mail_parser::Message<'_>) -> Option<String> {
+    message
+        .parts
+        .iter()
+        .find(|part| {
+            let calendar = part.content_type().is_some_and(|c| c.ctype().eq_ignore_ascii_case("text") && c.subtype().is_some_and(|s| s.eq_ignore_ascii_case("calendar")));
+            calendar || part.attachment_name().is_some_and(|n| n.to_ascii_lowercase().ends_with(".ics"))
+        })
+        .map(|part| String::from_utf8_lossy(part.contents()).into_owned())
+        .filter(|text| text.contains("BEGIN:VCALENDAR"))
 }
 
 /// The `<…>` links of a `List-Unsubscribe` value that a mail client may use: `https:` and `mailto:`.
@@ -1376,6 +1390,14 @@ impl MailSource for ImapSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_invitation_part_is_read_from_the_message() {
+        let raw = "From: ada@example.org\r\nSubject: Invitation\r\nContent-Type: multipart/alternative; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nYou are invited\r\n--b\r\nContent-Type: text/calendar; method=REQUEST; charset=utf-8\r\n\r\nBEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:x\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n--b--\r\n";
+        let body = parse_body(raw.as_bytes()).unwrap();
+        assert!(body.calendar.as_deref().is_some_and(|c| c.contains("METHOD:REQUEST")));
+        assert_eq!(parse_body(b"From: a@b.c\r\nSubject: x\r\n\r\nhello").unwrap().calendar, None);
+    }
 
     const WITH_FILES: &str = "From: a@x.org\r\nSubject: files\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: multipart/related; boundary=\"r\"\r\n\r\n--r\r\nContent-Type: text/html\r\n\r\n<p>hi <img src=\"cid:logo\"></p>\r\n--r\r\nContent-Type: image/png\r\nContent-ID: <logo>\r\nContent-Disposition: inline\r\nContent-Transfer-Encoding: base64\r\n\r\niVBORw0K\r\n--r--\r\n--b\r\nContent-Type: application/pdf; name=\"plan.pdf\"\r\nContent-Disposition: attachment; filename=\"plan.pdf\"\r\nContent-Transfer-Encoding: base64\r\n\r\nSGVsbG8gd29ybGQ=\r\n--b\r\nContent-Type: text/plain\r\nContent-Disposition: attachment; filename=\"notes.txt\"\r\n\r\nremember\r\n--b--\r\n";
 
