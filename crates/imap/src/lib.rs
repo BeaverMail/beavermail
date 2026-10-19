@@ -412,8 +412,12 @@ fn ids(value: &mail_parser::HeaderValue<'_>) -> Vec<String> {
     }
 }
 
-/// A header block as the archive stores it, or `None` when the fetch has no UID or header.
+/// A header block as the archive stores it, or `None` when the fetch has no UID or header, or the
+/// message is flagged deleted (another client deleted it and has not expunged it yet: it is gone).
 fn header(fetch: &Fetch) -> Option<Header> {
+    if fetch.flags().any(|f| f == Flag::Deleted) {
+        return None;
+    }
     let uid = fetch.uid?;
     let raw = fetch.header().or_else(|| fetch.section(&async_imap::imap_proto::SectionPath::Full(async_imap::imap_proto::MessageSection::Header)))?;
     let message = MessageParser::default().parse_headers(raw)?;
@@ -667,7 +671,9 @@ impl ImapSource {
         // Flags and deletions among the newest cached messages.
         if let Some(from) = store.nth_newest_uid(account, folder, RECONCILE_WINDOW)?.or(store.uid_range(account, folder)?.map(|(lo, _, _)| lo)) {
             let fetches: Vec<Fetch> = session.uid_fetch(format!("{from}:*"), "(UID FLAGS)").await?.try_collect().await?;
-            let server: std::collections::HashMap<u32, bool> = fetches.iter().filter_map(|f| Some((f.uid?, !f.flags().any(|fl| fl == Flag::Seen)))).collect();
+            // One flagged deleted is gone as if expunged.
+            let server: std::collections::HashMap<u32, bool> =
+                fetches.iter().filter(|f| !f.flags().any(|fl| fl == Flag::Deleted)).filter_map(|f| Some((f.uid?, !f.flags().any(|fl| fl == Flag::Seen)))).collect();
             let local = store.flags_since(account, folder, from)?;
             let gone: Vec<u32> = local.iter().filter(|(uid, _)| !server.contains_key(uid)).map(|(uid, _)| *uid).collect();
             let changed: Vec<(u32, bool)> = local.iter().filter_map(|(uid, unread)| server.get(uid).filter(|s| *s != unread).map(|s| (*uid, *s))).collect();
@@ -1219,14 +1225,14 @@ impl MailSource for ImapSource {
         }
         let folder = self.folder_with_role(role).await?.ok_or_else(|| backend(format!("this account has no {role:?} folder")))?;
         // Only what the user has seen listed: what arrived meanwhile is not erased unseen.
-        let uids: Vec<u32> = self.store.flags_since(&self.account, &folder, 0)?.into_iter().map(|(uid, _)| uid).collect();
-        if uids.is_empty() {
-            return Ok(0);
-        }
+        let listed: Vec<u32> = self.store.flags_since(&self.account, &folder, 0)?.into_iter().map(|(uid, _)| uid).collect();
         let mut state = self.state.lock().await;
         let session = state.session(&self.config).await?;
         let result = async {
             session.select(&folder).await?;
+            // And what another client already deleted without expunging: not listed, but still counted.
+            let mut uids = listed.clone();
+            uids.extend(session.uid_search("DELETED").await?.into_iter().filter(|u| !listed.contains(u)));
             for chunk in uids.chunks(500) {
                 let set = chunk.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
                 session.uid_store(&set, "+FLAGS.SILENT (\\Deleted)").await?.try_collect::<Vec<_>>().await?;
@@ -1236,9 +1242,9 @@ impl MailSource for ImapSource {
         }
         .await;
         result.map_err(|e| state.failed(e))?;
-        self.drop_files(&folder, &uids);
-        self.store.remove_uids(&self.account, &folder, &uids)?;
-        Ok(uids.len())
+        self.drop_files(&folder, &listed);
+        self.store.remove_uids(&self.account, &folder, &listed)?;
+        Ok(listed.len())
     }
 }
 

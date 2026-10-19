@@ -168,6 +168,9 @@ async fn serve(socket: TcpStream, log: Arc<Mutex<Vec<String>>>, move_works: bool
             format!("{tag} OK [APPENDUID 1 1] done\r\n")
         } else if verb.starts_with("UID MOVE") && !move_works {
             format!("{tag} NO [CANNOT] MOVE is not supported\r\n")
+        } else if verb.starts_with("UID SEARCH DELETED") {
+            // Deleted by another client and not expunged.
+            format!("* SEARCH 7\r\n{tag} OK done\r\n")
         } else if verb.starts_with("UID SEARCH") {
             // Two copies of the same draft: the older (5) and the one just appended (9).
             format!("* SEARCH 5 9\r\n{tag} OK done\r\n")
@@ -255,7 +258,8 @@ async fn emptying_erases_the_known_messages_of_that_folder_only() {
     message_in(&mock, "Trash").await;
     assert!(mock.source.empty(Role::Inbox).await.is_err(), "only Trash and Spam");
     assert_eq!(mock.source.empty(Role::Trash).await.unwrap(), 1);
-    assert_eq!(mock.writes(), ["UID STORE 5 +FLAGS.SILENT (\\Deleted)", "UID EXPUNGE 5"]);
+    // With what another client already deleted (7), never left behind.
+    assert_eq!(mock.writes(), ["UID STORE 5,7 +FLAGS.SILENT (\\Deleted)", "UID EXPUNGE 5,7"]);
     assert!(mock.source.messages("Trash").await.unwrap().is_empty());
 }
 
