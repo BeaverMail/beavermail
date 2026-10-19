@@ -1815,8 +1815,12 @@ impl BeaverApp {
             Some(pane) => self.activate(pane),
             None => {
                 self.in_tab = false;
-                self.message = None;
                 self.body = None;
+                // Without the reading pane the message stays selected, so the keys go on from it; with
+                // the pane, nothing is shown beside the list.
+                if self.settings.reading_pane {
+                    self.message = None;
+                }
             }
         }
     }
@@ -6227,9 +6231,12 @@ impl BeaverApp {
                             None => {}
                         }
                     }
-                    if !body.data.to.is_empty() {
+                    if !body.data.to.is_empty() || !body.data.cc.is_empty() {
                         ui.add_space(6.0);
-                        ui.add(egui::Label::new(RichText::new(format!("To: {}", body.data.to.join(", "))).size(13.0).color(t.text_dim)).truncate());
+                    }
+                    for (label, list) in [("To", &body.data.to), ("Cc", &body.data.cc)].into_iter().filter(|(_, l)| !l.is_empty()) {
+                        // A line cut short shows every address on hover.
+                        ui.add(egui::Label::new(RichText::new(format!("{label}: {}", list.join(", "))).size(13.0).color(t.text_dim)).truncate());
                     }
                     if !body.data.attachments.is_empty() {
                         ui.add_space(10.0);

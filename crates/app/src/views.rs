@@ -318,7 +318,9 @@ pub fn person_row(ui: &mut Ui, t: &Tokens, name: &str, line: &str, photo: Option
 /// `mark`: the colour of its account, in All inboxes.
 #[allow(clippy::too_many_arguments)]
 pub fn message_row(ui: &mut Ui, t: &Tokens, message: &MessageSummary, selected: bool, folder: Option<&str>, warning: Option<&str>, count: usize, mark: Option<Color32>) -> Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), MESSAGE_ROW_H), Sense::click());
+    // Clicked, never focused: the arrow keys move the list's own selection (`handle_keys`), and a focused
+    // row would have egui move its focus with them too, scrolling the list elsewhere.
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), MESSAGE_ROW_H), Sense::CLICK);
     let card = rect.shrink2(vec2(8.0, 2.0));
     row_background(ui, card, &response, selected, t);
     if let Some(color) = mark {
