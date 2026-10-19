@@ -466,6 +466,8 @@ pub struct InviteInfo {
     pub answered: Option<String>,
     /// A calendar here has it.
     pub in_calendar: bool,
+    /// An answer sent by the user (their own copy, in Sent).
+    pub mine: bool,
 }
 
 /// What was chosen on an invitation's card.
@@ -477,6 +479,8 @@ pub enum Invite {
     Add,
     /// A link of the event (its place, or the call to join), cleaned of tracking.
     Open(String),
+    /// The event in the Calendar section, with its details open.
+    Show,
 }
 
 /// Hosts of video calls: their link in an event is the call to join.
@@ -523,6 +527,12 @@ pub fn invitation_card(ui: &mut egui::Ui, t: &Tokens, calendar: &ical::Calendar,
         "REQUEST" if info.in_calendar => "Updated invitation".to_owned(),
         "REQUEST" => "Invitation".to_owned(),
         "CANCEL" => "Cancelled by the organiser".to_owned(),
+        "REPLY" if info.mine => match event.attendees.first().map(|a| a.partstat.as_str()) {
+            Some("ACCEPTED") => "You accepted this invitation".to_owned(),
+            Some("DECLINED") => "You declined this invitation".to_owned(),
+            Some("TENTATIVE") => "You answered maybe to this invitation".to_owned(),
+            _ => "Your answer to this invitation".to_owned(),
+        },
         "REPLY" => {
             let who = event.attendees.first().map(person).unwrap_or_default();
             let answer = match event.attendees.first().map(|a| a.partstat.as_str()) {
@@ -554,14 +564,23 @@ pub fn invitation_card(ui: &mut egui::Ui, t: &Tokens, calendar: &ical::Calendar,
         if !info.conflicts.is_empty() && calendar.method == "REQUEST" {
             views::note(ui, Icon::Spam, t.danger, &format!("Busy then: {}", info.conflicts.join(", ")), "");
         }
-        if let Some(answer) = &info.answered {
-            let said = match answer.as_str() {
-                "ACCEPTED" => "You accepted",
-                "DECLINED" => "You declined",
-                "TENTATIVE" => "You answered maybe",
-                _ => "In your calendar, not answered yet",
-            };
-            ui.label(RichText::new(said).size(13.0).color(t.text_dim));
+        // The answer given, and the event in the calendar (a declined one is out of the views).
+        let said = info.answered.as_deref().map(|answer| match answer {
+            "ACCEPTED" => "You accepted",
+            "DECLINED" => "You declined",
+            "TENTATIVE" => "You answered maybe",
+            _ => "In your calendar, not answered yet",
+        });
+        let viewable = info.in_calendar && info.answered.as_deref() != Some("DECLINED") && calendar.method != "CANCEL";
+        if said.is_some() || viewable {
+            ui.horizontal(|ui| {
+                if let Some(said) = said {
+                    ui.label(RichText::new(said).size(13.0).color(t.text_dim));
+                }
+                if viewable && ui.link(RichText::new("View in calendar").size(13.0)).on_hover_text("Open it in Calendar, with its details").clicked() {
+                    chosen = Some(Invite::Show);
+                }
+            });
         }
         ui.add_space(8.0);
         match answerable {
@@ -572,14 +591,23 @@ pub fn invitation_card(ui: &mut egui::Ui, t: &Tokens, calendar: &ical::Calendar,
                 ui.horizontal(|ui| {
                     match calendar.method.as_str() {
                         "REQUEST" => {
-                            if views::primary_button(ui, t, "Accept", true).on_hover_text("Tell the organiser, and add it to your calendar").clicked() {
-                                chosen = Some(Invite::Answer("ACCEPTED"));
-                            }
-                            if ui.button("Maybe").on_hover_text("Tell the organiser you may come; it goes in your calendar as tentative").clicked() {
-                                chosen = Some(Invite::Answer("TENTATIVE"));
-                            }
-                            if ui.button("Decline").on_hover_text("Tell the organiser you will not come").clicked() {
-                                chosen = Some(Invite::Answer("DECLINED"));
+                            // Answered: that answer shows as chosen, the others change it.
+                            let given = info.answered.as_deref().filter(|a| ["ACCEPTED", "TENTATIVE", "DECLINED"].contains(a));
+                            let answers = [
+                                ("Accept", "ACCEPTED", "Tell the organiser, and add it to your calendar"),
+                                ("Maybe", "TENTATIVE", "Tell the organiser you may come; it goes in your calendar as tentative"),
+                                ("Decline", "DECLINED", "Tell the organiser you will not come; it leaves your calendar views"),
+                            ];
+                            for (label, partstat, tip) in answers {
+                                let response = match given {
+                                    Some(g) if g == partstat => ui.add_enabled(false, egui::Button::new(RichText::new(label).color(t.on_accent)).fill(t.accent)).on_disabled_hover_text("Your answer"),
+                                    Some(_) => ui.button(label).on_hover_text(format!("Change your answer: {}", tip.to_lowercase())),
+                                    None if partstat == "ACCEPTED" => views::primary_button(ui, t, label, true).on_hover_text(tip),
+                                    None => ui.button(label).on_hover_text(tip),
+                                };
+                                if response.clicked() {
+                                    chosen = Some(Invite::Answer(partstat));
+                                }
                             }
                         }
                         "CANCEL" if info.in_calendar && ui.button("Remove from calendar").clicked() => chosen = Some(Invite::Remove),
@@ -646,6 +674,8 @@ mod tests {
                 let info = InviteInfo { conflicts: vec!["Standup".into()], ..Default::default() };
                 assert!(invitation_card(ui, &t, &invite, &info, Ok(())).is_none());
                 assert!(invitation_card(ui, &t, &invite, &info, Err("Answering is off")).is_none());
+                let answered = InviteInfo { answered: Some("ACCEPTED".into()), in_calendar: true, ..Default::default() };
+                assert!(invitation_card(ui, &t, &invite, &answered, Ok(())).is_none(), "the answer given shows as chosen");
                 let cancel = ical::Calendar { method: "CANCEL".into(), ..invite.clone() };
                 assert!(invitation_card(ui, &t, &cancel, &InviteInfo { in_calendar: true, ..Default::default() }, Ok(())).is_none());
             });

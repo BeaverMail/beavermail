@@ -56,12 +56,29 @@ impl SmtpSender {
             Tls::Tls => AsyncSmtpTransport::<Tokio1Executor>::relay(host),
         }
         .map_err(backend)?;
-        let builder = builder.port(*port).credentials(Credentials::new(self.user.clone(), secret));
+        let builder = builder.port(*port).credentials(Credentials::new(self.user.clone(), secret)).hello_name(local_client(host, *port).await);
         Ok(match mechanisms {
             Some(mechanisms) => builder.authentication(mechanisms),
             None => builder,
         }
         .build())
+    }
+}
+
+/// How the client names itself in EHLO: the address this computer reaches the server from, as an
+/// address literal (RFC 5321 4.1.4), as desktop mail programs do. The library's default, `[127.0.0.1]`,
+/// is a loopback address the server never sees the client at, which spam filters hold against the
+/// message; the machine's own name would tell its hostname to every server on the way.
+async fn local_client(host: &str, port: u16) -> lettre::transport::smtp::extension::ClientId {
+    use lettre::transport::smtp::extension::ClientId;
+    let Ok(Some(server)) = tokio::net::lookup_host((host, port)).await.map(|mut found| found.next()) else { return ClientId::default() };
+    // A UDP socket "connected" to the server sends nothing; it only picks the local address of the route.
+    let unspecified: std::net::SocketAddr = if server.is_ipv4() { ([0, 0, 0, 0], 0).into() } else { (std::net::Ipv6Addr::UNSPECIFIED, 0).into() };
+    let local = std::net::UdpSocket::bind(unspecified).and_then(|socket| socket.connect(server).and_then(|()| socket.local_addr()));
+    match local.map(|a| a.ip()) {
+        Ok(std::net::IpAddr::V4(ip)) if !ip.is_loopback() && !ip.is_unspecified() => ClientId::Ipv4(ip),
+        Ok(std::net::IpAddr::V6(ip)) if !ip.is_loopback() && !ip.is_unspecified() => ClientId::Ipv6(ip),
+        _ => ClientId::default(),
     }
 }
 

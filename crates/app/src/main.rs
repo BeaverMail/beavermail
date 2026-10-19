@@ -3958,6 +3958,7 @@ impl BeaverApp {
         let mut info = calview::InviteInfo::default();
         let Some(event) = calendar.events.iter().find(|e| e.recurrence_id.is_none()).or(calendar.events.first()).cloned() else { return (calendar, info) };
         let own: Vec<String> = self.accounts.iter().map(|v| v.account.address().to_lowercase()).collect();
+        info.mine = calendar.method == "REPLY" && event.attendees.first().is_some_and(|a| own.contains(&a.email));
         for stored in self.archive.events_with_uid(&event.uid).unwrap_or_default() {
             info.in_calendar = true;
             let kept = beavermail_carddav::ical::parse(&stored.ics);
@@ -4021,22 +4022,37 @@ impl BeaverApp {
                         }
                     }
                 }
-                if partstat == "DECLINED" {
-                    self.remove_event(&event.uid);
-                } else {
-                    self.put_event(&event.uid, beavermail_carddav::ical::with_answer(&ics, &me, partstat));
-                }
+                // Declined too, it stays in the calendar with the answer (as servers keep it), so the
+                // answer is remembered and can be changed; the views leave it out.
+                self.put_event(&event.uid, beavermail_carddav::ical::with_answer(&ics, &me, partstat));
                 let said = match partstat {
                     "ACCEPTED" => "Accepted: the organiser is told, and it is in your calendar",
                     "TENTATIVE" => "Answered maybe: the organiser is told, and it is in your calendar as tentative",
-                    _ => "Declined: the organiser is told",
+                    _ => "Declined: the organiser is told, and it leaves your calendar views",
                 };
                 self.notice = Some((said.into(), std::time::Instant::now()));
             }
             calview::Invite::Remove => self.remove_event(&event.uid),
             calview::Invite::Add => self.put_event(&event.uid, beavermail_carddav::ical::as_kept(&ics)),
+            calview::Invite::Show => self.show_event(&event.uid),
             calview::Invite::Open(_) => {}
         }
+    }
+
+    /// Shows the event with this UID in the Calendar section: its week, with its details open.
+    fn show_event(&mut self, uid: &str) {
+        let Some(kept) = self.archive.events_with_uid(uid).unwrap_or_default().into_iter().next() else { return };
+        let events = beavermail_carddav::ical::parse(&kept.ics).events;
+        let Some(start) = events.iter().find(|e| e.recurrence_id.is_none()).and_then(|e| e.start.as_ref()?.utc()) else { return };
+        let day = start.with_timezone(&chrono::Local).date_naive();
+        if let Some(calendar) = self.settings.calendars.iter_mut().find(|c| c.url == kept.calendar && !c.shown) {
+            calendar.shown = true; // a hidden calendar would hide it
+            self.save_settings();
+        }
+        (self.section, self.calendar_view, self.calendar_day, self.calendar_morning) = (Section::Calendar, calview::View::Week, day, true);
+        self.calendar_month = day.with_day(1).unwrap_or(day);
+        let (from, days) = calview::range(calview::View::Week, day);
+        self.calendar_open = self.calendar_items(from, days).iter().find(|i| i.occurrence.uid == uid).cloned();
     }
 
     /// Keeps an event in the calendar that has it already (an update), else in the default calendar
@@ -4117,11 +4133,16 @@ impl BeaverApp {
         }
         let (start, end) = (calview::midnight(from), calview::midnight(from + chrono::Duration::days(days)));
         let urls: Vec<String> = shown.iter().map(|(_, c)| c.url.clone()).collect();
+        let own: Vec<String> = self.accounts.iter().map(|v| v.account.address().to_lowercase()).collect();
         let mut items = Vec::new();
         for stored in self.archive.events_between(&urls, start.timestamp(), end.timestamp()).unwrap_or_default() {
             let Some((at, calendar)) = shown.iter().find(|(_, c)| c.url == stored.calendar) else { continue };
             let color = calendars::color(calendar, *at);
             let events = beavermail_carddav::ical::parse(&stored.ics).events;
+            // An invitation declined stays in its calendar with the answer, out of sight.
+            if events.iter().any(|e| e.attendees.iter().any(|a| a.partstat == "DECLINED" && own.contains(&a.email))) {
+                continue;
+            }
             items.extend(beavermail_carddav::calendar::occurrences(&events, start, end).into_iter().map(|occurrence| calview::Item { occurrence, calendar: stored.calendar.clone(), color }));
         }
         items.sort_by_key(|i| (i.occurrence.start, i.occurrence.end));
