@@ -21,7 +21,7 @@ beavermail-store = { path = "crates/store" }
 beavermail-vault = { path = "crates/vault" }
 beavermail-crypto = { path = "crates/crypto" }
 beavermail-carddav = { path = "crates/carddav" }
-eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "links", "x11", "wayland"] }
 egui_extras = { version = "0.36", default-features = false, features = ["svg"] }
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 blitz-dom = "0.3.0-beta.3"
