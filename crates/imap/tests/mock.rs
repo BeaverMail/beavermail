@@ -19,6 +19,8 @@ const DRAFT: &[u8] = b"From: me@example.com\r\nX-BeaverMail-Draft: d1\r\nSubject
 
 const MESSAGE: &str = "From: Ada <ada@example.com>\r\nTo: Me <me@example.com>, grace@example.com\r\nCc: Linus <linus@example.com>\r\nReply-To: lists@example.com\r\nSubject: Hello\r\nMessage-ID: <m2@example.com>\r\nReferences: <m0@example.com> <m1@example.com>\r\nDate: Mon, 1 Jan 2024 10:00:00 +0000\r\n\r\nHi there.\r\n";
 
+const LIST: &str = "* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n* LIST (\\Archive) \"/\" \"Archive\"\r\n* LIST (\\Sent) \"/\" \"Sent\"\r\n* LIST (\\Drafts) \"/\" \"Drafts\"\r\n* LIST (\\Trash) \"/\" \"Trash\"\r\n";
+
 const PLAIN_STRUCTURE: &str = "BODYSTRUCTURE (\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 9 1 NIL NIL NIL) ";
 const MIXED_STRUCTURE: &str = "BODYSTRUCTURE ((\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 9 1 NIL NIL NIL)(\"APPLICATION\" \"PDF\" (\"NAME\" \"plan.pdf\") NIL NIL \"BASE64\" 100 NIL (\"ATTACHMENT\" (\"FILENAME\" \"plan.pdf\")) NIL) \"MIXED\" (\"BOUNDARY\" \"b\") NIL NIL) ";
 
@@ -30,6 +32,10 @@ struct Mock {
     log: Arc<Mutex<Vec<String>>>,
     /// The message the server sends when asked for one.
     message: Arc<Mutex<String>>,
+    /// The folders the server answers LIST with.
+    list: Arc<Mutex<String>>,
+    /// A command the server answers with BYE before closing the connection, as when shutting down.
+    bye: Arc<Mutex<Option<&'static str>>>,
 }
 
 impl Mock {
@@ -65,20 +71,31 @@ async fn start_opts(move_works: bool, attachment: bool, idle: bool) -> Mock {
     let port = listener.local_addr().unwrap().port();
     let log = Arc::new(Mutex::new(Vec::new()));
     let message = Arc::new(Mutex::new(MESSAGE.to_owned()));
-    let (served, text) = (log.clone(), message.clone());
+    let list = Arc::new(Mutex::new(LIST.to_owned()));
+    let bye = Arc::new(Mutex::new(None));
+    let (served, replies) = (log.clone(), Replies { message: message.clone(), list: list.clone(), bye: bye.clone() });
     tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
-            tokio::spawn(serve(socket, served.clone(), move_works, attachment, idle, text.clone()));
+            tokio::spawn(serve(socket, served.clone(), move_works, attachment, idle, replies.clone()));
         }
     });
     let server = Server { host: "127.0.0.1".into(), port, tls: Tls::None };
     let account = Account { name: "mock".into(), user: "u".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true, keep: beavermail_core::Keep::default(), signature: String::new(), oauth: None, smtp_user: None };
     let store = Arc::new(Store::in_memory().unwrap());
     let files = Arc::new(Vault::in_memory());
-    Mock { source: ImapSource::new(&account, "p".into(), store.clone(), files.clone()), account, store, files, log, message }
+    Mock { source: ImapSource::new(&account, "p".into(), store.clone(), files.clone()), account, store, files, log, message, list, bye }
 }
 
-async fn serve(socket: TcpStream, log: Arc<Mutex<Vec<String>>>, move_works: bool, attachment: bool, idle: bool, message: Arc<Mutex<String>>) {
+/// What a test can change in the server's answers while it runs; see [`Mock`].
+#[derive(Clone)]
+struct Replies {
+    message: Arc<Mutex<String>>,
+    list: Arc<Mutex<String>>,
+    bye: Arc<Mutex<Option<&'static str>>>,
+}
+
+async fn serve(socket: TcpStream, log: Arc<Mutex<Vec<String>>>, move_works: bool, attachment: bool, idle: bool, replies: Replies) {
+    let Replies { message, list, bye } = replies;
     let (read, mut write) = socket.into_split();
     let mut read = BufReader::new(read);
     let _ = write.write_all(b"* OK ready\r\n").await;
@@ -91,6 +108,10 @@ async fn serve(socket: TcpStream, log: Arc<Mutex<Vec<String>>>, move_works: bool
         let line = line.trim_end().to_owned();
         let Some((tag, command)) = line.split_once(' ') else { continue };
         log.lock().unwrap().push(command.to_owned());
+        if bye.lock().unwrap().is_some_and(|b| command.contains(b)) {
+            let _ = write.write_all(b"* BYE [UNAVAILABLE] Server shutting down\r\n").await;
+            return; // closed cleanly, the command never answered
+        }
         let verb = command.to_ascii_uppercase();
         let reply = if verb.starts_with("CAPABILITY") {
             let extra = if idle { " IDLE" } else { "" };
@@ -127,9 +148,7 @@ async fn serve(socket: TcpStream, log: Arc<Mutex<Vec<String>>>, move_works: bool
         } else if verb.starts_with("NOOP") {
             format!("{tag} OK done\r\n")
         } else if verb.starts_with("LIST") {
-            format!(
-                "* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n* LIST (\\Archive) \"/\" \"Archive\"\r\n* LIST (\\Sent) \"/\" \"Sent\"\r\n* LIST (\\Drafts) \"/\" \"Drafts\"\r\n* LIST (\\Trash) \"/\" \"Trash\"\r\n{tag} OK done\r\n"
-            )
+            format!("{}{tag} OK done\r\n", list.lock().unwrap())
         } else if verb.starts_with("STATUS") {
             let name = command.split(' ').nth(1).unwrap_or("\"INBOX\"");
             format!("* STATUS {name} (MESSAGES 1240 UNSEEN 1)\r\n{tag} OK done\r\n")
@@ -201,6 +220,40 @@ async fn folders_get_their_roles() {
     assert_eq!(role("INBOX"), Role::Inbox);
     assert_eq!(role("Archive"), Role::Archive);
     assert_eq!(role("Trash"), Role::Trash);
+}
+
+#[tokio::test]
+async fn a_list_without_the_inbox_forgets_nothing() {
+    let mock = start(true).await;
+    message_in(&mock, "INBOX").await;
+    // As a server still starting answers: no folders at all.
+    mock.list.lock().unwrap().clear();
+    assert!(mock.source.mailboxes().await.is_err());
+    assert_eq!(mock.source.cached_mailboxes().await.unwrap().len(), 5);
+    assert_eq!(mock.source.messages("INBOX").await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_list_cut_short_by_the_server_leaving_forgets_nothing() {
+    let mock = start(true).await;
+    message_in(&mock, "INBOX").await;
+    *mock.bye.lock().unwrap() = Some("LIST");
+    let error = mock.source.mailboxes().await.unwrap_err();
+    assert!(matches!(error, MailError::Offline(_)), "a server leaving is offline for a while, tried again: {error:?}");
+    assert_eq!(mock.source.cached_mailboxes().await.unwrap().len(), 5);
+    assert_eq!(mock.source.messages("INBOX").await.unwrap().len(), 1);
+    // The server is back: a new connection lists the folders again.
+    *mock.bye.lock().unwrap() = None;
+    assert_eq!(mock.source.mailboxes().await.unwrap().len(), 5);
+}
+
+#[tokio::test]
+async fn flags_cut_short_by_the_server_leaving_forget_no_message() {
+    let mock = start(true).await;
+    message_in(&mock, "INBOX").await;
+    *mock.bye.lock().unwrap() = Some("(UID FLAGS)");
+    assert!(matches!(mock.source.sync("INBOX").await, Err(MailError::Offline(_))));
+    assert_eq!(mock.source.messages("INBOX").await.unwrap().len(), 1);
 }
 
 #[tokio::test]

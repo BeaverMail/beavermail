@@ -5,6 +5,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use async_imap::imap_proto::{AttributeValue, MailboxDatum, Response, Status};
 use async_imap::types::{Fetch, Flag, NameAttribute};
 use async_imap::{Client, Session};
 use beavermail_core::{AuthCheck, AuthResult, Account, Attachment, Encryption, Hit, Keep, MailError, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Progress, Role, Server, SignedWith, SyncReport, Tls};
@@ -245,6 +246,37 @@ fn backend(e: impl fmt::Display) -> MailError {
     MailError::Backend(e.to_string())
 }
 
+/// An IMAP error as the app tells it: a connection that ended (the server restarting, the network
+/// gone) is being offline for a while, to be tried again, not a failure.
+fn imap_error(e: async_imap::error::Error) -> MailError {
+    match e {
+        async_imap::error::Error::ConnectionLost | async_imap::error::Error::Io(_) => MailError::Offline(e.to_string()),
+        e => backend(e),
+    }
+}
+
+/// Runs `command` and keeps what `take` finds in its answer, only once the command's tagged OK came.
+/// The library's streams just end when the connection closes (after a BYE, say): an answer cut short
+/// would read as a complete one, and what it misses would be forgotten here as gone from the server.
+async fn answered<T>(session: &mut Session<Stream>, command: &str, mut take: impl FnMut(&Response<'_>) -> Option<T>) -> Result<Vec<T>, async_imap::error::Error> {
+    let tag = session.run_command(command).await?;
+    let mut found = Vec::new();
+    loop {
+        let Some(response) = session.read_response().await? else { return Err(async_imap::error::Error::ConnectionLost) };
+        match response.parsed() {
+            Response::Done { tag: done, status, outcome } if *done == tag => {
+                let why = || outcome.information.as_deref().unwrap_or_default().to_owned();
+                return match status {
+                    Status::Ok => Ok(found),
+                    Status::No => Err(async_imap::error::Error::No(why())),
+                    _ => Err(async_imap::error::Error::Bad(why())),
+                };
+            }
+            parsed => found.extend(take(parsed)),
+        }
+    }
+}
+
 async fn tls(tcp: TcpStream, host: &str) -> Result<Stream, MailError> {
     let mut roots = rustls::RootCertStore::empty();
     roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
@@ -349,7 +381,7 @@ impl State {
     /// Maps an IMAP error and drops the session, so the next call reconnects.
     fn failed(&mut self, e: async_imap::error::Error) -> MailError {
         self.session = None;
-        backend(e)
+        imap_error(e)
     }
 }
 
@@ -752,7 +784,16 @@ impl ImapSource {
 
         // Flags and deletions among the newest cached messages.
         if let Some(from) = store.nth_newest_uid(account, folder, RECONCILE_WINDOW)?.or(store.uid_range(account, folder)?.map(|(lo, _, _)| lo)) {
-            let fetches: Vec<Fetch> = session.uid_fetch(format!("{from}:*"), "(UID FLAGS)").await?.try_collect().await?;
+            // What is missing from the answer is forgotten here, so only a complete one counts.
+            let fetches: Vec<(u32, Vec<Flag>)> = answered(session, &format!("UID FETCH {from}:* (UID FLAGS)"), |r| match r {
+                Response::Fetch(_, attributes) => {
+                    let uid = attributes.iter().find_map(|a| match a { AttributeValue::Uid(uid) => Some(*uid), _ => None })?;
+                    let flags = attributes.iter().find_map(|a| match a { AttributeValue::Flags(f) => Some(f.iter().map(|f| Flag::from(f.to_string())).collect()), _ => None });
+                    Some((uid, flags.unwrap_or_default()))
+                }
+                _ => None,
+            })
+            .await?;
             // One flagged deleted is gone as if expunged.
             // Where the server keeps no keywords, the pins and labels made here stay as they are.
             let keywords = takes_keywords(&selected.permanent_flags);
@@ -760,14 +801,14 @@ impl ImapSource {
             let kept: std::collections::HashMap<u32, &Flags> = local.iter().map(|(uid, f)| (*uid, f)).collect();
             let server: std::collections::HashMap<u32, Flags> = fetches
                 .iter()
-                .filter(|f| !f.flags().any(|fl| fl == Flag::Deleted))
-                .filter_map(|f| {
-                    let uid = f.uid?;
-                    let (pinned, labels) = match kept.get(&uid) {
+                .filter(|(_, flags)| !flags.contains(&Flag::Deleted))
+                .map(|(uid, flags)| {
+                    let has = |flag: Flag| flags.contains(&flag);
+                    let (pinned, labels) = match kept.get(uid) {
                         Some(here) if !keywords => (here.pinned, here.labels.clone()),
-                        _ => (f.flags().any(|fl| matches!(fl, Flag::Custom(k) if k == PINNED)), labels(f.flags())),
+                        _ => (has(Flag::Custom(PINNED.into())), labels(flags.iter().cloned())),
                     };
-                    Some((uid, Flags { unread: !f.flags().any(|fl| fl == Flag::Seen), pinned, starred: f.flags().any(|fl| fl == Flag::Flagged), labels }))
+                    (*uid, Flags { unread: !has(Flag::Seen), pinned, starred: has(Flag::Flagged), labels })
                 })
                 .collect();
             let gone: Vec<u32> = local.iter().filter(|(uid, _)| !server.contains_key(uid)).map(|(uid, _)| *uid).collect();
@@ -1056,20 +1097,24 @@ impl MailSource for ImapSource {
         let mut state = self.state.lock().await;
         let result = async {
             let session = state.session(&self.config).await?;
-            let mut folders: Vec<(String, Role)> = session
-                .list(None, Some("*"))
-                .await
-                .map_err(backend)?
-                .try_filter(|n| futures::future::ready(!n.attributes().contains(&NameAttribute::NoSelect)))
-                .map_ok(|n| (n.name().to_owned(), role_of(n.attributes())))
-                .try_collect::<Vec<_>>()
-                .await
-                .map_err(backend)?;
+            let mut folders: Vec<(String, Role)> = answered(session, "LIST \"\" *", |r| match r {
+                Response::MailboxData(MailboxDatum::List(list)) if !list.name_attributes.contains(&NameAttribute::NoSelect) => {
+                    Some((list.name.to_string(), role_of(&list.name_attributes)))
+                }
+                _ => None,
+            })
+            .await
+            .map_err(imap_error)?;
+            // Every account has an Inbox: a list without one (a server still starting) is not taken
+            // as every folder gone, which would forget them and their messages here.
+            if !folders.iter().any(|(n, _)| n.eq_ignore_ascii_case("INBOX")) {
+                return Err(backend("the server listed no Inbox"));
+            }
             folders.sort_by_key(|(n, _)| (n != "INBOX", n.clone()));
             resolve_roles(&mut folders);
             let mut mailboxes = Vec::with_capacity(folders.len());
             for (name, role) in &folders {
-                let status = session.status(name, "(UNSEEN MESSAGES)").await.map_err(backend)?;
+                let status = session.status(name, "(UNSEEN MESSAGES)").await.map_err(imap_error)?;
                 mailboxes.push(Mailbox { name: name.clone(), unread: status.unseen.unwrap_or(0), role: *role, total: status.exists, stored: 0 });
             }
             Ok((folders, mailboxes))

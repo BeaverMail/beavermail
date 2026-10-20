@@ -50,6 +50,8 @@ use tokio::runtime::Runtime;
 enum Event {
     /// The folders of an account. The flag is true when the answer came from the server.
     Mailboxes(u64, Result<Vec<Mailbox>, MailError>, bool),
+    /// The server's folders, asked again on its own after the account went offline.
+    Retried(u64, Result<Vec<Mailbox>, MailError>),
     /// The background download of an account ended.
     Downloaded(u64, Result<(), MailError>),
     /// The server says something changed in the Inbox of an account.
@@ -174,6 +176,9 @@ const OFFLINE_CHANGES: &str = "offline/changes.json";
 
 /// How long an Archive or Move to Trash waits before going to the server, so Undo can take it back.
 const UNDO_SECS: u64 = 10;
+/// How long an offline account waits before its server is asked again, doubling up to the most.
+const RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(15);
+const RETRY_MOST: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Archive or Move to Trash, shown at once but sent to the server only after [`UNDO_SECS`].
 struct Pending {
@@ -527,6 +532,9 @@ struct AccountView {
     /// Set to stop the Inbox watcher; `watching` says whether one is running.
     watch_stop: Arc<std::sync::atomic::AtomicBool>,
     watching: bool,
+    /// Whether the server is to be asked again on its own, and after how long the next time.
+    retrying: bool,
+    retry_wait: std::time::Duration,
 }
 
 /// The "Add account" form. Ports are text until submitted.
@@ -1518,7 +1526,7 @@ impl BeaverApp {
         }
         let progress = Arc::new(Progress::default());
         progress.paused.store(self.downloads_paused, std::sync::atomic::Ordering::Relaxed);
-        let view = AccountView { serial, account, source, sender, mailboxes: Vec::new(), error, offline: None, progress, watch_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)), watching: false };
+        let view = AccountView { serial, account, source, sender, mailboxes: Vec::new(), error, offline: None, progress, watch_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)), watching: false, retrying: false, retry_wait: RETRY_FIRST };
         match position {
             Some(at) => self.accounts.insert(at.min(self.accounts.len()), view),
             None => self.accounts.push(view),
@@ -2143,6 +2151,22 @@ impl BeaverApp {
         if let Some(view) = self.accounts.iter_mut().find(|v| v.serial == serial) {
             view.offline = Some(why);
         }
+        self.retry_later(serial);
+    }
+
+    /// Offline (the server restarting, the network gone): its server is asked again on its own, less
+    /// and less often, until it answers; then what waited is sent (see `Event::Mailboxes`).
+    fn retry_later(&mut self, serial: u64) {
+        let work_offline = self.work_offline;
+        let Some(view) = self.accounts.iter_mut().find(|v| v.serial == serial) else { return };
+        let Some(source) = view.source.clone().filter(|_| !view.retrying && !work_offline) else { return };
+        view.retrying = true;
+        let wait = view.retry_wait;
+        view.retry_wait = (wait * 2).min(RETRY_MOST);
+        self.spawn(async move {
+            tokio::time::sleep(wait).await;
+            Event::Retried(serial, source.mailboxes().await)
+        });
     }
 
     /// Sends the Archive or Move to Trash that was waiting for Undo.
@@ -5349,6 +5373,7 @@ impl BeaverApp {
                     return;
                 }
                 let mut download = false;
+                let lost = fresh && matches!(result, Err(MailError::Offline(_)));
                 let unread_before = view.mailboxes.iter().find(|m| m.role == Role::Inbox).map(|m| m.unread);
                 match result {
                     Ok(mut mailboxes) => {
@@ -5379,14 +5404,26 @@ impl BeaverApp {
                             if self.accounts.len() >= 2 { self.show_all_inboxes() } else { self.select_mailbox(serial, inbox) }
                         }
                     }
-                    Err(MailError::Offline(why)) => view.offline = Some(why),
+                    Err(MailError::Offline(why)) => (view.offline, view.error) = (Some(why), None),
                     Err(e) => view.error = Some(e.to_string()),
                 }
+                if lost {
+                    self.retry_later(serial);
+                }
                 if download {
+                    if let Some(view) = self.accounts.iter_mut().find(|v| v.serial == serial) {
+                        view.retry_wait = RETRY_FIRST;
+                    }
                     self.start_download(serial);
                     self.start_watch(serial);
                     self.send_outbox(serial);
                 }
+            }
+            Event::Retried(serial, result) => {
+                if let Some(view) = self.accounts.iter_mut().find(|v| v.serial == serial) {
+                    view.retrying = false;
+                }
+                self.apply(Event::Mailboxes(serial, result, true));
             }
             Event::Found(seq, serial, result) => {
                 if seq != self.search_seq {
@@ -6423,8 +6460,6 @@ impl BeaverApp {
                             let small = |color| egui::TextFormat::simple(egui::FontId::proportional(12.5), color);
                             if view.error.is_some() {
                                 title.append("not connected", 8.0, small(t.danger));
-                            } else if view.offline.is_some() && !self.work_offline {
-                                title.append("offline", 8.0, small(t.text_dim));
                             }
                             let header = egui::CollapsingHeader::new(title)
                                 .id_salt(view.serial)
@@ -6432,9 +6467,7 @@ impl BeaverApp {
                                 .show(ui, |ui| {
                                     if let Some(error) = &view.error {
                                         ui.add(egui::Label::new(RichText::new(error).size(13.0).color(t.danger)).wrap());
-                                    } else if let Some(why) = view.offline.as_ref().filter(|_| !self.work_offline) {
-                                        ui.add(egui::Label::new(RichText::new(why).size(13.0).color(t.text_dim)).wrap());
-                                    } else if view.mailboxes.is_empty() && view.source.is_some() && !self.work_offline {
+                                    } else if view.mailboxes.is_empty() && view.offline.is_none() && view.source.is_some() && !self.work_offline {
                                         // The server's list has not come yet, and none is stored from before.
                                         ui.horizontal(|ui| {
                                             ui.add(egui::Spinner::new().size(12.0));
@@ -6467,6 +6500,23 @@ impl BeaverApp {
                                         }
                                     }
                                 });
+                            // Offline is a state, not news: a badge on the account, and why on a click.
+                            if let Some(why) = view.offline.as_ref().filter(|_| view.error.is_none() && !self.work_offline) {
+                                let galley = ui.painter().layout_no_wrap("offline".into(), egui::FontId::proportional(12.0), t.text_dim);
+                                let row = header.header_response.rect;
+                                let size = galley.size() + egui::vec2(16.0, 6.0);
+                                let pill = egui::Rect::from_center_size(egui::pos2(row.right() - 8.0 - size.x / 2.0, row.center().y), size);
+                                let badge = ui.interact(pill, ui.id().with(("offline", view.serial)), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+                                ui.painter().rect_filled(pill, egui::CornerRadius::same(11), if badge.hovered() { t.border } else { t.hover });
+                                ui.painter().galley(pill.center() - galley.size() / 2.0, galley, t.text_dim);
+                                egui::Popup::from_toggle_button_response(&badge).show(|ui| {
+                                    ui.set_max_width(280.0);
+                                    ui.label(RichText::new(format!("{} cannot be reached", view.account.imap.host)).size(14.0).strong().color(t.text));
+                                    ui.add(egui::Label::new(RichText::new(why).size(13.0).color(t.text_dim)).wrap());
+                                    ui.add_space(4.0);
+                                    ui.add(egui::Label::new(RichText::new("The mail stored on this computer is shown meanwhile, and the server is asked again on its own.").size(13.0).color(t.text_dim)).wrap());
+                                });
+                            }
                             if header.header_response.clicked() {
                                 fold = Some(view.account.key());
                             }
