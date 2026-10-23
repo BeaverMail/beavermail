@@ -44,10 +44,4 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Google and Microsoft sign-in show only when built with `BEAVERMAIL_GOOGLE_CLIENT_ID`,
-`BEAVERMAIL_GOOGLE_CLIENT_SECRET` and `BEAVERMAIL_MICROSOFT_CLIENT_ID` set.
-
 `cargo run -p beavermail -- --screen-dry-run` prints what the spam checks would do to each Inbox, without moving anything.
-
-Packages for Windows (.exe and installer), macOS (.app, not notarised) and Linux (.tar.gz and .deb) come
-from the workflows in `.github/workflows`, run by hand or by a `v*` tag.

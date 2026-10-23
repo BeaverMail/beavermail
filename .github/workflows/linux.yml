@@ -9,6 +9,10 @@ on:
   push:
     tags: ["v*"]
 
+# Writing to the repository's releases, for a version tag.
+permissions:
+  contents: write
+
 jobs:
   build:
     # The oldest supported Ubuntu, so the binary runs on systems with an older glibc too.
@@ -47,3 +51,13 @@ jobs:
           path: dist/*.deb
       - name: Test
         run: cargo test --workspace --release
+      # A version tag publishes the packages on its GitHub release, made by whichever build ends first;
+      # only after the tests pass.
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes || true
+          gh release upload "$GITHUB_REF_NAME" dist/beavermail-linux-x64.tar.gz dist/*.deb --clobber
