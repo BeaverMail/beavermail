@@ -121,6 +121,18 @@ pub trait MailSource {
     /// the server. The folder list is read again to show it.
     fn create_folder(&self, parent: Option<&str>, name: &str) -> impl Future<Output = Result<String, MailError>> + Send;
 
+    /// Renames folder `from` to `name` where it is, with the folders inside it (the server renames them
+    /// too); returns its new full name. Not for the Inbox nor the folders with a role.
+    fn rename_folder(&self, from: &str, name: &str) -> impl Future<Output = Result<String, MailError>> + Send;
+
+    /// Moves folder `name`, with the folders inside it and their messages, into the trash folder, where it
+    /// can be brought back from; returns its new full name. A server may refuse folders in its trash.
+    fn trash_folder(&self, name: &str) -> impl Future<Output = Result<String, MailError>> + Send;
+
+    /// Deletes folder `name`, the folders inside it and all their messages, on the server and here, for
+    /// good. Not for the Inbox nor the folders with a role.
+    fn delete_folder(&self, name: &str) -> impl Future<Output = Result<(), MailError>> + Send;
+
     /// Moves a message to the account's trash folder.
     fn trash(&self, id: MessageId) -> impl Future<Output = Result<(), MailError>> + Send;
 

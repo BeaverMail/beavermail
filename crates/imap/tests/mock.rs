@@ -324,6 +324,53 @@ async fn a_folder_is_created_inside_another_with_the_servers_separator_and_its_n
 }
 
 #[tokio::test]
+async fn a_renamed_folder_keeps_its_messages_and_those_inside_it_and_a_deleted_one_goes_with_them() {
+    let mock = start(true).await;
+    let extra = ["Work", "Work/Old", "Work.2025"].map(|n| format!("* LIST (\\HasNoChildren) \"/\" \"{n}\"\r\n")).concat();
+    mock.list.lock().unwrap().push_str(&extra);
+    let id = message_in(&mock, "Work/Old").await;
+    let key = mock.account.key();
+    let file = beavermail_vault::folder_path(&key, "Work/Old").join("1-5.eml");
+    mock.files.write(&file, b"kept here").unwrap();
+
+    assert_eq!(mock.source.rename_folder("Work", " Jobs ").await.unwrap(), "Jobs");
+    assert!(mock.commands().iter().any(|c| c == "RENAME \"Work\" \"Jobs\""), "{:?}", mock.commands());
+    assert_eq!(mock.source.messages("Jobs/Old").await.unwrap()[0].id, id, "the same message, under the new name");
+    assert_eq!(mock.files.read(&beavermail_vault::folder_path(&key, "Jobs/Old").join("1-5.eml")).unwrap().as_deref(), Some(&b"kept here"[..]));
+    assert_eq!(mock.files.read(&file).unwrap(), None, "not left behind");
+    let names: Vec<String> = mock.source.cached_mailboxes().await.unwrap().into_iter().map(|m| m.name).collect();
+    assert!(names.contains(&"Work.2025".to_owned()), "a dot is part of a name here: {names:?}");
+
+    for (from, name) in [("INBOX", "Mail"), ("Trash", "Bin"), ("Jobs", "a/b"), ("Jobs", "50%"), ("Jobs", "#shared"), ("Jobs", "tab\there"), ("Jobs", "  "), ("Jobs", "work.2025")] {
+        let error = mock.source.rename_folder(from, name).await.unwrap_err();
+        assert!(matches!(error, MailError::Backend(_)), "{from} to {name:?}: {error:?}");
+    }
+    assert!(mock.source.delete_folder("Trash").await.is_err());
+
+    mock.source.delete_folder("Jobs").await.unwrap();
+    let deletes: Vec<String> = mock.commands().into_iter().filter(|c| c.starts_with("DELETE")).collect();
+    assert_eq!(deletes, ["DELETE \"Jobs/Old\"", "DELETE \"Jobs\""], "those inside first");
+    let names: Vec<String> = mock.source.cached_mailboxes().await.unwrap().into_iter().map(|m| m.name).collect();
+    assert!(!names.iter().any(|n| n.starts_with("Jobs")) && names.contains(&"Work.2025".to_owned()), "{names:?}");
+    assert!(mock.source.messages("Jobs/Old").await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_deleted_folder_goes_into_the_trash_with_those_inside_it_numbered_when_the_name_is_taken() {
+    let mock = start(true).await;
+    let extra = ["Work", "Work/Old", "Trash/Work"].map(|n| format!("* LIST (\\HasNoChildren) \"/\" \"{n}\"\r\n")).concat();
+    mock.list.lock().unwrap().push_str(&extra);
+    let id = message_in(&mock, "Work/Old").await;
+    assert_eq!(mock.source.trash_folder("Work").await.unwrap(), "Trash/Work 2");
+    assert!(mock.commands().iter().any(|c| c == "RENAME \"Work\" \"Trash/Work 2\""), "{:?}", mock.commands());
+    assert!(!mock.commands().iter().any(|c| c.starts_with("DELETE")), "nothing deleted for good");
+    assert_eq!(mock.source.messages("Trash/Work 2/Old").await.unwrap()[0].id, id, "its messages can be brought back");
+    let error = mock.source.trash_folder("Trash/Work").await.unwrap_err();
+    assert!(matches!(&error, MailError::Backend(why) if why.contains("trash already")), "{error:?}");
+    assert!(mock.source.trash_folder("Trash").await.is_err(), "not the trash itself");
+}
+
+#[tokio::test]
 async fn move_falls_back_to_copy_and_expunge() {
     let mock = start(false).await;
     let id = message_in(&mock, "INBOX").await;

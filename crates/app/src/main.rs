@@ -80,6 +80,12 @@ enum Event {
     Done(u64, usize, Option<(MessageId, Action)>, Result<(), MailError>),
     /// A folder was created in account `serial`, with its full name, or the server refused it.
     FolderMade(u64, Result<String, MailError>),
+    /// Folder (account, old name) was renamed, to this full name, or the server refused it.
+    FolderRenamed(u64, String, Result<String, MailError>),
+    /// Folder (account, name) was deleted with those inside it, or the server refused it.
+    FolderDeleted(u64, String, Result<(), MailError>),
+    /// Folder (account, name) went into the trash, under this full name, or the server refused it.
+    FolderTrashed(u64, String, Result<String, MailError>),
     /// A message was sent, or the server refused it: (draft id, result, why the copy in Sent could not
     /// be saved when the message itself went out). The draft is the compose window's or one in the Outbox.
     Sent(String, Result<(), MailError>, Option<String>),
@@ -179,6 +185,8 @@ struct NewFolder {
     name: String,
     busy: bool,
     error: Option<String>,
+    /// Rename…: the folder's full name; only its own name changes, where it is.
+    renaming: Option<String>,
 }
 
 /// Messages being dragged from the list onto a folder.
@@ -238,6 +246,9 @@ struct SidebarOutcome {
     dropped: Option<(Vec<MessageId>, u64, usize)>,
     /// "New folder…" was chosen in this (account, folder index)'s menu.
     new_inside: Option<(u64, usize)>,
+    /// "Rename…" or "Delete folder…" was chosen in this (account, folder index)'s menu.
+    rename: Option<(u64, usize)>,
+    delete: Option<(u64, usize)>,
 }
 
 /// A message as the server holds it, shown in a source tab.
@@ -482,6 +493,18 @@ impl ReaderOutcome {
         self.trust = said.trust.then_some(id).or(self.trust);
         self.source = said.source.then_some(id).or(self.source);
         self.invite = said.invite.map(|i| (id, i)).or(self.invite.take());
+    }
+}
+
+impl AccountView {
+    /// The server's separator between a folder and those inside it, the same for all its folders.
+    fn delimiter(&self) -> Option<char> {
+        self.mailboxes.iter().find_map(|m| m.delimiter)
+    }
+
+    /// Whether folder `name` is Trash or Spam, or inside one: no place for new folders.
+    fn in_trash_or_spam(&self, name: &str) -> bool {
+        self.mailboxes.iter().filter(|m| matches!(m.role, Role::Trash | Role::Junk)).any(|m| m.name == name || views::is_inside(name, &m.name, m.delimiter))
     }
 }
 
@@ -1177,6 +1200,9 @@ struct BeaverApp {
     contact_query: String,
     new_contact: Option<(String, String)>,
     new_folder: Option<NewFolder>,
+    /// Delete folder… asked for (account, folder name); waiting for the user to confirm. With why the
+    /// server refused it in the trash, when it did: then it can only be deleted for good.
+    confirm_folder_delete: Option<(u64, String, Option<String>)>,
     /// Everyone written to, to suggest in a message's address fields; read again for each new message.
     contacts: Arc<Vec<beavermail_store::Contact>>,
     /// Where the user asked to go from an account page with unsaved changes (`None`: close Settings),
@@ -1378,6 +1404,7 @@ impl BeaverApp {
             contact_query: String::new(),
             new_contact: None,
             new_folder: None,
+            confirm_folder_delete: None,
             settings_leave: None,
             confirm_remove: None,
             confirm_unsubscribe: None,
@@ -1541,11 +1568,11 @@ impl BeaverApp {
         if view.source.is_none() || view.mailboxes.get(index).is_none() {
             return;
         }
-        let (key, name) = (view.account.key().to_owned(), view.mailboxes[index].name.clone());
+        let (key, name, delimiter) = (view.account.key().to_owned(), view.mailboxes[index].name.clone(), view.delimiter());
         self.send_pending(); // Undo puts mail back in the list it left
         // A folder opened from the palette or a link shows in the sidebar: the folders it is inside unfold.
         let before = self.settings.folded.len();
-        self.settings.folded.retain(|k| !k.strip_prefix(&folder_fold_key(&key, "")).is_some_and(|folder| views::is_inside(&name, folder)));
+        self.settings.folded.retain(|k| !k.strip_prefix(&folder_fold_key(&key, "")).is_some_and(|folder| views::is_inside(&name, folder, delimiter)));
         if self.settings.folded.len() != before {
             self.save_settings();
         }
@@ -2067,6 +2094,7 @@ impl BeaverApp {
         }
         match kept {
             Some((pos, message)) => {
+                let delimiter = self.view(serial).and_then(AccountView::delimiter);
                 let pending = self.pending.get_or_insert_with(|| Pending { text: String::new(), until: std::time::Instant::now(), items: Vec::new() });
                 pending.items.push((serial, index, action.clone(), message, pos));
                 pending.until = std::time::Instant::now() + std::time::Duration::from_secs(UNDO_SECS);
@@ -2074,7 +2102,7 @@ impl BeaverApp {
                 let s = if n == 1 { "" } else { "s" };
                 pending.text = match &action {
                     Action::Archive => format!("Archived {n} message{s}"),
-                    Action::Move(folder) => format!("Moved {n} message{s} to {}", views::folder_title(folder, Role::Other)),
+                    Action::Move(folder) => format!("Moved {n} message{s} to {}", views::folder_title(folder, Role::Other, delimiter)),
                     _ => format!("Moved {n} message{s} to Trash"),
                 };
             }
@@ -3503,14 +3531,14 @@ impl BeaverApp {
             let from: std::collections::HashSet<String> = palette.moving.iter().filter_map(|id| Some(self.archive.locate(*id).ok()??.folder)).collect();
             for (i, _) in views::folder_tree(&view.mailboxes).into_iter().filter(|&(i, _)| !(from.len() == 1 && from.contains(&view.mailboxes[i].name))) {
                 let mailbox = &view.mailboxes[i];
-                let name = views::folder_path(&mailbox.name, mailbox.role);
+                let name = views::folder_path(&mailbox.name, mailbox.role, mailbox.delimiter);
                 entries.push((Entry::MoveTo(view.serial, i), name, String::new()));
             }
         }
         for view in self.accounts.iter().filter(|_| !moving) {
             for (i, _) in views::folder_tree(&view.mailboxes) {
                 let mailbox = &view.mailboxes[i];
-                entries.push((Entry::Folder(view.serial, i), format!("Go to {} › {}", view.account.address(), views::folder_title(&mailbox.name, mailbox.role)), String::new()));
+                entries.push((Entry::Folder(view.serial, i), format!("Go to {} › {}", view.account.address(), views::folder_title(&mailbox.name, mailbox.role, mailbox.delimiter)), String::new()));
             }
         }
         entries.retain(|(_, label, _)| Command::matches(label, &palette.query));
@@ -4868,16 +4896,21 @@ impl BeaverApp {
     fn new_folder_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
         let Some(mut form) = self.new_folder.take() else { return };
         let accounts: Vec<(u64, String)> = self.accounts.iter().filter(|v| v.source.is_some()).map(|v| (v.serial, v.account.address().to_owned())).collect();
-        let folders: Vec<(String, Role)> = self.view(form.serial).map(|v| views::folder_tree(&v.mailboxes).into_iter().map(|(i, _)| (v.mailboxes[i].name.clone(), v.mailboxes[i].role)).collect()).unwrap_or_default();
-        let shown = views::folder_path;
+        let folders: Vec<(String, Role)> = self
+            .view(form.serial)
+            .map(|v| views::folder_tree(&v.mailboxes).into_iter().map(|(i, _)| &v.mailboxes[i]).filter(|m| !v.in_trash_or_spam(&m.name)).map(|m| (m.name.clone(), m.role)).collect())
+            .unwrap_or_default();
+        let delimiter = self.view(form.serial).and_then(AccountView::delimiter);
+        let shown = |name: &str, role: Role| views::folder_path(name, role, delimiter);
         let (mut create, mut cancel) = (false, false);
         let modal = egui::Modal::new(egui::Id::new("new_folder")).show(ctx, |ui| {
             ui.set_width(FORM_WIDTH);
-            ui.heading("New folder");
-            ui.label(RichText::new("Made on the server, so every device that reads this account sees it.").color(t.text_dim));
+            ui.heading(if form.renaming.is_some() { "Rename folder" } else { "New folder" });
+            let about = if form.renaming.is_some() { "Renamed on the server, with the folders inside it, so every device sees the new name." } else { "Made on the server, so every device that reads this account sees it." };
+            ui.label(RichText::new(about).color(t.text_dim));
             ui.add_space(12.0);
             form_grid(ui, "new_folder_form", |ui| {
-                if accounts.len() > 1 {
+                if accounts.len() > 1 && form.renaming.is_none() {
                     ui.label("Account");
                     let current = accounts.iter().find(|(s, _)| *s == form.serial).map(|(_, a)| a.clone()).unwrap_or_default();
                     egui::ComboBox::from_id_salt("new_folder_account").width(FIELD_WIDTH).selected_text(current).show_ui(ui, |ui| {
@@ -4889,19 +4922,21 @@ impl BeaverApp {
                     });
                     ui.end_row();
                 }
-                ui.label("Inside");
-                let inside = form.parent.as_deref().map_or("Top level".to_owned(), |p| shown(p, folders.iter().find(|(n, _)| n == p).map_or(Role::Other, |(_, r)| *r)));
-                egui::ComboBox::from_id_salt("new_folder_parent").width(FIELD_WIDTH).selected_text(inside).show_ui(ui, |ui| {
-                    if ui.selectable_label(form.parent.is_none(), "Top level").clicked() {
-                        form.parent = None;
-                    }
-                    for (name, role) in &folders {
-                        if ui.selectable_label(form.parent.as_deref() == Some(name.as_str()), shown(name, *role)).clicked() {
-                            form.parent = Some(name.clone());
+                if form.renaming.is_none() {
+                    ui.label("Inside");
+                    let inside = form.parent.as_deref().map_or("Top level".to_owned(), |p| shown(p, folders.iter().find(|(n, _)| n == p).map_or(Role::Other, |(_, r)| *r)));
+                    egui::ComboBox::from_id_salt("new_folder_parent").width(FIELD_WIDTH).selected_text(inside).show_ui(ui, |ui| {
+                        if ui.selectable_label(form.parent.is_none(), "Top level").clicked() {
+                            form.parent = None;
                         }
-                    }
-                });
-                ui.end_row();
+                        for (name, role) in &folders {
+                            if ui.selectable_label(form.parent.as_deref() == Some(name.as_str()), shown(name, *role)).clicked() {
+                                form.parent = Some(name.clone());
+                            }
+                        }
+                    });
+                    ui.end_row();
+                }
                 ui.label("Name");
                 let field = ui.add_enabled(!form.busy, field(&mut form.name).hint_text("Receipts"));
                 // On opening only: once the user is in a field, it is theirs.
@@ -4920,7 +4955,13 @@ impl BeaverApp {
             ui.add_space(12.0);
             let ready = !form.busy && !form.name.trim().is_empty();
             ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
-                create = views::primary_button(ui, t, if form.busy { "Creating…" } else { "Create folder" }, ready).on_disabled_hover_text("Type a name first").clicked() || (ready && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                let label = match (form.busy, form.renaming.is_some()) {
+                    (true, true) => "Renaming…",
+                    (true, false) => "Creating…",
+                    (false, true) => "Rename",
+                    (false, false) => "Create folder",
+                };
+                create = views::primary_button(ui, t, label, ready).on_disabled_hover_text("Type a name first").clicked() || (ready && ui.input(|i| i.key_pressed(egui::Key::Enter)));
                 cancel = ui.button("Cancel").clicked();
                 if form.busy {
                     ui.add(egui::Spinner::new().size(16.0));
@@ -4930,10 +4971,107 @@ impl BeaverApp {
         if create && let Some(source) = self.view(form.serial).and_then(|v| v.source.clone()) {
             (form.busy, form.error) = (true, None);
             let (serial, parent, name) = (form.serial, form.parent.clone(), form.name.clone());
-            self.spawn(async move { Event::FolderMade(serial, source.create_folder(parent.as_deref(), &name).await) });
+            match form.renaming.clone() {
+                Some(from) => self.spawn(async move { Event::FolderRenamed(serial, from.clone(), source.rename_folder(&from, &name).await) }),
+                None => self.spawn(async move { Event::FolderMade(serial, source.create_folder(parent.as_deref(), &name).await) }),
+            }
         }
         if !(cancel || modal.should_close()) {
             self.new_folder = Some(form);
+        }
+    }
+
+    /// Asks account `serial`'s server for its folders again, after one was made, renamed or deleted.
+    fn refresh_folders(&mut self, serial: u64) {
+        if let Some(source) = self.view(serial).and_then(|v| v.source.clone()) {
+            self.spawn(async move { Event::Mailboxes(serial, source.mailboxes().await, true) });
+        }
+    }
+
+    /// Folder `from` of account `serial` is called `to` now, and those inside it with it: the names this
+    /// app keeps follow at once (the folder shown, which folders are folded, moves waiting offline), so
+    /// the list read again finds them.
+    fn folder_renamed(&mut self, serial: u64, from: &str, to: &str) {
+        let Some(view) = self.accounts.iter_mut().find(|v| v.serial == serial) else { return };
+        let (key, delimiter) = (view.account.key().to_owned(), view.delimiter());
+        let renamed = |name: &str| match name.strip_prefix(from) {
+            Some("") => Some(to.to_owned()),
+            Some(rest) if views::is_inside(name, from, delimiter) => Some(format!("{to}{rest}")),
+            _ => None,
+        };
+        for mailbox in &mut view.mailboxes {
+            if let Some(new) = renamed(&mailbox.name) {
+                mailbox.name = new;
+            }
+        }
+        let prefix = folder_fold_key(&key, "");
+        self.settings.folded = std::mem::take(&mut self.settings.folded)
+            .into_iter()
+            .map(|k| match k.strip_prefix(&prefix).and_then(renamed) {
+                Some(new) => folder_fold_key(&key, &new),
+                None => k,
+            })
+            .collect();
+        self.save_settings();
+        for change in self.offline_changes.iter_mut().filter(|c| c.0 == serial) {
+            if let Action::Move(folder) = &mut change.3
+                && let Some(new) = renamed(folder)
+            {
+                *folder = new;
+            }
+        }
+        self.save_offline();
+        self.refresh_folders(serial);
+    }
+
+    /// Confirms deleting a folder. It goes into the trash, with the folders inside it and their messages,
+    /// to be brought back from there; one in the trash already, or one the server refused there, is deleted
+    /// for good.
+    fn folder_delete_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
+        let Some((serial, name, refused)) = self.confirm_folder_delete.clone() else { return };
+        let Some(view) = self.view(serial) else {
+            self.confirm_folder_delete = None;
+            return;
+        };
+        let delimiter = view.delimiter();
+        let inside: Vec<&Mailbox> = view.mailboxes.iter().filter(|m| views::is_inside(&m.name, &name, delimiter)).collect();
+        let messages: u32 = view.mailboxes.iter().filter(|m| m.name == name).chain(inside.iter().copied()).map(|m| m.total).sum();
+        let title = views::folder_path(&name, Role::Other, delimiter);
+        let in_trash = view.mailboxes.iter().any(|m| m.role == Role::Trash && views::is_inside(&name, &m.name, delimiter));
+        let for_good = in_trash || refused.is_some();
+        let (mut confirm, mut cancel) = (false, false);
+        let modal = egui::Modal::new(egui::Id::new("confirm_folder_delete")).show(ctx, |ui| {
+            ui.set_width(FORM_WIDTH * 0.8);
+            ui.heading(if for_good { format!("Delete {title} for good?") } else { format!("Move {title} to Trash?") });
+            let folders = match inside.len() {
+                0 => String::new(),
+                n => format!(", with the {n} folder{} inside it,", if n == 1 { "" } else { "s" }),
+            };
+            let count = format!("{} message{}", views::thousands(messages), if messages == 1 { "" } else { "s" });
+            let what = match &refused {
+                Some(why) => format!("The server did not take it into the trash ({why}). The folder{folders} and its {count} can only be deleted from the server, and cannot be recovered."),
+                None if for_good => format!("The folder{folders} and its {count} will be deleted from the server and cannot be recovered."),
+                None => format!("The folder{folders} and its {count} go into Trash, where they can be brought back from."),
+            };
+            ui.add(egui::Label::new(RichText::new(what).color(t.text_dim)).wrap());
+            ui.add_space(12.0);
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
+                confirm = if for_good {
+                    ui.add(egui::Button::new(RichText::new("Delete for good").color(t.on_accent)).fill(t.danger)).clicked()
+                } else {
+                    views::primary_button(ui, t, "Move to Trash", true).clicked()
+                };
+                cancel = ui.button("Cancel").clicked();
+            });
+        });
+        if confirm && let Some(source) = self.view(serial).and_then(|v| v.source.clone()) {
+            match for_good {
+                true => self.spawn(async move { Event::FolderDeleted(serial, name.clone(), source.delete_folder(&name).await) }),
+                false => self.spawn(async move { Event::FolderTrashed(serial, name.clone(), source.trash_folder(&name).await) }),
+            }
+        }
+        if confirm || cancel || modal.should_close() {
+            self.confirm_folder_delete = None;
         }
     }
 
@@ -5444,7 +5582,7 @@ impl BeaverApp {
                 // In the account shown, at the top; the dialog can change both.
                 let serial = self.shown().first().map(|(s, _)| *s).filter(|s| self.view(*s).is_some_and(|v| v.source.is_some()));
                 if let Some(serial) = serial.or_else(|| self.accounts.iter().find(|v| v.source.is_some()).map(|v| v.serial)) {
-                    self.new_folder = Some(NewFolder { serial, parent: None, name: String::new(), busy: false, error: None });
+                    self.new_folder = Some(NewFolder { serial, parent: None, name: String::new(), busy: false, error: None, renaming: None });
                 }
             }
             Command::Undo => self.undo(),
@@ -5859,10 +5997,50 @@ impl BeaverApp {
                 if self.new_folder.as_ref().is_some_and(|f| f.serial == serial) {
                     self.new_folder = None;
                 }
-                self.notice = Some((format!("Folder {} created", views::folder_title(&full, Role::Other)), std::time::Instant::now()));
-                if let Some(source) = self.view(serial).and_then(|v| v.source.clone()) {
-                    self.spawn(async move { Event::Mailboxes(serial, source.mailboxes().await, true) });
+                let title = views::folder_title(&full, Role::Other, self.view(serial).and_then(AccountView::delimiter));
+                self.notice = Some((format!("Folder {title} created"), std::time::Instant::now()));
+                self.refresh_folders(serial);
+            }
+            Event::FolderRenamed(serial, from, Ok(to)) => {
+                if self.new_folder.as_ref().is_some_and(|f| f.serial == serial) {
+                    self.new_folder = None;
                 }
+                self.folder_renamed(serial, &from, &to);
+                let title = views::folder_title(&to, Role::Other, self.view(serial).and_then(AccountView::delimiter));
+                self.notice = Some((format!("Folder renamed to {title}"), std::time::Instant::now()));
+            }
+            Event::FolderTrashed(serial, name, Ok(to)) => {
+                self.folder_renamed(serial, &name, &to);
+                let title = views::folder_title(&name, Role::Other, self.view(serial).and_then(AccountView::delimiter));
+                self.notice = Some((format!("Folder {title} moved to Trash"), std::time::Instant::now()));
+            }
+            Event::FolderTrashed(_, _, Err(MailError::Offline(why))) => self.error = Some(format!("The folder was not moved to Trash: {why}")),
+            // The server keeps no folders in its trash: the user is asked again, about deleting it for good.
+            Event::FolderTrashed(serial, name, Err(e)) => self.confirm_folder_delete = Some((serial, name, Some(e.to_string()))),
+            Event::FolderRenamed(serial, _, Err(e)) | Event::FolderDeleted(serial, _, Err(e)) => match self.new_folder.as_mut().filter(|f| f.serial == serial) {
+                Some(form) => (form.busy, form.error) = (false, Some(e.to_string())),
+                None => self.error = Some(format!("The folder was not changed: {e}")),
+            },
+            Event::FolderDeleted(serial, name, Ok(())) => {
+                let delimiter = self.view(serial).and_then(AccountView::delimiter);
+                let shown = self.selected.filter(|(s, _)| *s == serial).and_then(|(_, i)| self.view(serial)?.mailboxes.get(i)).map(|m| m.name.clone());
+                // The folder shown went: the Inbox takes its place.
+                if shown.is_some_and(|open| open == name || views::is_inside(&open, &name, delimiter))
+                    && let Some(inbox) = self.view(serial).and_then(|v| v.mailboxes.iter().position(|m| m.role == Role::Inbox))
+                {
+                    self.select_mailbox(serial, inbox);
+                }
+                // Gone from the sidebar at once, not when the server's list comes; the folder shown keeps
+                // its place by name, as positions move.
+                let shown = self.selected.filter(|(s, _)| *s == serial).and_then(|(_, i)| self.view(serial)?.mailboxes.get(i)).map(|m| m.name.clone());
+                if let Some(view) = self.accounts.iter_mut().find(|v| v.serial == serial) {
+                    view.mailboxes.retain(|m| m.name != name && !views::is_inside(&m.name, &name, delimiter));
+                    if let Some(open) = shown {
+                        self.selected = view.mailboxes.iter().position(|m| m.name == open).map(|i| (serial, i));
+                    }
+                }
+                self.notice = Some((format!("Folder {} deleted", views::folder_title(&name, Role::Other, delimiter)), std::time::Instant::now()));
+                self.refresh_folders(serial);
             }
             Event::FolderMade(serial, Err(e)) => match self.new_folder.as_mut().filter(|f| f.serial == serial) {
                 Some(form) => (form.busy, form.error) = (false, Some(e.to_string())),
@@ -6135,21 +6313,43 @@ impl BeaverApp {
             return;
         };
         let count = self.view(serial).and_then(|v| Some(self.archive.messages(&v.account.key(), &v.mailboxes.get(index)?.name).ok()?.len())).unwrap_or(0);
+        // The folders moved into the trash go with it, each with those inside it and their messages.
+        let (folders, in_folders) = self.view(serial).and_then(|v| v.mailboxes.get(index).filter(|m| m.role == Role::Trash).map(|trash| (v, trash))).map_or((Vec::new(), 0), |(v, trash)| {
+            let inside: Vec<&Mailbox> = v.mailboxes.iter().filter(|m| views::is_inside(&m.name, &trash.name, trash.delimiter)).collect();
+            let top = inside.iter().filter(|m| !inside.iter().any(|o| views::is_inside(&m.name, &o.name, trash.delimiter))).map(|m| m.name.clone()).collect();
+            (top, inside.iter().map(|m| m.total).sum::<u32>())
+        });
         let (mut confirm, mut cancel) = (false, false);
         let modal = egui::Modal::new(egui::Id::new("confirm_empty")).show(ctx, |ui| {
             ui.set_width(FORM_WIDTH * 0.8);
-            ui.heading(format!("Delete {} message{} in {name}?", views::thousands(count as u32), if count == 1 { "" } else { "s" }));
+            let messages = format!("{} message{}", views::thousands(count as u32), if count == 1 { "" } else { "s" });
+            ui.heading(match folders.len() {
+                0 => format!("Delete {messages} in {name}?"),
+                n => format!("Delete {messages} and {n} folder{} in {name}?", if n == 1 { "" } else { "s" }),
+            });
             let learn = if name == "Spam" { " The spam checks keep learning from them." } else { "" };
-            ui.label(RichText::new(format!("They will be erased from the server and cannot be recovered.{learn}")).color(t.text_dim));
+            let held = match in_folders {
+                0 => String::new(),
+                n => format!(" The folders hold {} message{} of their own.", views::thousands(n), if n == 1 { "" } else { "s" }),
+            };
+            ui.add(egui::Label::new(RichText::new(format!("They will be erased from the server and cannot be recovered.{held}{learn}")).color(t.text_dim)).wrap());
             ui.add_space(12.0);
             ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
                 let erase = egui::Button::new(RichText::new(format!("Empty {name}")).color(t.on_accent)).fill(t.danger);
-                confirm = ui.add_enabled(count > 0, erase).clicked();
+                confirm = ui.add_enabled(count > 0 || !folders.is_empty(), erase).clicked();
                 cancel = ui.button("Cancel").clicked();
             });
         });
         if confirm {
-            self.empty_folder(serial, index);
+            if count > 0 {
+                self.empty_folder(serial, index);
+            }
+            if let Some(source) = self.view(serial).and_then(|v| v.source.clone()) {
+                for folder in folders {
+                    let source = source.clone();
+                    self.spawn(async move { Event::FolderDeleted(serial, folder.clone(), source.delete_folder(&folder).await) });
+                }
+            }
         }
         if confirm || cancel || modal.should_close() {
             self.confirm_empty = None;
@@ -6692,6 +6892,7 @@ impl BeaverApp {
         let mut fold = None;
         let mut dropped = None;
         let mut new_inside = None;
+        let (mut rename, mut delete) = (None, None);
         // shortcut: only the Inboxes being shown have verdicts; the others keep the count of their last
         // check (All inboxes, shown at start, checks every one). Checking every account in the background
         // during sync would keep them all current.
@@ -6800,7 +7001,7 @@ impl BeaverApp {
                                     }
                                     for (i, depth, held, folding, hidden_unread) in visible {
                                         let mailbox = &view.mailboxes[i];
-                                        let title = views::folder_title(&mailbox.name, mailbox.role);
+                                        let title = views::folder_title(&mailbox.name, mailbox.role, mailbox.delimiter);
                                         let here = self.selected == Some((view.serial, i));
                                         let holding = self.settings.hold_suspicious && mailbox.role == Role::Inbox;
                                         if held {
@@ -6809,7 +7010,7 @@ impl BeaverApp {
                                             if row.clicked() {
                                                 suspicious = Some((view.serial, i));
                                             }
-                                            views::context_menu(&row, |ui| folder_menu(ui, mailbox.role, (0, mailbox.total), true, &mut recheck, &mut empty, (view.serial, i)));
+                                            views::context_menu(&row, |ui| folder_menu(ui, mailbox.role, (0, mailbox.total, 0), true, &mut recheck, &mut empty, (view.serial, i)));
                                             continue;
                                         }
                                         let tip = format!("{} message{}  ·  {} unread", views::thousands(mailbox.total), if mailbox.total == 1 { "" } else { "s" }, views::thousands(mailbox.unread));
@@ -6840,12 +7041,30 @@ impl BeaverApp {
                                         // What emptying would erase: the messages listed here (worked out only when the menu is open).
                                         let listed = || self.archive.messages(&view.account.key(), &mailbox.name).map_or(0, |m| m.len());
                                         views::context_menu(&row, |ui| {
-                                            if ui.button("New folder…").clicked() {
+                                            // Only what can be done here is listed: no new folders in Trash or Spam, and the
+                                            // Inbox and the other folders with a role keep their names (the app finds some by name).
+                                            let can_add = !view.in_trash_or_spam(&mailbox.name);
+                                            let own = mailbox.role == Role::Other;
+                                            if can_add && ui.button("New folder…").clicked() {
                                                 new_inside = Some((view.serial, i));
                                                 ui.close();
                                             }
-                                            ui.separator();
-                                            folder_menu(ui, mailbox.role, (listed(), mailbox.total), self.settings.hold_suspicious, &mut recheck, &mut empty, (view.serial, i));
+                                            if own && ui.button("Rename…").clicked() {
+                                                rename = Some((view.serial, i));
+                                                ui.close();
+                                            }
+                                            // In the trash there is nowhere left to put it: it goes for good, and says so.
+                                            let in_trash = view.mailboxes.iter().any(|m| m.role == Role::Trash && views::is_inside(&mailbox.name, &m.name, mailbox.delimiter));
+                                            let label = if in_trash { "Delete for good…" } else { "Delete folder…" };
+                                            if own && ui.button(RichText::new(label).color(t.danger)).clicked() {
+                                                delete = Some((view.serial, i));
+                                                ui.close();
+                                            }
+                                            if (can_add || own) && matches!(mailbox.role, Role::Inbox | Role::Trash | Role::Junk) {
+                                                ui.separator();
+                                            }
+                                            let inside = if mailbox.role == Role::Trash { view.mailboxes.iter().filter(|m| views::is_inside(&m.name, &mailbox.name, mailbox.delimiter)).count() } else { 0 };
+                                            folder_menu(ui, mailbox.role, (listed(), mailbox.total, inside), self.settings.hold_suspicious, &mut recheck, &mut empty, (view.serial, i));
                                         });
                                     }
                                 });
@@ -6894,7 +7113,7 @@ impl BeaverApp {
             }
             self.save_settings();
         }
-        SidebarOutcome { chosen, suspicious, recheck, empty, removed, edit, add, all, scheduled, all_suspicious, all_spam, dropped, new_inside }
+        SidebarOutcome { chosen, suspicious, recheck, empty, removed, edit, add, all, scheduled, all_suspicious, all_spam, dropped, new_inside, rename, delete }
     }
 
     /// Search, refresh and the message list. Returns the message the user clicked and whether to add an account.
@@ -7585,11 +7804,20 @@ impl eframe::App for BeaverApp {
                 _ => {}
             }
         }
-        let SidebarOutcome { chosen, suspicious, recheck, empty, removed, edit, mut add, all, scheduled, all_suspicious, all_spam, dropped, new_inside } =
+        let SidebarOutcome { chosen, suspicious, recheck, empty, removed, edit, mut add, all, scheduled, all_suspicious, all_spam, dropped, new_inside, rename, delete } =
             if self.in_tab || contacts { SidebarOutcome::default() } else { self.sidebar(ui, &t) };
         if let Some((serial, index)) = new_inside {
             let parent = self.view(serial).and_then(|v| v.mailboxes.get(index)).map(|m| m.name.clone());
-            self.new_folder = Some(NewFolder { serial, parent, name: String::new(), busy: false, error: None });
+            self.new_folder = Some(NewFolder { serial, parent, name: String::new(), busy: false, error: None, renaming: None });
+        }
+        if let Some((serial, index)) = rename
+            && let Some(mailbox) = self.view(serial).and_then(|v| v.mailboxes.get(index))
+        {
+            let name = views::folder_title(&mailbox.name, mailbox.role, mailbox.delimiter);
+            self.new_folder = Some(NewFolder { serial, parent: None, name, busy: false, error: None, renaming: Some(mailbox.name.clone()) });
+        }
+        if let Some((serial, index)) = delete {
+            self.confirm_folder_delete = self.view(serial).and_then(|v| v.mailboxes.get(index)).map(|m| (serial, m.name.clone(), None));
         }
         if let Some((ids, serial, index)) = dropped {
             self.move_to_folder(ids, serial, index);
@@ -7746,6 +7974,7 @@ impl eframe::App for BeaverApp {
         self.card_delete_dialog(ui.ctx(), &t);
         self.new_contact_dialog(ui.ctx(), &t);
         self.new_folder_dialog(ui.ctx(), &t);
+        self.folder_delete_dialog(ui.ctx(), &t);
         self.book_remove_dialog(ui.ctx(), &t);
         self.calendar_remove_dialog(ui.ctx(), &t);
         self.event_dialogs(ui.ctx(), &t);
@@ -7804,28 +8033,29 @@ fn emptied(role: Role) -> Option<&'static str> {
     }
 }
 
-/// The right-click menu of a folder; `count`: how many of its messages are listed here, and how many
-/// the server says it holds.
-fn folder_menu(ui: &mut egui::Ui, role: Role, count: (usize, u32), holding: bool, recheck: &mut Option<(u64, usize)>, empty: &mut Option<(u64, usize)>, folder: (u64, usize)) {
+/// The right-click menu of a folder, for what only some roles have (emptying Trash or Spam, checking the
+/// Inbox for spam); `count`: how many of its messages are listed here, how many the
+/// server says it holds, and how many folders are inside it (those in the trash go when it is emptied).
+fn folder_menu(ui: &mut egui::Ui, role: Role, count: (usize, u32, usize), holding: bool, recheck: &mut Option<(u64, usize)>, empty: &mut Option<(u64, usize)>, folder: (u64, usize)) {
     if let Some(name) = emptied(role) {
         // Only what is listed is erased, never mail the user has not seen.
         let why = match count {
-            (0, 0) => format!("{name} is empty"),
-            (0, _) => format!("Open {name} first: only the messages listed there are erased"),
+            (0, 0, 0) => format!("{name} is empty"),
+            (0, _, 0) => format!("Open {name} first: only the messages listed there are erased"),
             _ => String::new(),
         };
+        let what = if role == Role::Trash { "Delete every message and folder in Trash for good" } else { "Delete every message in Spam for good" };
         let button = ui.add_enabled(why.is_empty(), egui::Button::new(format!("Empty {name}…")));
-        if button.on_hover_text(format!("Delete every message in {name} for good")).on_disabled_hover_text(why).clicked() {
+        if button.on_hover_text(what).on_disabled_hover_text(why).clicked() {
             *empty = Some(folder);
             ui.close();
         }
-        ui.separator();
     }
-    let why = match (role, holding) {
-        (Role::Inbox, true) => None,
-        (Role::Inbox, false) => Some("Holding suspicious mail is turned off in Settings"),
-        _ => Some("Only the Inbox is checked for spam"),
-    };
+    // Only the Inbox is checked for spam.
+    if role != Role::Inbox {
+        return;
+    }
+    let why = (!holding).then_some("Holding suspicious mail is turned off in Settings");
     let check = ui.add_enabled(why.is_none(), egui::Button::new("Check all mail for spam"));
     let check = match why {
         Some(why) => check.on_disabled_hover_text(why),

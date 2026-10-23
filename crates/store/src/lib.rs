@@ -362,6 +362,8 @@ pub struct FolderRow {
     pub total: u32,
     /// Messages whose file is stored.
     pub stored: u32,
+    /// The server's separator between this folder and those inside it; `None` until it lists it again.
+    pub delimiter: Option<char>,
 }
 
 /// Where a message lives on the server.
@@ -773,6 +775,12 @@ fn migrate(conn: &Connection) -> Result<(), MailError> {
             }
             conn.execute_batch(&format!("{add} PRAGMA user_version = 21;")).map_err(db)?;
         }
+        // Version 23: the server's separator between a folder and those inside it, as LIST gives it.
+        if version < 23 {
+            let have = conn.prepare("SELECT delimiter FROM folders LIMIT 0").is_ok();
+            let add = if have { "" } else { "ALTER TABLE folders ADD COLUMN delimiter TEXT;" };
+            conn.execute_batch(&format!("{add} PRAGMA user_version = 23;")).map_err(db)?;
+        }
     Ok(())
 }
 
@@ -925,13 +933,15 @@ impl Store {
                 "SELECT f.name, f.role,
                         (SELECT COUNT(*) FROM messages m WHERE m.account = f.account AND m.folder = f.name AND m.unread = 1),
                         COALESCE(f.total, (SELECT COUNT(*) FROM messages m WHERE m.account = f.account AND m.folder = f.name)),
-                        (SELECT COUNT(*) FROM messages m WHERE m.account = f.account AND m.folder = f.name AND m.stored = 1)
+                        (SELECT COUNT(*) FROM messages m WHERE m.account = f.account AND m.folder = f.name AND m.stored = 1),
+                        f.delimiter
                  FROM folders f WHERE f.account = ?1",
             )
             .map_err(db)?;
         let rows = stmt
             .query_map([account], |r| {
-                Ok(FolderRow { name: r.get(0)?, role: role_from_int(r.get(1)?), unread: r.get::<_, i64>(2)? as u32, total: r.get::<_, i64>(3)? as u32, stored: r.get::<_, i64>(4)? as u32 })
+                let delimiter = r.get::<_, Option<String>>(5)?.and_then(|d| d.chars().next());
+                Ok(FolderRow { name: r.get(0)?, role: role_from_int(r.get(1)?), unread: r.get::<_, i64>(2)? as u32, total: r.get::<_, i64>(3)? as u32, stored: r.get::<_, i64>(4)? as u32, delimiter })
             })
             .map_err(db)?;
         rows.collect::<Result<_, _>>().map_err(db)
@@ -940,6 +950,50 @@ impl Store {
     /// Remembers how many messages the server says a folder holds.
     pub fn set_total(&self, account: &str, folder: &str, total: u32) -> Result<(), MailError> {
         self.conn().execute("UPDATE folders SET total = ?3 WHERE account = ?1 AND name = ?2", params![account, folder, i64::from(total)]).map(|_| ()).map_err(db)
+    }
+
+    /// Remembers the separator the server gave with a folder in its list.
+    pub fn set_delimiter(&self, account: &str, folder: &str, delimiter: Option<char>) -> Result<(), MailError> {
+        self.conn().execute("UPDATE folders SET delimiter = ?3 WHERE account = ?1 AND name = ?2", params![account, folder, delimiter.map(String::from)]).map(|_| ()).map_err(db)
+    }
+
+    /// Renames folder `from` to `to`, with the folders inside it (`from` + `delimiter` + …), as the server
+    /// just did; their messages keep their ids, flags and what is kept only here. Returns each (old, new)
+    /// name, for their files to follow.
+    pub fn rename_folder(&self, account: &str, from: &str, to: &str, delimiter: char) -> Result<Vec<(String, String)>, MailError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(db)?;
+        let names: Vec<String> = tx
+            .prepare("SELECT name FROM folders WHERE account = ?1")
+            .map_err(db)?
+            .query_map([account], |r| r.get(0))
+            .map_err(db)?
+            .collect::<Result<_, _>>()
+            .map_err(db)?;
+        let inside = format!("{from}{delimiter}");
+        let moved: Vec<(String, String)> = names
+            .into_iter()
+            .filter_map(|name| match name.strip_prefix(&inside) {
+                _ if name == from => Some((name, to.to_owned())),
+                Some(rest) => Some((name.clone(), format!("{to}{delimiter}{rest}"))),
+                None => None,
+            })
+            .collect();
+        for (old, new) in &moved {
+            tx.execute("UPDATE folders SET name = ?3 WHERE account = ?1 AND name = ?2", params![account, old, new]).map_err(db)?;
+            tx.execute("UPDATE messages SET folder = ?3 WHERE account = ?1 AND folder = ?2", params![account, old, new]).map_err(db)?;
+        }
+        tx.commit().map_err(db)?;
+        Ok(moved)
+    }
+
+    /// Forgets a folder the server deleted, with its messages.
+    pub fn forget_folder(&self, account: &str, folder: &str) -> Result<(), MailError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(db)?;
+        tx.execute("DELETE FROM messages WHERE account = ?1 AND folder = ?2", params![account, folder]).map_err(db)?;
+        tx.execute("DELETE FROM folders WHERE account = ?1 AND name = ?2", params![account, folder]).map_err(db)?;
+        tx.commit().map_err(db)
     }
 
     pub fn folder_state(&self, account: &str, folder: &str) -> Result<FolderState, MailError> {
@@ -1720,6 +1774,27 @@ mod tests {
         assert_eq!(list.iter().map(|m| m.subject.as_str()).collect::<Vec<_>>(), ["new", "old"]);
         assert!(list[0].unread, "an existing UID keeps its row");
         assert_eq!(store.uid_range("me", "INBOX").unwrap(), Some((1, 2, 2)));
+    }
+
+    #[test]
+    fn a_renamed_folder_takes_those_inside_it_and_their_messages_along() {
+        let store = Store::in_memory().unwrap();
+        let folders: Vec<(String, Role)> = ["INBOX", "INBOX/Receipts", "INBOX/Receipts/Old", "INBOX/Receipts.2025", "INBOX/ReceiptsX"].into_iter().map(|n| (n.to_owned(), Role::Other)).collect();
+        store.set_folders("me", &folders).unwrap();
+        store.set_delimiter("me", "INBOX/Receipts", Some('/')).unwrap();
+        store.add_headers("me", "INBOX/Receipts/Old", &[header(1, "kept", 1, true)]).unwrap();
+        let id = store.messages("me", "INBOX/Receipts/Old").unwrap()[0].id;
+        let moved = store.rename_folder("me", "INBOX/Receipts", "INBOX/Bills", '/').unwrap();
+        assert_eq!(moved, [("INBOX/Receipts".to_owned(), "INBOX/Bills".to_owned()), ("INBOX/Receipts/Old".to_owned(), "INBOX/Bills/Old".to_owned())]);
+        let mut names: Vec<String> = store.folders("me").unwrap().into_iter().map(|f| f.name).collect();
+        names.sort();
+        // A dot is part of a name when the separator is "/", and a longer name is not inside a shorter one.
+        assert_eq!(names, ["INBOX", "INBOX/Bills", "INBOX/Bills/Old", "INBOX/Receipts.2025", "INBOX/ReceiptsX"]);
+        assert_eq!(store.messages("me", "INBOX/Bills/Old").unwrap()[0].id, id, "the same message, not a new one");
+        assert_eq!(store.folders("me").unwrap().iter().find(|f| f.name == "INBOX/Bills").unwrap().delimiter, Some('/'));
+        store.forget_folder("me", "INBOX/Bills/Old").unwrap();
+        assert!(store.messages("me", "INBOX/Bills/Old").unwrap().is_empty());
+        assert!(!store.folders("me").unwrap().iter().any(|f| f.name == "INBOX/Bills/Old"));
     }
 
     #[test]

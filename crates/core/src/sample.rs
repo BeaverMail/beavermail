@@ -100,6 +100,7 @@ impl MailSource for SampleSource {
                     .count() as u32,
                 total: self.messages.iter().filter(|(folder, _, _)| folder == name).count() as u32,
                 stored: 0,
+                delimiter: None,
             })
             .collect())
     }
@@ -181,6 +182,18 @@ impl MailSource for SampleSource {
     }
 
     async fn create_folder(&self, _: Option<&str>, _: &str) -> Result<String, MailError> {
+        Err(read_only())
+    }
+
+    async fn rename_folder(&self, _: &str, _: &str) -> Result<String, MailError> {
+        Err(read_only())
+    }
+
+    async fn trash_folder(&self, _: &str) -> Result<String, MailError> {
+        Err(read_only())
+    }
+
+    async fn delete_folder(&self, _: &str) -> Result<(), MailError> {
         Err(read_only())
     }
 

@@ -237,6 +237,48 @@ impl ImapSource {
     }
 
     /// Deletes the files of messages that no longer exist on the server.
+    /// The server's separator between a folder and those inside it, from an empty LIST (RFC 9051 6.3.9).
+    async fn delimiter(&self, state: &mut State) -> Result<Option<char>, MailError> {
+        let listed = answered(state.session(&self.config).await?, "LIST \"\" \"\"", |r| match r {
+            Response::MailboxData(MailboxDatum::List(list)) => list.delimiter.as_deref().and_then(|d| d.chars().next()),
+            _ => None,
+        })
+        .await;
+        match listed {
+            Ok(found) => Ok(found.into_iter().next()),
+            Err(e) => Err(state.failed(e)),
+        }
+    }
+
+    /// Renames folder `from` to `to` on the server, then here: the folders inside it and their messages
+    /// follow, keeping their ids, flags and files. `to` is checked already.
+    async fn move_folder(&self, mut state: tokio::sync::MutexGuard<'_, State>, from: &str, to: &str, delimiter: Option<char>) -> Result<String, MailError> {
+        let renamed = state.session(&self.config).await?.rename(from, to).await;
+        if let Err(e) = renamed {
+            return Err(state.failed(e));
+        }
+        let _ = state.session(&self.config).await?.subscribe(to).await;
+        drop(state);
+        // Without a separator the server keeps no folders inside others, so any will do.
+        for (old, new) in self.store.rename_folder(&self.account, from, to, delimiter.unwrap_or('/'))? {
+            self.move_files(&old, &new);
+        }
+        Ok(to.to_owned())
+    }
+
+    /// Moves a renamed folder's stored messages to its new name. They are encrypted for their place, so
+    /// each is written again there; one that cannot be (the vault locked) is downloaded again when opened.
+    fn move_files(&self, old: &str, new: &str) {
+        let (from, to) = (folder_path(&self.account, old), folder_path(&self.account, new));
+        for path in self.files.list(&from).unwrap_or_default() {
+            let (Some(file), Ok(Some(data))) = (path.file_name(), self.files.read(&path)) else { continue };
+            if self.files.write(&to.join(file), &data).is_ok() {
+                let _ = self.files.remove(&path);
+            }
+        }
+        let _ = self.files.remove_dir(&from);
+    }
+
     fn drop_files(&self, folder: &str, uids: &[u32]) {
         for uid in uids {
             if let Ok(path) = self.file_of(&self.account, folder, *uid) {
@@ -244,6 +286,25 @@ impl ImapSource {
             }
         }
     }
+}
+
+/// Why the Inbox and the folders with a role keep their names: the app finds some of them by name.
+const KEEPS_NAME: &str = "the Inbox and the folders for sent mail, drafts, the archive, spam and the trash keep their names";
+
+/// A folder name the user typed, against what RFC 9051 (5.1) forbids or advises against, and the
+/// server's separator, which cannot be inside one level's name.
+fn check_name(name: &str, delimiter: Option<char>) -> Result<(), MailError> {
+    let refused = match name {
+        "" => "the folder needs a name".to_owned(),
+        _ if name.chars().any(char::is_control) => "a folder name cannot hold control characters".to_owned(),
+        _ if name.contains(['%', '*']) => "a folder name cannot hold % or *: servers read them as wildcards".to_owned(),
+        _ if name.starts_with('#') => "a folder name cannot start with #: servers use it for shared folders".to_owned(),
+        _ => match delimiter.filter(|d| name.contains(*d)) {
+            Some(d) => format!("a folder name cannot contain \"{d}\" on this server: it separates a folder from those inside it"),
+            None => return Ok(()),
+        },
+    };
+    Err(backend(refused))
 }
 
 fn backend(e: impl fmt::Display) -> MailError {
@@ -1098,7 +1159,7 @@ impl ImapSource {
 
 impl MailSource for ImapSource {
     async fn cached_mailboxes(&self) -> Result<Vec<Mailbox>, MailError> {
-        Ok(self.store.folders(&self.account)?.into_iter().map(|f| Mailbox { name: f.name, unread: f.unread, role: f.role, total: f.total, stored: f.stored }).collect())
+        Ok(self.store.folders(&self.account)?.into_iter().map(|f| Mailbox { name: f.name, unread: f.unread, role: f.role, total: f.total, stored: f.stored, delimiter: f.delimiter }).collect())
     }
 
     async fn search(&self, query: &str, limit: usize) -> Result<Vec<Hit>, MailError> {
@@ -1109,14 +1170,17 @@ impl MailSource for ImapSource {
         let mut state = self.state.lock().await;
         let result = async {
             let session = state.session(&self.config).await?;
-            let mut folders: Vec<(String, Role)> = answered(session, "LIST \"\" *", |r| match r {
+            let listed: Vec<(String, Role, Option<char>)> = answered(session, "LIST \"\" *", |r| match r {
                 Response::MailboxData(MailboxDatum::List(list)) if !list.name_attributes.contains(&NameAttribute::NoSelect) => {
-                    Some((list.name.to_string(), role_of(&list.name_attributes)))
+                    Some((list.name.to_string(), role_of(&list.name_attributes), list.delimiter.as_deref().and_then(|d| d.chars().next())))
                 }
                 _ => None,
             })
             .await
             .map_err(imap_error)?;
+            // The separator comes with each folder (RFC 9051 6.3.9); a "." is part of a name where it is "/".
+            let delimiters: std::collections::HashMap<String, Option<char>> = listed.iter().map(|(name, _, d)| (name.clone(), *d)).collect();
+            let mut folders: Vec<(String, Role)> = listed.into_iter().map(|(name, role, _)| (name, role)).collect();
             // Every account has an Inbox: a list without one (a server still starting) is not taken
             // as every folder gone, which would forget them and their messages here.
             if !folders.iter().any(|(n, _)| n.eq_ignore_ascii_case("INBOX")) {
@@ -1127,7 +1191,8 @@ impl MailSource for ImapSource {
             let mut mailboxes = Vec::with_capacity(folders.len());
             for (name, role) in &folders {
                 let status = session.status(name, "(UNSEEN MESSAGES)").await.map_err(imap_error)?;
-                mailboxes.push(Mailbox { name: name.clone(), unread: status.unseen.unwrap_or(0), role: *role, total: status.exists, stored: 0 });
+                let delimiter = delimiters.get(name).copied().flatten();
+                mailboxes.push(Mailbox { name: name.clone(), unread: status.unseen.unwrap_or(0), role: *role, total: status.exists, stored: 0, delimiter });
             }
             Ok((folders, mailboxes))
         }
@@ -1137,6 +1202,7 @@ impl MailSource for ImapSource {
                 self.store.set_folders(&self.account, &folders)?;
                 for m in &mut mailboxes {
                     self.store.set_total(&self.account, &m.name, m.total)?;
+                    self.store.set_delimiter(&self.account, &m.name, m.delimiter)?;
                 }
                 // The counts of what is stored come from the archive, the rest from the server.
                 for row in self.store.folders(&self.account)? {
@@ -1417,23 +1483,9 @@ impl MailSource for ImapSource {
 
     async fn create_folder(&self, parent: Option<&str>, name: &str) -> Result<String, MailError> {
         let name = name.trim();
-        if name.is_empty() {
-            return Err(backend("the folder needs a name"));
-        }
         let mut state = self.state.lock().await;
-        // The server's separator between a folder and those inside it ("/" or "."), from an empty LIST.
-        let listed = answered(state.session(&self.config).await?, "LIST \"\" \"\"", |r| match r {
-            Response::MailboxData(MailboxDatum::List(list)) => list.delimiter.as_ref().map(|d| d.to_string()),
-            _ => None,
-        })
-        .await;
-        let delimiter = match listed {
-            Ok(found) => found.into_iter().next(),
-            Err(e) => return Err(state.failed(e)),
-        };
-        if let Some(d) = delimiter.as_deref().filter(|d| name.contains(d)) {
-            return Err(backend(format!("a folder name cannot contain \"{d}\" on this server")));
-        }
+        let delimiter = self.delimiter(&mut state).await?;
+        check_name(name, delimiter)?;
         let full = match (parent, delimiter) {
             (None, _) => folder_name::encode(name),
             (Some(parent), Some(d)) => format!("{parent}{d}{}", folder_name::encode(name)),
@@ -1449,6 +1501,84 @@ impl MailSource for ImapSource {
         // Listed by clients that show subscribed folders only; a server without subscriptions is fine.
         let _ = state.session(&self.config).await?.subscribe(&full).await;
         Ok(full)
+    }
+
+    async fn rename_folder(&self, from: &str, name: &str) -> Result<String, MailError> {
+        let name = name.trim();
+        let folders = self.store.folders(&self.account)?;
+        let folder = folders.iter().find(|f| f.name == from).ok_or_else(|| backend(format!("there is no folder {from} any more")))?;
+        if folder.role != Role::Other {
+            return Err(backend(KEEPS_NAME));
+        }
+        let mut state = self.state.lock().await;
+        let delimiter = match folder.delimiter {
+            Some(d) => Some(d),
+            None => self.delimiter(&mut state).await?,
+        };
+        check_name(name, delimiter)?;
+        // Where it is: only its own name changes.
+        let to = match delimiter.and_then(|d| from.rfind(d).map(|at| (d, at))) {
+            Some((d, at)) => format!("{}{d}{}", &from[..at], folder_name::encode(name)),
+            None => folder_name::encode(name),
+        };
+        if to == from {
+            return Ok(to);
+        }
+        if folders.iter().any(|f| f.name != from && f.name.eq_ignore_ascii_case(&to)) {
+            return Err(backend(format!("there is a folder {name} already")));
+        }
+        self.move_folder(state, from, &to, delimiter).await
+    }
+
+    async fn trash_folder(&self, name: &str) -> Result<String, MailError> {
+        let trash = self.folder_with_role(Role::Trash).await?.ok_or_else(|| backend("this account has no trash folder"))?;
+        let folders = self.store.folders(&self.account)?;
+        let folder = folders.iter().find(|f| f.name == name).ok_or_else(|| backend(format!("there is no folder {name} any more")))?;
+        if folder.role != Role::Other {
+            return Err(backend("the Inbox and the folders for sent mail, drafts, the archive, spam and the trash cannot be deleted"));
+        }
+        let mut state = self.state.lock().await;
+        let delimiter = match folder.delimiter {
+            Some(d) => d,
+            None => self.delimiter(&mut state).await?.ok_or_else(|| backend("this server keeps no folders inside others, so none in the trash"))?,
+        };
+        if name.strip_prefix(&trash).is_some_and(|rest| rest.starts_with(delimiter)) {
+            return Err(backend("the folder is in the trash already"));
+        }
+        // Its own name inside the trash, numbered when the trash holds one of that name already.
+        let own = name.rfind(delimiter).map_or(name, |at| &name[at + delimiter.len_utf8()..]);
+        let taken = |to: &str| folders.iter().any(|f| f.name.eq_ignore_ascii_case(to));
+        let to = std::iter::once(format!("{trash}{delimiter}{own}"))
+            .chain((2..).map(|n| format!("{trash}{delimiter}{own} {n}")))
+            .find(|to| !taken(to))
+            .expect("some number is free");
+        self.move_folder(state, name, &to, Some(delimiter)).await
+    }
+
+    async fn delete_folder(&self, name: &str) -> Result<(), MailError> {
+        let folders = self.store.folders(&self.account)?;
+        let folder = folders.iter().find(|f| f.name == name).ok_or_else(|| backend(format!("there is no folder {name} any more")))?;
+        if folder.role != Role::Other {
+            return Err(backend("the Inbox and the folders for sent mail, drafts, the archive, spam and the trash cannot be deleted"));
+        }
+        // Those inside first, deepest first: a server may refuse a folder that still holds others.
+        let mut doomed: Vec<&str> = match folder.delimiter {
+            Some(d) => folders.iter().map(|f| f.name.as_str()).filter(|f| f.strip_prefix(name).is_some_and(|rest| rest.starts_with(d))).collect(),
+            None => Vec::new(),
+        };
+        doomed.sort_by_key(|f| std::cmp::Reverse(f.len()));
+        doomed.push(name);
+        let mut state = self.state.lock().await;
+        for folder in doomed {
+            let deleted = state.session(&self.config).await?.delete(folder).await;
+            if let Err(e) = deleted {
+                return Err(state.failed(e));
+            }
+            let _ = state.session(&self.config).await?.unsubscribe(folder).await;
+            self.store.forget_folder(&self.account, folder)?;
+            let _ = self.files.remove_dir(&folder_path(&self.account, folder));
+        }
+        Ok(())
     }
 
     async fn erase(&self, id: MessageId) -> Result<(), MailError> {

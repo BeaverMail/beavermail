@@ -31,6 +31,8 @@ pub struct Mailbox {
     pub total: u32,
     /// Messages of the folder whose file is stored on this computer.
     pub stored: u32,
+    /// The server's separator between this folder and those inside it ("/" or "."), when known.
+    pub delimiter: Option<char>,
 }
 
 /// What the message list needs to show a row. The body is loaded separately.

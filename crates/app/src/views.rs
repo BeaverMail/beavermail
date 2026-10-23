@@ -62,22 +62,31 @@ pub fn avatar(ui: &Ui, t: &Tokens, name: &str, center: egui::Pos2, diameter: f32
     ui.painter().text(center, egui::Align2::CENTER_CENTER, text, FontId::proportional(diameter * 0.36), fg);
 }
 
+/// The levels of a folder's name, split at the server's separator; where it is not known (a search
+/// result, an archive from before it was kept), at "/" and at ".", the two servers use.
+fn levels(name: &str, delimiter: Option<char>) -> Vec<&str> {
+    match delimiter {
+        Some(d) => name.split(d).collect(),
+        None => name.split(['/', '.']).collect(),
+    }
+}
+
 /// The folder name as shown: INBOX in capitals is noise, and nested names show their last part.
-pub fn folder_title(name: &str, role: Role) -> String {
+pub fn folder_title(name: &str, role: Role, delimiter: Option<char>) -> String {
     if role == Role::Inbox {
         return "Inbox".to_owned();
     }
-    beavermail_imap::folder_name::decode(name.rsplit(['/', '.']).next().unwrap_or(name))
+    beavermail_imap::folder_name::decode(levels(name, delimiter).last().unwrap_or(&name))
 }
 
 /// A folder's whole place as people read it, for lists that name folders of every level: "Inbox ›
 /// Clients" for "INBOX/Clients" or "INBOX.Clients".
-pub fn folder_path(name: &str, role: Role) -> String {
+pub fn folder_path(name: &str, role: Role, delimiter: Option<char>) -> String {
     if role == Role::Inbox {
         return "Inbox".to_owned();
     }
-    let parts: Vec<String> = name
-        .split(['/', '.'])
+    let parts: Vec<String> = levels(name, delimiter)
+        .into_iter()
         .enumerate()
         .map(|(i, part)| if i == 0 && part.eq_ignore_ascii_case("INBOX") { "Inbox".to_owned() } else { beavermail_imap::folder_name::decode(part) })
         .collect();
@@ -100,11 +109,11 @@ pub fn folder_rank(role: Role) -> u8 {
 
 /// The folders in sidebar order, as (position in `mailboxes`, depth): those with a role first, always at
 /// the top, then the rest by name; a folder without a role goes under the one its name is inside, as
-/// "INBOX.Receipts" under the Inbox. The server's separator is not known here, so "/" and "." both count.
+/// "INBOX.Receipts" under the Inbox, by each folder's own separator.
 pub fn folder_tree(mailboxes: &[beavermail_core::Mailbox]) -> Vec<(usize, usize)> {
     let parent: Vec<Option<usize>> = mailboxes
         .iter()
-        .map(|m| (m.role == Role::Other).then(|| (0..mailboxes.len()).filter(|&j| is_inside(&m.name, &mailboxes[j].name)).max_by_key(|&j| mailboxes[j].name.len())).flatten())
+        .map(|m| (m.role == Role::Other).then(|| (0..mailboxes.len()).filter(|&j| is_inside(&m.name, &mailboxes[j].name, m.delimiter)).max_by_key(|&j| mailboxes[j].name.len())).flatten())
         .collect();
     let sorted = |mut list: Vec<usize>| {
         list.sort_by_key(|&i| (folder_rank(mailboxes[i].role), beavermail_imap::folder_name::decode(&mailboxes[i].name).to_lowercase()));
@@ -126,9 +135,13 @@ pub fn fold_arrow(ui: &mut Ui, openness: f32, response: &Response) {
     egui::collapsing_header::paint_default_icon(ui, openness, &drawn);
 }
 
-/// Whether folder `child` is inside folder `parent`, at any depth ("INBOX.Receipts.Old" in "INBOX").
-pub fn is_inside(child: &str, parent: &str) -> bool {
-    child.len() > parent.len() + 1 && child.starts_with(parent) && matches!(child.as_bytes()[parent.len()], b'/' | b'.')
+/// Whether folder `child` is inside folder `parent`, at any depth ("INBOX.Receipts.Old" in "INBOX"), by
+/// the server's separator (see [`levels`] without it).
+pub fn is_inside(child: &str, parent: &str, delimiter: Option<char>) -> bool {
+    let Some(rest) = child.strip_prefix(parent) else { return false };
+    let mut rest = rest.chars();
+    let next = rest.next();
+    rest.next().is_some() && next.is_some_and(|c| delimiter.map_or(c == '/' || c == '.', |d| c == d))
 }
 
 fn role_icon(role: Role) -> Icon {
@@ -455,7 +468,7 @@ pub fn message_row(ui: &mut Ui, t: &Tokens, message: &MessageSummary, selected: 
     let subject = truncated(ui, &message.subject, FontId::new(14.5, weight), primary, chips_right - subject_x - 6.0);
     ui.painter().galley(pos2(subject_x, card.top() + 33.0), subject, primary);
     // In search results: which folder the message is in, so identical subjects can be told apart.
-    let label = folder.map(|f| ui.painter().layout_no_wrap(folder_title(f, Role::Other), FontId::proportional(12.5), t.accent));
+    let label = folder.map(|f| ui.painter().layout_no_wrap(folder_title(f, Role::Other, None), FontId::proportional(12.5), t.accent));
     let label_w = label.as_ref().map_or(0.0, |l| l.size().x + 12.0);
     match warning {
         Some(text) => {
@@ -1124,16 +1137,21 @@ mod tests {
     #[test]
     fn a_folders_place_reads_as_words() {
         use beavermail_core::Role;
-        assert_eq!(super::folder_path("INBOX/Receipts", Role::Other), "Inbox › Receipts");
-        assert_eq!(super::folder_path("INBOX.Receipts.Old", Role::Other), "Inbox › Receipts › Old");
-        assert_eq!(super::folder_path("Hobby/Citt&AOA-", Role::Other), "Hobby › Città");
-        assert_eq!(super::folder_path("INBOX", Role::Inbox), "Inbox");
+        assert_eq!(super::folder_path("INBOX/Receipts", Role::Other, Some('/')), "Inbox › Receipts");
+        assert_eq!(super::folder_path("INBOX.Receipts.Old", Role::Other, Some('.')), "Inbox › Receipts › Old");
+        assert_eq!(super::folder_path("Hobby/Citt&AOA-", Role::Other, None), "Hobby › Città");
+        assert_eq!(super::folder_path("INBOX", Role::Inbox, Some('/')), "Inbox");
+        // With "/" as the separator, a dot is part of the name.
+        assert_eq!(super::folder_path("Projects/v1.0", Role::Other, Some('/')), "Projects › v1.0");
+        assert_eq!(super::folder_title("Projects/v1.0", Role::Other, Some('/')), "v1.0");
+        assert!(super::is_inside("A/B", "A", Some('/')) && !super::is_inside("A.B", "A", Some('/')) && super::is_inside("A.B", "A", None));
+        assert!(!super::is_inside("AB", "A", None) && !super::is_inside("A/", "A", Some('/')));
     }
 
     #[test]
     fn a_folder_sits_under_the_one_it_is_inside_and_role_folders_stay_at_the_top() {
         use beavermail_core::{Mailbox, Role};
-        let folder = |name: &str, role| Mailbox { name: name.into(), unread: 0, role, total: 0, stored: 0 };
+        let folder = |name: &str, role| Mailbox { name: name.into(), unread: 0, role, total: 0, stored: 0, delimiter: Some('.') };
         let mailboxes = [
             folder("INBOX.Trash", Role::Trash),
             folder("INBOX.Zeta", Role::Other),
@@ -1141,8 +1159,10 @@ mod tests {
             folder("INBOX.Receipts.Old", Role::Other),
             folder("INBOX.Sent", Role::Sent),
             folder("INBOX.Receipts", Role::Other),
-            folder("Hobby/Garden", Role::Other),
+            folder("Hobby.Garden", Role::Other),
             folder("Hobby", Role::Other),
+            // The separator is "." here: a "/" is part of the name.
+            folder("Hobby/Notes", Role::Other),
             folder("INBOX.alpha", Role::Other),
         ];
         let shown: Vec<(&str, usize)> = super::folder_tree(&mailboxes).into_iter().map(|(i, depth)| (mailboxes[i].name.as_str(), depth)).collect();
@@ -1157,7 +1177,8 @@ mod tests {
                 ("INBOX.Sent", 0),
                 ("INBOX.Trash", 0),
                 ("Hobby", 0),
-                ("Hobby/Garden", 1),
+                ("Hobby.Garden", 1),
+                ("Hobby/Notes", 0),
             ]
         );
     }
