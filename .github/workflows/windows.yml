@@ -3,6 +3,7 @@
 # The Windows build, on a real Windows machine: started by hand (Actions > Windows build > Run
 # workflow) or by a version tag. The standalone .exe and an installer come out as the run's artifacts.
 name: Windows build
+run-name: ${{ github.workflow }} ${{ github.ref_name }}
 
 on:
   workflow_dispatch:

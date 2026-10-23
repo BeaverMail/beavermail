@@ -3,6 +3,7 @@
 # The Linux build: started by hand (Actions > Linux build > Run workflow) or by a version tag. A
 # standalone .tar.gz and a .deb come out as the run's artifacts.
 name: Linux build
+run-name: ${{ github.workflow }} ${{ github.ref_name }}
 
 on:
   workflow_dispatch:

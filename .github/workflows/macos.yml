@@ -4,6 +4,7 @@
 # BeaverMail.app for Apple Silicon and Intel comes out zipped as the run's artifact. It is not signed
 # with a Developer ID nor notarised: macOS asks to confirm the first opening (right click > Open).
 name: macOS build
+run-name: ${{ github.workflow }} ${{ github.ref_name }}
 
 on:
   workflow_dispatch:
