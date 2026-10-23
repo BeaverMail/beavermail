@@ -5,7 +5,7 @@ resolver = "3"
 members = ["crates/core", "crates/app", "crates/imap", "crates/accounts", "crates/smtp", "crates/store", "crates/vault", "crates/crypto", "crates/carddav"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "AGPL-3.0-only"
 publish = false

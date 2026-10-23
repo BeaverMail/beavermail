@@ -533,7 +533,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "beavermail"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyrender",
  "anyrender_vello_cpu",
@@ -567,7 +567,7 @@ dependencies = [
 
 [[package]]
 name = "beavermail-accounts"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "beavermail-core",
@@ -583,7 +583,7 @@ dependencies = [
 
 [[package]]
 name = "beavermail-carddav"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "beavermail-core",
@@ -597,7 +597,7 @@ dependencies = [
 
 [[package]]
 name = "beavermail-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "pollster 0.4.0",
  "serde",
@@ -605,7 +605,7 @@ dependencies = [
 
 [[package]]
 name = "beavermail-crypto"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm",
@@ -633,7 +633,7 @@ dependencies = [
 
 [[package]]
 name = "beavermail-imap"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-imap",
  "beavermail-core",
@@ -650,7 +650,7 @@ dependencies = [
 
 [[package]]
 name = "beavermail-smtp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "beavermail-core",
  "beavermail-crypto",
@@ -661,7 +661,7 @@ dependencies = [
 
 [[package]]
 name = "beavermail-store"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "beavermail-core",
  "chrono",
@@ -670,7 +670,7 @@ dependencies = [
 
 [[package]]
 name = "beavermail-vault"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "argon2",
  "beavermail-core",
