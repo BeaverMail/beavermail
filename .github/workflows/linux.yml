@@ -18,7 +18,7 @@ jobs:
     # The oldest supported Ubuntu, so the binary runs on systems with an older glibc too.
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
@@ -41,11 +41,11 @@ jobs:
           tar -czf dist/beavermail-linux-x64.tar.gz -C dist beavermail
           cargo deb -p beavermail --no-build --output dist/
       # Uploaded before the tests, so a test that fails only here still leaves the build to try.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: beavermail-linux-x64
           path: dist/beavermail-linux-x64.tar.gz
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: beavermail-linux-x64-deb
           path: dist/*.deb

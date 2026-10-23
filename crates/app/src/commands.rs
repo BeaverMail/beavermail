@@ -213,6 +213,8 @@ mod tests {
     #[test]
     fn every_command_is_listed_once_with_its_own_name_and_key() {
         let ctx = egui::Context::default();
+        // One frame loads the fonts: on macOS the keys are written with symbols (⌘) when a font has them.
+        ctx.run_ui(Default::default(), |_| {}).textures_delta.clear();
         for (i, a) in Command::ALL.iter().enumerate() {
             for b in &Command::ALL[i + 1..] {
                 assert_ne!(a, b, "listed twice");
@@ -222,7 +224,8 @@ mod tests {
             }
         }
         assert_eq!(Command::Reply.tip(&ctx), "Reply (R)");
-        assert_eq!(Command::NewMessage.keys(&ctx), "Ctrl+N or C");
+        let ctrl_n = ctx.format_shortcut(&KeyboardShortcut::new(CTRL, egui::Key::N));
+        assert_eq!(Command::NewMessage.keys(&ctx), format!("{ctrl_n} or C"));
     }
 
     #[test]

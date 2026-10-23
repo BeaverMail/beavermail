@@ -17,7 +17,7 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build
@@ -36,11 +36,11 @@ jobs:
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DVersion=$version /DBinary="$PWD\target\release\beavermail.exe" /O"$PWD\dist" crates\app\packaging\beavermail.iss
       # Uploaded before the tests, so a test that fails only on Windows still leaves the build to try.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: beavermail-windows-x64
           path: target/release/beavermail.exe
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: beavermail-windows-x64-setup
           path: dist/beavermail-setup-*.exe

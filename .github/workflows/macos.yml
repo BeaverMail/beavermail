@@ -18,7 +18,7 @@ jobs:
   build:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin, x86_64-apple-darwin
@@ -67,7 +67,7 @@ jobs:
           codesign --force --deep --sign - dist/BeaverMail.app
           ditto -c -k --keepParent dist/BeaverMail.app dist/beavermail-macos.zip
       # Uploaded before the tests, so a test that fails only on macOS still leaves the build to try.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: beavermail-macos
           path: dist/beavermail-macos.zip
