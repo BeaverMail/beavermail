@@ -162,9 +162,9 @@ pub fn palette_row(ui: &mut Ui, t: &Tokens, label: &str, keys: &str, chosen: boo
     if enabled { response.on_hover_cursor(egui::CursorIcon::PointingHand) } else { response }
 }
 
-/// A month to pick a day from: the chosen `day` filled, today ringed, days before `today` dimmed and
-/// out of reach; ‹ › move `month` (its first day). Drawn in place, so it works inside a menu.
-pub fn calendar(ui: &mut Ui, t: &Tokens, day: &mut chrono::NaiveDate, month: &mut chrono::NaiveDate, today: chrono::NaiveDate) {
+/// A month to pick a day from: the chosen `day` filled, today ringed, days before `earliest` (when
+/// given) dimmed and out of reach; ‹ › move `month` (its first day). Drawn in place, so it works inside a menu.
+pub fn calendar(ui: &mut Ui, t: &Tokens, day: &mut chrono::NaiveDate, month: &mut chrono::NaiveDate, today: chrono::NaiveDate, earliest: Option<chrono::NaiveDate>) {
     use chrono::{Datelike, Months};
     const CELL: egui::Vec2 = vec2(34.0, 30.0);
     let width = CELL.x * 7.0;
@@ -172,9 +172,9 @@ pub fn calendar(ui: &mut Ui, t: &Tokens, day: &mut chrono::NaiveDate, month: &mu
     // Rows of days, not controls: the theme's 40-point control height would space the weeks apart.
     ui.spacing_mut().interact_size.y = 0.0;
     ui.allocate_ui_with_layout(vec2(width, CELL.y), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-        let first = today.with_day(1).unwrap_or(today);
+        let first = earliest.map(|e| e.with_day(1).unwrap_or(e));
         let arrow = |ui: &mut Ui, text: &str, enabled: bool| ui.add_enabled(enabled, egui::Button::new(egui::RichText::new(text).size(18.0)).frame(false).min_size(CELL)).clicked();
-        if arrow(ui, "‹", *month > first) {
+        if arrow(ui, "‹", first.is_none_or(|first| *month > first)) {
             *month = month.checked_sub_months(Months::new(1)).unwrap_or(*month);
         }
         let title = month.format("%B %Y").to_string();
@@ -205,7 +205,7 @@ pub fn calendar(ui: &mut Ui, t: &Tokens, day: &mut chrono::NaiveDate, month: &mu
                     continue;
                 }
                 let date = *month + chrono::Duration::days((n - lead) as i64);
-                let open = date >= today;
+                let open = earliest.is_none_or(|e| date >= e);
                 let (rect, response) = ui.allocate_exact_size(CELL, if open { Sense::click() } else { Sense::hover() });
                 let spot = Rect::from_center_size(rect.center(), vec2(28.0, 26.0));
                 let chosen = date == *day;

@@ -68,6 +68,14 @@ pub enum ViewAction {
     Open(usize),
     /// A day picked in the month: its week is shown.
     Day(NaiveDate),
+    /// An empty time clicked in the week: a new event then, minutes past midnight.
+    New(NaiveDate, u32),
+}
+
+/// What the user asked of an event's details.
+pub enum EventAction {
+    Edit,
+    Delete,
 }
 
 /// The range a view shows around `day`, as (first day, days).
@@ -142,7 +150,8 @@ pub fn week(ui: &mut egui::Ui, t: &Tokens, from: NaiveDate, items: &[Item], toda
     ui.painter().hline(band.x_range(), band.bottom(), Stroke::new(1.0, t.border));
     // The hours.
     egui::ScrollArea::vertical().id_salt("week_hours").auto_shrink([false, false]).show(ui, |ui| {
-        let (grid, _) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0 * HOUR), Sense::hover());
+        // Events are placed over it afterwards, so a click on one opens it and a click beside adds one.
+        let (grid, empty) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0 * HOUR), Sense::click());
         // To the working morning, once the grid is laid out (an offset set before would be clamped to
         // nothing on the first frame, before the area knows how tall it is).
         if morning {
@@ -183,6 +192,15 @@ pub fn week(ui: &mut egui::Ui, t: &Tokens, from: NaiveDate, items: &[Item], toda
                     action = Some(ViewAction::Open(at));
                 }
             }
+        }
+        if empty.clicked()
+            && let Some(pos) = empty.interact_pointer_pos()
+            && pos.x >= grid.left() + GUTTER
+            && let Some(day) = days.get(((pos.x - grid.left() - GUTTER) / column) as usize)
+        {
+            // The half hour clicked.
+            let minutes = ((pos.y - grid.top()) / HOUR * 2.0).floor().clamp(0.0, 47.0) as u32 * 30;
+            action = Some(ViewAction::New(*day, minutes));
         }
         // Now, across today's column.
         if let Some(d) = days.iter().position(|d| *d == today) {
@@ -358,8 +376,9 @@ pub fn agenda(ui: &mut egui::Ui, t: &Tokens, from: NaiveDate, days: i64, items: 
 
 /// An event's details: what, when (in its own zone too when that is another), where, which calendar,
 /// who organises it and who is invited with their answers, and its description. Returns a link
-/// clicked, cleaned of tracking; `close` is set when it is closed.
-pub fn details(ui: &mut egui::Ui, t: &Tokens, item: &Item, calendar: &str, close: &mut bool) -> Option<String> {
+/// clicked, cleaned of tracking; `close` is set when it is closed, `act` when Edit or Delete is
+/// pressed. `can`: whether it can be changed and deleted here, or why not.
+pub fn details(ui: &mut egui::Ui, t: &Tokens, item: &Item, calendar: &str, can: (Result<(), &str>, Result<(), &str>), close: &mut bool, act: &mut Option<EventAction>) -> Option<String> {
     let event = &item.occurrence.event;
     let mut url = None;
     ui.horizontal(|ui| {
@@ -399,6 +418,17 @@ pub fn details(ui: &mut egui::Ui, t: &Tokens, item: &Item, calendar: &str, close
         let (r, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
         ui.painter().rect_filled(r, CornerRadius::same(3), item.color);
         ui.label(RichText::new(calendar).size(13.0).color(t.text_dim));
+    });
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        let (edit, delete) = can;
+        let button = |icon: Icon, text: &str, color| egui::Button::image_and_text(icon.image(icons::SIZE, color), RichText::new(text).color(color));
+        if ui.add_enabled(edit.is_ok(), button(Icon::Pencil, "Edit", t.text)).on_disabled_hover_text(edit.err().unwrap_or_default()).clicked() {
+            *act = Some(EventAction::Edit);
+        }
+        if ui.add_enabled(delete.is_ok(), button(Icon::Trash, "Delete", t.danger)).on_disabled_hover_text(delete.err().unwrap_or_default()).clicked() {
+            *act = Some(EventAction::Delete);
+        }
     });
     match event.status.as_str() {
         "CANCELLED" => views::note(ui, Icon::Ban, t.danger, "Cancelled by the organiser", ""),
@@ -669,7 +699,7 @@ mod tests {
                 assert!(month(ui, &t, monday, 10, &items, monday).is_none());
                 assert!(agenda(ui, &t, monday, 30, &items, monday).is_none());
                 let mut close = false;
-                assert!(details(ui, &t, &items[1], "Work", &mut close).is_none() && !close);
+                assert!(details(ui, &t, &items[1], "Work", (Ok(()), Ok(())), &mut close, &mut None).is_none() && !close);
                 let invite = ical::parse("BEGIN:VCALENDAR\nMETHOD:REQUEST\nBEGIN:VEVENT\nUID:i\nSUMMARY:Plan review\nDTSTART:20261013T090000Z\nDTEND:20261013T100000Z\nORGANIZER;CN=Ada:mailto:ada@example.org\nATTENDEE:mailto:bob@example.org\nEND:VEVENT\nEND:VCALENDAR\n");
                 let info = InviteInfo { conflicts: vec!["Standup".into()], ..Default::default() };
                 assert!(invitation_card(ui, &t, &invite, &info, Ok(())).is_none());

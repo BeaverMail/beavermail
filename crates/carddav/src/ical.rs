@@ -6,7 +6,7 @@
 
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
 
-use crate::vcard::{split_unquoted, unescape, unfold};
+use crate::vcard::{escape, split_unquoted, unescape, unfold};
 
 /// A calendar object, or the calendar part of a message.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -341,6 +341,61 @@ pub fn as_kept(text: &str) -> String {
     fold(&unfold(text).into_iter().filter(|l| !l.to_ascii_uppercase().starts_with("METHOD:")).collect::<Vec<_>>())
 }
 
+/// What the user writes of an event of their own: its title, place, notes and times. An all-day event
+/// has dates (its end the day after its last), a timed one moments in UTC.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Draft {
+    pub summary: String,
+    pub location: String,
+    pub description: String,
+    pub start: When,
+    pub end: When,
+}
+
+/// The properties a [`Draft`] sets; an event written over keeps all the others (people, alarms…).
+const DRAFTED: [&str; 9] = ["SUMMARY", "LOCATION", "DESCRIPTION", "DTSTART", "DTEND", "DURATION", "DTSTAMP", "LAST-MODIFIED", "SEQUENCE"];
+
+/// The calendar object for `draft`: a new event with this `uid`, or, given the text kept (`old`), that
+/// event with the draft's values in place of its own and its sequence one higher, the rest untouched.
+pub fn written(old: Option<&str>, uid: &str, draft: &Draft, now: DateTime<Utc>) -> String {
+    let stamp = now.format("%Y%m%dT%H%M%SZ").to_string();
+    let when = |name: &str, w: &When| if w.date_only { format!("{name};VALUE=DATE:{}", w.value) } else { format!("{name}:{}", w.value) };
+    let mut drafted = vec![format!("SUMMARY:{}", escape(draft.summary.trim())), when("DTSTART", &draft.start), when("DTEND", &draft.end)];
+    for (name, value) in [("LOCATION", &draft.location), ("DESCRIPTION", &draft.description)] {
+        if !value.trim().is_empty() {
+            drafted.push(format!("{name}:{}", escape(value.trim())));
+        }
+    }
+    drafted.extend([format!("DTSTAMP:{stamp}"), format!("LAST-MODIFIED:{stamp}")]);
+    let Some(old) = old else {
+        let mut out = vec!["BEGIN:VCALENDAR".to_owned(), "VERSION:2.0".to_owned(), "PRODID:-//BeaverMail//Calendar//EN".to_owned(), "BEGIN:VEVENT".to_owned(), format!("UID:{uid}"), format!("CREATED:{stamp}"), "SEQUENCE:0".to_owned()];
+        out.extend(drafted);
+        out.extend(["END:VEVENT".to_owned(), "END:VCALENDAR".to_owned()]);
+        return fold(&out);
+    };
+    let sequence = parse(old).events.first().map_or(0, |e| e.sequence) + 1;
+    let (mut out, mut open) = (Vec::new(), Vec::<String>::new());
+    for line in unfold(old) {
+        let Some((head, value)) = split_unquoted(&line) else { continue };
+        let name = split_params(head)[0].to_ascii_uppercase();
+        let in_event = open.last().is_some_and(|c| c == "VEVENT");
+        match name.as_str() {
+            "BEGIN" => open.push(value.trim().to_ascii_uppercase()),
+            "END" => {
+                if in_event {
+                    out.extend(drafted.iter().cloned());
+                    out.push(format!("SEQUENCE:{sequence}"));
+                }
+                open.pop();
+            }
+            _ if in_event && DRAFTED.contains(&name.as_str()) => continue,
+            _ => {}
+        }
+        out.push(line);
+    }
+    fold(&out)
+}
+
 /// Lines folded at 75 octets (RFC 5545 3.1), never inside a character, ending in CRLF.
 fn fold(lines: &[String]) -> String {
     let mut out = String::new();
@@ -401,6 +456,34 @@ mod tests {
         assert!(!kept.contains("RSVP=TRUE") && kept.contains("RRULE:FREQ=WEEKLY"), "the rest as it was: {kept}");
         let elsewhere = parse(&with_answer(INVITE, "carl@example.org", "ACCEPTED"));
         assert_eq!(elsewhere.events[0].attendees.len(), 2, "added when not invited by name");
+    }
+
+    #[test]
+    fn a_new_event_is_written_whole_and_an_edited_one_keeps_what_the_draft_does_not_set() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 1, 8, 0, 0).unwrap();
+        let draft = Draft {
+            summary: "Lunch, with Ada".into(),
+            location: "Café; upstairs".into(),
+            description: "Bring\nthe plan".replace("\\n", "\n"),
+            start: When { value: "20261012T110000Z".into(), tzid: None, date_only: false },
+            end: When { value: "20261012T120000Z".into(), tzid: None, date_only: false },
+        };
+        let new = written(None, "lunch-1@example.org", &draft, now);
+        let e = &parse(&new).events[0];
+        assert_eq!((e.uid.as_str(), e.summary.as_str(), e.location.as_str(), e.sequence), ("lunch-1@example.org", "Lunch, with Ada", "Café; upstairs", 0));
+        assert_eq!(e.end.as_ref().and_then(When::utc).map(|t| t.to_rfc3339()), Some("2026-10-12T12:00:00+00:00".into()));
+        assert!(new.contains("DTSTAMP:20261001T080000Z") && new.ends_with("END:VCALENDAR\r\n"), "{new}");
+
+        let all_day = Draft { summary: "Off".into(), start: When { value: "20261012".into(), tzid: None, date_only: true }, end: When { value: "20261014".into(), tzid: None, date_only: true }, ..Default::default() };
+        let edited = written(Some(INVITE), "plan-42@example.org", &all_day, now);
+        let read = parse(&edited);
+        let e = &read.events[0];
+        assert_eq!((e.summary.as_str(), e.location.as_str(), e.sequence), ("Off", "", 3), "the draft's values, one sequence on");
+        assert!(e.start.as_ref().is_some_and(|s| s.date_only && s.value == "20261012"), "{edited}");
+        assert_eq!((e.attendees.len(), e.organizer.is_some()), (1, true), "the people stay");
+        assert!(edited.contains("BEGIN:VALARM") && edited.contains("TRIGGER:-PT15M") && edited.contains("BEGIN:VTIMEZONE"), "the rest as it was: {edited}");
+        assert!(!edited.contains("Agenda") && !edited.contains("Room 2"), "what the draft leaves empty goes: {edited}");
+        assert_eq!(edited.matches("SUMMARY:").count(), 1, "the alarm's own lines are not the event's: {edited}");
     }
 
     #[test]

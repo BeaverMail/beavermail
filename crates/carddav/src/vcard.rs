@@ -67,7 +67,7 @@ pub(crate) fn unescape(value: &str) -> String {
     out
 }
 
-fn escape(value: &str) -> String {
+pub(crate) fn escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace(',', "\\,").replace(';', "\\;").replace("\r\n", "\\n").replace('\n', "\\n")
 }
 

@@ -17,6 +17,7 @@ mod card;
 mod commands;
 mod compose;
 mod drafts;
+mod event_form;
 mod encryption;
 mod original;
 mod remote;
@@ -822,7 +823,7 @@ impl SettingsPage {
     }
 }
 
-const FORM_WIDTH: f32 = 460.0;
+pub(crate) const FORM_WIDTH: f32 = 460.0;
 const SETTINGS_WIDTH: f32 = 780.0;
 const PALETTE_WIDTH: f32 = 560.0;
 /// How far the toast sits above the window's bottom edge: clear of the status bar.
@@ -831,7 +832,7 @@ const PALETTE_LIST_H: f32 = 360.0;
 /// The settings sidebar, page list and accounts.
 const SETTINGS_NAV: f32 = 220.0;
 /// Text field width in the account form: the form minus its label column and spacing.
-const FIELD_WIDTH: f32 = 310.0;
+pub(crate) const FIELD_WIDTH: f32 = 310.0;
 
 fn form_grid(ui: &mut egui::Ui, id: &str, add: impl FnOnce(&mut egui::Ui)) {
     egui::Grid::new(id).num_columns(2).spacing([16.0, 12.0]).min_col_width(84.0).show(ui, add);
@@ -1224,6 +1225,10 @@ struct BeaverApp {
     /// index, message, action). Kept in the vault too (see [`Self::save_offline`]), so closing the app
     /// does not drop them.
     offline_changes: Vec<(u64, usize, MessageId, Action)>,
+    /// Changes sent to the server and not answered yet, as in `offline_changes`; closing waits for them.
+    in_flight: Vec<(u64, usize, MessageId, Action)>,
+    /// The window was closed with changes in flight: it closes once they are answered.
+    closing: bool,
     /// The pane F6 moved the keys to; `None` until then, and again after a click in the list.
     pane: Option<Pane>,
     /// A scroll of the reader asked for from the keyboard, done when it is next drawn.
@@ -1257,6 +1262,10 @@ struct BeaverApp {
     calendars_syncing: std::collections::HashSet<String>,
     /// Stop syncing was asked for this calendar (by URL), until confirmed.
     confirm_calendar_remove: Option<String>,
+    /// The dialog to add or change an event, while open.
+    event_form: Option<event_form::EventForm>,
+    /// Asking whether to delete the event with this UID.
+    confirm_event_delete: Option<String>,
     /// Other messages of the open conversation shown open in the reader, beside the tab's own
     /// (`message`), in the order they were opened.
     unfolded: Vec<Unfolded>,
@@ -1396,6 +1405,8 @@ impl BeaverApp {
             scheduled: Vec::new(),
             show_scheduled: false,
             offline_changes: Vec::new(),
+            in_flight: Vec::new(),
+            closing: false,
             work_offline: false,
             pane: None,
             reader_scroll: None,
@@ -1417,6 +1428,8 @@ impl BeaverApp {
             add_calendar: None,
             calendars_syncing: Default::default(),
             confirm_calendar_remove: None,
+            event_form: None,
+            confirm_event_delete: None,
             unfolded: Vec::new(),
             folded_anchor: false,
             list_view: (0.0, 0.0),
@@ -2069,7 +2082,7 @@ impl BeaverApp {
                 let done = if matches!(action, Action::Archive) { "Archived" } else { "Moved to Trash" };
                 pending.text = format!("{done} {n} message{}", if n == 1 { "" } else { "s" });
             }
-            None => self.spawn(async move { Event::Done(serial, index, Some((id, action)), perform(source, id, action).await) }),
+            None => self.change(source, serial, index, id, action),
         }
         if action.removes() {
             // The message left its folder: its tab goes, and triage goes on with the one that took
@@ -2169,12 +2182,18 @@ impl BeaverApp {
         });
     }
 
+    /// Makes `action` on the server, kept in `in_flight` until it answers.
+    fn change(&mut self, source: Arc<ImapSource>, serial: u64, index: usize, id: MessageId, action: Action) {
+        self.in_flight.push((serial, index, id, action));
+        self.spawn(async move { Event::Done(serial, index, Some((id, action)), perform(source, id, action).await) });
+    }
+
     /// Sends the Archive or Move to Trash that was waiting for Undo.
     fn send_pending(&mut self) {
         let Some(pending) = self.pending.take() else { return };
         for (serial, index, action, message, _) in pending.items {
             if let Some(source) = self.view(serial).and_then(|v| v.source.clone()) {
-                self.spawn(async move { Event::Done(serial, index, Some((message.id, action)), perform(source, message.id, action).await) });
+                self.change(source, serial, index, message.id, action);
             }
         }
     }
@@ -2659,8 +2678,7 @@ impl BeaverApp {
                 self.save_offline(); // one that fails offline again comes back through Event::Done
             }
             for (serial, index, id, action) in now {
-                let source = source.clone();
-                self.spawn(async move { Event::Done(serial, index, Some((id, action)), perform(source, id, action).await) });
+                self.change(source.clone(), serial, index, id, action);
             }
         }
         let open = self.compose.as_ref().map(|c| c.id.clone());
@@ -2846,6 +2864,38 @@ impl BeaverApp {
             }
         }
         self.compose = Some(compose);
+    }
+
+    /// Closing waits for the changes in flight; Quit now keeps them for the next run instead.
+    fn closing_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
+        if !self.closing {
+            return;
+        }
+        let n = self.in_flight.len();
+        let mut quit = n == 0;
+        if n > 0 {
+            egui::Modal::new(egui::Id::new("closing")).show(ctx, |ui| {
+                ui.set_width(FORM_WIDTH * 0.8);
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().size(16.0));
+                    ui.heading("Finishing changes on the server");
+                });
+                let text = format!("BeaverMail closes once the server confirms {n} change{}.", if n == 1 { "" } else { "s" });
+                ui.label(RichText::new(text).color(t.text_dim));
+                ui.add_space(12.0);
+                ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
+                    quit = ui.button(accelerated("Quit now", 0, egui::Color32::PLACEHOLDER)).on_hover_text("The changes are made at the next start").clicked();
+                });
+            });
+            quit |= ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Q));
+        }
+        if quit {
+            if n > 0 {
+                self.offline_changes.append(&mut self.in_flight);
+                self.save_offline();
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
     }
 
     /// The stored mail is protected by a passphrase that has not been entered, and the prompt is showing.
@@ -3975,6 +4025,91 @@ impl BeaverApp {
         }
     }
 
+    /// Opens the dialog for a new event on `day`: at `minutes` past midnight when an hour was clicked,
+    /// else at the next full hour today or nine o'clock another day; in the default calendar.
+    fn new_event(&mut self, day: chrono::NaiveDate, minutes: Option<u32>) {
+        self.ensure_local_calendar();
+        let now = chrono::Local::now();
+        let minutes = minutes.unwrap_or(if day == now.date_naive() { (chrono::Timelike::hour(&now) + 1).min(23) * 60 } else { 9 * 60 });
+        let calendar = self.settings.calendars.iter().find(|c| c.default && !c.read_only).or_else(|| self.settings.calendars.iter().find(|c| c.is_local())).map(|c| c.url.clone()).unwrap_or_default();
+        self.event_form = Some(event_form::EventForm::new(day, minutes, &calendar));
+    }
+
+    /// Whether an event can be changed and deleted here, or why not. Only the user's own: not in a
+    /// read-only calendar, not an invitation from someone else, not a meeting whose people would not be
+    /// told; a repeating one can only be deleted (all of it) for now.
+    fn event_can(&self, item: &calview::Item) -> (Result<(), &'static str>, Result<(), &'static str>) {
+        let event = &item.occurrence.event;
+        let own: Vec<String> = self.accounts.iter().map(|v| v.account.address().to_lowercase()).collect();
+        if self.settings.calendars.iter().find(|c| c.url == item.calendar).is_none_or(|c| c.read_only) {
+            let why = "A read-only calendar: it cannot be changed here";
+            return (Err(why), Err(why));
+        }
+        if event.organizer.as_ref().is_some_and(|o| !own.contains(&o.email)) {
+            let why = "An invitation: its organiser changes it. Answer it from its message";
+            return (Err(why), Err(why));
+        }
+        if event.attendees.iter().any(|a| !own.contains(&a.email)) {
+            let why = "A meeting with people invited: they would not be told of a change made here";
+            return (Err(why), Err(why));
+        }
+        if !event.rules.is_empty() || !event.rdates.is_empty() || event.recurrence_id.is_some() {
+            return (Err("A repeating event: it can only be deleted here, all of it, for now"), Ok(()));
+        }
+        (Ok(()), Ok(()))
+    }
+
+    /// The new-event dialog and the question before deleting one.
+    fn event_dialogs(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
+        let targets: Vec<(String, String)> = self.settings.calendars.iter().filter(|c| !c.read_only).map(|c| (c.url.clone(), c.name.clone())).collect();
+        if let Some((form, draft)) = event_form::dialog(ctx, t, &mut self.event_form, &targets) {
+            let (uid, old) = match &form.uid {
+                Some(uid) => (uid.clone(), self.archive.events_with_uid(uid).unwrap_or_default().into_iter().next().map(|k| k.ics)),
+                None => (beavermail_carddav::new_uid(), None),
+            };
+            if form.uid.is_some() && old.is_none() {
+                self.error = Some("The event is no longer here: it was deleted meanwhile".into());
+                return;
+            }
+            let ics = beavermail_carddav::ical::written(old.as_deref(), &uid, &draft, chrono::Utc::now());
+            self.put_event(&uid, ics, Some(&form.calendar));
+            // What the details showed is the old version.
+            self.calendar_open = None;
+            self.notice = Some((if form.uid.is_some() { "Changes saved" } else { "Event added" }.into(), std::time::Instant::now()));
+        }
+        let Some(uid) = self.confirm_event_delete.clone() else { return };
+        let kept = self.archive.events_with_uid(&uid).unwrap_or_default().into_iter().next();
+        let event = kept.as_ref().and_then(|k| beavermail_carddav::ical::parse(&k.ics).events.into_iter().find(|e| e.recurrence_id.is_none()));
+        let title = event.as_ref().map(|e| e.summary.trim().to_owned()).filter(|s| !s.is_empty()).unwrap_or_else(|| "this event".into());
+        let repeats = event.as_ref().is_some_and(|e| !e.rules.is_empty() || !e.rdates.is_empty());
+        let local = kept.as_ref().is_some_and(|k| k.calendar == beavermail_core::CalendarSource::LOCAL);
+        let (mut confirm, mut cancel) = (false, false);
+        let modal = egui::Modal::new(egui::Id::new("confirm_event_delete")).show(ctx, |ui| {
+            ui.set_width(FORM_WIDTH * 0.85);
+            ui.heading(format!("Delete {title}?"));
+            let what = match (repeats, local) {
+                (true, true) => "Every time it repeats goes.",
+                (true, false) => "Every time it repeats goes, on the server too.",
+                (false, true) => "It leaves your calendar.",
+                (false, false) => "It leaves your calendar, on the server too.",
+            };
+            ui.label(RichText::new(what).color(t.text_dim));
+            ui.add_space(12.0);
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
+                confirm = ui.add(egui::Button::new(RichText::new("Delete event").color(t.on_accent)).fill(t.danger)).clicked();
+                cancel = ui.button("Cancel").clicked();
+            });
+        });
+        if confirm {
+            self.remove_event(&uid);
+            self.calendar_open = None;
+            self.notice = Some(("Event deleted".into(), std::time::Instant::now()));
+        }
+        if confirm || cancel || modal.should_close() {
+            self.confirm_event_delete = None;
+        }
+    }
+
     /// What the calendars here say about the event of `ics`: whether one has it, the answer given, and
     /// what else happens at that time.
     fn invite_info(&mut self, ics: &str) -> (beavermail_carddav::ical::Calendar, calview::InviteInfo) {
@@ -4048,7 +4183,7 @@ impl BeaverApp {
                 }
                 // Declined too, it stays in the calendar with the answer (as servers keep it), so the
                 // answer is remembered and can be changed; the views leave it out.
-                self.put_event(&event.uid, beavermail_carddav::ical::with_answer(&ics, &me, partstat));
+                self.put_event(&event.uid, beavermail_carddav::ical::with_answer(&ics, &me, partstat), None);
                 let said = match partstat {
                     "ACCEPTED" => "Accepted: the organiser is told, and it is in your calendar",
                     "TENTATIVE" => "Answered maybe: the organiser is told, and it is in your calendar as tentative",
@@ -4057,7 +4192,7 @@ impl BeaverApp {
                 self.notice = Some((said.into(), std::time::Instant::now()));
             }
             calview::Invite::Remove => self.remove_event(&event.uid),
-            calview::Invite::Add => self.put_event(&event.uid, beavermail_carddav::ical::as_kept(&ics)),
+            calview::Invite::Add => self.put_event(&event.uid, beavermail_carddav::ical::as_kept(&ics), None),
             calview::Invite::Show => self.show_event(&event.uid),
             calview::Invite::Open(_) => {}
         }
@@ -4079,15 +4214,17 @@ impl BeaverApp {
         self.calendar_open = self.calendar_items(from, days).iter().find(|i| i.occurrence.uid == uid).cloned();
     }
 
-    /// Keeps an event in the calendar that has it already (an update), else in the default calendar
-    /// (the one on this computer when there is no other): on the server first, then here.
-    fn put_event(&mut self, uid: &str, ics: String) {
+    /// Keeps an event in the calendar that has it already (an update), else in `into` when given and
+    /// writable, else in the default calendar (the one on this computer when there is no other): on the
+    /// server first, then here.
+    fn put_event(&mut self, uid: &str, ics: String, into: Option<&str>) {
         self.ensure_local_calendar();
         let span = beavermail_carddav::calendar::span(&ics);
         let (calendar, href, etag) = match self.archive.events_with_uid(uid).unwrap_or_default().into_iter().next() {
             Some(kept) => (kept.calendar, kept.href, Some(kept.etag)),
             None => {
-                let target = self.settings.calendars.iter().find(|c| c.default && !c.read_only).or_else(|| self.settings.calendars.iter().find(|c| c.is_local())).cloned();
+                let chosen = into.and_then(|url| self.settings.calendars.iter().find(|c| c.url == url && !c.read_only));
+                let target = chosen.or_else(|| self.settings.calendars.iter().find(|c| c.default && !c.read_only)).or_else(|| self.settings.calendars.iter().find(|c| c.is_local())).cloned();
                 let Some(target) = target else { return };
                 let href = if target.is_local() { format!("{uid}.ics") } else { beavermail_carddav::calendar::Calendar::open(&target.url, "", "").new_href(uid) };
                 (target.url, href, None)
@@ -4186,7 +4323,7 @@ impl BeaverApp {
         let typing = ui.ctx().egui_wants_keyboard_input() || egui::Popup::is_any_open(ui.ctx());
         let mut action = None;
         // The keys of the section: T today, left and right for the previous and next range, W, M and A for the views.
-        if !typing && self.add_calendar.is_none() && self.confirm_calendar_remove.is_none() && self.palette.is_none() && !self.show_settings {
+        if !typing && self.add_calendar.is_none() && self.confirm_calendar_remove.is_none() && self.event_form.is_none() && self.confirm_event_delete.is_none() && self.palette.is_none() && !self.show_settings {
             let key = |k| ui.input(|i| i.key_pressed(k) && !i.modifiers.command && !i.modifiers.alt);
             let step = match self.calendar_view {
                 calview::View::Week => 7,
@@ -4202,6 +4339,9 @@ impl BeaverApp {
             if key(egui::Key::T) {
                 self.calendar_day = today;
                 self.calendar_morning = true;
+            }
+            if key(egui::Key::N) {
+                self.new_event(self.calendar_day, None);
             }
             if key(egui::Key::ArrowLeft) {
                 self.calendar_day = shift(self.calendar_day, true);
@@ -4248,26 +4388,37 @@ impl BeaverApp {
         let mut url = None;
         if let Some(item) = self.calendar_open.clone() {
             let name = self.settings.calendars.iter().find(|c| c.url == item.calendar).map(|c| c.name.clone()).unwrap_or_default();
-            let mut close = false;
+            let can = self.event_can(&item);
+            let (mut close, mut act) = (false, None);
             let frame = egui::Frame::new().fill(t.surface).inner_margin(egui::Margin::same(24));
             egui::Panel::right("event").frame(frame).default_size(380.0).size_range(320.0..=560.0).show(ui, |ui| {
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                    url = calview::details(ui, t, &item, &name, &mut close);
+                    url = calview::details(ui, t, &item, &name, can, &mut close, &mut act);
                 });
             });
             if close {
                 self.calendar_open = None;
             }
+            match act {
+                Some(calview::EventAction::Edit) => self.event_form = Some(event_form::EventForm::editing(&item)),
+                Some(calview::EventAction::Delete) => self.confirm_event_delete = Some(item.occurrence.uid.clone()),
+                None => {}
+            }
         }
         let (from, days) = calview::range(self.calendar_view, self.calendar_day);
         let items = self.calendar_items(from, days);
-        let mut view_action = None;
+        let (mut view_action, mut new_event) = (None, false);
         let frame = egui::Frame::new().fill(t.surface).inner_margin(egui::Margin { left: 16, right: 16, top: 12, bottom: 8 });
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
             let (title, week) = calview::title(self.calendar_view, self.calendar_day);
             ui.horizontal(|ui| {
                 ui.label(RichText::new(title).size(22.0).family(theme::bold()).color(t.text));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let new = egui::Button::image_and_text(Icon::Plus.image(icons::SIZE, t.on_accent), RichText::new("New event").color(t.on_accent)).fill(t.accent);
+                    if ui.add(new).on_hover_text("Add an event (N)").clicked() {
+                        new_event = true;
+                    }
+                    ui.add_space(8.0);
                     if ui.button("Today").on_hover_text("Back to today (T)").clicked() {
                         self.calendar_day = today;
                         self.calendar_morning = true;
@@ -4308,7 +4459,11 @@ impl BeaverApp {
             Some(calview::ViewAction::Day(day)) => {
                 (self.calendar_day, self.calendar_view, self.calendar_morning) = (day, calview::View::Week, true);
             }
+            Some(calview::ViewAction::New(day, minutes)) => self.new_event(day, Some(minutes)),
             None => {}
+        }
+        if new_event {
+            self.new_event(self.calendar_day, None);
         }
         if let Some(a) = action {
             self.calendar_action(a);
@@ -4851,7 +5006,7 @@ impl BeaverApp {
     /// first picked, as a list shows it selected.
     fn toggle_pick(&mut self, id: MessageId) {
         if self.picked.is_empty()
-            && let Some(open) = self.message.filter(|open| *open != id && self.listed().contains(open))
+            && let Some(open) = self.listed_open(&self.listed()).filter(|open| *open != id)
         {
             self.picked.push(open);
         }
@@ -4866,10 +5021,16 @@ impl BeaverApp {
         }
     }
 
+    /// The row of `ids` showing the open message: in conversations, the row of its conversation.
+    fn listed_open(&self, ids: &[MessageId]) -> Option<MessageId> {
+        let open = self.message?;
+        ids.iter().copied().find(|i| *i == open).or_else(|| ids.iter().copied().find(|i| self.threaded() && self.conversations.same(*i, open)))
+    }
+
     /// Shift+click: picks every message from the first picked (or the open one) to `id`, in list order.
     fn pick_range(&mut self, id: MessageId) {
         let ids = self.listed();
-        let Some(anchor) = self.picked.first().copied().or(self.message) else { return self.move_to(id) };
+        let Some(anchor) = self.picked.first().copied().or_else(|| self.listed_open(&ids)) else { return self.move_to(id) };
         if let Some(range) = range(&ids, anchor, id) {
             self.picked = range;
         }
@@ -5066,18 +5227,27 @@ impl BeaverApp {
         } else if !ids.is_empty() {
             let page = (self.list_view.1 / views::MESSAGE_ROW_H).floor().max(1.0) as isize;
             let last = ids.len() - 1;
+            // With Shift the open message stays the anchor and the far end of the picked range moves.
+            let anchor = if shift { self.picked.first().copied().or_else(|| self.listed_open(&ids)) } else { None };
+            let at = |id: MessageId| ids.iter().position(|i| *i == id);
+            let from = match anchor.and_then(at) {
+                Some(a) => self.picked.iter().filter_map(|p| at(*p)).max_by_key(|p| p.abs_diff(a)).or(Some(a)),
+                None => pos,
+            };
             let next = match () {
-                _ if key(egui::Key::ArrowDown) => Some(pos.map_or(0, |p| p.saturating_add(1))),
-                _ if key(egui::Key::ArrowUp) => Some(pos.map_or(0, |p| p.saturating_sub(1))),
-                _ if key(egui::Key::PageDown) => Some(pos.map_or(0, |p| p.saturating_add_signed(page))),
-                _ if key(egui::Key::PageUp) => Some(pos.map_or(0, |p| p.saturating_add_signed(-page))),
+                _ if key(egui::Key::ArrowDown) => Some(from.map_or(0, |p| p.saturating_add(1))),
+                _ if key(egui::Key::ArrowUp) => Some(from.map_or(0, |p| p.saturating_sub(1))),
+                _ if key(egui::Key::PageDown) => Some(from.map_or(0, |p| p.saturating_add_signed(page))),
+                _ if key(egui::Key::PageUp) => Some(from.map_or(0, |p| p.saturating_add_signed(-page))),
                 _ if key(egui::Key::Home) => Some(0),
                 _ if key(egui::Key::End) => Some(last),
                 _ => None,
             };
             if let Some(next) = next.map(|n| n.min(last)) {
                 self.list_reveal = Some(next);
-                if pos != Some(next) {
+                if let Some(range) = anchor.and_then(|a| range(&ids, a, ids[next])) {
+                    self.picked = if range.len() >= 2 { range } else { Vec::new() };
+                } else if pos != Some(next) {
                     self.move_to(ids[next]);
                 }
             }
@@ -5357,6 +5527,11 @@ impl BeaverApp {
     }
 
     fn apply(&mut self, event: Event) {
+        if let Event::Done(serial, _, Some((id, _)), _) = &event
+            && let Some(at) = self.in_flight.iter().position(|c| c.0 == *serial && c.2 == *id)
+        {
+            self.in_flight.remove(at);
+        }
         match event {
             Event::Mailboxes(serial, result, fresh) => {
                 let selected_name = self.selected.filter(|(s, _)| *s == serial).and_then(|(_, i)| self.view(serial)?.mailboxes.get(i)).map(|m| m.name.clone());
@@ -7185,6 +7360,13 @@ impl eframe::App for BeaverApp {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
             (self.confirm_discard, self.quitting) = (true, true);
         }
+        // Changes still on their way to the server are waited for in a dialog, rather than in a window
+        // that stops answering on the way out.
+        if ui.ctx().input(|i| i.viewport().close_requested()) && !self.confirm_discard && (self.pending.is_some() || !self.in_flight.is_empty()) {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.send_pending();
+            self.closing = true;
+        }
         if self.settings.threads {
             self.conversations.update(&self.messages, &self.sent);
         }
@@ -7369,6 +7551,7 @@ impl eframe::App for BeaverApp {
         self.new_contact_dialog(ui.ctx(), &t);
         self.book_remove_dialog(ui.ctx(), &t);
         self.calendar_remove_dialog(ui.ctx(), &t);
+        self.event_dialogs(ui.ctx(), &t);
         let added: Vec<String> = self.settings.calendars.iter().map(|c| c.url.clone()).collect();
         if let Some(action) = books::add_dialog(ui.ctx(), &t, &mut self.add_calendar, &added.iter().map(String::as_str).collect::<Vec<_>>(), &calendars::CALENDARS) {
             match action {
@@ -7401,6 +7584,7 @@ impl eframe::App for BeaverApp {
         }
         self.drop_files_on_the_app(ui.ctx(), &t);
         self.compose_window(ui.ctx(), &t);
+        self.closing_dialog(ui.ctx(), &t);
         if add {
             self.form = Some(NewAccount::default());
         }

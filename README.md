@@ -30,7 +30,7 @@ Licensed under AGPL-3.0-only (see [LICENSE](LICENSE)).
 - Markdown compose, addresses as chips (a wrong one in red) with suggestions from everyone you wrote to, Cc and Bcc on demand (Bcc kept in your Sent copy only), drafts kept locally and on the server, attachments; undo send (configurable), send later, signatures per account.
 - Conversations: one row per thread (References, In-Reply-To, "Re:" subjects) with your replies from Sent, read in a row with several messages open and quoted text folded; can be turned off.
 - Messages open in tabs (double click); the reading pane beside the list can be turned off, and then every message opens in a tab.
-- Calendar, from the rail: CalDAV calendars and one on this computer, in week, month and agenda views, with repeating events and time zones; keys T (today), Left/Right, W, M, A. Invitations in mail: Accept, Maybe or Decline, with what they clash with; cancellations and events to add.
+- Calendar, from the rail: CalDAV calendars and one on this computer, in week, month and agenda views, with repeating events and time zones; keys T (today), Left/Right, W, M, A. New event (N, or a click on an empty hour of the week), and the user's own events changed or deleted from their details. Invitations in mail: Accept, Maybe or Decline, with what they clash with; cancellations and events to add.
 
 Keys (Ctrl+K lists every command with its key, and goes to any folder): Up/Down, Page Up/Down, Home/End, F6 (list or reader; in the reader the same keys and Space scroll), Enter, E, Delete, U, P (pin), S (star), 1–5 (labels), `!` (spam), C or Ctrl+N (new), R, A, F, `/`, Ctrl+U (source, Ctrl+F finds in it), Ctrl+W, Ctrl+Tab; in a new message Esc or Ctrl+Shift+D discards.
 

@@ -1182,7 +1182,7 @@ fn pick_when(ctx: &egui::Context, t: &Tokens, compose: &mut Compose) -> Option<i
         // As Gmail: the month on the left, the day picked and the time on the right.
         ui.horizontal_top(|ui| {
             // Its own column: inside the row it would lay its weeks side by side.
-            ui.vertical(|ui| views::calendar(ui, t, &mut compose.later_day, &mut compose.later_month, now.date_naive()));
+            ui.vertical(|ui| views::calendar(ui, t, &mut compose.later_day, &mut compose.later_month, now.date_naive(), Some(now.date_naive())));
             ui.add_space(24.0);
             ui.vertical(|ui| {
                 ui.add_space(4.0);
