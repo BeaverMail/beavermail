@@ -9,6 +9,7 @@
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
+mod actions;
 mod attachments;
 mod books;
 mod calendars;
@@ -42,6 +43,7 @@ use beavermail_vault::{Mode, SystemStore, Vault};
 use chrono::Datelike;
 use eframe::egui::{self, Align, Layout, RichText, pos2, vec2};
 
+use crate::actions::{Action, OFFLINE_CHANGES, Pending, UNDO_SECS, perform};
 use crate::commands::Command;
 use crate::icons::Icon;
 use tokio::runtime::Runtime;
@@ -144,67 +146,9 @@ enum VaultOutcome {
     Recovered(Result<(), MailError>),
 }
 
-#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
-enum Action {
-    Unread(bool),
-    /// Kept at the top of its folder (`true`), or not any more.
-    Pin(bool),
-    /// The star every client shows, on or off.
-    Star(bool),
-    /// The standard label `$label<n>`, on or off.
-    Label(u8, bool),
-    Archive,
-    Trash,
-    /// To the server's Spam folder.
-    Spam,
-    /// From the Spam folder back to the Inbox.
-    NotSpam,
-    Erase,
-    Reply,
-    ReplyAll,
-    Forward,
-}
-
-impl Action {
-    /// Whether the message leaves the folder being shown.
-    fn removes(self) -> bool {
-        matches!(self, Self::Archive | Self::Trash | Self::Spam | Self::NotSpam | Self::Erase)
-    }
-}
-
-/// Where the changes waiting for the server are kept, in the vault.
-const OFFLINE_CHANGES: &str = "offline/changes.json";
-
-/// How long an Archive or Move to Trash waits before going to the server, so Undo can take it back.
-const UNDO_SECS: u64 = 10;
 /// How long an offline account waits before its server is asked again, doubling up to the most.
 const RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(15);
 const RETRY_MOST: std::time::Duration = std::time::Duration::from_secs(300);
-
-/// Archive or Move to Trash, shown at once but sent to the server only after [`UNDO_SECS`].
-struct Pending {
-    /// For the bar: "Archived 3 messages".
-    text: String,
-    until: std::time::Instant,
-    /// Each message: (account, folder index shown, the action, the message as listed, its place in the list).
-    items: Vec<(u64, usize, Action, MessageSummary, usize)>,
-}
-
-/// Runs `action` on message `id` on the server.
-async fn perform(source: Arc<ImapSource>, id: MessageId, action: Action) -> Result<(), MailError> {
-    match action {
-        Action::Unread(unread) => source.set_unread(id, unread).await,
-        Action::Pin(on) => source.set_pinned(id, on).await,
-        Action::Star(on) => source.set_starred(id, on).await,
-        Action::Label(n, on) => source.set_label(id, &format!("$label{n}"), on).await,
-        Action::Archive => source.archive(id).await,
-        Action::Trash => source.trash(id).await,
-        Action::Spam => source.move_to(id, Role::Junk).await,
-        Action::NotSpam => source.move_to(id, Role::Inbox).await,
-        Action::Erase => source.erase(id).await,
-        Action::Reply | Action::ReplyAll | Action::Forward => Ok(()),
-    }
-}
 
 /// The command palette (Ctrl+K): what is typed and which line is chosen.
 #[derive(Default)]
@@ -213,14 +157,20 @@ struct Palette {
     at: usize,
     /// The user moved with the arrows; until then the first line that can run is chosen.
     moved: bool,
+    /// Move to…: the messages to move; it lists only the folders of their account then.
+    moving: Vec<MessageId>,
 }
 
-/// A line of the palette: a command, or a folder to go to as (account, folder index).
+/// A line of the palette: a command, or a folder to go to or move to as (account, folder index).
 #[derive(Clone)]
 enum Entry {
     Run(Command),
     Folder(u64, usize),
+    MoveTo(u64, usize),
 }
+
+/// Messages being dragged from the list onto a folder.
+struct Dragged(Vec<MessageId>);
 
 /// Which pane the keys act on: the list (arrows move through it) or the reader (arrows scroll it).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -272,6 +222,8 @@ struct SidebarOutcome {
     all_suspicious: bool,
     /// The Spam of every account, under All inboxes, was clicked.
     all_spam: bool,
+    /// Messages dropped onto (account, folder index).
+    dropped: Option<(Vec<MessageId>, u64, usize)>,
 }
 
 /// A message as the server holds it, shown in a source tab.
@@ -455,6 +407,8 @@ struct ReaderOutcome {
     mark: Option<Correction>,
     /// A command for all the messages picked in the list.
     bulk: Option<Action>,
+    /// Move to folder… was pressed, for the open message or those picked.
+    move_to: bool,
     /// Unsubscribe was pressed: who sent the message, and how to leave the list.
     unsubscribe: Option<(String, unsubscribe::Method)>,
     /// Block sender was pressed on this message.
@@ -1475,7 +1429,7 @@ impl BeaverApp {
     /// made after a restart too. By account and message, which outlive a run; the folder is known again
     /// from the message.
     fn save_offline(&mut self) {
-        let queued: Vec<(String, u64, Action)> = self.offline_changes.iter().filter_map(|(serial, _, id, action)| Some((self.view(*serial)?.account.key(), id.0, *action))).collect();
+        let queued: Vec<(String, u64, Action)> = self.offline_changes.iter().filter_map(|(serial, _, id, action)| Some((self.view(*serial)?.account.key(), id.0, action.clone()))).collect();
         let path = std::path::Path::new(OFFLINE_CHANGES);
         let saved = if queued.is_empty() { self.vault.remove(path) } else { serde_json::to_vec(&queued).map_err(|e| MailError::Backend(e.to_string())).and_then(|json| self.vault.write(path, &json)) };
         if let Err(e) = saved {
@@ -2022,8 +1976,8 @@ impl BeaverApp {
         let index = self.shown().into_iter().find(|(s, _)| *s == serial).map_or(usize::MAX, |(_, i)| i);
         let Some(source) = self.view(serial).and_then(|v| v.source.clone()) else { return };
         let pos = self.messages.iter().position(|m| m.id == id);
-        // Archive and Move to Trash of a listed message wait, so Undo can put it back.
-        let undoable = matches!(action, Action::Archive | Action::Trash) && self.role_of(id) != Role::Trash;
+        // Archive, Move to Trash and to another folder of a listed message wait, so Undo can put it back.
+        let undoable = matches!(action, Action::Archive | Action::Trash | Action::Move(_)) && self.role_of(id) != Role::Trash;
         let kept = pos.filter(|_| undoable).map(|p| (p, self.messages[p].clone()));
         if let Some(pos) = pos {
             let was_unread = self.messages[pos].unread;
@@ -2076,13 +2030,17 @@ impl BeaverApp {
         match kept {
             Some((pos, message)) => {
                 let pending = self.pending.get_or_insert_with(|| Pending { text: String::new(), until: std::time::Instant::now(), items: Vec::new() });
-                pending.items.push((serial, index, action, message, pos));
+                pending.items.push((serial, index, action.clone(), message, pos));
                 pending.until = std::time::Instant::now() + std::time::Duration::from_secs(UNDO_SECS);
                 let n = pending.items.len();
-                let done = if matches!(action, Action::Archive) { "Archived" } else { "Moved to Trash" };
-                pending.text = format!("{done} {n} message{}", if n == 1 { "" } else { "s" });
+                let s = if n == 1 { "" } else { "s" };
+                pending.text = match &action {
+                    Action::Archive => format!("Archived {n} message{s}"),
+                    Action::Move(folder) => format!("Moved {n} message{s} to {}", views::folder_title(folder, Role::Other)),
+                    _ => format!("Moved {n} message{s} to Trash"),
+                };
             }
-            None => self.change(source, serial, index, id, action),
+            None => self.change(source, serial, index, id, action.clone()),
         }
         if action.removes() {
             // The message left its folder: its tab goes, and triage goes on with the one that took
@@ -2184,8 +2142,8 @@ impl BeaverApp {
 
     /// Makes `action` on the server, kept in `in_flight` until it answers.
     fn change(&mut self, source: Arc<ImapSource>, serial: u64, index: usize, id: MessageId, action: Action) {
-        self.in_flight.push((serial, index, id, action));
-        self.spawn(async move { Event::Done(serial, index, Some((id, action)), perform(source, id, action).await) });
+        self.in_flight.push((serial, index, id, action.clone()));
+        self.spawn(async move { Event::Done(serial, index, Some((id, action.clone())), perform(source, id, action).await) });
     }
 
     /// Sends the Archive or Move to Trash that was waiting for Undo.
@@ -3500,8 +3458,20 @@ impl BeaverApp {
     /// The command palette: every command and folder, found by typing, run with Enter.
     fn palette_window(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
         let Some(mut palette) = self.palette.take() else { return };
-        let mut entries: Vec<(Entry, String, String)> = Command::ALL.into_iter().filter(|c| *c != Command::Palette).map(|c| (Entry::Run(c), c.label().to_owned(), c.keys(ctx))).collect();
-        for view in &self.accounts {
+        let moving = !palette.moving.is_empty();
+        let mut entries: Vec<(Entry, String, String)> = if moving { Vec::new() } else { Command::ALL.into_iter().filter(|c| *c != Command::Palette).map(|c| (Entry::Run(c), c.label().to_owned(), c.keys(ctx))).collect() };
+        if let Some(view) = palette.moving.first().and_then(|id| self.view(self.serial_of(*id)?)).filter(|_| moving) {
+            // Not the folder they are all in already; its whole path, as subfolders can share a name.
+            let from: std::collections::HashSet<String> = palette.moving.iter().filter_map(|id| Some(self.archive.locate(*id).ok()??.folder)).collect();
+            let mut order: Vec<usize> = (0..view.mailboxes.len()).filter(|&i| !(from.len() == 1 && from.contains(&view.mailboxes[i].name))).collect();
+            order.sort_by_key(|&i| (views::folder_rank(view.mailboxes[i].role), view.mailboxes[i].name.clone()));
+            for i in order {
+                let mailbox = &view.mailboxes[i];
+                let name = if mailbox.role == Role::Inbox { "Inbox".to_owned() } else { mailbox.name.clone() };
+                entries.push((Entry::MoveTo(view.serial, i), name, String::new()));
+            }
+        }
+        for view in self.accounts.iter().filter(|_| !moving) {
             let mut order: Vec<usize> = (0..view.mailboxes.len()).collect();
             order.sort_by_key(|&i| (views::folder_rank(view.mailboxes[i].role), view.mailboxes[i].name.clone()));
             for i in order {
@@ -3512,7 +3482,7 @@ impl BeaverApp {
         entries.retain(|(_, label, _)| Command::matches(label, &palette.query));
         let why = |entry: &Entry| match entry {
             Entry::Run(c) => self.can(*c).err(),
-            Entry::Folder(..) => None,
+            Entry::Folder(..) | Entry::MoveTo(..) => None,
         };
         let last = entries.len().saturating_sub(1);
         if !palette.moved {
@@ -3547,14 +3517,14 @@ impl BeaverApp {
             let before = palette.query.clone();
             // A row of fixed height: the box centres itself in whatever height it is given.
             ui.allocate_ui_with_layout(vec2(PALETTE_WIDTH, theme::CONTROL_H), Layout::left_to_right(Align::Center), |ui| {
-                views::search_box(ui, t, &mut palette.query, "Type a command or a folder", PALETTE_WIDTH, true);
+                views::search_box(ui, t, &mut palette.query, if moving { "Move to the folder…" } else { "Type a command or a folder" }, PALETTE_WIDTH, true);
             });
             if palette.query != before {
                 palette.moved = false;
             }
             ui.add_space(8.0);
             if entries.is_empty() {
-                ui.label(RichText::new("No command or folder matches.").color(t.text_dim));
+                ui.label(RichText::new(if moving { "No folder matches." } else { "No command or folder matches." }).color(t.text_dim));
             }
             egui::ScrollArea::vertical().max_height(PALETTE_LIST_H).show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
@@ -3572,7 +3542,8 @@ impl BeaverApp {
                 }
             });
             ui.add_space(6.0);
-            ui.label(RichText::new("↑ ↓ and Page Up/Down to choose  ·  Enter to run  ·  Esc to close").size(12.5).color(t.text_dim));
+            let enter = if moving { "Enter to move" } else { "Enter to run" };
+            ui.label(RichText::new(format!("↑ ↓ and Page Up/Down to choose  ·  {enter}  ·  Esc to close")).size(12.5).color(t.text_dim));
         });
         if let Some((entry, ..)) = chosen.and_then(|at| entries.get(at)) {
             match *entry {
@@ -3582,6 +3553,7 @@ impl BeaverApp {
                     self.show_suspicious = false;
                     self.select_mailbox(serial, index);
                 }
+                Entry::MoveTo(serial, index) => self.move_to_folder(palette.moving, serial, index),
             }
         } else if !modal.should_close() {
             self.palette = Some(palette);
@@ -4952,7 +4924,7 @@ impl BeaverApp {
             // Triage goes on with the conversation that takes this one's row, as for a single message.
             let row = self.listed().iter().position(|i| self.conversations.same(*i, id));
             let open = self.message.is_some_and(|m| whole.contains(&m));
-            self.request_all(whole, action);
+            self.request_all(whole, action.clone());
             if action.removes() && open && self.confirm_erase.is_empty()
                 && let Some(next) = row.and_then(|r| self.listed().get(r).copied())
             {
@@ -4968,6 +4940,21 @@ impl BeaverApp {
     /// The messages a command applies to: those picked in the list, or else the one open.
     fn targets(&self) -> Vec<MessageId> {
         if self.picked.len() >= 2 { self.picked.clone() } else { self.message.into_iter().collect() }
+    }
+
+    /// Moves `ids` to folder `index` of account `serial`. To the archive, the trash or Spam it is the
+    /// command of that name, so Spam learns from it too.
+    fn move_to_folder(&mut self, ids: Vec<MessageId>, serial: u64, index: usize) {
+        let Some(mailbox) = self.view(serial).and_then(|v| v.mailboxes.get(index)) else { return };
+        let from_spam = ids.first().is_some_and(|id| self.role_of(*id) == Role::Junk);
+        let action = match mailbox.role {
+            Role::Archive => Action::Archive,
+            Role::Trash => Action::Trash,
+            Role::Junk => Action::Spam,
+            Role::Inbox if from_spam => Action::NotSpam,
+            _ => Action::Move(mailbox.name.clone()),
+        };
+        self.request_all(ids, action);
     }
 
     /// Runs `action` on several messages at once, as [`Self::request`] does on one. Spam and Not spam
@@ -4994,7 +4981,7 @@ impl BeaverApp {
         match action {
             Action::Spam => self.move_to_spam(&ids),
             Action::NotSpam => ids.iter().for_each(|id| self.not_spam(*id)),
-            _ => ids.iter().for_each(|id| self.act(*id, action)),
+            _ => ids.iter().for_each(|id| self.act(*id, action.clone())),
         }
         // Marking read keeps the selection, as the messages are still there.
         if action.removes() {
@@ -5278,6 +5265,11 @@ impl BeaverApp {
             // A message only selected, or still loading, is answered once its text is there.
             Command::Reply | Command::ReplyAll | Command::Forward => one().map(|_| ()),
             Command::Archive | Command::Trash | Command::ToggleRead | Command::Pin | Command::Star | Command::Label(_) => some(),
+            Command::MoveTo => {
+                some()?;
+                let accounts: std::collections::HashSet<u64> = self.targets().iter().filter_map(|id| self.serial_of(*id)).collect();
+                if accounts.len() > 1 { Err("The messages are in different accounts") } else { Ok(()) }
+            }
             Command::Undo => if self.pending.is_some() { Ok(()) } else { Err("Nothing to undo") },
             Command::Spam => {
                 some()?;
@@ -5338,6 +5330,7 @@ impl BeaverApp {
             }
             Command::Archive => self.request_all(targets, Action::Archive),
             Command::Trash => self.request_all(targets, Action::Trash),
+            Command::MoveTo => self.palette = Some(Palette { moving: targets, ..Palette::default() }),
             Command::Undo => self.undo(),
             Command::ToggleRead => {
                 let unread = targets.iter().any(|id| self.summary_of(*id).is_some_and(|m| m.unread));
@@ -6568,6 +6561,7 @@ impl BeaverApp {
         let (mut chosen, mut removed, mut edit, mut add, mut suspicious, mut recheck, mut empty) = (None, None, None, false, None, None, None);
         let (mut all, mut scheduled, mut all_suspicious, mut all_spam) = (false, false, false, false);
         let mut fold = None;
+        let mut dropped = None;
         // shortcut: only the Inboxes being shown have verdicts; the others keep the count of their last
         // check (All inboxes, shown at start, checks every one). Checking every account in the background
         // during sync would keep them all current.
@@ -6662,6 +6656,14 @@ impl BeaverApp {
                                         if row.clicked() {
                                             chosen = Some((view.serial, i));
                                         }
+                                        // Messages are dropped only on another folder of their own account.
+                                        let takes = |d: &Dragged| d.0.iter().all(|id| self.serial_of(*id) == Some(view.serial) && self.archive.locate(*id).ok().flatten().is_none_or(|at| at.folder != mailbox.name));
+                                        if row.dnd_hover_payload::<Dragged>().is_some_and(|d| takes(&d)) {
+                                            ui.painter().rect_stroke(row.rect, egui::CornerRadius::same(theme::CONTROL_RADIUS), egui::Stroke::new(2.0, t.accent), egui::StrokeKind::Inside);
+                                        }
+                                        if let Some(d) = row.dnd_release_payload::<Dragged>().filter(|d| takes(d)) {
+                                            dropped = Some((d.0.clone(), view.serial, i));
+                                        }
                                         // What emptying would erase: the messages listed here (worked out only when the menu is open).
                                         let listed = || self.archive.messages(&view.account.key(), &mailbox.name).map_or(0, |m| m.len());
                                         row.context_menu(|ui| folder_menu(ui, mailbox.role, (listed(), mailbox.total), self.settings.hold_suspicious, &mut recheck, &mut empty, (view.serial, i)));
@@ -6720,7 +6722,7 @@ impl BeaverApp {
             }
             self.save_settings();
         }
-        SidebarOutcome { chosen, suspicious, recheck, empty, removed, edit, add, all, scheduled, all_suspicious, all_spam }
+        SidebarOutcome { chosen, suspicious, recheck, empty, removed, edit, add, all, scheduled, all_suspicious, all_spam, dropped }
     }
 
     /// Search, refresh and the message list. Returns the message the user clicked and whether to add an account.
@@ -6795,6 +6797,7 @@ impl BeaverApp {
                         let id = hit.message.id;
                         let selected = if self.picked.len() >= 2 { self.picked.contains(&id) } else { self.message == Some(id) };
                         let row = views::message_row(ui, t, &hit.message, selected, Some(&hit.folder), None, 1, None);
+                        row.dnd_set_drag_payload(Dragged(if self.picked.contains(&id) { self.picked.clone() } else { vec![id] }));
                         let (ctrl, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
                         let keep = row.double_clicked() || row.triple_clicked() || row.middle_clicked();
                         if row.clicked() && !keep && ctrl {
@@ -6858,6 +6861,8 @@ impl BeaverApp {
                     let summary = MessageSummary { unread, received, ..(*message).clone() };
                     let mark = self.origin.get(&message.id).and_then(|s| self.accounts.iter().position(|v| v.serial == *s)).filter(|_| self.unified).map(theme::account_color);
                     let row = views::message_row(ui, t, &summary, selected, None, warning, count, mark);
+                    // The picked messages go together when one of them is dragged.
+                    row.dnd_set_drag_payload(Dragged(if self.picked.contains(&message.id) { self.picked.clone() } else { vec![message.id] }));
                     let (ctrl, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
                     // A click just before the double click makes egui count three: that opens the tab too.
                     if row.double_clicked() || row.triple_clicked() || row.middle_clicked() {
@@ -6958,7 +6963,7 @@ impl BeaverApp {
         let folder_role = self.picked_role();
         let draw = |ui: &mut egui::Ui| {
             if picked >= 2 {
-                out.bulk = views::picked_panel(ui, t, picked, picked_unread, folder_role);
+                out.bulk = views::picked_panel(ui, t, picked, picked_unread, folder_role, &mut out.move_to);
                 return;
             }
             let Some(message) = current else {
@@ -7000,6 +7005,7 @@ impl BeaverApp {
                         out.action = Some((message.id, what));
                     }
                 }
+                out.move_to |= icons::button(ui, t, Icon::Folder, &Command::MoveTo.tip(&ctx), true, false).clicked();
                 // Drawn pressed in while pinned.
                 let tip = format!("{} ({})", if message.pinned { "Unpin" } else { "Pin to the top of the list" }, key(Command::Pin));
                 if icons::button(ui, t, Icon::Pin, &tip, true, message.pinned).clicked() {
@@ -7322,7 +7328,7 @@ impl eframe::App for BeaverApp {
         // One that cannot reach the server waits for the next run instead.
         if let Some(pending) = self.pending.take() {
             let jobs: Vec<_> = pending.items.into_iter().filter_map(|(serial, index, action, m, _)| Some((self.view(serial)?.source.clone()?, serial, index, m.id, action))).collect();
-            let mut unsent: Vec<(u64, usize, MessageId, Action)> = jobs.iter().map(|(_, serial, index, id, action)| (*serial, *index, *id, *action)).collect();
+            let mut unsent: Vec<(u64, usize, MessageId, Action)> = jobs.iter().map(|(_, serial, index, id, action)| (*serial, *index, *id, action.clone())).collect();
             self.runtime.block_on(async {
                 let all = async {
                     for (source, _, _, id, action) in jobs {
@@ -7407,8 +7413,19 @@ impl eframe::App for BeaverApp {
                 _ => {}
             }
         }
-        let SidebarOutcome { chosen, suspicious, recheck, empty, removed, edit, mut add, all, scheduled, all_suspicious, all_spam } =
+        let SidebarOutcome { chosen, suspicious, recheck, empty, removed, edit, mut add, all, scheduled, all_suspicious, all_spam, dropped } =
             if self.in_tab || contacts { SidebarOutcome::default() } else { self.sidebar(ui, &t) };
+        if let Some((ids, serial, index)) = dropped {
+            self.move_to_folder(ids, serial, index);
+        }
+        // What is being dragged follows the pointer.
+        if let (Some(dragged), Some(at)) = (egui::DragAndDrop::payload::<Dragged>(ui.ctx()), ui.ctx().pointer_interact_pos()) {
+            let n = dragged.0.len();
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            egui::Area::new(egui::Id::new("dragged")).order(egui::Order::Tooltip).fixed_pos(at + vec2(14.0, 10.0)).interactable(false).show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| ui.label(format!("Move {n} message{}", if n == 1 { "" } else { "s" })));
+            });
+        }
         if all {
             self.show_suspicious = false;
             self.show_all_inboxes();
@@ -7460,7 +7477,7 @@ impl eframe::App for BeaverApp {
         self.handle_keys(ui.ctx());
         // Without the reading pane only a message tab has a reader.
         let shows_reader = !contacts && (self.in_tab || self.settings.reading_pane);
-        let ReaderOutcome { action, url, mode, remember, attachment, save_many, allow_sender, mark, bulk, unsubscribe, block, unfold, collapse, expand, trust, card, retry, source, invite } =
+        let ReaderOutcome { action, url, mode, remember, attachment, save_many, allow_sender, mark, bulk, move_to, unsubscribe, block, unfold, collapse, expand, trust, card, retry, source, invite } =
             if shows_reader { self.reader(ui, &t) } else { ReaderOutcome::default() };
         if retry && let Some(at) = self.active() {
             self.activate(at);
@@ -7499,6 +7516,9 @@ impl eframe::App for BeaverApp {
             Some((_, calview::Invite::Open(url))) => ui.ctx().open_url(egui::OpenUrl::new_tab(url)),
             Some((id, choice)) => self.answer_invitation(id, choice),
             None => {}
+        }
+        if move_to && self.can(Command::MoveTo).is_ok() {
+            self.run(Command::MoveTo);
         }
         if let Some(action) = bulk {
             self.request_all(self.targets(), action);

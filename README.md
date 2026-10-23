@@ -19,7 +19,7 @@ computer, remote content stays blocked, and it works offline. Written in Rust wi
 - Calendar: week, month and agenda over CalDAV or on this computer; events made and changed here; invitations answered from mail.
 
 Keys (Ctrl+K lists every command): Up/Down, Page Up/Down, Home/End (with Shift, pick a range), F6, Enter,
-E, Delete, U, P, S, 1–5, `!`, C or Ctrl+N, R, A, F, `/`, Ctrl+Z, Ctrl+U, Ctrl+W, Ctrl+Tab; in the calendar
+E, Delete, V (move to folder), U, P, S, 1–5, `!`, C or Ctrl+N, R, A, F, `/`, Ctrl+Z, Ctrl+U, Ctrl+W, Ctrl+Tab; in the calendar
 T, Left/Right, W, M, A, N.
 
 Drag and drop of attachments does not work on Wayland yet: start with `WAYLAND_DISPLAY=` to use X11.

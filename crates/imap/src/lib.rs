@@ -51,6 +51,8 @@ enum Op {
     Trash,
     /// To the folder with this role (Spam, or back to the Inbox).
     Move(Role),
+    /// To the account's folder of this name.
+    Folder(String),
     /// Permanent delete; allowed only inside the trash folder.
     Erase,
 }
@@ -556,6 +558,13 @@ impl ImapSource {
             Op::Archive => Some(self.folder_with_role(Role::Archive).await?.ok_or_else(|| backend("this account has no archive folder"))?),
             Op::Trash => Some(self.folder_with_role(Role::Trash).await?.ok_or_else(|| backend("this account has no trash folder"))?),
             Op::Move(role) => Some(self.folder_with_role(*role).await?.ok_or_else(|| backend(format!("this account has no {role:?} folder")))?),
+            // One removed or renamed meanwhile (on the server, or from another client) is not created again.
+            Op::Folder(name) => {
+                if self.store.folders(&self.account)?.is_empty() {
+                    self.mailboxes().await?;
+                }
+                Some(self.store.folders(&self.account)?.into_iter().find(|f| f.name == *name).ok_or_else(|| backend(format!("there is no folder {name} any more")))?.name)
+            }
         };
         if matches!(op, Op::Erase) && self.folder_with_role(Role::Trash).await?.as_deref() != Some(at.folder.as_str()) {
             return Err(backend("only messages in Trash can be erased"));
@@ -591,7 +600,7 @@ impl ImapSource {
             Op::Pinned(on) => self.store.set_pinned(id, *on == forward),
             Op::Starred(on) => self.store.set_starred(id, *on == forward),
             Op::Label(keyword, on) => self.store.set_label(id, keyword, *on == forward),
-            Op::Archive | Op::Trash | Op::Move(_) | Op::Erase => Ok(()),
+            Op::Archive | Op::Trash | Op::Move(_) | Op::Folder(_) | Op::Erase => Ok(()),
         }
     }
 
@@ -1398,6 +1407,10 @@ impl MailSource for ImapSource {
 
     async fn move_to(&self, id: MessageId, role: Role) -> Result<(), MailError> {
         self.write(id, Op::Move(role)).await
+    }
+
+    async fn move_to_folder(&self, id: MessageId, folder: &str) -> Result<(), MailError> {
+        self.write(id, Op::Folder(folder.to_owned())).await
     }
 
     async fn erase(&self, id: MessageId) -> Result<(), MailError> {

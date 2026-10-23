@@ -114,6 +114,9 @@ pub trait MailSource {
     /// to the Inbox when they say it is not.
     fn move_to(&self, id: MessageId, role: Role) -> impl Future<Output = Result<(), MailError>> + Send;
 
+    /// Moves a message to the account's folder named `folder`, which must exist.
+    fn move_to_folder(&self, id: MessageId, folder: &str) -> impl Future<Output = Result<(), MailError>> + Send;
+
     /// Moves a message to the account's trash folder.
     fn trash(&self, id: MessageId) -> impl Future<Output = Result<(), MailError>> + Send;
 

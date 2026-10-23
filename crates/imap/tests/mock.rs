@@ -294,6 +294,20 @@ async fn archive_and_trash_move_to_their_folders() {
 }
 
 #[tokio::test]
+async fn a_message_moves_to_any_folder_by_name_but_not_to_one_gone() {
+    let mock = start(true).await;
+    mock.list.lock().unwrap().push_str("* LIST (\\HasNoChildren) \"/\" \"Work/Clients\"\r\n");
+    mock.source.mailboxes().await.unwrap();
+    let id = message_in(&mock, "INBOX").await;
+    mock.source.move_to_folder(id, "Work/Clients").await.unwrap();
+    assert!(mock.source.messages("INBOX").await.unwrap().is_empty(), "gone from the Inbox at once");
+    let id = message_in(&mock, "INBOX").await;
+    let error = mock.source.move_to_folder(id, "Old").await.unwrap_err();
+    assert!(matches!(&error, MailError::Backend(why) if why.contains("Old")), "{error:?}");
+    assert_eq!(mock.writes(), ["UID MOVE 5 \"Work/Clients\""], "nothing sent for a folder that is not there");
+}
+
+#[tokio::test]
 async fn move_falls_back_to_copy_and_expunge() {
     let mock = start(false).await;
     let id = message_in(&mock, "INBOX").await;

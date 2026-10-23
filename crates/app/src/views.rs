@@ -319,8 +319,9 @@ pub fn person_row(ui: &mut Ui, t: &Tokens, name: &str, line: &str, photo: Option
 #[allow(clippy::too_many_arguments)]
 pub fn message_row(ui: &mut Ui, t: &Tokens, message: &MessageSummary, selected: bool, folder: Option<&str>, warning: Option<&str>, count: usize, mark: Option<Color32>) -> Response {
     // Clicked, never focused: the arrow keys move the list's own selection (`handle_keys`), and a focused
-    // row would have egui move its focus with them too, scrolling the list elsewhere.
-    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), MESSAGE_ROW_H), Sense::CLICK);
+    // row would have egui move its focus with them too, scrolling the list elsewhere. Dragged onto a folder,
+    // it moves there.
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), MESSAGE_ROW_H), Sense::click_and_drag());
     let card = rect.shrink2(vec2(8.0, 2.0));
     row_background(ui, card, &response, selected, t);
     if let Some(color) = mark {
@@ -507,7 +508,8 @@ pub fn empty_state(ui: &mut Ui, t: &Tokens, title: &str, hint: &str, action: Opt
 }
 
 /// The reader while several messages are picked in the list: how many, and what can be done to all.
-pub fn picked_panel(ui: &mut Ui, t: &Tokens, count: usize, any_unread: bool, role: Role) -> Option<crate::Action> {
+/// Move to folder… sets `moving`, as it asks for the folder first.
+pub fn picked_panel(ui: &mut Ui, t: &Tokens, count: usize, any_unread: bool, role: Role, moving: &mut bool) -> Option<crate::Action> {
     use crate::Action;
     let mut chosen = None;
     ui.vertical_centered(|ui| {
@@ -533,6 +535,8 @@ pub fn picked_panel(ui: &mut Ui, t: &Tokens, count: usize, any_unread: bool, rol
                 chosen = Some(action);
             }
         }
+        let button = egui::Button::image_and_text(Icon::Folder.image(icons::SIZE, t.text_dim), "Move to folder…").min_size(vec2(220.0, CONTROL_H));
+        *moving |= ui.add(button).on_hover_text("Move to folder… (V)").clicked();
     });
     chosen
 }

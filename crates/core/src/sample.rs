@@ -176,6 +176,10 @@ impl MailSource for SampleSource {
         Err(read_only())
     }
 
+    async fn move_to_folder(&self, _: MessageId, _: &str) -> Result<(), MailError> {
+        Err(read_only())
+    }
+
     async fn erase(&self, _: MessageId) -> Result<(), MailError> {
         Err(read_only())
     }
