@@ -118,7 +118,7 @@ pub fn section(ui: &mut egui::Ui, t: &Tokens, calendars: &[CalendarSource], sync
     }
     for name in servers {
         let key = format!("caldav:{name}");
-        let header = egui::CollapsingHeader::new(RichText::new(&name).size(15.0).color(t.text)).id_salt(&key).default_open(!folded.contains(&key)).show(ui, |ui| {
+        let header = egui::CollapsingHeader::new(RichText::new(&name).size(15.0).color(t.text)).id_salt(&key).default_open(!folded.contains(&key)).icon(crate::views::fold_arrow).show(ui, |ui| {
             for (at, calendar) in calendars.iter().enumerate().filter(|(_, c)| server(c) == name) {
                 let label = match (calendar.default, syncing.contains(&calendar.url)) {
                     (_, true) => format!("{}  ·  syncing", calendar.name),
@@ -131,7 +131,7 @@ pub fn section(ui: &mut egui::Ui, t: &Tokens, calendars: &[CalendarSource], sync
                 if row.clicked() {
                     action = Some(CalendarAction::Toggle(calendar.url.clone()));
                 }
-                row.context_menu(|ui| {
+                crate::views::context_menu(&row, |ui| {
                     let why = if calendar.read_only { "Read-only: answers to invitations cannot go there" } else { "Accepted invitations already go here" };
                     if ui.add_enabled(!calendar.default && !calendar.read_only, egui::Button::new("Make default")).on_disabled_hover_text(why).clicked() {
                         action = Some(CalendarAction::MakeDefault(calendar.url.clone()));

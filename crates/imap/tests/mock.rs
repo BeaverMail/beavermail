@@ -296,15 +296,31 @@ async fn archive_and_trash_move_to_their_folders() {
 #[tokio::test]
 async fn a_message_moves_to_any_folder_by_name_but_not_to_one_gone() {
     let mock = start(true).await;
-    mock.list.lock().unwrap().push_str("* LIST (\\HasNoChildren) \"/\" \"Work/Clients\"\r\n");
+    mock.list.lock().unwrap().push_str("* LIST (\\HasNoChildren) \"/\" \"Work/Receipts\"\r\n");
     mock.source.mailboxes().await.unwrap();
     let id = message_in(&mock, "INBOX").await;
-    mock.source.move_to_folder(id, "Work/Clients").await.unwrap();
+    mock.source.move_to_folder(id, "Work/Receipts").await.unwrap();
     assert!(mock.source.messages("INBOX").await.unwrap().is_empty(), "gone from the Inbox at once");
     let id = message_in(&mock, "INBOX").await;
     let error = mock.source.move_to_folder(id, "Old").await.unwrap_err();
     assert!(matches!(&error, MailError::Backend(why) if why.contains("Old")), "{error:?}");
-    assert_eq!(mock.writes(), ["UID MOVE 5 \"Work/Clients\""], "nothing sent for a folder that is not there");
+    assert_eq!(mock.writes(), ["UID MOVE 5 \"Work/Receipts\""], "nothing sent for a folder that is not there");
+}
+
+#[tokio::test]
+async fn a_folder_is_created_inside_another_with_the_servers_separator_and_its_name_encoded() {
+    let mock = start(true).await;
+    mock.source.mailboxes().await.unwrap();
+    assert_eq!(mock.source.create_folder(Some("Archive"), " Città ").await.unwrap(), "Archive/Citt&AOA-");
+    assert_eq!(mock.source.create_folder(None, "Receipts").await.unwrap(), "Receipts");
+    let commands = mock.commands();
+    assert!(commands.iter().any(|c| c == "CREATE \"Archive/Citt&AOA-\""), "{commands:?}");
+    assert!(commands.iter().any(|c| c == "SUBSCRIBE \"Receipts\""), "{commands:?}");
+    for (parent, name) in [(None, "  "), (None, "a/b"), (None, "trash")] {
+        let error = mock.source.create_folder(parent, name).await.unwrap_err();
+        assert!(matches!(error, MailError::Backend(_)), "{name:?}: {error:?}");
+    }
+    assert_eq!(mock.commands().iter().filter(|c| c.starts_with("CREATE")).count(), 2, "nothing asked for the refused names");
 }
 
 #[tokio::test]

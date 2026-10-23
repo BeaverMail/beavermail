@@ -88,7 +88,7 @@ pub fn section(ui: &mut egui::Ui, t: &Tokens, books: &[AddressBook], syncing: &s
     }
     for name in servers {
         let key = format!("carddav:{name}");
-        let header = egui::CollapsingHeader::new(RichText::new(&name).size(15.0).color(t.text)).id_salt(&key).default_open(!folded.contains(&key)).show(ui, |ui| {
+        let header = egui::CollapsingHeader::new(RichText::new(&name).size(15.0).color(t.text)).id_salt(&key).default_open(!folded.contains(&key)).icon(crate::views::fold_arrow).show(ui, |ui| {
             for book in books.iter().filter(|b| server(b, books) == name) {
                 let name = if book.name.is_empty() { "Contacts" } else { book.name.as_str() };
                 let title = match (book.default && books.len() > 1, syncing.contains(&book.url)) {
@@ -105,7 +105,7 @@ pub fn section(ui: &mut egui::Ui, t: &Tokens, books: &[AddressBook], syncing: &s
                 if row.clicked() && !here {
                     action = Some(BookAction::Show(Some(book.url.clone())));
                 }
-                row.context_menu(|ui| {
+                crate::views::context_menu(&row, |ui| {
                     let why = if book.read_only { "Read-only: the server makes it" } else { "New contacts already go here" };
                     if ui.add_enabled(!book.default && !book.read_only, egui::Button::new("Make default")).on_disabled_hover_text(why).clicked() {
                         action = Some(BookAction::MakeDefault(book.url.clone()));

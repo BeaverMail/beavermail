@@ -117,6 +117,10 @@ pub trait MailSource {
     /// Moves a message to the account's folder named `folder`, which must exist.
     fn move_to_folder(&self, id: MessageId, folder: &str) -> impl Future<Output = Result<(), MailError>> + Send;
 
+    /// Creates folder `name` inside folder `parent`, or at the top with `None`; returns its full name on
+    /// the server. The folder list is read again to show it.
+    fn create_folder(&self, parent: Option<&str>, name: &str) -> impl Future<Output = Result<String, MailError>> + Send;
+
     /// Moves a message to the account's trash folder.
     fn trash(&self, id: MessageId) -> impl Future<Output = Result<(), MailError>> + Send;
 

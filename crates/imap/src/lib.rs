@@ -2,6 +2,8 @@
 
 //! IMAP backend: implements [`MailSource`] over one account.
 
+pub mod folder_name;
+
 use std::fmt;
 use std::sync::Arc;
 
@@ -1411,6 +1413,42 @@ impl MailSource for ImapSource {
 
     async fn move_to_folder(&self, id: MessageId, folder: &str) -> Result<(), MailError> {
         self.write(id, Op::Folder(folder.to_owned())).await
+    }
+
+    async fn create_folder(&self, parent: Option<&str>, name: &str) -> Result<String, MailError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(backend("the folder needs a name"));
+        }
+        let mut state = self.state.lock().await;
+        // The server's separator between a folder and those inside it ("/" or "."), from an empty LIST.
+        let listed = answered(state.session(&self.config).await?, "LIST \"\" \"\"", |r| match r {
+            Response::MailboxData(MailboxDatum::List(list)) => list.delimiter.as_ref().map(|d| d.to_string()),
+            _ => None,
+        })
+        .await;
+        let delimiter = match listed {
+            Ok(found) => found.into_iter().next(),
+            Err(e) => return Err(state.failed(e)),
+        };
+        if let Some(d) = delimiter.as_deref().filter(|d| name.contains(d)) {
+            return Err(backend(format!("a folder name cannot contain \"{d}\" on this server")));
+        }
+        let full = match (parent, delimiter) {
+            (None, _) => folder_name::encode(name),
+            (Some(parent), Some(d)) => format!("{parent}{d}{}", folder_name::encode(name)),
+            (Some(_), None) => return Err(backend("this server keeps no folders inside others")),
+        };
+        if self.store.folders(&self.account)?.iter().any(|f| f.name.eq_ignore_ascii_case(&full)) {
+            return Err(backend(format!("there is a folder {name} already")));
+        }
+        let created = state.session(&self.config).await?.create(&full).await;
+        if let Err(e) = created {
+            return Err(state.failed(e));
+        }
+        // Listed by clients that show subscribed folders only; a server without subscriptions is fine.
+        let _ = state.session(&self.config).await?.subscribe(&full).await;
+        Ok(full)
     }
 
     async fn erase(&self, id: MessageId) -> Result<(), MailError> {

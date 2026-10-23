@@ -16,6 +16,7 @@ pub enum Command {
     Archive,
     Trash,
     MoveTo,
+    NewFolder,
     Undo,
     ToggleRead,
     Pin,
@@ -59,7 +60,7 @@ const CTRL_SHIFT: Modifiers = Modifiers::COMMAND.plus(Modifiers::SHIFT);
 
 impl Command {
     /// In the order the keys are tried (Ctrl+Shift+Tab before Ctrl+Tab) and the palette lists them.
-    pub const ALL: [Self; 37] = [
+    pub const ALL: [Self; 38] = [
         Self::Palette,
         Self::NewMessage,
         Self::Reply,
@@ -68,6 +69,7 @@ impl Command {
         Self::Archive,
         Self::Trash,
         Self::MoveTo,
+        Self::NewFolder,
         Self::Undo,
         Self::ToggleRead,
         Self::Pin,
@@ -109,6 +111,7 @@ impl Command {
             Self::Archive => "Archive",
             Self::Trash => "Move to Trash",
             Self::MoveTo => "Move to folder…",
+            Self::NewFolder => "New folder…",
             Self::Undo => "Undo archive or move",
             Self::ToggleRead => "Mark as read or unread",
             Self::Pin => "Pin or unpin",
@@ -171,7 +174,7 @@ impl Command {
             Self::SelectAll => &[Trigger::Shortcut(CTRL, Key::A, false)],
             Self::Search => &[Trigger::Text("/")],
             Self::SwitchPane => &[Trigger::Key(Key::F6)],
-            Self::TrustSender | Self::BlockSender | Self::Refresh | Self::AllInboxes | Self::Mail | Self::Calendar | Self::Contacts | Self::WorkOffline | Self::WorkOnline | Self::Settings => &[],
+            Self::NewFolder | Self::TrustSender | Self::BlockSender | Self::Refresh | Self::AllInboxes | Self::Mail | Self::Calendar | Self::Contacts | Self::WorkOffline | Self::WorkOnline | Self::Settings => &[],
         }
     }
 

@@ -76,10 +76,10 @@ mod tests {
 
     #[test]
     fn a_move_waits_offline_with_its_folder_and_older_queues_still_read() {
-        let queued = vec![("alice@example.com".to_owned(), 5_u64, Action::Move("Work/Clients".into()))];
+        let queued = vec![("alice@example.com".to_owned(), 5_u64, Action::Move("Work/Receipts".into()))];
         let json = serde_json::to_vec(&queued).unwrap();
         let back: Vec<(String, u64, Action)> = serde_json::from_slice(&json).unwrap();
-        assert!(matches!(&back[0].2, Action::Move(folder) if folder == "Work/Clients"));
+        assert!(matches!(&back[0].2, Action::Move(folder) if folder == "Work/Receipts"));
         assert!(back[0].2.removes());
         // Written before moving to any folder was possible.
         let old: Vec<(String, u64, Action)> = serde_json::from_str(r#"[["alice@example.com",5,"Archive"],["alice@example.com",6,{"Unread":true}]]"#).unwrap();

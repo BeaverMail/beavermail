@@ -180,6 +180,10 @@ impl MailSource for SampleSource {
         Err(read_only())
     }
 
+    async fn create_folder(&self, _: Option<&str>, _: &str) -> Result<String, MailError> {
+        Err(read_only())
+    }
+
     async fn erase(&self, _: MessageId) -> Result<(), MailError> {
         Err(read_only())
     }

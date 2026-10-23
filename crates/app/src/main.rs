@@ -78,6 +78,8 @@ enum Event {
     /// A write (read flag, archive, trash) finished; the UI already showed its result.
     /// The third field is the message and action, for a change that can wait for the connection.
     Done(u64, usize, Option<(MessageId, Action)>, Result<(), MailError>),
+    /// A folder was created in account `serial`, with its full name, or the server refused it.
+    FolderMade(u64, Result<String, MailError>),
     /// A message was sent, or the server refused it: (draft id, result, why the copy in Sent could not
     /// be saved when the message itself went out). The draft is the compose window's or one in the Outbox.
     Sent(String, Result<(), MailError>, Option<String>),
@@ -169,6 +171,16 @@ enum Entry {
     MoveTo(u64, usize),
 }
 
+/// The New folder dialog: the account, the folder it goes inside (by name; `None` at the top), the
+/// name typed, whether the server is creating it, and why it refused.
+struct NewFolder {
+    serial: u64,
+    parent: Option<String>,
+    name: String,
+    busy: bool,
+    error: Option<String>,
+}
+
 /// Messages being dragged from the list onto a folder.
 struct Dragged(Vec<MessageId>);
 
@@ -224,6 +236,8 @@ struct SidebarOutcome {
     all_spam: bool,
     /// Messages dropped onto (account, folder index).
     dropped: Option<(Vec<MessageId>, u64, usize)>,
+    /// "New folder…" was chosen in this (account, folder index)'s menu.
+    new_inside: Option<(u64, usize)>,
 }
 
 /// A message as the server holds it, shown in a source tab.
@@ -828,6 +842,21 @@ fn reveal_offset(row: usize, offset: f32, height: f32) -> Option<f32> {
 }
 
 /// Marks the pane the keys act on after F6.
+/// Where a folder folded in the sidebar is remembered, in [`Settings::folded`] beside the accounts.
+fn folder_fold_key(account: &str, folder: &str) -> String {
+    format!("folder:{account}:{folder}")
+}
+
+/// A folder row of an account in the sidebar, drawn in from the left: a margin for the arrow of a folder
+/// with others inside (one level in from the account's own), then a step per level of the folders it is in.
+fn indented(ui: &mut egui::Ui, depth: usize, row: impl FnOnce(&mut egui::Ui) -> egui::Response) -> egui::Response {
+    ui.horizontal(|ui| {
+        ui.add_space(10.0 + 16.0 * depth as f32); // with the row's spacing, 18 points for the arrow
+        row(ui)
+    })
+    .inner
+}
+
 fn pane_ring(ui: &egui::Ui, t: &theme::Tokens, rect: egui::Rect) {
     ui.painter().rect_stroke(rect.shrink(1.0), egui::CornerRadius::ZERO, egui::Stroke::new(2.0, t.accent), egui::StrokeKind::Inside);
 }
@@ -1147,6 +1176,7 @@ struct BeaverApp {
     /// What is typed in the Contacts section's search, and the "New contact" dialog: (address, name).
     contact_query: String,
     new_contact: Option<(String, String)>,
+    new_folder: Option<NewFolder>,
     /// Everyone written to, to suggest in a message's address fields; read again for each new message.
     contacts: Arc<Vec<beavermail_store::Contact>>,
     /// Where the user asked to go from an account page with unsaved changes (`None`: close Settings),
@@ -1347,6 +1377,7 @@ impl BeaverApp {
             confirm_card_delete: None,
             contact_query: String::new(),
             new_contact: None,
+            new_folder: None,
             settings_leave: None,
             confirm_remove: None,
             confirm_unsubscribe: None,
@@ -1510,7 +1541,14 @@ impl BeaverApp {
         if view.source.is_none() || view.mailboxes.get(index).is_none() {
             return;
         }
+        let (key, name) = (view.account.key().to_owned(), view.mailboxes[index].name.clone());
         self.send_pending(); // Undo puts mail back in the list it left
+        // A folder opened from the palette or a link shows in the sidebar: the folders it is inside unfold.
+        let before = self.settings.folded.len();
+        self.settings.folded.retain(|k| !k.strip_prefix(&folder_fold_key(&key, "")).is_some_and(|folder| views::is_inside(&name, folder)));
+        if self.settings.folded.len() != before {
+            self.save_settings();
+        }
         self.selected = Some((serial, index));
         self.unified = false;
         self.searched.clear(); // a search runs again over this folder
@@ -3463,18 +3501,14 @@ impl BeaverApp {
         if let Some(view) = palette.moving.first().and_then(|id| self.view(self.serial_of(*id)?)).filter(|_| moving) {
             // Not the folder they are all in already; its whole path, as subfolders can share a name.
             let from: std::collections::HashSet<String> = palette.moving.iter().filter_map(|id| Some(self.archive.locate(*id).ok()??.folder)).collect();
-            let mut order: Vec<usize> = (0..view.mailboxes.len()).filter(|&i| !(from.len() == 1 && from.contains(&view.mailboxes[i].name))).collect();
-            order.sort_by_key(|&i| (views::folder_rank(view.mailboxes[i].role), view.mailboxes[i].name.clone()));
-            for i in order {
+            for (i, _) in views::folder_tree(&view.mailboxes).into_iter().filter(|&(i, _)| !(from.len() == 1 && from.contains(&view.mailboxes[i].name))) {
                 let mailbox = &view.mailboxes[i];
-                let name = if mailbox.role == Role::Inbox { "Inbox".to_owned() } else { mailbox.name.clone() };
+                let name = views::folder_path(&mailbox.name, mailbox.role);
                 entries.push((Entry::MoveTo(view.serial, i), name, String::new()));
             }
         }
         for view in self.accounts.iter().filter(|_| !moving) {
-            let mut order: Vec<usize> = (0..view.mailboxes.len()).collect();
-            order.sort_by_key(|&i| (views::folder_rank(view.mailboxes[i].role), view.mailboxes[i].name.clone()));
-            for i in order {
+            for (i, _) in views::folder_tree(&view.mailboxes) {
                 let mailbox = &view.mailboxes[i];
                 entries.push((Entry::Folder(view.serial, i), format!("Go to {} › {}", view.account.address(), views::folder_title(&mailbox.name, mailbox.role)), String::new()));
             }
@@ -4830,6 +4864,79 @@ impl BeaverApp {
         }
     }
 
+    /// New folder: its account (when there are several), the folder it goes inside, and its name.
+    fn new_folder_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
+        let Some(mut form) = self.new_folder.take() else { return };
+        let accounts: Vec<(u64, String)> = self.accounts.iter().filter(|v| v.source.is_some()).map(|v| (v.serial, v.account.address().to_owned())).collect();
+        let folders: Vec<(String, Role)> = self.view(form.serial).map(|v| views::folder_tree(&v.mailboxes).into_iter().map(|(i, _)| (v.mailboxes[i].name.clone(), v.mailboxes[i].role)).collect()).unwrap_or_default();
+        let shown = views::folder_path;
+        let (mut create, mut cancel) = (false, false);
+        let modal = egui::Modal::new(egui::Id::new("new_folder")).show(ctx, |ui| {
+            ui.set_width(FORM_WIDTH);
+            ui.heading("New folder");
+            ui.label(RichText::new("Made on the server, so every device that reads this account sees it.").color(t.text_dim));
+            ui.add_space(12.0);
+            form_grid(ui, "new_folder_form", |ui| {
+                if accounts.len() > 1 {
+                    ui.label("Account");
+                    let current = accounts.iter().find(|(s, _)| *s == form.serial).map(|(_, a)| a.clone()).unwrap_or_default();
+                    egui::ComboBox::from_id_salt("new_folder_account").width(FIELD_WIDTH).selected_text(current).show_ui(ui, |ui| {
+                        for (serial, address) in &accounts {
+                            if ui.selectable_label(form.serial == *serial, address).clicked() && form.serial != *serial {
+                                (form.serial, form.parent) = (*serial, None);
+                            }
+                        }
+                    });
+                    ui.end_row();
+                }
+                ui.label("Inside");
+                let inside = form.parent.as_deref().map_or("Top level".to_owned(), |p| shown(p, folders.iter().find(|(n, _)| n == p).map_or(Role::Other, |(_, r)| *r)));
+                egui::ComboBox::from_id_salt("new_folder_parent").width(FIELD_WIDTH).selected_text(inside).show_ui(ui, |ui| {
+                    if ui.selectable_label(form.parent.is_none(), "Top level").clicked() {
+                        form.parent = None;
+                    }
+                    for (name, role) in &folders {
+                        if ui.selectable_label(form.parent.as_deref() == Some(name.as_str()), shown(name, *role)).clicked() {
+                            form.parent = Some(name.clone());
+                        }
+                    }
+                });
+                ui.end_row();
+                ui.label("Name");
+                let field = ui.add_enabled(!form.busy, field(&mut form.name).hint_text("Receipts"));
+                // On opening only: once the user is in a field, it is theirs.
+                if ui.memory(|m| m.focused().is_none()) {
+                    field.request_focus();
+                }
+                if field.changed() {
+                    form.error = None;
+                }
+                ui.end_row();
+            });
+            if let Some(error) = &form.error {
+                ui.add_space(6.0);
+                ui.add(egui::Label::new(RichText::new(error).color(t.danger)).wrap());
+            }
+            ui.add_space(12.0);
+            let ready = !form.busy && !form.name.trim().is_empty();
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
+                create = views::primary_button(ui, t, if form.busy { "Creating…" } else { "Create folder" }, ready).on_disabled_hover_text("Type a name first").clicked() || (ready && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                cancel = ui.button("Cancel").clicked();
+                if form.busy {
+                    ui.add(egui::Spinner::new().size(16.0));
+                }
+            });
+        });
+        if create && let Some(source) = self.view(form.serial).and_then(|v| v.source.clone()) {
+            (form.busy, form.error) = (true, None);
+            let (serial, parent, name) = (form.serial, form.parent.clone(), form.name.clone());
+            self.spawn(async move { Event::FolderMade(serial, source.create_folder(parent.as_deref(), &name).await) });
+        }
+        if !(cancel || modal.should_close()) {
+            self.new_folder = Some(form);
+        }
+    }
+
     /// Syncs the address book at `url` now, to send a change made here.
     fn sync_book(&mut self, url: &str) {
         self.sync_contacts(Some(url));
@@ -5270,6 +5377,8 @@ impl BeaverApp {
                 let accounts: std::collections::HashSet<u64> = self.targets().iter().filter_map(|id| self.serial_of(*id)).collect();
                 if accounts.len() > 1 { Err("The messages are in different accounts") } else { Ok(()) }
             }
+            Command::NewFolder if self.work_offline => Err("Working offline"),
+            Command::NewFolder => if self.accounts.iter().any(|v| v.source.is_some()) { Ok(()) } else { Err("Add an account first") },
             Command::Undo => if self.pending.is_some() { Ok(()) } else { Err("Nothing to undo") },
             Command::Spam => {
                 some()?;
@@ -5331,6 +5440,13 @@ impl BeaverApp {
             Command::Archive => self.request_all(targets, Action::Archive),
             Command::Trash => self.request_all(targets, Action::Trash),
             Command::MoveTo => self.palette = Some(Palette { moving: targets, ..Palette::default() }),
+            Command::NewFolder => {
+                // In the account shown, at the top; the dialog can change both.
+                let serial = self.shown().first().map(|(s, _)| *s).filter(|s| self.view(*s).is_some_and(|v| v.source.is_some()));
+                if let Some(serial) = serial.or_else(|| self.accounts.iter().find(|v| v.source.is_some()).map(|v| v.serial)) {
+                    self.new_folder = Some(NewFolder { serial, parent: None, name: String::new(), busy: false, error: None });
+                }
+            }
             Command::Undo => self.undo(),
             Command::ToggleRead => {
                 let unread = targets.iter().any(|id| self.summary_of(*id).is_some_and(|m| m.unread));
@@ -5739,6 +5855,19 @@ impl BeaverApp {
                 }
             }
             // No connection: the change waits and is made when the server answers again.
+            Event::FolderMade(serial, Ok(full)) => {
+                if self.new_folder.as_ref().is_some_and(|f| f.serial == serial) {
+                    self.new_folder = None;
+                }
+                self.notice = Some((format!("Folder {} created", views::folder_title(&full, Role::Other)), std::time::Instant::now()));
+                if let Some(source) = self.view(serial).and_then(|v| v.source.clone()) {
+                    self.spawn(async move { Event::Mailboxes(serial, source.mailboxes().await, true) });
+                }
+            }
+            Event::FolderMade(serial, Err(e)) => match self.new_folder.as_mut().filter(|f| f.serial == serial) {
+                Some(form) => (form.busy, form.error) = (false, Some(e.to_string())),
+                None => self.error = Some(format!("The folder was not created: {e}")),
+            },
             Event::Done(serial, index, Some(change), Err(MailError::Offline(why))) => {
                 self.went_offline(serial, why);
                 self.offline_changes.push((serial, index, change.0, change.1));
@@ -6562,6 +6691,7 @@ impl BeaverApp {
         let (mut all, mut scheduled, mut all_suspicious, mut all_spam) = (false, false, false, false);
         let mut fold = None;
         let mut dropped = None;
+        let mut new_inside = None;
         // shortcut: only the Inboxes being shown have verdicts; the others keep the count of their last
         // check (All inboxes, shown at start, checks every one). Checking every account in the background
         // during sync would keep them all current.
@@ -6631,6 +6761,7 @@ impl BeaverApp {
                                 title.append("not connected", 8.0, small(t.danger));
                             }
                             let header = egui::CollapsingHeader::new(title)
+                                .icon(views::fold_arrow)
                                 .id_salt(view.serial)
                                 .default_open(!self.settings.folded.contains(&view.account.key()))
                                 .show(ui, |ui| {
@@ -6643,16 +6774,58 @@ impl BeaverApp {
                                             ui.label(RichText::new("Loading folders…").size(13.0).color(t.text_dim));
                                         });
                                     }
-                                    let mut order: Vec<usize> = (0..view.mailboxes.len()).collect();
-                                    order.sort_by_key(|&i| (views::folder_rank(view.mailboxes[i].role), view.mailboxes[i].name.clone()));
-                                    for i in order {
+                                    // Suspicious is a row of its own after the Inbox and its subfolders, not one of them.
+                                    let mut rows: Vec<(usize, usize, bool)> = views::folder_tree(&view.mailboxes).into_iter().map(|(i, depth)| (i, depth, false)).collect();
+                                    if self.settings.hold_suspicious && let Some(inbox) = rows.iter().position(|&(i, ..)| view.mailboxes[i].role == Role::Inbox) {
+                                        let after = rows[inbox + 1..].iter().position(|&(_, depth, _)| depth <= rows[inbox].1).map_or(rows.len(), |n| inbox + 1 + n);
+                                        rows.insert(after, (rows[inbox].0, rows[inbox].1, true));
+                                    }
+                                    // A folded folder hides those inside it and counts their unread mail in its own.
+                                    let fold_key = |name: &str| folder_fold_key(&view.account.key(), name);
+                                    let mut hide_below: Option<usize> = None;
+                                    let mut visible = Vec::with_capacity(rows.len());
+                                    for (at, &(i, depth, held)) in rows.iter().enumerate() {
+                                        if hide_below.is_some_and(|d| depth > d) {
+                                            continue;
+                                        }
+                                        hide_below = None;
+                                        let inside: Vec<usize> = rows[at + 1..].iter().take_while(|&&(_, d, _)| d > depth).map(|&(j, ..)| j).collect();
+                                        let has_kids = !held && !inside.is_empty();
+                                        let folded = has_kids && self.settings.folded.contains(&fold_key(&view.mailboxes[i].name));
+                                        if folded {
+                                            hide_below = Some(depth);
+                                        }
+                                        let hidden_unread: u32 = if folded { inside.iter().map(|&j| view.mailboxes[j].unread).sum() } else { 0 };
+                                        visible.push((i, depth, held, has_kids.then_some(folded), hidden_unread));
+                                    }
+                                    for (i, depth, held, folding, hidden_unread) in visible {
                                         let mailbox = &view.mailboxes[i];
                                         let title = views::folder_title(&mailbox.name, mailbox.role);
                                         let here = self.selected == Some((view.serial, i));
                                         let holding = self.settings.hold_suspicious && mailbox.role == Role::Inbox;
+                                        if held {
+                                            let count = held_of.get(&view.serial).map_or(0, |h| h.0);
+                                            let row = indented(ui, depth, |ui| views::suspicious_row(ui, t, count, here && self.show_suspicious)).on_hover_text("Mail from new senders that failed a check, held apart from the Inbox");
+                                            if row.clicked() {
+                                                suspicious = Some((view.serial, i));
+                                            }
+                                            views::context_menu(&row, |ui| folder_menu(ui, mailbox.role, (0, mailbox.total), true, &mut recheck, &mut empty, (view.serial, i)));
+                                            continue;
+                                        }
                                         let tip = format!("{} message{}  ·  {} unread", views::thousands(mailbox.total), if mailbox.total == 1 { "" } else { "s" }, views::thousands(mailbox.unread));
-                                        let unread = if mailbox.role == Role::Inbox { inbox_unread(view.serial, mailbox) } else { mailbox.unread };
-                                        let row = views::folder_row(ui, t, &title, mailbox.role, unread, here && !(holding && self.show_suspicious)).on_hover_text(tip);
+                                        let unread = if mailbox.role == Role::Inbox { inbox_unread(view.serial, mailbox) } else { mailbox.unread } + hidden_unread;
+                                        let selected = here && !(holding && self.show_suspicious);
+                                        let row = indented(ui, depth, |ui| views::folder_row(ui, t, &title, mailbox.role, unread, selected)).on_hover_text(tip);
+                                        // The arrow sits in the margin left of the row, drawn as the accounts' own.
+                                        if let Some(folded) = folding {
+                                            let side = ui.spacing().icon_width;
+                                            let spot = egui::Rect::from_center_size(egui::pos2(row.rect.left() - 9.0, row.rect.center().y), vec2(side, side));
+                                            let arrow = ui.interact(spot, ui.id().with(("fold", &mailbox.name)), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+                                            views::fold_arrow(ui, if folded { 0.0 } else { 1.0 }, &arrow);
+                                            if arrow.on_hover_text(if folded { "Show the folders inside" } else { "Hide the folders inside" }).clicked() {
+                                                fold = Some(fold_key(&mailbox.name));
+                                            }
+                                        }
                                         if row.clicked() {
                                             chosen = Some((view.serial, i));
                                         }
@@ -6666,15 +6839,14 @@ impl BeaverApp {
                                         }
                                         // What emptying would erase: the messages listed here (worked out only when the menu is open).
                                         let listed = || self.archive.messages(&view.account.key(), &mailbox.name).map_or(0, |m| m.len());
-                                        row.context_menu(|ui| folder_menu(ui, mailbox.role, (listed(), mailbox.total), self.settings.hold_suspicious, &mut recheck, &mut empty, (view.serial, i)));
-                                        if holding {
-                                            let count = held_of.get(&view.serial).map_or(0, |h| h.0);
-                                            let row = views::suspicious_row(ui, t, count, here && self.show_suspicious).on_hover_text("Mail from new senders that failed a check, held apart from the Inbox");
-                                            if row.clicked() {
-                                                suspicious = Some((view.serial, i));
+                                        views::context_menu(&row, |ui| {
+                                            if ui.button("New folder…").clicked() {
+                                                new_inside = Some((view.serial, i));
+                                                ui.close();
                                             }
-                                            row.context_menu(|ui| folder_menu(ui, mailbox.role, (0, mailbox.total), true, &mut recheck, &mut empty, (view.serial, i)));
-                                        }
+                                            ui.separator();
+                                            folder_menu(ui, mailbox.role, (listed(), mailbox.total), self.settings.hold_suspicious, &mut recheck, &mut empty, (view.serial, i));
+                                        });
                                     }
                                 });
                             // Offline is a state, not news: a badge on the account, and why on a click.
@@ -6697,7 +6869,7 @@ impl BeaverApp {
                             if header.header_response.clicked() {
                                 fold = Some(view.account.key());
                             }
-                            header.header_response.context_menu(|ui| {
+                            views::context_menu(&header.header_response, |ui| {
                                 if ui.button("Account settings…").clicked() {
                                     edit = Some(view.serial);
                                     ui.close();
@@ -6722,7 +6894,7 @@ impl BeaverApp {
             }
             self.save_settings();
         }
-        SidebarOutcome { chosen, suspicious, recheck, empty, removed, edit, add, all, scheduled, all_suspicious, all_spam, dropped }
+        SidebarOutcome { chosen, suspicious, recheck, empty, removed, edit, add, all, scheduled, all_suspicious, all_spam, dropped, new_inside }
     }
 
     /// Search, refresh and the message list. Returns the message the user clicked and whether to add an account.
@@ -7054,7 +7226,7 @@ impl BeaverApp {
                     let mut text_right = rect.right();
                     ui.scope_builder(egui::UiBuilder::new().max_rect(rect).layout(Layout::right_to_left(Align::Center)), |ui| {
                         let more = icons::button(ui, t, Icon::Ellipsis, "More: Reply all, Forward, View source", true, false);
-                        egui::Popup::menu(&more).show(|ui| {
+                        egui::Popup::menu(&more).style(views::menu_look).show(|ui| {
                             for (label, what) in [("Reply all", Action::ReplyAll), ("Forward", Action::Forward)] {
                                 if ui.button(label).clicked() {
                                     said.answer = Some(what);
@@ -7413,8 +7585,12 @@ impl eframe::App for BeaverApp {
                 _ => {}
             }
         }
-        let SidebarOutcome { chosen, suspicious, recheck, empty, removed, edit, mut add, all, scheduled, all_suspicious, all_spam, dropped } =
+        let SidebarOutcome { chosen, suspicious, recheck, empty, removed, edit, mut add, all, scheduled, all_suspicious, all_spam, dropped, new_inside } =
             if self.in_tab || contacts { SidebarOutcome::default() } else { self.sidebar(ui, &t) };
+        if let Some((serial, index)) = new_inside {
+            let parent = self.view(serial).and_then(|v| v.mailboxes.get(index)).map(|m| m.name.clone());
+            self.new_folder = Some(NewFolder { serial, parent, name: String::new(), busy: false, error: None });
+        }
         if let Some((ids, serial, index)) = dropped {
             self.move_to_folder(ids, serial, index);
         }
@@ -7569,6 +7745,7 @@ impl eframe::App for BeaverApp {
         self.card_dialog(ui.ctx(), &t);
         self.card_delete_dialog(ui.ctx(), &t);
         self.new_contact_dialog(ui.ctx(), &t);
+        self.new_folder_dialog(ui.ctx(), &t);
         self.book_remove_dialog(ui.ctx(), &t);
         self.calendar_remove_dialog(ui.ctx(), &t);
         self.event_dialogs(ui.ctx(), &t);

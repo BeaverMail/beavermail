@@ -1111,7 +1111,8 @@ pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &
                     outcome = Outcome::Send;
                 }
                 ui.add_enabled_ui(ready, |ui| {
-                    let menu = ui.menu_button("Send later", |ui| {
+                    let look = egui::containers::menu::MenuConfig::new().style(views::menu_look);
+                    let menu = egui::containers::menu::MenuButton::new("Send later").config(look).ui(ui, |ui| {
                         for (label, at) in later_choices(chrono::Local::now()) {
                             if ui.button(label).clicked() {
                                 outcome = Outcome::Schedule(at);
@@ -1124,7 +1125,7 @@ pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &
                             ui.close();
                         }
                     });
-                    menu.response.on_hover_text("Choose when it is sent; BeaverMail sends it then, if it is open");
+                    menu.0.on_hover_text("Choose when it is sent; BeaverMail sends it then, if it is open");
                 });
                 if ui.add_enabled(!compose.sending, egui::Button::image_and_text(Icon::Paperclip.image(crate::icons::SIZE, t.text_dim), "Attach")).on_hover_text(if on_wayland() { "Attach files. Dropping files in does not work on Wayland yet; start the app with WAYLAND_DISPLAY unset to use X11." } else { "Attach files, or drop them in the window" }).clicked() {
                     outcome = Outcome::Attach;

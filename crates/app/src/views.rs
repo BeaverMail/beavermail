@@ -67,7 +67,21 @@ pub fn folder_title(name: &str, role: Role) -> String {
     if role == Role::Inbox {
         return "Inbox".to_owned();
     }
-    name.rsplit(['/', '.']).next().unwrap_or(name).to_owned()
+    beavermail_imap::folder_name::decode(name.rsplit(['/', '.']).next().unwrap_or(name))
+}
+
+/// A folder's whole place as people read it, for lists that name folders of every level: "Inbox ›
+/// Clients" for "INBOX/Clients" or "INBOX.Clients".
+pub fn folder_path(name: &str, role: Role) -> String {
+    if role == Role::Inbox {
+        return "Inbox".to_owned();
+    }
+    let parts: Vec<String> = name
+        .split(['/', '.'])
+        .enumerate()
+        .map(|(i, part)| if i == 0 && part.eq_ignore_ascii_case("INBOX") { "Inbox".to_owned() } else { beavermail_imap::folder_name::decode(part) })
+        .collect();
+    parts.join(" › ")
 }
 
 /// Sidebar order: the usual mail folders first, then the rest alphabetically.
@@ -82,6 +96,39 @@ pub fn folder_rank(role: Role) -> u8 {
         Role::Trash => 6,
         Role::Other => 7,
     }
+}
+
+/// The folders in sidebar order, as (position in `mailboxes`, depth): those with a role first, always at
+/// the top, then the rest by name; a folder without a role goes under the one its name is inside, as
+/// "INBOX.Receipts" under the Inbox. The server's separator is not known here, so "/" and "." both count.
+pub fn folder_tree(mailboxes: &[beavermail_core::Mailbox]) -> Vec<(usize, usize)> {
+    let parent: Vec<Option<usize>> = mailboxes
+        .iter()
+        .map(|m| (m.role == Role::Other).then(|| (0..mailboxes.len()).filter(|&j| is_inside(&m.name, &mailboxes[j].name)).max_by_key(|&j| mailboxes[j].name.len())).flatten())
+        .collect();
+    let sorted = |mut list: Vec<usize>| {
+        list.sort_by_key(|&i| (folder_rank(mailboxes[i].role), beavermail_imap::folder_name::decode(&mailboxes[i].name).to_lowercase()));
+        list
+    };
+    let mut stack: Vec<(usize, usize)> = sorted((0..mailboxes.len()).filter(|&i| parent[i].is_none()).collect()).into_iter().rev().map(|i| (i, 0)).collect();
+    let mut out = Vec::with_capacity(mailboxes.len());
+    while let Some((i, depth)) = stack.pop() {
+        out.push((i, depth));
+        stack.extend(sorted((0..mailboxes.len()).filter(|&j| parent[j] == Some(i)).collect()).into_iter().rev().map(|j| (j, depth + 1)));
+    }
+    out
+}
+
+/// The arrow of what folds in a sidebar (an account, a server, a folder with others inside), all one size.
+pub fn fold_arrow(ui: &mut Ui, openness: f32, response: &Response) {
+    const SIDE: f32 = 12.0;
+    let drawn = response.clone().with_new_rect(Rect::from_center_size(response.rect.center(), vec2(SIDE, SIDE)));
+    egui::collapsing_header::paint_default_icon(ui, openness, &drawn);
+}
+
+/// Whether folder `child` is inside folder `parent`, at any depth ("INBOX.Receipts.Old" in "INBOX").
+pub fn is_inside(child: &str, parent: &str) -> bool {
+    child.len() > parent.len() + 1 && child.starts_with(parent) && matches!(child.as_bytes()[parent.len()], b'/' | b'.')
 }
 
 fn role_icon(role: Role) -> Icon {
@@ -795,10 +842,21 @@ impl LinkInfo {
     }
 }
 
+/// Menus as egui draws them, with room around the text of each line (egui leaves 2 points).
+pub fn menu_look(style: &mut egui::Style) {
+    egui::containers::menu::menu_style(style);
+    style.spacing.button_padding = vec2(10.0, 6.0);
+}
+
+/// A right-click menu on `response`, in [`menu_look`].
+pub fn context_menu(response: &Response, add: impl FnOnce(&mut Ui)) {
+    egui::Popup::context_menu(response).style(menu_look).show(add);
+}
+
 /// "Open link" and "Copy link" on a right click, both with the cleaned link; returns it when opened.
 pub fn link_menu(response: &Response, clean: &str) -> Option<String> {
     let mut open = None;
-    response.context_menu(|ui| {
+    context_menu(response, |ui| {
         if ui.button("Open link").clicked() {
             open = Some(clean.to_owned());
         }
@@ -1022,7 +1080,7 @@ pub fn draft_row(ui: &mut Ui, t: &Tokens, draft: &crate::drafts::DraftData) -> D
     let start = truncated(ui, start, FontId::proportional(13.5), t.text_dim, width);
     ui.painter().galley(pos2(left, card.top() + 56.0), start, t.text_dim);
     let mut action = if response.clicked() { DraftAction::Open } else { DraftAction::None };
-    response.on_hover_cursor(egui::CursorIcon::PointingHand).context_menu(|ui| {
+    context_menu(&response.on_hover_cursor(egui::CursorIcon::PointingHand), |ui| {
         if draft.queued && draft.send_at.is_some() {
             if ui.button("Send now").clicked() {
                 action = DraftAction::SendNow;
@@ -1062,6 +1120,47 @@ pub fn thousands(n: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::{signature_line, thousands, trackers_line};
+
+    #[test]
+    fn a_folders_place_reads_as_words() {
+        use beavermail_core::Role;
+        assert_eq!(super::folder_path("INBOX/Receipts", Role::Other), "Inbox › Receipts");
+        assert_eq!(super::folder_path("INBOX.Receipts.Old", Role::Other), "Inbox › Receipts › Old");
+        assert_eq!(super::folder_path("Hobby/Citt&AOA-", Role::Other), "Hobby › Città");
+        assert_eq!(super::folder_path("INBOX", Role::Inbox), "Inbox");
+    }
+
+    #[test]
+    fn a_folder_sits_under_the_one_it_is_inside_and_role_folders_stay_at_the_top() {
+        use beavermail_core::{Mailbox, Role};
+        let folder = |name: &str, role| Mailbox { name: name.into(), unread: 0, role, total: 0, stored: 0 };
+        let mailboxes = [
+            folder("INBOX.Trash", Role::Trash),
+            folder("INBOX.Zeta", Role::Other),
+            folder("INBOX", Role::Inbox),
+            folder("INBOX.Receipts.Old", Role::Other),
+            folder("INBOX.Sent", Role::Sent),
+            folder("INBOX.Receipts", Role::Other),
+            folder("Hobby/Garden", Role::Other),
+            folder("Hobby", Role::Other),
+            folder("INBOX.alpha", Role::Other),
+        ];
+        let shown: Vec<(&str, usize)> = super::folder_tree(&mailboxes).into_iter().map(|(i, depth)| (mailboxes[i].name.as_str(), depth)).collect();
+        assert_eq!(
+            shown,
+            [
+                ("INBOX", 0),
+                ("INBOX.alpha", 1),
+                ("INBOX.Receipts", 1),
+                ("INBOX.Receipts.Old", 2),
+                ("INBOX.Zeta", 1),
+                ("INBOX.Sent", 0),
+                ("INBOX.Trash", 0),
+                ("Hobby", 0),
+                ("Hobby/Garden", 1),
+            ]
+        );
+    }
 
     #[test]
     fn encryption_and_a_good_signature_share_one_line_and_problems_get_their_own() {

@@ -154,6 +154,8 @@ pub fn apply(ctx: &egui::Context) {
         s.text_styles.insert(TextStyle::Small, egui::FontId::proportional(13.0));
         s.text_styles.insert(TextStyle::Heading, egui::FontId::new(22.0, bold()));
         s.interaction.tooltip_delay = 0.4;
+        // What is inside a folded group (an account's folders, a server's calendars) is told by its indent alone.
+        s.visuals.indent_has_left_vline = false;
     });
 }
 
