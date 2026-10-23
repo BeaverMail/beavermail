@@ -5,7 +5,6 @@
 # Local secrets and test accounts
 .env
 .env.*
-!.env.example
 # Local mail cache
 *.sqlite
 *.sqlite-*

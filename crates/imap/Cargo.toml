@@ -26,5 +26,4 @@ tokio = { version = "1", features = ["net", "sync", "time", "macros", "rt"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 
 [dev-dependencies]
-dotenvy = "0.15"
 tokio = { version = "1", features = ["macros", "rt", "io-util"] }
