@@ -47,3 +47,5 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 "Sign in with Google/Microsoft" shows only when the build has the app's client IDs: set `BEAVERMAIL_GOOGLE_CLIENT_ID`, `BEAVERMAIL_GOOGLE_CLIENT_SECRET` and `BEAVERMAIL_MICROSOFT_CLIENT_ID` when building.
+
+Builds for Windows (standalone .exe and installer), macOS (BeaverMail.app, not notarised) and Linux (.tar.gz and .deb) come from the workflows in `.github/workflows`, run by hand or by a `v*` tag.

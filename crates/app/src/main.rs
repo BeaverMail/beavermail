@@ -7677,7 +7677,8 @@ fn main() -> eframe::Result {
     // shown in a dialog and kept in a log file.
     std::panic::set_hook(Box::new(|info| report(&format!("BeaverMail stopped because of an error:\n\n{info}"))));
     let options = || eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_title("BeaverMail").with_inner_size([1280.0, 800.0]),
+        viewport: egui::ViewportBuilder::default().with_title("BeaverMail").with_app_id("beavermail").with_inner_size([1280.0, 800.0])
+            .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/beavermail.png")).expect("the app's icon is a valid PNG")),
         // With vsync, Mesa's Wayland swap blocks the UI thread until the compositor sends a frame
         // callback, which it withholds for hidden windows; the compositor then reports the app as
         // not responding. egui only repaints on demand, so tearing is not a concern.

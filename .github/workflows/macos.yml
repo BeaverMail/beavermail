@@ -1,0 +1,71 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# The macOS build: started by hand (Actions > macOS build > Run workflow) or by a version tag. One
+# BeaverMail.app for Apple Silicon and Intel comes out zipped as the run's artifact. It is not signed
+# with a Developer ID nor notarised: macOS asks to confirm the first opening (right click > Open).
+name: macOS build
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        # The sign-in buttons appear only with the app's client IDs, kept as repository secrets; without
+        # them the build works and has no Google or Microsoft sign-in.
+        env:
+          BEAVERMAIL_GOOGLE_CLIENT_ID: ${{ secrets.BEAVERMAIL_GOOGLE_CLIENT_ID }}
+          BEAVERMAIL_GOOGLE_CLIENT_SECRET: ${{ secrets.BEAVERMAIL_GOOGLE_CLIENT_SECRET }}
+          BEAVERMAIL_MICROSOFT_CLIENT_ID: ${{ secrets.BEAVERMAIL_MICROSOFT_CLIENT_ID }}
+        run: |
+          cargo build --release -p beavermail --target aarch64-apple-darwin
+          cargo build --release -p beavermail --target x86_64-apple-darwin
+      - name: Bundle
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          app=dist/BeaverMail.app/Contents
+          mkdir -p "$app/MacOS" "$app/Resources" dist/AppIcon.iconset
+          for size in 16 32 128 256 512; do
+            sips -z $size $size crates/app/assets/beavermail.png --out dist/AppIcon.iconset/icon_${size}x${size}.png
+            sips -z $((size * 2)) $((size * 2)) crates/app/assets/beavermail.png --out dist/AppIcon.iconset/icon_${size}x${size}@2x.png
+          done
+          iconutil -c icns dist/AppIcon.iconset -o "$app/Resources/AppIcon.icns"
+          lipo -create -output "$app/MacOS/beavermail" target/aarch64-apple-darwin/release/beavermail target/x86_64-apple-darwin/release/beavermail
+          cat > "$app/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>BeaverMail</string>
+            <key>CFBundleDisplayName</key><string>BeaverMail</string>
+            <key>CFBundleIdentifier</key><string>org.beavermail.BeaverMail</string>
+            <key>CFBundleExecutable</key><string>beavermail</string>
+            <key>CFBundleIconFile</key><string>AppIcon</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>$version</string>
+            <key>CFBundleVersion</key><string>$version</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          # Apple Silicon runs only signed code: an ad-hoc signature, until there is a Developer ID.
+          codesign --force --deep --sign - dist/BeaverMail.app
+          ditto -c -k --keepParent dist/BeaverMail.app dist/beavermail-macos.zip
+      # Uploaded before the tests, so a test that fails only on macOS still leaves the build to try.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: beavermail-macos
+          path: dist/beavermail-macos.zip
+      - name: Test
+        run: cargo test --workspace --release

@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# The Linux build: started by hand (Actions > Linux build > Run workflow) or by a version tag. A
+# standalone .tar.gz and a .deb come out as the run's artifacts.
+name: Linux build
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    # The oldest supported Ubuntu, so the binary runs on systems with an older glibc too.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+      - name: System libraries
+        run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev
+      - name: Build
+        # The sign-in buttons appear only with the app's client IDs, kept as repository secrets; without
+        # them the build works and has no Google or Microsoft sign-in.
+        env:
+          BEAVERMAIL_GOOGLE_CLIENT_ID: ${{ secrets.BEAVERMAIL_GOOGLE_CLIENT_ID }}
+          BEAVERMAIL_GOOGLE_CLIENT_SECRET: ${{ secrets.BEAVERMAIL_GOOGLE_CLIENT_SECRET }}
+          BEAVERMAIL_MICROSOFT_CLIENT_ID: ${{ secrets.BEAVERMAIL_MICROSOFT_CLIENT_ID }}
+        run: cargo build --release -p beavermail
+      - name: Package
+        run: |
+          mkdir -p dist/beavermail
+          cp target/release/beavermail crates/app/packaging/beavermail.desktop crates/app/assets/beavermail.svg LICENSE dist/beavermail/
+          tar -czf dist/beavermail-linux-x64.tar.gz -C dist beavermail
+          cargo deb -p beavermail --no-build --output dist/
+      # Uploaded before the tests, so a test that fails only here still leaves the build to try.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: beavermail-linux-x64
+          path: dist/beavermail-linux-x64.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: beavermail-linux-x64-deb
+          path: dist/*.deb
+      - name: Test
+        run: cargo test --workspace --release

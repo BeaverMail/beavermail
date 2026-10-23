@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=BeaverMail
+Comment=Mail, contacts and calendar
+Exec=beavermail
+Icon=beavermail
+Terminal=false
+Categories=Network;Email;
+StartupWMClass=beavermail
