@@ -298,8 +298,9 @@ const CONNECT_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 fn unreachable(host: &str, port: u16, e: &std::io::Error) -> MailError {
     match e.kind() {
         std::io::ErrorKind::ConnectionRefused => MailError::Offline(format!("{host} refused the connection on port {port}: check the port, or the server is down")),
-        // The lookup's own error has no kind of its own, only its text.
-        _ if e.to_string().contains("lookup") => MailError::Offline(format!("{host} could not be found: check the server name, or the connection")),
+        // The lookup's own error has no kind of its own: its text says so on Linux and macOS, its code on
+        // Windows (WSAHOST_NOT_FOUND, WSATRY_AGAIN, WSANO_DATA).
+        _ if e.to_string().contains("lookup") || matches!(e.raw_os_error(), Some(11001 | 11002 | 11004)) =>MailError::Offline(format!("{host} could not be found: check the server name, or the connection")),
         _ => MailError::Offline(format!("{host} could not be reached: {e}")),
     }
 }
