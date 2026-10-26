@@ -159,6 +159,19 @@ pub fn apply(ctx: &egui::Context) {
     });
 }
 
+/// The sidebars' rows at `density`: their height and the gap between them. Set on the `ui` holding
+/// them, for the rows and the account and server headers alike.
+pub fn dense(ui: &mut egui::Ui, density: beavermail_core::Density) {
+    use beavermail_core::Density;
+    let (height, gap) = match density {
+        Density::Compact => (28.0, 0.0),
+        Density::Normal => (32.0, 2.0),
+        Density::Comfortable => (38.0, 8.0),
+    };
+    ui.spacing_mut().interact_size.y = height;
+    ui.spacing_mut().item_spacing.y = gap;
+}
+
 /// Folder icon colours: the same in both themes so a folder is recognisable at a glance.
 pub fn role_color(role: Role) -> Color32 {
     match role {

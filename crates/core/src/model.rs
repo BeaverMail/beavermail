@@ -468,6 +468,16 @@ pub enum DisplayMode {
     Original,
 }
 
+/// How close together the rows of the sidebars (folders, address books, calendars) sit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Density {
+    Compact,
+    #[default]
+    Normal,
+    Comfortable,
+}
+
 /// User preferences, stored apart from the accounts.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
@@ -506,6 +516,9 @@ pub struct Settings {
     /// the folders opened (folders start folded).
     #[serde(default)]
     pub folded: std::collections::BTreeSet<String>,
+    /// How close together the sidebars' rows sit.
+    #[serde(default)]
+    pub density: Density,
     /// Link parameters removed before a link is opened or copied, besides the known tracking ones:
     /// names separated by spaces or commas; one ending in `*` removes every parameter starting so.
     #[serde(default)]
@@ -528,7 +541,7 @@ fn undo_secs() -> u32 {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { display: DisplayMode::default(), sender_display: Default::default(), rich_outgoing: true, undo_send_secs: undo_secs(), remote_senders: Default::default(), hold_suspicious: true, marked: Default::default(), threads: true, reading_pane: true, folded: Default::default(), link_params: String::new(), address_books: Vec::new(), calendars: Vec::new() }
+        Self { display: DisplayMode::default(), sender_display: Default::default(), rich_outgoing: true, undo_send_secs: undo_secs(), remote_senders: Default::default(), hold_suspicious: true, marked: Default::default(), threads: true, reading_pane: true, folded: Default::default(), density: Density::default(), link_params: String::new(), address_books: Vec::new(), calendars: Vec::new() }
     }
 }
 

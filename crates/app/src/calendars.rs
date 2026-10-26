@@ -159,7 +159,8 @@ pub fn section(ui: &mut egui::Ui, t: &Tokens, calendars: &[CalendarSource], sync
 
 /// A calendar in the list: a square of its colour, filled while it is shown, and its name.
 fn calendar_row(ui: &mut egui::Ui, t: &Tokens, name: &str, color: Color32, shown: bool) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::click());
+    let height = 36.0_f32.min(ui.spacing().interact_size.y); // see theme::dense
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
     if response.hovered() {
         ui.painter().rect_filled(rect, CornerRadius::same(theme::CONTROL_RADIUS), t.hover);
     }

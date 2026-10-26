@@ -175,7 +175,9 @@ pub fn settings_row(ui: &mut Ui, t: &Tokens, title: &str, icon: Option<Icon>, se
 }
 
 fn nav_row(ui: &mut Ui, t: &Tokens, title: &str, icon: Option<(Icon, Color32)>, unread: u32, selected: bool) -> Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), FOLDER_ROW_H), Sense::click());
+    // A sidebar made denser (see [`theme::dense`]) lowers it.
+    let height = FOLDER_ROW_H.min(ui.spacing().interact_size.y);
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
     row_background(ui, rect, &response, selected, t);
     let lead = pos2(rect.left() + 22.0, rect.center().y);
     match icon {

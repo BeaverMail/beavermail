@@ -35,7 +35,7 @@ mod unsubscribe;
 mod views;
 
 use beavermail_accounts as store;
-use beavermail_core::{OAuthProvider, Account, DisplayMode, Hit, Keep, MailError, MailSender, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Progress, Role, Server, Settings, SyncReport, Tls};
+use beavermail_core::{OAuthProvider, Account, Density, DisplayMode, Hit, Keep, MailError, MailSender, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Progress, Role, Server, Settings, SyncReport, Tls};
 use beavermail_imap::ImapSource;
 use beavermail_smtp::{SmtpSender, render_draft};
 use beavermail_store::Store;
@@ -773,6 +773,7 @@ enum Section {
 enum SettingsPage {
     #[default]
     Reading,
+    Appearance,
     Writing,
     Spam,
     Encryption,
@@ -782,11 +783,12 @@ enum SettingsPage {
 }
 
 impl SettingsPage {
-    const ALL: [Self; 5] = [Self::Reading, Self::Writing, Self::Spam, Self::Encryption, Self::Storage];
+    const ALL: [Self; 6] = [Self::Reading, Self::Appearance, Self::Writing, Self::Spam, Self::Encryption, Self::Storage];
 
     fn title(self) -> &'static str {
         match self {
             Self::Reading => "Reading",
+            Self::Appearance => "Appearance",
             Self::Writing => "Writing",
             Self::Spam => "Suspicious mail",
             Self::Storage => "Stored mail",
@@ -798,6 +800,7 @@ impl SettingsPage {
     fn icon(self) -> Option<Icon> {
         match self {
             Self::Reading => Some(Icon::MailOpen),
+            Self::Appearance => Some(Icon::Palette),
             Self::Writing => Some(Icon::Pencil),
             Self::Spam => Some(Icon::Spam),
             Self::Storage => Some(Icon::Lock),
@@ -809,6 +812,7 @@ impl SettingsPage {
     fn about(self) -> &'static str {
         match self {
             Self::Reading => "Most unwanted mail and tracking arrives as HTML, so messages start as text.",
+            Self::Appearance => "How the app looks.",
             Self::Writing => "How messages you write are composed and sent.",
             Self::Spam => "Mail from people you know is never held. Nothing moves on the server.",
             Self::Storage => "How downloaded messages are kept on this computer.",
@@ -3312,6 +3316,18 @@ impl BeaverApp {
                 }
             }
                             }
+                            SettingsPage::Appearance => {
+                                ui.label("Density");
+                                ui.horizontal(|ui| {
+                                    for (density, name) in [(Density::Compact, "Compact"), (Density::Normal, "Normal"), (Density::Comfortable, "Comfortable")] {
+                                        if ui.radio(self.settings.density == density, name).clicked() && self.settings.density != density {
+                                            self.settings.density = density;
+                                            changed = true;
+                                        }
+                                    }
+                                });
+                                hint(ui, "How close together the folders, address books and calendars sit in the sidebar.");
+                            }
                             SettingsPage::Writing => {
                                 let about = "Bold, lists, links and quotes. The plain-text part is always sent, readable as written. Off: plain text only.";
                                 changed |= views::switch_row(ui, t, &mut self.settings.rich_outgoing, "Write in Markdown and send an HTML version too", about).changed();
@@ -4418,6 +4434,7 @@ impl BeaverApp {
                 ui.add_space(4.0);
                 ui.with_layout(Layout::top_down(Align::Min), |ui| {
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        theme::dense(ui, self.settings.density);
                         if let Some(a) = calendars::section(ui, t, &self.settings.calendars, &self.calendars_syncing, &self.settings.folded) {
                             action = Some(a);
                         }
@@ -6832,6 +6849,7 @@ impl BeaverApp {
                 ui.add_space(4.0);
                 ui.with_layout(Layout::top_down(Align::Min), |ui| {
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        theme::dense(ui, self.settings.density);
                         if let Some(action) = books::section(ui, t, &self.settings.address_books, &self.contacts_syncing, self.contacts_shown.as_deref(), &counts, book.len() as u32, &self.settings.folded) {
                             book_action = Some(action);
                         }
@@ -6950,6 +6968,7 @@ impl BeaverApp {
                 ui.add_space(4.0);
                 ui.with_layout(Layout::top_down(Align::Min), |ui| {
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        theme::dense(ui, self.settings.density);
                         if self.accounts.len() >= 2 {
                             let unread = self.accounts.iter().filter_map(|v| Some(inbox_unread(v.serial, v.mailboxes.iter().find(|m| m.role == Role::Inbox)?))).sum();
                             let inboxes = self.unified && self.unified_role == Role::Inbox;
