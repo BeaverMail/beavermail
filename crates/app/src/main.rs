@@ -3261,6 +3261,8 @@ impl BeaverApp {
                     // What is left once the footer, its gap and the spacing around both are taken off.
                     let body = (ui.available_height() - theme::CONTROL_H - 8.0 - 2.0 * ui.spacing().item_spacing.y).max(0.0);
                     egui::ScrollArea::vertical().id_salt(("settings_page", self.settings_page)).max_height(body).min_scrolled_height(body).auto_shrink([false, false]).show(ui, |ui| {
+                        // Room between the page and its scroll bar.
+                        ui.set_max_width(ui.available_width() - 16.0);
                         let hint = |ui: &mut egui::Ui, text: &str| ui.label(RichText::new(text).size(13.0).color(t.text_dim));
                         match self.settings_page {
                             SettingsPage::Account(_) => {

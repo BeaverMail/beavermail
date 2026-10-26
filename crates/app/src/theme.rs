@@ -149,6 +149,8 @@ pub fn apply(ctx: &egui::Context) {
         s.spacing.interact_size = egui::vec2(CONTROL_H, CONTROL_H);
         s.spacing.menu_margin = Margin::same(8);
         s.spacing.window_margin = Margin::same(20);
+        // A list or page longer than its pane shows its scroll bar at rest, not only under the pointer.
+        s.spacing.scroll.dormant_handle_opacity = 0.6;
         s.text_styles.insert(TextStyle::Body, egui::FontId::proportional(15.0));
         s.text_styles.insert(TextStyle::Button, egui::FontId::proportional(15.0));
         s.text_styles.insert(TextStyle::Small, egui::FontId::proportional(13.0));
