@@ -203,16 +203,21 @@ pub fn screen_all(source: &ImapSource, known: &Known, settings: &Settings, serve
         let domain = organisation(m);
         // The same text from the same domain is the same sender, which its own checks judge.
         let twin = print.and_then(|p| held.iter().find(|(h, d)| *d != domain && similarity(&p, h) >= SAME_CAMPAIGN));
-        if screened.new_sender && screened.place == Place::Inbox && let Some((_, from)) = twin {
+        // shortcut: a reply quotes its thread, which matches any message of it held as spam, so replies
+        // are not compared; a campaign that sets In-Reply-To passes this check (the others still apply).
+        // Compare with the held message's thread instead once its Message-ID is kept with its print.
+        if screened.new_sender && screened.place == Place::Inbox && m.parents.is_empty() && let Some((_, from)) = twin {
             let text = format!("Its text is the same as spam you already have, sent from {from}: one campaign under many names");
             screened.findings.insert(0, Finding { level: Level::Danger, text: text.clone() });
             screened.place = Place::Spam;
             screened.why = format!("new sender: {text}");
         }
-        // Last, what the user's own spam taught: only for new senders nothing else held.
+        // Last, what the user's own spam taught: alone it holds nothing, as the text of a whole language
+        // can read as spam; with a lesser finding, which holds nothing alone either, it holds the message.
         if let Some(model) = &known.model
             && screened.new_sender
             && screened.place == Place::Inbox
+            && !screened.findings.is_empty()
         {
             let (spam, words) = model.score(&text_of(m), &domain);
             if spam >= HOLD_PROBABILITY {
@@ -226,8 +231,8 @@ pub fn screen_all(source: &ImapSource, known: &Known, settings: &Settings, serve
     all
 }
 
-/// The learnt model holds a new sender's mail from this probability of spam up: it errs towards the
-/// Inbox, where a missed spam costs a glance and a held message could cost a reply.
+/// The learnt model joins a lesser finding to hold a new sender's mail from this probability of spam
+/// up: it errs towards the Inbox, where a missed spam costs a glance and a held message could cost a reply.
 const HOLD_PROBABILITY: f32 = 0.9;
 
 /// A min-hash of a text's three-word phrases: texts that share most of
@@ -270,7 +275,8 @@ fn similarity(a: &Print, b: &Print) -> f32 {
 }
 
 /// Checks message `m` of an Inbox from what is stored of it: the whole message, or its header fields.
-/// A new sender whose mail fails a check is held as spam; anyone the user knows never is.
+/// A new sender whose mail fails a serious check is held as spam; a lesser one (a [`Level::Notice`])
+/// holds it only with the learnt model's word (see [`screen_all`]); anyone the user knows never is.
 pub fn screen_message(source: &ImapSource, known: &Known, settings: &Settings, server_host: &str, m: &MessageSummary) -> Screened {
     let (body, whole) = match source.stored_body(m.id) {
         Ok(Some(body)) => (Some(body), true),
@@ -279,7 +285,7 @@ pub fn screen_message(source: &ImapSource, known: &Known, settings: &Settings, s
     let verdict = body.as_ref().map(|b| sender::authenticity(&b.auth, server_host, &m.address));
     let (mut place, mut why, new_sender) = place(known, settings, m.id, &m.address, verdict == Some(sender::Authenticity::Failed));
     let findings = body.map(|b| findings(known, &m.from, &m.address, &b, server_host)).unwrap_or_default();
-    if new_sender && let Some(first) = findings.first() {
+    if new_sender && let Some(first) = findings.first().filter(|f| f.level == Level::Danger) {
         place = Place::Spam;
         why = format!("new sender: {}", first.text);
     }
@@ -294,7 +300,8 @@ pub fn findings(known: &Known, name: &str, address: &str, body: &MessageBody, se
     let from = sender::domain(&address);
     let stranger = !known.addresses.contains(&address);
 
-    if sender::authenticity(&body.auth, server_host, &address) == sender::Authenticity::Failed {
+    let authenticity = sender::authenticity(&body.auth, server_host, &address);
+    if authenticity == sender::Authenticity::Failed {
         add(Level::Danger, "Your mail server checked this message and it does not come from the domain it claims. It is probably forged".into());
     }
     // Your own name on someone else's address: the "I hacked your account" extortion, or a fake
@@ -331,8 +338,10 @@ pub fn findings(known: &Known, name: &str, address: &str, body: &MessageBody, se
     // that borrows a word of its own ("Acme Corp" from acme-invoices.net).
     let words = |label: String| label.split('-').filter(|w| w.len() >= 4).map(str::to_owned).collect::<Vec<_>>();
     let borrowed = |owns: &[String]| sender::public_mail(&from) || words(organisation_label(&from)).iter().any(|w| owns.iter().any(|o| words(o.clone()).contains(w)));
+    // A name that is only the address ("billing.acme@agency.example") shows where it comes from.
     if stranger
         && !from.is_empty()
+        && !sender::names_the_address(name, &address)
         && let Some(brand) = brand_in(name, known).filter(|(_, owns, ours)| !owns.contains(&organisation_label(&from)) && !(*ours && (PLATFORMS.contains(&organisation_label(&from).as_str()) || !borrowed(owns))))
     {
         add(Level::Danger, format!("The name says {}, but the message comes from {from}", brand.0));
@@ -365,11 +374,13 @@ pub fn findings(known: &Known, name: &str, address: &str, body: &MessageBody, se
                 html::Run::Text { .. } => None,
             })
             .collect();
-        // A link to the sender's own domain is its click tracking, not a disguise.
+        // A link to the sender's own domain is its click tracking, not a disguise; so is one that shows
+        // the sender's own site when the server verified the sender (the tracking of the service that sends its mail).
         // By where each link really leads: through a known redirect, to its target.
+        let own_site = |text: &str| authenticity == sender::Authenticity::Verified && sender::registrable(&html::host(text)) == sender::registrable(&from);
         if let Some((text, url)) = links.iter().find(|(text, url)| {
             let target = html::clean_url(url, "");
-            html::looks_misleading(text, &target) && !sender::same_site(&html::host(&target), &from)
+            html::looks_misleading(text, &target) && !sender::same_site(&html::host(&target), &from) && !own_site(text)
         }) {
             add(Level::Danger, format!("A link shows {} but opens {}", text.trim(), html::host(&html::clean_url(url, ""))));
         }
@@ -727,6 +738,7 @@ mod tests {
         assert!(findings(&known, "Acme Corp Shop", "mailer@shopify.com", &body, "").is_empty(), "a platform sending for an organisation you know");
         assert_eq!(texts(&findings(&known, "Acme Corp", "acme.corp.billing@gmail.com", &body, "")), ["The name says Acme Corp, but the message comes from gmail.com"], "but not a mailbox anyone can open");
         assert!(!findings(&known, "PayPal", "mailer@shopify.com", &body, "").is_empty(), "but not for a listed brand");
+        assert!(findings(&known, "billing.ing@agency.example", "billing.ing@agency.example", &body, "").is_empty(), "a name that is only the address");
         for local in ["WqOAXUVzQcKNliJ", "ewtkxdrhdafnwzj", "xkcdqwrt.bob"] {
             assert!(machine_made(local), "{local}");
         }
@@ -809,6 +821,10 @@ mod tests {
         assert!(all.contains(&"A link shows www.bank.com but opens evil.io"), "{all:?}");
         let tracked = MessageBody { html: Some(r#"<a href="https://lmj.shop.net/c">www.shop.com</a>"#.into()), ..MessageBody::default() };
         assert!(findings(&known, "Shop", "news@shop.net", &tracked, "").is_empty(), "the sender's own tracking domain");
+        let mailer = |auth: Vec<beavermail_core::AuthResult>| MessageBody { html: Some(r#"<a href="https://u123.ct.mailer.example/ls">my.shop.com</a>"#.into()), auth, ..MessageBody::default() };
+        let dkim = vec![beavermail_core::AuthResult { server: "mx.home.net".into(), checks: vec![beavermail_core::AuthCheck { method: "dkim".into(), result: "pass".into(), domain: "news.shop.com".into() }] }];
+        assert!(findings(&known, "Shop", "x@news.shop.com", &mailer(dkim), "mx.home.net").is_empty(), "a verified sender showing its own site through its mailer's tracking");
+        assert!(!findings(&known, "Shop", "x@news.shop.com", &mailer(Vec::new()), "mx.home.net").is_empty(), "but not unverified");
         let redirected = |to: &str| MessageBody { html: Some(format!(r#"<a href="https://www.google.com/url?q={to}">www.bank.com</a>"#)), ..MessageBody::default() };
         assert!(findings(&known, "Shop", "news@shop.com", &redirected("https%3A%2F%2Fbank.com%2Flogin"), "").is_empty(), "through a redirect to the site it names");
         assert_eq!(texts(&findings(&known, "Shop", "news@shop.com", &redirected("https%3A%2F%2Fevil.io%2Fx"), "")), ["A link shows www.bank.com but opens evil.io"], "named by where it really leads");

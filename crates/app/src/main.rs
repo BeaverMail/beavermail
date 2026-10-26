@@ -231,6 +231,10 @@ struct SidebarOutcome {
     recheck: Option<(u64, usize)>,
     /// "Empty Spam" or "Empty Trash" was chosen in this (account, folder index)'s menu.
     empty: Option<(u64, usize)>,
+    /// "Check all mail for spam" was chosen in the menu of All inboxes or of every account's Suspicious.
+    recheck_all: bool,
+    /// "Empty Spam" was chosen in the menu of every account's Spam.
+    empty_all: bool,
     removed: Option<u64>,
     edit: Option<u64>,
     add: bool,
@@ -865,9 +869,10 @@ fn reveal_offset(row: usize, offset: f32, height: f32) -> Option<f32> {
 }
 
 /// Marks the pane the keys act on after F6.
-/// Where a folder folded in the sidebar is remembered, in [`Settings::folded`] beside the accounts.
-fn folder_fold_key(account: &str, folder: &str) -> String {
-    format!("folder:{account}:{folder}")
+/// Where a folder opened in the sidebar is remembered, in [`Settings::folded`] beside the accounts:
+/// folders start folded, the user opens those they want.
+fn folder_open_key(account: &str, folder: &str) -> String {
+    format!("open:{account}:{folder}")
 }
 
 /// A folder row of an account in the sidebar, drawn in from the left: a margin for the arrow of a folder
@@ -1133,7 +1138,7 @@ struct BeaverApp {
     /// "Move all to Spam" was pressed in the suspicious view; waiting for the user to confirm.
     confirm_spam: bool,
     /// The Spam or Trash folder (account, index) the user asked to empty, until they confirm.
-    confirm_empty: Option<(u64, usize)>,
+    confirm_empty: Vec<(u64, usize)>,
     /// Text of the search box; filters the loaded messages by sender and subject.
     query: String,
     /// The query the results below belong to, which search they are, and what was found: (account, hit).
@@ -1364,7 +1369,7 @@ impl BeaverApp {
             confirm_erase: Vec::new(),
             picked: Vec::new(),
             confirm_spam: false,
-            confirm_empty: None,
+            confirm_empty: Vec::new(),
             query: String::new(),
             searched: String::new(),
             search_seq: 0,
@@ -1568,11 +1573,12 @@ impl BeaverApp {
         if view.source.is_none() || view.mailboxes.get(index).is_none() {
             return;
         }
-        let (key, name, delimiter) = (view.account.key().to_owned(), view.mailboxes[index].name.clone(), view.delimiter());
-        self.send_pending(); // Undo puts mail back in the list it left
+        let (key, name, delimiter) = (view.account.key(), &view.mailboxes[index].name, view.delimiter());
         // A folder opened from the palette or a link shows in the sidebar: the folders it is inside unfold.
+        let outer: Vec<String> = view.mailboxes.iter().filter(|m| views::is_inside(name, &m.name, delimiter)).map(|m| folder_open_key(&key, &m.name)).collect();
+        self.send_pending(); // Undo puts mail back in the list it left
         let before = self.settings.folded.len();
-        self.settings.folded.retain(|k| !k.strip_prefix(&folder_fold_key(&key, "")).is_some_and(|folder| views::is_inside(&name, folder, delimiter)));
+        self.settings.folded.extend(outer);
         if self.settings.folded.len() != before {
             self.save_settings();
         }
@@ -5004,11 +5010,11 @@ impl BeaverApp {
                 mailbox.name = new;
             }
         }
-        let prefix = folder_fold_key(&key, "");
+        let prefix = folder_open_key(&key, "");
         self.settings.folded = std::mem::take(&mut self.settings.folded)
             .into_iter()
             .map(|k| match k.strip_prefix(&prefix).and_then(renamed) {
-                Some(new) => folder_fold_key(&key, &new),
+                Some(new) => folder_open_key(&key, &new),
                 None => k,
             })
             .collect();
@@ -5419,7 +5425,7 @@ impl BeaverApp {
 
     /// Up/Down move through the list, E archives, Delete trashes, U toggles unread.
     fn handle_keys(&mut self, ctx: &egui::Context) {
-        if self.form.is_some() || !self.confirm_erase.is_empty() || self.confirm_spam || self.confirm_empty.is_some() || self.confirm_remove.is_some() || self.confirm_unsubscribe.is_some() || self.confirm_block.is_some() || self.compose.is_some() || self.show_settings || self.palette.is_some() || self.locked() {
+        if self.form.is_some() || !self.confirm_erase.is_empty() || self.confirm_spam || !self.confirm_empty.is_empty() || self.confirm_remove.is_some() || self.confirm_unsubscribe.is_some() || self.confirm_block.is_some() || self.compose.is_some() || self.show_settings || self.palette.is_some() || self.locked() {
             return;
         }
         // Ctrl+N and Ctrl+K work while the search box has the keyboard; the other keys do not.
@@ -6296,6 +6302,10 @@ impl BeaverApp {
         }
         if self.selected == Some((serial, index)) {
             self.messages.clear();
+        } else if self.unified && self.unified_role == role {
+            // Every account's folder of this kind: only this account's messages go.
+            let origin = &self.origin;
+            self.messages.retain(|m| origin.get(&m.id) != Some(&serial));
         }
         self.tabs.retain(|t| t.serial != serial || t.role != role);
         if let Some(mailbox) = self.accounts.iter_mut().find(|v| v.serial == serial).and_then(|v| v.mailboxes.get_mut(index)) {
@@ -6305,20 +6315,27 @@ impl BeaverApp {
         self.spawn(async move { Event::Done(serial, index, None, source.empty(role).await.map(drop)) });
     }
 
-    /// Confirms emptying Spam or Trash: nothing in it can be brought back afterwards.
+    /// Confirms emptying Spam or Trash, of one account or of several: nothing in it can be brought back afterwards.
     fn empty_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
-        let Some((serial, index)) = self.confirm_empty else { return };
-        let Some(name) = self.view(serial).and_then(|v| emptied(v.mailboxes.get(index)?.role)) else {
-            self.confirm_empty = None;
+        let targets = self.confirm_empty.clone();
+        let Some(name) = targets.first().and_then(|&(serial, index)| emptied(self.view(serial)?.mailboxes.get(index)?.role)) else {
+            self.confirm_empty.clear();
             return;
         };
-        let count = self.view(serial).and_then(|v| Some(self.archive.messages(&v.account.key(), &v.mailboxes.get(index)?.name).ok()?.len())).unwrap_or(0);
+        let count: usize = targets.iter().filter_map(|&(serial, index)| self.view(serial).and_then(|v| Some(self.archive.messages(&v.account.key(), &v.mailboxes.get(index)?.name).ok()?.len()))).sum();
         // The folders moved into the trash go with it, each with those inside it and their messages.
-        let (folders, in_folders) = self.view(serial).and_then(|v| v.mailboxes.get(index).filter(|m| m.role == Role::Trash).map(|trash| (v, trash))).map_or((Vec::new(), 0), |(v, trash)| {
-            let inside: Vec<&Mailbox> = v.mailboxes.iter().filter(|m| views::is_inside(&m.name, &trash.name, trash.delimiter)).collect();
-            let top = inside.iter().filter(|m| !inside.iter().any(|o| views::is_inside(&m.name, &o.name, trash.delimiter))).map(|m| m.name.clone()).collect();
-            (top, inside.iter().map(|m| m.total).sum::<u32>())
-        });
+        let mut folders: Vec<(u64, String)> = Vec::new();
+        let mut in_folders = 0;
+        for &(serial, index) in &targets {
+            if let Some(v) = self.view(serial)
+                && let Some(trash) = v.mailboxes.get(index).filter(|m| m.role == Role::Trash)
+            {
+                let inside: Vec<&Mailbox> = v.mailboxes.iter().filter(|m| views::is_inside(&m.name, &trash.name, trash.delimiter)).collect();
+                folders.extend(inside.iter().filter(|m| !inside.iter().any(|o| views::is_inside(&m.name, &o.name, trash.delimiter))).map(|m| (serial, m.name.clone())));
+                in_folders += inside.iter().map(|m| m.total).sum::<u32>();
+            }
+        }
+        let accounts: Vec<String> = targets.iter().filter_map(|&(serial, _)| Some(self.view(serial)?.account.address().to_owned())).collect();
         let (mut confirm, mut cancel) = (false, false);
         let modal = egui::Modal::new(egui::Id::new("confirm_empty")).show(ctx, |ui| {
             ui.set_width(FORM_WIDTH * 0.8);
@@ -6327,6 +6344,9 @@ impl BeaverApp {
                 0 => format!("Delete {messages} in {name}?"),
                 n => format!("Delete {messages} and {n} folder{} in {name}?", if n == 1 { "" } else { "s" }),
             });
+            if accounts.len() > 1 {
+                ui.add(egui::Label::new(RichText::new(format!("Of {}.", accounts.join(", "))).color(t.text_dim)).wrap());
+            }
             let learn = if name == "Spam" { " The spam checks keep learning from them." } else { "" };
             let held = match in_folders {
                 0 => String::new(),
@@ -6341,18 +6361,19 @@ impl BeaverApp {
             });
         });
         if confirm {
-            if count > 0 {
-                self.empty_folder(serial, index);
+            for &(serial, index) in &targets {
+                if self.view(serial).and_then(|v| self.archive.messages(&v.account.key(), &v.mailboxes.get(index)?.name).ok()).is_some_and(|l| !l.is_empty()) {
+                    self.empty_folder(serial, index);
+                }
             }
-            if let Some(source) = self.view(serial).and_then(|v| v.source.clone()) {
-                for folder in folders {
-                    let source = source.clone();
+            for (serial, folder) in folders {
+                if let Some(source) = self.view(serial).and_then(|v| v.source.clone()) {
                     self.spawn(async move { Event::FolderDeleted(serial, folder.clone(), source.delete_folder(&folder).await) });
                 }
             }
         }
         if confirm || cancel || modal.should_close() {
-            self.confirm_empty = None;
+            self.confirm_empty.clear();
         }
     }
 
@@ -6889,6 +6910,7 @@ impl BeaverApp {
     fn sidebar(&mut self, ui: &mut egui::Ui, t: &theme::Tokens) -> SidebarOutcome {
         let (mut chosen, mut removed, mut edit, mut add, mut suspicious, mut recheck, mut empty) = (None, None, None, false, None, None, None);
         let (mut all, mut scheduled, mut all_suspicious, mut all_spam) = (false, false, false, false);
+        let (mut recheck_all, mut empty_all) = (false, false);
         let mut fold = None;
         let mut dropped = None;
         let mut new_inside = None;
@@ -6931,15 +6953,32 @@ impl BeaverApp {
                         if self.accounts.len() >= 2 {
                             let unread = self.accounts.iter().filter_map(|v| Some(inbox_unread(v.serial, v.mailboxes.iter().find(|m| m.role == Role::Inbox)?))).sum();
                             let inboxes = self.unified && self.unified_role == Role::Inbox;
-                            all = views::folder_row(ui, t, "All inboxes", Role::Inbox, unread, inboxes && !self.show_suspicious).on_hover_text("The Inbox of every account, newest first").clicked();
+                            // The menus of every account's folders: the one of an account's own, for all of them at once.
+                            // Its (account, folder) answer stands for every account here.
+                            let mut inbox_menu = |ui: &mut egui::Ui| {
+                                let mut asked = None;
+                                folder_menu(ui, Role::Inbox, (0, 0, 0), self.settings.hold_suspicious, &mut asked, &mut None, (0, 0));
+                                recheck_all |= asked.is_some();
+                            };
+                            let row = views::folder_row(ui, t, "All inboxes", Role::Inbox, unread, inboxes && !self.show_suspicious).on_hover_text("The Inbox of every account, newest first");
+                            all = row.clicked();
+                            views::context_menu(&row, &mut inbox_menu);
                             if self.settings.hold_suspicious {
                                 let held = self.accounts.iter().filter_map(|v| held_of.get(&v.serial)).map(|h| h.0).sum();
-                                let row = views::suspicious_row(ui, t, held, inboxes && self.show_suspicious);
-                                all_suspicious = row.on_hover_text("Mail from new senders that failed a check, every account's, held apart from the Inboxes").clicked();
+                                let row = views::suspicious_row(ui, t, held, inboxes && self.show_suspicious).on_hover_text("Mail from new senders that failed a check, every account's, held apart from the Inboxes");
+                                all_suspicious = row.clicked();
+                                views::context_menu(&row, &mut inbox_menu);
                             }
-                            let spam = self.accounts.iter().filter_map(|v| v.mailboxes.iter().find(|m| m.role == Role::Junk)).map(|m| m.unread).sum();
-                            let row = views::folder_row(ui, t, "Spam", Role::Junk, spam, self.unified && self.unified_role == Role::Junk);
-                            all_spam = row.on_hover_text("The Spam folder of every account, newest first").clicked();
+                            let spam_folders = || self.accounts.iter().filter_map(|v| Some((v, v.mailboxes.iter().find(|m| m.role == Role::Junk)?)));
+                            let spam = spam_folders().map(|(_, m)| m.unread).sum();
+                            let row = views::folder_row(ui, t, "Spam", Role::Junk, spam, self.unified && self.unified_role == Role::Junk).on_hover_text("The Spam folder of every account, newest first");
+                            all_spam = row.clicked();
+                            views::context_menu(&row, |ui| {
+                                let listed = spam_folders().map(|(v, m)| self.archive.messages(&v.account.key(), &m.name).map_or(0, |l| l.len())).sum();
+                                let mut asked = None;
+                                folder_menu(ui, Role::Junk, (listed, spam_folders().map(|(_, m)| m.total).sum(), 0), self.settings.hold_suspicious, &mut None, &mut asked, (0, 0));
+                                empty_all |= asked.is_some();
+                            });
                         }
                         if !self.scheduled.is_empty() {
                             let row = views::icon_row(ui, t, "Scheduled", Icon::Calendar, self.scheduled.len() as u32, self.show_scheduled);
@@ -6982,7 +7021,7 @@ impl BeaverApp {
                                         rows.insert(after, (rows[inbox].0, rows[inbox].1, true));
                                     }
                                     // A folded folder hides those inside it and counts their unread mail in its own.
-                                    let fold_key = |name: &str| folder_fold_key(&view.account.key(), name);
+                                    let open_key = |name: &str| folder_open_key(&view.account.key(), name);
                                     let mut hide_below: Option<usize> = None;
                                     let mut visible = Vec::with_capacity(rows.len());
                                     for (at, &(i, depth, held)) in rows.iter().enumerate() {
@@ -6992,7 +7031,7 @@ impl BeaverApp {
                                         hide_below = None;
                                         let inside: Vec<usize> = rows[at + 1..].iter().take_while(|&&(_, d, _)| d > depth).map(|&(j, ..)| j).collect();
                                         let has_kids = !held && !inside.is_empty();
-                                        let folded = has_kids && self.settings.folded.contains(&fold_key(&view.mailboxes[i].name));
+                                        let folded = has_kids && !self.settings.folded.contains(&open_key(&view.mailboxes[i].name));
                                         if folded {
                                             hide_below = Some(depth);
                                         }
@@ -7024,7 +7063,7 @@ impl BeaverApp {
                                             let arrow = ui.interact(spot, ui.id().with(("fold", &mailbox.name)), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
                                             views::fold_arrow(ui, if folded { 0.0 } else { 1.0 }, &arrow);
                                             if arrow.on_hover_text(if folded { "Show the folders inside" } else { "Hide the folders inside" }).clicked() {
-                                                fold = Some(fold_key(&mailbox.name));
+                                                fold = Some(open_key(&mailbox.name));
                                             }
                                         }
                                         if row.clicked() {
@@ -7113,7 +7152,7 @@ impl BeaverApp {
             }
             self.save_settings();
         }
-        SidebarOutcome { chosen, suspicious, recheck, empty, removed, edit, add, all, scheduled, all_suspicious, all_spam, dropped, new_inside, rename, delete }
+        SidebarOutcome { chosen, suspicious, recheck, empty, recheck_all, empty_all, removed, edit, add, all, scheduled, all_suspicious, all_spam, dropped, new_inside, rename, delete }
     }
 
     /// Search, refresh and the message list. Returns the message the user clicked and whether to add an account.
@@ -7804,7 +7843,7 @@ impl eframe::App for BeaverApp {
                 _ => {}
             }
         }
-        let SidebarOutcome { chosen, suspicious, recheck, empty, removed, edit, mut add, all, scheduled, all_suspicious, all_spam, dropped, new_inside, rename, delete } =
+        let SidebarOutcome { chosen, suspicious, recheck, empty, recheck_all, empty_all, removed, edit, mut add, all, scheduled, all_suspicious, all_spam, dropped, new_inside, rename, delete } =
             if self.in_tab || contacts { SidebarOutcome::default() } else { self.sidebar(ui, &t) };
         if let Some((serial, index)) = new_inside {
             let parent = self.view(serial).and_then(|v| v.mailboxes.get(index)).map(|m| m.name.clone());
@@ -7873,8 +7912,23 @@ impl eframe::App for BeaverApp {
                 self.select_mailbox(serial, index);
             }
         }
+        if recheck_all {
+            if !self.unified || self.unified_role != Role::Inbox {
+                self.show_all_inboxes();
+            }
+            self.rescreen();
+        }
         if empty.is_some() {
-            self.confirm_empty = empty;
+            self.confirm_empty = empty.into_iter().collect();
+        }
+        // Only the Spam folders with mail listed: as for one, never mail the user has not seen.
+        if empty_all {
+            self.confirm_empty = self
+                .accounts
+                .iter()
+                .filter_map(|v| Some((v.serial, v.mailboxes.iter().position(|m| m.role == Role::Junk)?)))
+                .filter(|&(serial, index)| self.view(serial).and_then(|v| self.archive.messages(&v.account.key(), &v.mailboxes[index].name).ok()).is_some_and(|l| !l.is_empty()))
+                .collect();
         }
         self.confirm_remove = removed.or(self.confirm_remove);
 

@@ -136,12 +136,22 @@ pub fn warning(name: &str, address: &str) -> Option<&'static str> {
     if disguised(&real) {
         return Some("The sender's domain is written with look-alike characters");
     }
+    if names_the_address(name, address) {
+        return None;
+    }
     let claimed = name.split(|c: char| c.is_whitespace() || "<>()[]\",;:".contains(c)).filter_map(claimed_domain).find(|d| !same_site(d, &real));
     claimed.map(|_| "The name shows an address or site that is not the one this was sent from")
 }
 
+/// A name that is only the address, or its part before the `@` ("ada.lovelace" from
+/// ada.lovelace@example.org): it claims nothing the address does not show.
+pub fn names_the_address(name: &str, address: &str) -> bool {
+    let (name, address) = (name.trim().trim_matches('"').to_lowercase(), address.trim().to_lowercase());
+    !name.is_empty() && (name == address || address.rsplit_once('@').is_some_and(|(local, _)| name == local))
+}
+
 /// The domain a word of a display name claims to be: "support@bank.com" or "www.bank.com".
-fn claimed_domain(word: &str) -> Option<String> {
+pub fn claimed_domain(word: &str) -> Option<String> {
     let word = word.trim_matches(|c: char| c == '.' || c == '/' || c == '\'' || c == '-');
     let host = word.rsplit_once('@').map_or(word, |(_, d)| d);
     let host = host.strip_prefix("http://").or_else(|| host.strip_prefix("https://")).unwrap_or(host);
@@ -182,7 +192,7 @@ mod tests {
 
     #[test]
     fn ordinary_senders_are_not_flagged() {
-        for (name, address) in [("Ada Lovelace", "ada@example.org"), ("Mr. Smith", "smith@corp.com"), ("Bank", "no-reply@bank.com"), ("Bank mail", "x@mail.bank.com"), ("bank.com", "x@www.bank.com"), ("J.R.R. Tolkien", "j@x.org"), ("", "a@b.org")] {
+        for (name, address) in [("Ada Lovelace", "ada@example.org"), ("Mr. Smith", "smith@corp.com"), ("Bank", "no-reply@bank.com"), ("Bank mail", "x@mail.bank.com"), ("bank.com", "x@www.bank.com"), ("J.R.R. Tolkien", "j@x.org"), ("", "a@b.org"), ("ada.lovelace", "ada.lovelace@school.example.org")] {
             assert_eq!(warning(name, address), None, "{name} <{address}>");
         }
     }

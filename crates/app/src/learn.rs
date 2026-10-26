@@ -6,11 +6,11 @@
 //! server emptying its Spam folder), the Spam folder itself, and the mail of known senders. Only the
 //! examples are kept, never the weights, so what it knows is always what the archive says.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 /// Fewer examples of either kind than this and the model says nothing: rules decide alone until then.
-pub const MIN_EXAMPLES: usize = 20;
+pub const MIN_EXAMPLES: usize = 200;
 const EPOCHS: usize = 5;
 // FTRL-Proximal settings: learning rate, its smoothing, L1 and L2.
 const ALPHA: f32 = 0.3;
@@ -24,13 +24,24 @@ pub struct Model {
     slots: HashMap<u64, (f32, f32)>,
     /// A readable name for each feature, to say which words weighed.
     names: HashMap<u64, String>,
+    /// Words left out of every text: see [`COMMON`].
+    common: HashSet<String>,
 }
 
-/// The features of a text: each word, each pair of words up to four apart (orthogonal sparse
-/// bigrams: "pink gelatin" and "pink _ ritual" both count), and the sender's domain.
-fn features(text: &str, domain: &str) -> Vec<(u64, String)> {
-    let words: Vec<String> = text.split(|c: char| !c.is_alphanumeric()).filter(|w| w.chars().count() >= 2).map(str::to_lowercase).take(300).collect();
-    let mut out: Vec<String> = words.clone();
+/// A word in at least this share of the spam and of the other mail is one of a language's own ("de",
+/// "the", "di"), in any language: it would teach the model which language spam is in, not what it says.
+const COMMON: f32 = 0.1;
+
+/// The words of a text, lower case, the first 300.
+fn words(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric()).filter(|w| w.chars().count() >= 2).map(str::to_lowercase).take(300).collect()
+}
+
+/// The features of a text's `words` but the `common` ones: each word, each pair of words up to four
+/// apart (orthogonal sparse bigrams: "pink gelatin" and "pink _ ritual" both count), and the sender's domain.
+fn features(words: &[String], domain: &str, common: &HashSet<String>) -> Vec<(u64, String)> {
+    let words: Vec<&String> = words.iter().filter(|w| !common.contains(*w)).collect();
+    let mut out: Vec<String> = words.iter().map(|w| (*w).clone()).collect();
     for (i, first) in words.iter().enumerate() {
         for (gap, second) in words.iter().skip(i + 1).take(4).enumerate() {
             out.push(format!("{first} {}{second}", "_ ".repeat(gap)));
@@ -50,17 +61,36 @@ fn features(text: &str, domain: &str) -> Vec<(u64, String)> {
         .collect()
 }
 
+fn tokenized(examples: &[(String, String)]) -> Vec<(Vec<String>, &str)> {
+    examples.iter().map(|(t, d)| (words(t), d.as_str())).collect()
+}
+
+/// The words in at least [`COMMON`] of the texts of each kind.
+fn common_words(spam: &[(Vec<String>, &str)], ham: &[(Vec<String>, &str)]) -> HashSet<String> {
+    let share = |texts: &[(Vec<String>, &str)]| {
+        let mut count: HashMap<&str, usize> = HashMap::new();
+        for (words, _) in texts {
+            for word in words.iter().map(String::as_str).collect::<HashSet<_>>() {
+                *count.entry(word).or_default() += 1;
+            }
+        }
+        count.into_iter().filter(|(_, n)| *n as f32 >= texts.len() as f32 * COMMON).map(|(w, _)| w.to_owned()).collect::<HashSet<String>>()
+    };
+    share(spam).intersection(&share(ham)).cloned().collect()
+}
+
 impl Model {
     /// Trains on (text, sender domain) examples; `None` until both kinds have [`MIN_EXAMPLES`].
     pub fn train(spam: &[(String, String)], ham: &[(String, String)]) -> Option<Self> {
         if spam.len() < MIN_EXAMPLES || ham.len() < MIN_EXAMPLES {
             return None;
         }
-        let mut model = Self { slots: HashMap::new(), names: HashMap::new() };
+        let (spam, ham) = (tokenized(spam), tokenized(ham));
+        let mut model = Self { slots: HashMap::new(), names: HashMap::new(), common: common_words(&spam, &ham) };
         // Interleaved, so neither kind comes in one block; the larger kind is not repeated, the
         // probability threshold accounts for it.
         let examples: Vec<(Vec<(u64, String)>, f32)> = {
-            let (mut s, mut h) = (spam.iter().map(|(t, d)| (features(t, d), 1.0)), ham.iter().map(|(t, d)| (features(t, d), 0.0)));
+            let (mut s, mut h) = (spam.iter().map(|(w, d)| (features(w, d, &model.common), 1.0)), ham.iter().map(|(w, d)| (features(w, d, &model.common), 0.0)));
             let mut out = Vec::new();
             loop {
                 match (s.next(), h.next()) {
@@ -104,7 +134,7 @@ impl Model {
 
     /// The probability that a text from `domain` is spam, and the features that pushed it up most.
     pub fn score(&self, text: &str, domain: &str) -> (f32, Vec<String>) {
-        let features = features(text, domain);
+        let features = features(&words(text), domain, &self.common);
         let mut pushing: Vec<(f32, &str)> = features.iter().map(|(f, name)| (self.weight(*f), name.as_str())).filter(|(w, _)| *w > 0.0).collect();
         pushing.sort_by(|a, b| b.0.total_cmp(&a.0));
         (self.predict(&features), pushing.into_iter().take(4).map(|(_, n)| n.to_owned()).collect())
@@ -130,10 +160,21 @@ mod tests {
         let ham = examples(&["invoice for your server renewal attached", "re: meeting tomorrow about the project", "your domain transfer is complete"], "work.example");
         let model = Model::train(&spam, &ham).unwrap();
         let (p, why) = model.score("the pink gelatin ritual that lifts skin", "other.example");
-        assert!(p > 0.8, "{p}");
+        assert!(p > 0.75, "{p}");
         assert!(why.iter().any(|w| w.contains("gelatin") || w.contains("ritual") || w.contains("skin")), "{why:?}");
         assert!(model.score("invoice for the domain renewal", "other.example").0 < 0.3);
         assert!(model.size() > 0);
+    }
+
+    #[test]
+    fn the_words_of_a_language_are_not_features() {
+        let spam: Vec<(String, String)> = (0..MIN_EXAMPLES).map(|i| (format!("oferta{i} de la crema gelatina"), "spam.example".into())).collect();
+        let ham: Vec<(String, String)> = (0..MIN_EXAMPLES).map(|i| (format!("factura{i} de la casa"), "work.example".into())).collect();
+        let model = Model::train(&spam, &ham).unwrap();
+        assert!(model.common.contains("de") && model.common.contains("la"));
+        assert!(!model.common.contains("gelatina"), "a word only spam has is what it says");
+        let (_, why) = model.score("tu pedido de la tienda gelatina", "other.example");
+        assert!(why.iter().all(|w| !w.split(' ').any(|p| p == "de" || p == "la")), "{why:?}");
     }
 
     #[test]

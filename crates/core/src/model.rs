@@ -502,7 +502,8 @@ pub struct Settings {
     /// The message shows beside the list; off, it opens in a tab.
     #[serde(default = "yes")]
     pub reading_pane: bool,
-    /// Accounts (by [`Account::key`]) folded in the sidebar, so they stay folded at the next start.
+    /// Accounts (by [`Account::key`]) folded in the sidebar, so they stay folded at the next start, and
+    /// the folders opened (folders start folded).
     #[serde(default)]
     pub folded: std::collections::BTreeSet<String>,
     /// Link parameters removed before a link is opened or copied, besides the known tracking ones:

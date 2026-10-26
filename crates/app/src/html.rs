@@ -489,7 +489,8 @@ pub fn host(url: &str) -> String {
 /// A link whose visible text names a different site than the one it goes to.
 pub fn looks_misleading(text: &str, url: &str) -> bool {
     let text = text.trim();
-    let named = text.starts_with("http://") || text.starts_with("https://") || (text.contains('.') && !text.contains(' ') && !text.contains('@'));
+    // A site's name, not any word with a dot: "aquí." ends a sentence, "7.0.4" is a version.
+    let named = (text.starts_with("http://") || text.starts_with("https://") || (!text.contains(' ') && !text.contains('@'))) && crate::sender::claimed_domain(text).is_some();
     named && !url.to_ascii_lowercase().starts_with("mailto:") && !crate::sender::same_site(&host(text), &host(url))
 }
 
@@ -714,6 +715,9 @@ mod tests {
         assert!(looks_misleading("https://bank.com/a", "https://evil.example/"));
         assert!(!looks_misleading("https://www.bank.com/a", "https://bank.com/b"));
         assert!(!looks_misleading("Click here", "https://evil.example/"));
+        for text in ["aqui.", "7.0.4", "v2.1"] {
+            assert!(!looks_misleading(text, "https://evil.example/"), "{text}");
+        }
         assert!(!looks_misleading("www.scaleway.com", "https://links.scaleway.com/c/1"), "a subdomain of the site named");
     }
 
