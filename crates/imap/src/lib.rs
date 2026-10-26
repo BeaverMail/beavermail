@@ -1354,13 +1354,21 @@ impl MailSource for ImapSource {
         let path = self.file_of(&at.account, &at.folder, at.uid)?;
         // A file that cannot be read (damaged, written under another key, or the vault is locked) is
         // downloaded again.
-        if let Some(raw) = self.files.read(&path).ok().flatten() {
-            return self.read(&raw);
+        match self.files.read(&path) {
+            Ok(Some(raw)) => return self.read(&raw),
+            Ok(None) => {}
+            Err(e) => log::warn!("message {}: its stored file cannot be read ({e}), so it is downloaded again", id.0),
         }
+        let started = std::time::Instant::now();
         let raw = self.download(&at).await?;
+        log::debug!("message {}: downloaded in {:.0?}, {} bytes", id.0, started.elapsed(), raw.len());
         let body = self.read(&raw)?;
         // Not being able to keep the file (a locked vault) must not stop the message from opening.
-        if self.files.write(&path, &raw).is_ok() {
+        let kept = self.files.write(&path, &raw);
+        if let Err(e) = &kept {
+            log::warn!("message {}: cannot be kept on this computer ({e}), so it is downloaded at every opening", id.0);
+        }
+        if kept.is_ok() {
             self.store.mark_stored(&at.account, &at.folder, at.uid)?;
             // What was decrypted is never kept: an encrypted message is indexed by its subject and sender only.
             if body.encryption.is_none() {

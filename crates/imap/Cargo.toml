@@ -19,6 +19,7 @@ beavermail-vault.workspace = true
 beavermail-crypto.workspace = true
 async-imap = { version = "0.12", default-features = false, features = ["runtime-tokio"] }
 futures = "0.3"
+log = "0.4"
 mail-parser = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"

@@ -17,6 +17,7 @@ mod calview;
 mod card;
 mod commands;
 mod compose;
+mod diag;
 mod drafts;
 mod event_form;
 mod encryption;
@@ -778,12 +779,13 @@ enum SettingsPage {
     Spam,
     Encryption,
     Storage,
+    Troubleshooting,
     /// One account's page, by serial.
     Account(u64),
 }
 
 impl SettingsPage {
-    const ALL: [Self; 6] = [Self::Reading, Self::Appearance, Self::Writing, Self::Spam, Self::Encryption, Self::Storage];
+    const ALL: [Self; 7] = [Self::Reading, Self::Appearance, Self::Writing, Self::Spam, Self::Encryption, Self::Storage, Self::Troubleshooting];
 
     fn title(self) -> &'static str {
         match self {
@@ -793,6 +795,7 @@ impl SettingsPage {
             Self::Spam => "Suspicious mail",
             Self::Storage => "Stored mail",
             Self::Encryption => "Encryption",
+            Self::Troubleshooting => "Troubleshooting",
             Self::Account(_) => "Account",
         }
     }
@@ -805,6 +808,7 @@ impl SettingsPage {
             Self::Spam => Some(Icon::Spam),
             Self::Storage => Some(Icon::Lock),
             Self::Encryption => Some(Icon::Key),
+            Self::Troubleshooting => Some(Icon::LifeBuoy),
             Self::Account(_) => None,
         }
     }
@@ -817,6 +821,7 @@ impl SettingsPage {
             Self::Spam => "Mail from people you know is never held. Nothing moves on the server.",
             Self::Storage => "How downloaded messages are kept on this computer.",
             Self::Encryption => "Your keys, to read encrypted mail and to send it encrypted.",
+            Self::Troubleshooting => "What to send when something is slow or does not work.",
             Self::Account(_) => "",
         }
     }
@@ -1481,6 +1486,9 @@ impl BeaverApp {
             Ok(settings) => app.settings = settings,
             Err(e) => app.error = Some(e),
         }
+        if app.settings.diagnostics {
+            diag::set(store::data_dir().ok().as_deref());
+        }
         match store::load() {
             Ok(accounts) => accounts.into_iter().for_each(|a| {
                 app.add_view(a);
@@ -1833,13 +1841,19 @@ impl BeaverApp {
         let own: Vec<String> = self.accounts.iter().map(|v| v.account.address().to_owned()).collect();
         let (archive, settings) = (self.archive.clone(), self.settings.clone());
         Some(async move {
+            let started = std::time::Instant::now();
             let body = source.body(message.id).await?;
+            let read = started.elapsed();
             // The checks load what the account knows and train the spam model: seconds on a big mailbox, never on the UI thread.
             let prepared = tokio::task::spawn_blocking(move || {
+                let checks = std::time::Instant::now();
                 let findings = screen::Known::load(&archive, &account, &own, &settings)
                     .map(|known| screen::findings(&known, &message.from, &message.address, &body, &source.auth_server()))
                     .unwrap_or_default();
-                Box::new(Prepared::new(body, findings))
+                let checks = checks.elapsed();
+                let prepared = Box::new(Prepared::new(body, findings));
+                log::debug!("message {}: read in {read:.0?}, checked in {checks:.0?}, ready in {:.0?}", message.id.0, started.elapsed());
+                prepared
             });
             prepared.await.map_err(|e| MailError::Backend(e.to_string()))
         })
@@ -1901,13 +1915,16 @@ impl BeaverApp {
         self.folded_anchor = false;
         self.attach_selected.clear();
         wanted.store(id.0, std::sync::atomic::Ordering::Relaxed);
+        let asked = std::time::Instant::now();
         self.spawn(async move {
             // Paging through the list asks for many messages in a row: only the one it stops on is read.
             tokio::time::sleep(std::time::Duration::from_millis(120)).await;
             if wanted.load(std::sync::atomic::Ordering::Relaxed) != id.0 {
                 return Event::Body(serial, id, Err(MailError::NotFound)); // dropped: another message is shown now
             }
-            Event::Body(serial, id, read.await)
+            let body = read.await;
+            log::debug!("message {}: shown {:.0?} after it was asked for", id.0, asked.elapsed());
+            Event::Body(serial, id, body)
         });
     }
 
@@ -3434,6 +3451,23 @@ impl BeaverApp {
                                 vault_request = security::section(ui, t, &mut self.security, mode, locked, self.vault.has_recovery(), job.as_deref());
                                 if locked && ui.button("Unlock…").clicked() {
                                     unlock_again = true;
+                                }
+                            }
+                            SettingsPage::Troubleshooting => {
+                                let about = "How long messages take to open, and what fails. Never the text, subject or addresses of a message.";
+                                if views::switch_row(ui, t, &mut self.settings.diagnostics, "Write a diagnostic log", about).changed() {
+                                    diag::set(store::data_dir().ok().filter(|_| self.settings.diagnostics).as_deref());
+                                    changed = true;
+                                }
+                                if let Ok(dir) = store::data_dir() {
+                                    ui.add_space(8.0);
+                                    hint(ui, &format!("Kept in {}", diag::path(&dir).display()));
+                                    let found = diag::path(&dir).exists();
+                                    if ui.add_enabled(found, egui::Button::new("Show the log")).on_disabled_hover_text("Nothing written yet").clicked()
+                                        && let Err(e) = opener::open(&dir)
+                                    {
+                                        self.error = Some(format!("Could not open {}: {e}", dir.display()));
+                                    }
                                 }
                             }
                         }
@@ -7652,7 +7686,9 @@ impl BeaverApp {
                         // Working offline nothing is fetched, whatever was allowed.
                         let remote = !work_offline && (body.remote || (settings.allows_remote(&m.address) && !suspicious));
                         if !body.original.as_ref().is_some_and(|p| p.fits(width, scale, remote)) {
+                            let drawing = std::time::Instant::now();
                             body.original = original::Page::new(ui.ctx(), source, width, scale, remote, &body.trackers);
+                            log::debug!("message {}: original HTML drawn in {:.0?}", m.id.0, drawing.elapsed());
                         }
                         if body.has_remote {
                             match views::remote_bar(ui, t, remote, if suspicious { "" } else { &m.address }) {
@@ -7797,6 +7833,16 @@ impl eframe::App for BeaverApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // A frame that keeps the window from answering goes in the diagnostic log.
+        struct SlowFrame(std::time::Instant);
+        impl Drop for SlowFrame {
+            fn drop(&mut self) {
+                if self.0.elapsed() > std::time::Duration::from_millis(100) {
+                    log::warn!("a frame took {:.0?}", self.0.elapsed());
+                }
+            }
+        }
+        let _slow = SlowFrame(std::time::Instant::now());
         while let Ok(event) = self.rx.try_recv() {
             self.apply(event);
         }
