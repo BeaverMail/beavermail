@@ -122,7 +122,7 @@ impl Conversations {
 const PREFIXES: [&str; 11] = ["re", "fw", "fwd", "aw", "wg", "sv", "vs", "r", "rif", "tr", "i"];
 
 /// The subject without its "Re:"/"Fwd:" prefixes (repeated, any case, "Re[2]:" too), in lower case.
-fn subject_key(subject: &str) -> String {
+pub fn subject_key(subject: &str) -> String {
     let mut rest = subject.trim();
     while let Some(after) = strip_prefix(rest) {
         rest = after.trim_start();

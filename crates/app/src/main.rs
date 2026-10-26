@@ -36,7 +36,7 @@ mod unsubscribe;
 mod views;
 
 use beavermail_accounts as store;
-use beavermail_core::{OAuthProvider, Account, Density, DisplayMode, Hit, Keep, MailError, MailSender, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Progress, Role, Server, Settings, SyncReport, Tls};
+use beavermail_core::{OAuthProvider, Account, Density, DisplayMode, Hit, Keep, MailError, MailSender, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Progress, Role, Server, Settings, Sort, SortBy, SyncReport, Tls, ListLayout};
 use beavermail_imap::ImapSource;
 use beavermail_smtp::{SmtpSender, render_draft};
 use beavermail_store::Store;
@@ -773,8 +773,8 @@ enum Section {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 enum SettingsPage {
     #[default]
-    Reading,
     Appearance,
+    Reading,
     Writing,
     Spam,
     Encryption,
@@ -785,7 +785,7 @@ enum SettingsPage {
 }
 
 impl SettingsPage {
-    const ALL: [Self; 7] = [Self::Reading, Self::Appearance, Self::Writing, Self::Spam, Self::Encryption, Self::Storage, Self::Troubleshooting];
+    const ALL: [Self; 7] = [Self::Appearance, Self::Reading, Self::Writing, Self::Spam, Self::Encryption, Self::Storage, Self::Troubleshooting];
 
     fn title(self) -> &'static str {
         match self {
@@ -857,21 +857,22 @@ fn sized_field(text: &mut String, width: f32) -> egui::TextEdit<'_> {
 
 /// The message list's scroll area, moved just enough to show row `reveal`, from what it showed last
 /// frame: (offset, height).
-fn list_area(reveal: Option<usize>, (offset, height): (f32, f32)) -> egui::ScrollArea {
+/// `to_end`: the number of rows, to start at the last one.
+fn list_area(reveal: Option<usize>, (offset, height): (f32, f32), row_h: f32, to_end: Option<usize>) -> egui::ScrollArea {
     let area = egui::ScrollArea::vertical().auto_shrink([false, false]);
-    match reveal.and_then(|row| reveal_offset(row, offset, height)) {
+    match to_end.map(|rows| rows as f32 * row_h).or_else(|| reveal.and_then(|row| reveal_offset(row, offset, height, row_h))) {
         Some(to) => area.vertical_scroll_offset(to),
         None => area,
     }
 }
 
 /// The scroll offset that shows row `row` with the least movement, or `None` when it is in view already.
-fn reveal_offset(row: usize, offset: f32, height: f32) -> Option<f32> {
-    let top = row as f32 * views::MESSAGE_ROW_H;
+fn reveal_offset(row: usize, offset: f32, height: f32, row_h: f32) -> Option<f32> {
+    let top = row as f32 * row_h;
     if top < offset {
         Some(top)
-    } else if top + views::MESSAGE_ROW_H > offset + height {
-        Some(top + views::MESSAGE_ROW_H - height)
+    } else if top + row_h > offset + height {
+        Some(top + row_h - height)
     } else {
         None
     }
@@ -1299,6 +1300,8 @@ struct BeaverApp {
     wanted: Arc<std::sync::atomic::AtomicU64>,
     /// A list row to bring into view after the keyboard moved to it.
     list_reveal: Option<usize>,
+    /// The list starts at its end the next time it has rows: oldest first, the newest are at the bottom.
+    list_to_end: bool,
     /// What the list showed last frame: (scroll offset, height).
     list_view: (f32, f32),
     /// Asking whether to forget the senders and messages marked as spam or not spam.
@@ -1437,6 +1440,7 @@ impl BeaverApp {
             pane: None,
             reader_scroll: None,
             list_reveal: None,
+            list_to_end: false,
             wanted: Arc::default(),
             unified: false,
             unified_role: Role::Inbox,
@@ -1596,6 +1600,7 @@ impl BeaverApp {
         }
         self.selected = Some((serial, index));
         self.unified = false;
+        self.list_to_end = self.oldest_first();
         self.searched.clear(); // a search runs again over this folder
         self.show_scheduled = false;
         self.refresh_drafts();
@@ -1623,6 +1628,7 @@ impl BeaverApp {
         self.send_pending();
         self.selected = None;
         (self.unified, self.unified_role) = (true, role);
+        self.list_to_end = self.oldest_first();
         self.searched.clear(); // a search runs again over what is shown now
         self.show_scheduled = false;
         self.drafts.clear();
@@ -2343,18 +2349,62 @@ impl BeaverApp {
         let want = if self.show_suspicious { screen::Place::Spam } else { screen::Place::Inbox };
         let threaded = self.threaded();
         let mut shown = std::collections::HashSet::new();
-        let mut list = self.messages
+        let list = self.messages
             .iter()
             .filter(|m| !ours.contains(&m.message_id))
             .filter(|m| if checked(m) { self.screening.get(&m.id).is_some_and(|s| s.place == want) } else { !self.show_suspicious })
             // Newest first, so a conversation's row is its latest message here.
             .filter(|m| !threaded || self.conversations.number(m.id).is_none_or(|n| shown.insert(n)))
             .collect::<Vec<_>>();
-        // Pinned first; then a conversation by its latest message, the user's replies from Sent included,
-        // as threaded clients order them.
+        // Pinned first, then in the folder's order; by date a conversation goes by its latest message,
+        // the user's replies from Sent included, as threaded clients order them.
         let latest = self.conversation_dates();
-        list.sort_by_key(|m| (!m.pinned, std::cmp::Reverse(latest.get(&m.id).map_or(m.timestamp, |l| l.0))));
-        list
+        ordered(list, self.sort(), |m| (m, latest.get(&m.id).map_or(m.timestamp, |l| l.0)))
+    }
+
+    /// Where the order of the list shown is kept: its folder's, or that of All inboxes or Spam of every account.
+    fn sort_key(&self) -> Option<String> {
+        if self.unified {
+            return Some(Settings::sort_key("every account", if self.unified_role == Role::Junk { "Spam" } else { "Inbox" }));
+        }
+        let (serial, index) = self.selected?;
+        let view = self.view(serial)?;
+        Some(Settings::sort_key(&view.account.key(), &view.mailboxes.get(index)?.name))
+    }
+
+    fn sort(&self) -> Sort {
+        self.sort_key().map_or_else(Sort::default, |key| self.settings.sort_of(&key))
+    }
+
+    /// The height of a row of the message list: a card, or a table's row at the chosen density.
+    fn list_row_h(&self) -> f32 {
+        match self.settings.list_layout {
+            ListLayout::Cards => views::MESSAGE_ROW_H,
+            ListLayout::Table => theme::row_height(self.settings.density),
+        }
+    }
+
+    /// The list shown has its newest messages at the bottom.
+    fn oldest_first(&self) -> bool {
+        let sort = self.sort();
+        sort.by == SortBy::Date && sort.ascending
+    }
+
+    /// Orders the list shown by `sort`, and remembers it for its folder.
+    fn set_sort(&mut self, sort: Sort) {
+        let Some(key) = self.sort_key() else { return };
+        if sort == Sort::default() {
+            self.settings.sorts.remove(&key);
+        } else {
+            self.settings.sorts.insert(key, sort);
+        }
+        self.save_settings();
+        self.hits = ordered(std::mem::take(&mut self.hits), sort, |(_, h)| (&h.message, h.message.timestamp));
+        // The open message stays in view; with none, the list starts where its newest are.
+        match self.message.and_then(|id| self.listed().iter().position(|i| *i == id)) {
+            Some(row) => self.list_reveal = Some(row),
+            None => self.list_to_end = self.oldest_first(),
+        }
     }
 
     /// For each conversation's row message, when threaded: the time and date text of its latest
@@ -3172,7 +3222,7 @@ impl BeaverApp {
                     self.account_edit = Some(NewAccount::editing(serial, &view.account));
                 }
                 Some(_) => {}
-                None => self.leave_settings_page(Some(SettingsPage::Reading)),
+                None => self.leave_settings_page(Some(SettingsPage::default())),
             }
         }
         let account = match self.settings_page {
@@ -3272,24 +3322,28 @@ impl BeaverApp {
                                 }
                             }
                             SettingsPage::Reading => {
-            let modes = [
-                (DisplayMode::Plain, "Plain text", "The safest view. Links stay clickable; images and styling are dropped."),
-                (DisplayMode::Simplified, "Simplified HTML", "Keeps headings, lists, quotes and links. Never loads images, fonts or trackers."),
-                (DisplayMode::Original, "Original HTML", "Layout and colours as the sender designed them. Nothing is loaded from a server, so no tracking."),
-            ];
-            for (mode, title, hint) in modes {
-                if ui.radio(self.settings.display == mode, title).clicked() && self.settings.display != mode {
-                    self.settings.display = mode;
-                    changed = true;
-                }
-                ui.label(RichText::new(hint).size(13.0).color(t.text_dim));
-                ui.add_space(4.0);
-            }
+                                let modes = [
+                                    (DisplayMode::Plain, "Plain text", "The safest view. Links stay clickable; images and styling are dropped."),
+                                    (DisplayMode::Simplified, "Simplified HTML", "Keeps headings, lists, quotes and links. Never loads images, fonts or trackers."),
+                                    (DisplayMode::Original, "Original HTML", "Layout and colours as the sender designed them. Nothing is loaded from a server, so no tracking."),
+                                ];
+                                changed |= views::choice(ui, t, "Show messages as", &mut self.settings.display, &modes);
                                 ui.add_space(12.0);
                                 let about = "One row per conversation, with your replies from Sent. Archive, Delete and Mark as read act on all of it.";
                                 changed |= views::switch_row(ui, t, &mut self.settings.threads, "Group messages into conversations", about).changed();
-                                let about = "Off: the list takes the whole width. A click selects a message; Enter or a double click opens it in a tab.";
-                                changed |= views::switch_row(ui, t, &mut self.settings.reading_pane, "Show the message beside the list", about).changed();
+                                ui.add_space(4.0);
+                                // (reading pane, below the list)
+                                let mut place = (self.settings.reading_pane, self.settings.reading_pane && self.settings.reader_below);
+                                let places = [
+                                    ((true, false), "Beside the list", "A click shows the message on the right of the list."),
+                                    ((true, true), "Below the list", "A click shows the message under the list, which keeps the whole width."),
+                                    ((false, false), "Only in a tab", "The list takes the whole window. A click selects a message; Enter or a double click opens it in a tab."),
+                                ];
+                                if views::choice(ui, t, "Show the message", &mut place, &places) {
+                                    (self.settings.reading_pane, self.settings.reader_below) = place;
+                                    changed = true;
+                                }
+                                ui.add_space(8.0);
                                 section_title(ui, "Links");
                                 hint(ui, "A link opens straight where it leads, without the redirects of Google, Outlook, Facebook and others, and without known tracking parameters (utm_…, fbclid, gclid and more). Right-click a link to copy it clean.");
                                 ui.add_space(4.0);
@@ -3336,16 +3390,15 @@ impl BeaverApp {
             }
                             }
                             SettingsPage::Appearance => {
-                                ui.label("Density");
-                                ui.horizontal(|ui| {
-                                    for (density, name) in [(Density::Compact, "Compact"), (Density::Normal, "Normal"), (Density::Comfortable, "Comfortable")] {
-                                        if ui.radio(self.settings.density == density, name).clicked() && self.settings.density != density {
-                                            self.settings.density = density;
-                                            changed = true;
-                                        }
-                                    }
-                                });
-                                hint(ui, "How close together the folders, address books and calendars sit in the sidebar.");
+                                let about = "How close together the folders, address books and calendars sit in the sidebar, and the rows of the message table.";
+                                let densities = [(Density::Compact, "Compact", about), (Density::Normal, "Normal", about), (Density::Comfortable, "Comfortable", about)];
+                                changed |= views::choice(ui, t, "Density", &mut self.settings.density, &densities);
+                                ui.add_space(12.0);
+                                let layouts = [
+                                    (ListLayout::Cards, "Cards", "The sender, the subject and a line of the text of each message."),
+                                    (ListLayout::Table, "Table", "One line per message, in columns: click a title to order by it, drag the edge between two to make them wider."),
+                                ];
+                                changed |= views::choice(ui, t, "Message list", &mut self.settings.list_layout, &layouts);
                             }
                             SettingsPage::Writing => {
                                 let about = "Bold, lists, links and quotes. The plain-text part is always sent, readable as written. Off: plain text only.";
@@ -5048,7 +5101,7 @@ impl BeaverApp {
     }
 
     /// Folder `from` of account `serial` is called `to` now, and those inside it with it: the names this
-    /// app keeps follow at once (the folder shown, which folders are folded, moves waiting offline), so
+    /// app keeps follow at once (the folder shown, which folders are folded, their order, moves waiting offline), so
     /// the list read again finds them.
     fn folder_renamed(&mut self, serial: u64, from: &str, to: &str) {
         let Some(view) = self.accounts.iter_mut().find(|v| v.serial == serial) else { return };
@@ -5069,6 +5122,14 @@ impl BeaverApp {
             .map(|k| match k.strip_prefix(&prefix).and_then(renamed) {
                 Some(new) => folder_open_key(&key, &new),
                 None => k,
+            })
+            .collect();
+        let prefix = Settings::sort_key(&key, "");
+        self.settings.sorts = std::mem::take(&mut self.settings.sorts)
+            .into_iter()
+            .map(|(k, sort)| match k.strip_prefix(&prefix).and_then(renamed) {
+                Some(new) => (Settings::sort_key(&key, &new), sort),
+                None => (k, sort),
             })
             .collect();
         self.save_settings();
@@ -5516,7 +5577,7 @@ impl BeaverApp {
             };
             self.reader_scroll = scroll.or(self.reader_scroll);
         } else if !ids.is_empty() {
-            let page = (self.list_view.1 / views::MESSAGE_ROW_H).floor().max(1.0) as isize;
+            let page = (self.list_view.1 / self.list_row_h()).floor().max(1.0) as isize;
             let last = ids.len() - 1;
             // With Shift the open message stays the anchor and the far end of the picked range moves.
             let anchor = if shift { self.picked.first().copied().or_else(|| self.listed_open(&ids)) } else { None };
@@ -5610,7 +5671,7 @@ impl BeaverApp {
             Command::SelectAll => if self.in_tab || self.listed().is_empty() { Err("No list is shown") } else { Ok(()) },
             Command::Refresh if self.work_offline => Err("Working offline"),
             Command::Refresh => if self.shown().is_empty() { Err("No folder is shown") } else { Ok(()) },
-            Command::SwitchPane if !self.settings.reading_pane => Err("The message is not shown beside the list"),
+            Command::SwitchPane if !self.settings.reading_pane => Err("Messages open only in tabs"),
             Command::SwitchPane => if self.in_tab { Err("A message tab has no list") } else { Ok(()) },
             Command::AllInboxes => if self.accounts.len() >= 2 { Ok(()) } else { Err("Needs two accounts or more") },
             Command::WorkOffline => if self.work_offline { Err("Already working offline") } else { Ok(()) },
@@ -5924,6 +5985,7 @@ impl BeaverApp {
                         self.hits.extend(found.into_iter().map(|h| (serial, h)));
                         self.hits.sort_by_key(|(_, h)| std::cmp::Reverse(h.message.timestamp));
                         self.hits.truncate(300);
+                        self.hits = ordered(std::mem::take(&mut self.hits), self.sort(), |(_, h)| (&h.message, h.message.timestamp));
                     }
                     Err(e) => self.error = Some(format!("Search failed: {e}")),
                 }
@@ -7218,7 +7280,12 @@ impl BeaverApp {
         let mut ask_spam = false;
         let (mut pinned, mut toggled, mut ranged): (Option<MessageId>, Option<MessageId>, Option<MessageId>) = (None, None, None);
         let mut clicked_hit: Option<(u64, Hit, bool)> = None;
-        let (reveal, view) = (self.list_reveal.take(), self.list_view);
+        let mut sorted: Option<Sort> = None;
+        let mut header = views::HeaderAction::default();
+        let (reveal, view, row_h) = (self.list_reveal.take(), self.list_view, self.list_row_h());
+        let (table, columns) = (self.settings.list_layout == ListLayout::Table, self.settings.columns);
+        // Taken by the first frame with rows: mail still loading keeps the request until it is there.
+        let (to_end, mut ended) = (self.list_to_end, false);
         let frame = egui::Frame::new().fill(t.surface);
         let list = egui::CentralPanel::default().frame(frame).show(ui, |ui| {
             if self.accounts.is_empty() {
@@ -7240,17 +7307,26 @@ impl BeaverApp {
             });
             let shown = self.visible();
             let can_move = self.show_suspicious && self.holding() && !shown.is_empty();
-            if let Some(summary) = self.folder_summary() {
+            // The table orders by its column titles; the cards by a menu at the end of this line.
+            let sort = self.sort();
+            let sortable = !self.show_scheduled && self.sort_key().is_some() && self.settings.list_layout == ListLayout::Cards;
+            let summary = self.folder_summary();
+            if summary.is_some() || sortable {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.add_space(16.0);
-                    ui.label(RichText::new(summary).size(13.0).color(t.text_dim));
-                    if can_move {
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.add_space(12.0);
-                            ask_spam = ui.button("Move all to Spam…").on_hover_text("Move every message held here to the server's Spam folder and mark their senders as spam").clicked();
-                        });
+                    if let Some(summary) = summary {
+                        ui.label(RichText::new(summary).size(13.0).color(t.text_dim));
                     }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.add_space(12.0);
+                        if can_move {
+                            ask_spam = ui.button("Move all to Spam…").on_hover_text("Move every message held here to the server's Spam folder and mark their senders as spam").clicked();
+                        }
+                        if sortable {
+                            sorted = views::sort_menu(ui, t, sort);
+                        }
+                    });
                 });
             }
             ui.add_space(6.0);
@@ -7276,12 +7352,19 @@ impl BeaverApp {
                     return;
                 }
                 ui.spacing_mut().item_spacing.y = 0.0; // rows touch, so row `i` starts at `i` times the row height
-                let area = list_area(reveal, view);
-                let shown_rows = area.show_rows(ui, views::MESSAGE_ROW_H, self.hits.len(), |ui, range| {
+                if table {
+                    header = views::table_header(ui, t, self.sort(), columns);
+                }
+                let area = list_area(reveal, view, row_h, None);
+                let shown_rows = area.show_rows(ui, row_h, self.hits.len(), |ui, range| {
                     for (serial, hit) in &self.hits[range] {
                         let id = hit.message.id;
                         let selected = if self.picked.len() >= 2 { self.picked.contains(&id) } else { self.message == Some(id) };
-                        let row = views::message_row(ui, t, &hit.message, selected, Some(&hit.folder), None, 1, None);
+                        let row = if table {
+                            views::table_row(ui, t, &hit.message, selected, Some(&hit.folder), None, 1, None, columns, row_h)
+                        } else {
+                            views::message_row(ui, t, &hit.message, selected, Some(&hit.folder), None, 1, None)
+                        };
                         row.dnd_set_drag_payload(Dragged(if self.picked.contains(&id) { self.picked.clone() } else { vec![id] }));
                         let (ctrl, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
                         let keep = row.double_clicked() || row.triple_clicked() || row.middle_clicked();
@@ -7331,10 +7414,14 @@ impl BeaverApp {
                 return;
             }
             ui.spacing_mut().item_spacing.y = 0.0; // rows touch, so row `i` starts at `i` times the row height
-            let area = list_area(reveal, view);
+            if table {
+                header = views::table_header(ui, t, sort, columns);
+            }
+            let area = list_area(reveal, view, row_h, to_end.then_some(shown.len()));
+            ended = to_end;
             let threaded = self.threaded();
             let latest = self.conversation_dates();
-            let shown_rows = area.show_rows(ui, views::MESSAGE_ROW_H, shown.len(), |ui, range| {
+            let shown_rows = area.show_rows(ui, row_h, shown.len(), |ui, range| {
                 for message in &shown[range] {
                     let warning = self.correction(message.id).and_then(|(_, warning)| warning);
                     // A conversation's row: its latest message here, bold while any of it is unread.
@@ -7345,7 +7432,11 @@ impl BeaverApp {
                     let received = latest.get(&message.id).map_or_else(|| message.received.clone(), |l| l.1.clone());
                     let summary = MessageSummary { unread, received, ..(*message).clone() };
                     let mark = self.origin.get(&message.id).and_then(|s| self.accounts.iter().position(|v| v.serial == *s)).filter(|_| self.unified).map(theme::account_color);
-                    let row = views::message_row(ui, t, &summary, selected, None, warning, count, mark);
+                    let row = if table {
+                        views::table_row(ui, t, &summary, selected, None, warning, count, mark, columns, row_h)
+                    } else {
+                        views::message_row(ui, t, &summary, selected, None, warning, count, mark)
+                    };
                     // The picked messages go together when one of them is dragged.
                     row.dnd_set_drag_payload(Dragged(if self.picked.contains(&message.id) { self.picked.clone() } else { vec![message.id] }));
                     let (ctrl, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
@@ -7372,6 +7463,18 @@ impl BeaverApp {
         }
         if refresh {
             self.refresh();
+        }
+        if ended {
+            self.list_to_end = false;
+        }
+        if let Some(sort) = sorted.or(header.sort) {
+            self.set_sort(sort);
+        }
+        if let Some((columns, done)) = header.resized {
+            self.settings.columns = columns;
+            if done {
+                self.save_settings();
+            }
         }
         self.confirm_spam |= ask_spam;
         if let Some(id) = pinned {
@@ -7800,7 +7903,12 @@ impl BeaverApp {
         if in_tab {
             egui::CentralPanel::default().frame(frame).show(ui, draw);
         } else {
-            let reader = egui::Panel::right("reader").frame(frame).default_size(470.0).size_range(360.0..=900.0).show(ui, draw);
+            let reader = if self.settings.reader_below {
+                let height = ui.available_height();
+                egui::Panel::bottom("reader_below").frame(frame).default_size(height * 0.55).size_range(200.0..=(height - 160.0).max(200.0)).show(ui, draw)
+            } else {
+                egui::Panel::right("reader").frame(frame).default_size(470.0).size_range(360.0..=900.0).show(ui, draw)
+            };
             if self.pane == Some(Pane::Reader) {
                 pane_ring(ui, t, reader.response.rect);
             }
@@ -8275,6 +8383,25 @@ fn report(text: &str) {
     rfd::MessageDialog::new().set_level(rfd::MessageLevel::Error).set_title("BeaverMail").set_description(&text).show();
 }
 
+/// `rows` in the order of `sort`, pinned ones first; `info` gives a row's message and its date (a
+/// conversation's latest). Between equals, newest first.
+fn ordered<T>(rows: Vec<T>, sort: Sort, info: impl Fn(&T) -> (&MessageSummary, i64)) -> Vec<T> {
+    let text = |m: &MessageSummary| match sort.by {
+        SortBy::Date => String::new(),
+        SortBy::From => if m.from.trim().is_empty() { m.address.to_lowercase() } else { m.from.trim().to_lowercase() },
+        SortBy::Subject => threads::subject_key(&m.subject),
+    };
+    let mut keyed: Vec<((bool, String, i64), T)> = rows.into_iter().map(|row| {
+        let (m, time) = info(&row);
+        ((!m.pinned, text(m), time), row)
+    }).collect();
+    keyed.sort_by(|(a, _), (b, _)| {
+        let by = if sort.by == SortBy::Date { a.2.cmp(&b.2) } else { a.1.cmp(&b.1) };
+        a.0.cmp(&b.0).then(if sort.ascending { by } else { by.reverse() }).then(b.2.cmp(&a.2))
+    });
+    keyed.into_iter().map(|(_, row)| row).collect()
+}
+
 /// The messages from `anchor` to `to` in list order `ids`, `anchor` first (where the next range starts).
 fn range(ids: &[MessageId], anchor: MessageId, to: MessageId) -> Option<Vec<MessageId>> {
     let (a, b) = (ids.iter().position(|i| *i == anchor)?, ids.iter().position(|i| *i == to)?);
@@ -8390,11 +8517,44 @@ mod tests {
     }
 
     #[test]
+    fn a_list_is_ordered_as_its_folder_says_pinned_first() {
+        let message = |id: u64, from: &str, subject: &str, timestamp: i64, pinned: bool| MessageSummary {
+            id: MessageId(id),
+            from: from.into(),
+            address: String::new(),
+            subject: subject.into(),
+            preview: String::new(),
+            received: String::new(),
+            timestamp,
+            unread: false,
+            pinned,
+            starred: false,
+            priority: 0,
+            labels: Vec::new(),
+            has_attachments: false,
+            message_id: String::new(),
+            parents: Vec::new(),
+        };
+        let rows = [
+            message(1, "Carol", "Re: Budget", 30, false),
+            message(2, "alice", "Agenda", 10, false),
+            message(3, "Bob", "Minutes", 20, false),
+            message(4, "Dave", "Zebra", 5, true),
+        ];
+        let order = |sort: Sort| ordered(rows.iter().collect(), sort, |m| (m, m.timestamp)).iter().map(|m| m.id.0).collect::<Vec<_>>();
+        assert_eq!(order(Sort::default()), [4, 1, 3, 2], "newest first");
+        assert_eq!(order(Sort { by: SortBy::Date, ascending: true }), [4, 2, 3, 1], "oldest first");
+        assert_eq!(order(Sort { by: SortBy::From, ascending: true }), [4, 2, 3, 1], "senders without regard to case");
+        assert_eq!(order(Sort { by: SortBy::Subject, ascending: true }), [4, 2, 1, 3], "\"Re:\" left out");
+        assert_eq!(order(Sort { by: SortBy::Subject, ascending: false }), [4, 3, 1, 2]);
+    }
+
+    #[test]
     fn the_list_scrolls_only_as_far_as_needed_to_show_a_row() {
         let h = views::MESSAGE_ROW_H;
-        assert_eq!(reveal_offset(2, 0.0, 5.0 * h), None, "already in view");
-        assert_eq!(reveal_offset(9, 0.0, 5.0 * h), Some(5.0 * h), "below: the row ends at the bottom edge");
-        assert_eq!(reveal_offset(1, 4.0 * h, 5.0 * h), Some(h), "above: the row starts at the top edge");
+        assert_eq!(reveal_offset(2, 0.0, 5.0 * h, h), None, "already in view");
+        assert_eq!(reveal_offset(9, 0.0, 5.0 * h, h), Some(5.0 * h), "below: the row ends at the bottom edge");
+        assert_eq!(reveal_offset(1, 4.0 * h, 5.0 * h, h), Some(h), "above: the row starts at the top edge");
     }
 
     #[test]

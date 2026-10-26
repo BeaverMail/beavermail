@@ -478,6 +478,46 @@ pub enum Density {
     Comfortable,
 }
 
+/// What a folder's list is ordered by.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SortBy {
+    #[default]
+    Date,
+    From,
+    Subject,
+}
+
+/// How a folder's list is ordered; newest first unless the user chose otherwise.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sort {
+    pub by: SortBy,
+    #[serde(default)]
+    pub ascending: bool,
+}
+
+/// The message list as cards (sender, subject and a line of the text) or as a table of columns.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ListLayout {
+    #[default]
+    Cards,
+    Table,
+}
+
+/// The widths of the table's From and Date columns, in points; Subject takes the rest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Columns {
+    pub from: u16,
+    pub date: u16,
+}
+
+impl Default for Columns {
+    fn default() -> Self {
+        Self { from: 200, date: 130 }
+    }
+}
+
 /// User preferences, stored apart from the accounts.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
@@ -512,6 +552,17 @@ pub struct Settings {
     /// The message shows beside the list; off, it opens in a tab.
     #[serde(default = "yes")]
     pub reading_pane: bool,
+    /// With the reading pane, it is under the list instead of beside it.
+    #[serde(default)]
+    pub reader_below: bool,
+    /// Cards or a table.
+    #[serde(default)]
+    pub list_layout: ListLayout,
+    #[serde(default)]
+    pub columns: Columns,
+    /// The order chosen for a folder's list, by [`Settings::sort_key`]; newest first when not here.
+    #[serde(default)]
+    pub sorts: std::collections::BTreeMap<String, Sort>,
     /// Accounts (by [`Account::key`]) folded in the sidebar, so they stay folded at the next start, and
     /// the folders opened (folders start folded).
     #[serde(default)]
@@ -544,11 +595,20 @@ fn undo_secs() -> u32 {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { display: DisplayMode::default(), sender_display: Default::default(), rich_outgoing: true, undo_send_secs: undo_secs(), remote_senders: Default::default(), hold_suspicious: true, marked: Default::default(), threads: true, reading_pane: true, folded: Default::default(), density: Density::default(), diagnostics: false, link_params: String::new(), address_books: Vec::new(), calendars: Vec::new() }
+        Self { display: DisplayMode::default(), sender_display: Default::default(), rich_outgoing: true, undo_send_secs: undo_secs(), remote_senders: Default::default(), hold_suspicious: true, marked: Default::default(), threads: true, reading_pane: true, reader_below: false, list_layout: ListLayout::default(), columns: Columns::default(), sorts: Default::default(), folded: Default::default(), density: Density::default(), diagnostics: false, link_params: String::new(), address_books: Vec::new(), calendars: Vec::new() }
     }
 }
 
 impl Settings {
+    /// Where the order of folder `folder` of account `account` is kept in [`Settings::sorts`].
+    pub fn sort_key(account: &str, folder: &str) -> String {
+        format!("{account}:{folder}")
+    }
+
+    pub fn sort_of(&self, key: &str) -> Sort {
+        self.sorts.get(key).copied().unwrap_or_default()
+    }
+
     /// The display mode for a message from `address`.
     pub fn mode_for(&self, address: &str) -> DisplayMode {
         self.sender_display.get(&address.trim().to_lowercase()).copied().unwrap_or(self.display)

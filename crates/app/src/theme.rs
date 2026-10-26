@@ -165,13 +165,23 @@ pub fn apply(ctx: &egui::Context) {
 /// them, for the rows and the account and server headers alike.
 pub fn dense(ui: &mut egui::Ui, density: beavermail_core::Density) {
     use beavermail_core::Density;
-    let (height, gap) = match density {
-        Density::Compact => (28.0, 0.0),
-        Density::Normal => (32.0, 2.0),
-        Density::Comfortable => (38.0, 8.0),
+    let gap = match density {
+        Density::Compact => 0.0,
+        Density::Normal => 2.0,
+        Density::Comfortable => 8.0,
     };
-    ui.spacing_mut().interact_size.y = height;
+    ui.spacing_mut().interact_size.y = row_height(density);
     ui.spacing_mut().item_spacing.y = gap;
+}
+
+/// The height of a sidebar row, or of a row of the message table, at `density`.
+pub fn row_height(density: beavermail_core::Density) -> f32 {
+    use beavermail_core::Density;
+    match density {
+        Density::Compact => 28.0,
+        Density::Normal => 32.0,
+        Density::Comfortable => 38.0,
+    }
 }
 
 /// Folder icon colours: the same in both themes so a folder is recognisable at a glance.

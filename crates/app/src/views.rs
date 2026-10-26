@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use beavermail_core::{Attachment, MessageSummary, Role};
+use beavermail_core::{Attachment, Columns, MessageSummary, Role, Sort, SortBy};
 use eframe::egui::{self, Color32, CornerRadius, FontId, Margin, Rect, Response, Sense, Ui, pos2, vec2};
 use egui::text::{LayoutJob, TextWrapping};
 
@@ -292,6 +292,23 @@ pub fn calendar(ui: &mut Ui, t: &Tokens, day: &mut chrono::NaiveDate, month: &mu
     }
 }
 
+/// A setting chosen among a few: its name, a drop-down of the choices, and below it what the chosen
+/// one does. `options`: (value, name, what it does). True when the user changed it.
+pub fn choice<T: PartialEq + Copy>(ui: &mut Ui, t: &Tokens, label: &str, value: &mut T, options: &[(T, &str, &str)]) -> bool {
+    let mut changed = false;
+    ui.label(label);
+    let current = options.iter().find(|o| o.0 == *value);
+    egui::ComboBox::from_id_salt(("choice", label)).width(240.0).selected_text(current.map_or("", |o| o.1)).show_ui(ui, |ui| {
+        for (option, name, _) in options {
+            changed |= ui.selectable_value(value, *option, *name).changed();
+        }
+    });
+    if let Some(hint) = options.iter().find(|o| o.0 == *value).map(|o| o.2).filter(|h| !h.is_empty()) {
+        ui.label(egui::RichText::new(hint).size(13.0).color(t.text_dim));
+    }
+    changed
+}
+
 /// An on/off setting: its name and a line saying what it does on the left, a switch on the right.
 /// The whole row flips it; the response is `changed` when it did.
 pub fn switch_row(ui: &mut Ui, t: &Tokens, on: &mut bool, label: &str, hint: &str) -> Response {
@@ -486,6 +503,178 @@ pub fn message_row(ui: &mut Ui, t: &Tokens, message: &MessageSummary, selected: 
     if let Some(label) = label {
         ui.painter().galley(pos2(card.right() - 14.0 - label.size().x, card.top() + 57.0), label, t.accent);
     }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Where the table's columns sit across `rect`: the From column, Subject, Date. From gives way first
+/// when the list is narrow, so the subject keeps some room.
+fn table_columns(rect: Rect, columns: Columns) -> [Rect; 3] {
+    const LEAD: f32 = 28.0; // the unread dot, and the account's mark in All inboxes
+    let date = f32::from(columns.date).min(rect.width() / 3.0);
+    let from = f32::from(columns.from).min(rect.width() - LEAD - date - 120.0).max(60.0);
+    let left = rect.left() + LEAD;
+    [
+        Rect::from_x_y_ranges(left..=left + from, rect.y_range()),
+        Rect::from_x_y_ranges(left + from..=rect.right() - date, rect.y_range()),
+        Rect::from_x_y_ranges(rect.right() - date..=rect.right(), rect.y_range()),
+    ]
+}
+
+/// The orders a list can have, by name.
+const ORDERS: [(SortBy, bool, &str); 6] = [
+    (SortBy::Date, false, "Newest first"),
+    (SortBy::Date, true, "Oldest first"),
+    (SortBy::From, true, "Sender, A to Z"),
+    (SortBy::From, false, "Sender, Z to A"),
+    (SortBy::Subject, true, "Subject, A to Z"),
+    (SortBy::Subject, false, "Subject, Z to A"),
+];
+
+/// A quiet button naming the list's order, with the others in its menu. Returns the one chosen.
+pub fn sort_menu(ui: &mut Ui, t: &Tokens, sort: Sort) -> Option<Sort> {
+    let name = ORDERS.iter().find(|(by, up, _)| *by == sort.by && *up == sort.ascending).map_or("Newest first", |o| o.2);
+    let button = egui::Button::image_and_text(Icon::ChevronDown.image(14.0, t.text_dim), egui::RichText::new(name).size(13.0).color(t.text_dim)).frame(false);
+    let response = ui.add(button).on_hover_text("Order of this folder's list").on_hover_cursor(egui::CursorIcon::PointingHand);
+    let mut chosen = None;
+    egui::Popup::menu(&response).style(menu_look).show(|ui| {
+        for (by, ascending, label) in ORDERS {
+            if ui.selectable_label(by == sort.by && ascending == sort.ascending, label).clicked() {
+                chosen = Some(Sort { by, ascending });
+            }
+        }
+    });
+    chosen.filter(|c| *c != sort)
+}
+
+/// What was done on the table's header.
+#[derive(Default)]
+pub struct HeaderAction {
+    /// Its title clicked: order by this column, the other way round if it is the order already.
+    pub sort: Option<Sort>,
+    /// A column edge dragged; `true` once it is let go, to keep the widths.
+    pub resized: Option<(Columns, bool)>,
+}
+
+/// The titles of the table's columns: a click orders by one, the edge between two moves them.
+pub fn table_header(ui: &mut Ui, t: &Tokens, sort: Sort, columns: Columns) -> HeaderAction {
+    let mut action = HeaderAction::default();
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::hover());
+    let inner = rect.shrink2(vec2(8.0, 0.0));
+    let cells = table_columns(inner, columns);
+    for (cell, (by, title)) in cells.iter().zip([(SortBy::From, "From"), (SortBy::Subject, "Subject"), (SortBy::Date, "Date")]) {
+        let response = ui.interact(*cell, ui.id().with(("table_title", title)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+        if response.hovered() {
+            ui.painter().rect_filled(cell.shrink2(vec2(0.0, 3.0)), CornerRadius::same(CONTROL_RADIUS), t.hover);
+        }
+        let current = sort.by == by;
+        let color = if current { t.text } else { t.text_dim };
+        let text = truncated(ui, title, FontId::new(13.0, theme::bold()), color, cell.width() - 34.0);
+        let x = if by == SortBy::Date { cell.right() - 12.0 - text.size().x } else { cell.left() + 8.0 };
+        if current {
+            let arrow = if sort.ascending { Icon::ChevronUp } else { Icon::ChevronDown };
+            let at = if by == SortBy::Date { x - 10.0 } else { x + text.size().x + 10.0 };
+            arrow.image(14.0, t.text_dim).paint_at(ui, Rect::from_center_size(pos2(at, cell.center().y), vec2(14.0, 14.0)));
+        }
+        ui.painter().galley(pos2(x, cell.center().y - text.size().y / 2.0), text, color);
+        let tip = match by {
+            SortBy::Date => "Order by date",
+            SortBy::From => "Order by sender",
+            SortBy::Subject => "Order by subject",
+        };
+        if response.on_hover_text(tip).clicked() {
+            // A new column starts the way people expect it: dates newest first, names from A.
+            action.sort = Some(if current { Sort { ascending: !sort.ascending, ..sort } } else { Sort { by, ascending: by != SortBy::Date } });
+        }
+    }
+    // The edges that move: after From (it grows to the right), before Date (it grows to the left).
+    for (edge, x) in [(0, cells[0].right()), (1, cells[2].left())] {
+        let grip = Rect::from_center_size(pos2(x, rect.center().y), vec2(8.0, rect.height()));
+        let response = ui.interact(grip, ui.id().with(("table_edge", edge)), Sense::drag()).on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+        let line = if response.hovered() || response.dragged() { t.border_strong } else { t.border };
+        ui.painter().vline(x, rect.y_range().shrink(7.0), egui::Stroke::new(1.0, line));
+        if response.dragged() || response.drag_stopped() {
+            let dx = response.drag_delta().x;
+            let mut next = columns;
+            if edge == 0 {
+                next.from = (f32::from(columns.from) + dx).clamp(80.0, 600.0) as u16;
+            } else {
+                next.date = (f32::from(columns.date) - dx).clamp(80.0, 300.0) as u16;
+            }
+            action.resized = Some((next, response.drag_stopped()));
+        }
+    }
+    ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, egui::Stroke::new(1.0, t.border));
+    action
+}
+
+/// A message as a row of the table: sender, subject, date, in the columns of [`table_header`]. As
+/// [`message_row`], `folder` names where a search result is and `count` a conversation's messages.
+#[allow(clippy::too_many_arguments)]
+pub fn table_row(ui: &mut Ui, t: &Tokens, message: &MessageSummary, selected: bool, folder: Option<&str>, warning: Option<&str>, count: usize, mark: Option<Color32>, columns: Columns, height: f32) -> Response {
+    // Clicked, never focused, as [`message_row`].
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click_and_drag());
+    let inner = rect.shrink2(vec2(8.0, 1.0));
+    row_background(ui, inner, &response, selected, t);
+    let [from_cell, subject_cell, date_cell] = table_columns(inner, columns);
+    let y = inner.center().y;
+    if let Some(color) = mark {
+        ui.painter().rect_filled(Rect::from_min_size(pos2(inner.left() + 3.0, inner.top() + 5.0), vec2(3.0, inner.height() - 10.0)), CornerRadius::same(2), color);
+    }
+    if message.unread {
+        ui.painter().circle_filled(pos2(inner.left() + 16.0, y), 4.0, t.accent);
+    }
+    let primary = if message.unread { t.text } else { t.text_dim };
+    let weight = if message.unread { theme::bold() } else { egui::FontFamily::Proportional };
+    let font = FontId::new(14.0, weight);
+    // A sender whose name claims another site is told at once, as in the cards.
+    let flagged = warning.is_some() || crate::sender::warning(&message.from, &message.address).is_some();
+    let mut x = from_cell.left() + 8.0;
+    if flagged {
+        Icon::Spam.image(14.0, t.danger).paint_at(ui, Rect::from_center_size(pos2(x + 7.0, y), vec2(14.0, 14.0)));
+        x += 20.0;
+    }
+    let name = if message.from.trim().is_empty() { &message.address } else { &message.from };
+    let sender = truncated(ui, name, font.clone(), if flagged { t.danger } else { primary }, from_cell.right() - 8.0 - x);
+    ui.painter().galley(pos2(x, y - sender.size().y / 2.0), sender, if flagged { t.danger } else { primary });
+
+    // Subject, then at its end the conversation's count, the folder of a search result and the marks.
+    let mut right = subject_cell.right() - 8.0;
+    for (on, icon, color) in [(message.has_attachments, Icon::Paperclip, t.text_dim), (message.starred, Icon::Star, theme::role_color(Role::Starred)), (message.pinned, Icon::Pin, t.accent)] {
+        if on {
+            icon.image(14.0, color).paint_at(ui, Rect::from_center_size(pos2(right - 7.0, y), vec2(14.0, 14.0)));
+            right -= 20.0;
+        }
+    }
+    if let Some(folder) = folder {
+        let label = truncated(ui, &folder_title(folder, Role::Other, None), FontId::proportional(12.5), t.accent, 140.0);
+        ui.painter().galley(pos2(right - label.size().x, y - label.size().y / 2.0), label.clone(), t.accent);
+        right -= label.size().x + 10.0;
+    }
+    if count > 1 {
+        let text = ui.painter().layout_no_wrap(count.to_string(), FontId::proportional(12.0), t.text_dim);
+        let pill = Rect::from_center_size(pos2(right - (text.size().x + 12.0).max(22.0) / 2.0, y), vec2((text.size().x + 12.0).max(22.0), 18.0));
+        ui.painter().rect_filled(pill, CornerRadius::same(9), if selected { t.accent.gamma_multiply(0.22) } else { t.hover });
+        ui.painter().galley(pill.center() - text.size() / 2.0, text, t.text_dim);
+        right = pill.left() - 8.0;
+    }
+    let mut x = subject_cell.left() + 8.0;
+    match message.priority {
+        1 => Icon::CircleAlert.image(14.0, t.danger).paint_at(ui, Rect::from_center_size(pos2(x + 7.0, y), vec2(14.0, 14.0))),
+        -1 => Icon::ArrowDown.image(14.0, t.text_dim).paint_at(ui, Rect::from_center_size(pos2(x + 7.0, y), vec2(14.0, 14.0))),
+        _ => {}
+    }
+    if message.priority != 0 {
+        x += 20.0;
+    }
+    let subject = truncated(ui, &message.subject, font, primary, right - x);
+    ui.painter().galley(pos2(x, y - subject.size().y / 2.0), subject, primary);
+
+    let date = truncated(ui, &message.received, FontId::proportional(13.0), t.text_dim, date_cell.width() - 20.0);
+    ui.painter().galley(pos2(date_cell.right() - 12.0 - date.size().x, y - date.size().y / 2.0), date, t.text_dim);
+    let response = match warning {
+        Some(text) => response.on_hover_text(text),
+        None => response,
+    };
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
