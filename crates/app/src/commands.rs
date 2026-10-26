@@ -24,11 +24,15 @@ pub enum Command {
     /// One of the five standard labels, `$label1` to `$label5`, on or off, by its number.
     Label(u8),
     Spam,
+    /// Back to the Inbox: from the Spam folder, or held as suspicious.
+    NotSpam,
     TrustSender,
     BlockSender,
     ViewSource,
     FindInSource,
     OpenInTab,
+    /// From a search result or All inboxes, to the folder the message is in, shown there.
+    OpenInFolder,
     CloseTab,
     PreviousTab,
     NextTab,
@@ -60,7 +64,7 @@ const CTRL_SHIFT: Modifiers = Modifiers::COMMAND.plus(Modifiers::SHIFT);
 
 impl Command {
     /// In the order the keys are tried (Ctrl+Shift+Tab before Ctrl+Tab) and the palette lists them.
-    pub const ALL: [Self; 38] = [
+    pub const ALL: [Self; 40] = [
         Self::Palette,
         Self::NewMessage,
         Self::Reply,
@@ -80,11 +84,13 @@ impl Command {
         Self::Label(4),
         Self::Label(5),
         Self::Spam,
+        Self::NotSpam,
         Self::TrustSender,
         Self::BlockSender,
         Self::ViewSource,
         Self::FindInSource,
         Self::OpenInTab,
+        Self::OpenInFolder,
         Self::CloseTab,
         Self::PreviousTab,
         Self::NextTab,
@@ -122,11 +128,13 @@ impl Command {
             Self::Label(4) => "Label To Do",
             Self::Label(_) => "Label Later",
             Self::Spam => "Spam",
+            Self::NotSpam => "Not spam",
             Self::TrustSender => "Trust sender",
             Self::BlockSender => "Block sender",
             Self::ViewSource => "View source",
             Self::FindInSource => "Find in source",
             Self::OpenInTab => "Open in a tab",
+            Self::OpenInFolder => "Open in its folder",
             Self::CloseTab => "Close tab",
             Self::PreviousTab => "Previous tab",
             Self::NextTab => "Next tab",
@@ -174,7 +182,7 @@ impl Command {
             Self::SelectAll => &[Trigger::Shortcut(CTRL, Key::A, false)],
             Self::Search => &[Trigger::Text("/")],
             Self::SwitchPane => &[Trigger::Key(Key::F6)],
-            Self::NewFolder | Self::TrustSender | Self::BlockSender | Self::Refresh | Self::AllInboxes | Self::Mail | Self::Calendar | Self::Contacts | Self::WorkOffline | Self::WorkOnline | Self::Settings => &[],
+            Self::NewFolder | Self::NotSpam | Self::OpenInFolder | Self::TrustSender | Self::BlockSender | Self::Refresh | Self::AllInboxes | Self::Mail | Self::Calendar | Self::Contacts | Self::WorkOffline | Self::WorkOnline | Self::Settings => &[],
         }
     }
 

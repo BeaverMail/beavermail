@@ -1302,6 +1302,12 @@ struct BeaverApp {
     list_reveal: Option<usize>,
     /// The list starts at its end the next time it has rows: oldest first, the newest are at the bottom.
     list_to_end: bool,
+    /// The messages of a right-click menu, while its command runs: they, not the open one, are acted on.
+    menu_targets: Option<Vec<MessageId>>,
+    /// Opened, and brought into view, once its folder's list has come (Open in its folder).
+    open_when_listed: Option<MessageId>,
+    /// The folder shown is brought into view in the sidebar, its account unfolded, once drawn.
+    reveal_folder: bool,
     /// What the list showed last frame: (scroll offset, height).
     list_view: (f32, f32),
     /// Asking whether to forget the senders and messages marked as spam or not spam.
@@ -1441,6 +1447,9 @@ impl BeaverApp {
             reader_scroll: None,
             list_reveal: None,
             list_to_end: false,
+            menu_targets: None,
+            open_when_listed: None,
+            reveal_folder: false,
             wanted: Arc::default(),
             unified: false,
             unified_role: Role::Inbox,
@@ -1590,17 +1599,21 @@ impl BeaverApp {
             return;
         }
         let (key, name, delimiter) = (view.account.key(), &view.mailboxes[index].name, view.delimiter());
-        // A folder opened from the palette or a link shows in the sidebar: the folders it is inside unfold.
+        // A folder opened from the palette or a link shows in the sidebar: its account and the folders it
+        // is inside unfold, and the sidebar scrolls to it.
         let outer: Vec<String> = view.mailboxes.iter().filter(|m| views::is_inside(name, &m.name, delimiter)).map(|m| folder_open_key(&key, &m.name)).collect();
         self.send_pending(); // Undo puts mail back in the list it left
+        let account_folded = self.settings.folded.remove(&key);
         let before = self.settings.folded.len();
         self.settings.folded.extend(outer);
-        if self.settings.folded.len() != before {
+        if account_folded || self.settings.folded.len() != before {
             self.save_settings();
         }
+        self.reveal_folder = true;
         self.selected = Some((serial, index));
         self.unified = false;
         self.list_to_end = self.oldest_first();
+        self.open_when_listed = None;
         self.searched.clear(); // a search runs again over this folder
         self.show_scheduled = false;
         self.refresh_drafts();
@@ -1629,6 +1642,7 @@ impl BeaverApp {
         self.selected = None;
         (self.unified, self.unified_role) = (true, role);
         self.list_to_end = self.oldest_first();
+        self.open_when_listed = None;
         self.searched.clear(); // a search runs again over what is shown now
         self.show_scheduled = false;
         self.drafts.clear();
@@ -2059,7 +2073,12 @@ impl BeaverApp {
 
     /// The folder role the picked messages share, or `Other` when they come from different kinds of folder.
     fn picked_role(&self) -> Role {
-        let mut roles = self.picked.iter().map(|id| self.role_of(*id));
+        self.role_of_all(&self.picked)
+    }
+
+    /// The folder role messages `ids` share, or `Other` when they come from different kinds of folder.
+    fn role_of_all(&self, ids: &[MessageId]) -> Role {
+        let mut roles = ids.iter().map(|id| self.role_of(*id));
         let first = roles.next().unwrap_or(Role::Other);
         if roles.all(|r| r == first) { first } else { Role::Other }
     }
@@ -5304,7 +5323,96 @@ impl BeaverApp {
 
     /// The messages a command applies to: those picked in the list, or else the one open.
     fn targets(&self) -> Vec<MessageId> {
+        if let Some(ids) = &self.menu_targets {
+            return ids.clone();
+        }
         if self.picked.len() >= 2 { self.picked.clone() } else { self.message.into_iter().collect() }
+    }
+
+    /// Runs `command` on `ids`, from a right-click menu, leaving the open message as it is.
+    fn run_on(&mut self, ids: Vec<MessageId>, command: Command) {
+        self.menu_targets = Some(ids);
+        if self.can(command).is_ok() {
+            self.run(command);
+        }
+        self.menu_targets = None;
+    }
+
+    /// The right-click menu of messages `ids` in the list: the commands that act on them, with their keys,
+    /// those that cannot dimmed with the reason. Returns the one chosen.
+    fn message_menu(&self, ui: &mut egui::Ui, ids: &[MessageId]) -> Option<Command> {
+        let ctx = ui.ctx().clone();
+        let mut chosen = None;
+        let many = ids.len() >= 2;
+        let all = |test: fn(&MessageSummary) -> bool| ids.iter().all(|id| self.summary_of(*id).is_some_and(test));
+        let mut item = |ui: &mut egui::Ui, command: Command, label: &str| {
+            let able = self.can_on(command, ids.to_vec());
+            let button = egui::Button::new(label).shortcut_text(command.keys(&ctx));
+            let response = ui.add_enabled(able.is_ok(), button);
+            let response = match able {
+                Err(why) => response.on_disabled_hover_text(why),
+                Ok(()) => response,
+            };
+            if response.clicked() {
+                chosen = Some(command);
+                ui.close();
+            }
+        };
+        if !many {
+            item(ui, Command::OpenInTab, "Open in a tab");
+            if self.searching() || self.unified {
+                item(ui, Command::OpenInFolder, "Open in its folder");
+            }
+            ui.separator();
+            for command in [Command::Reply, Command::ReplyAll, Command::Forward] {
+                item(ui, command, command.label());
+            }
+            ui.separator();
+        }
+        item(ui, Command::ToggleRead, if ids.iter().any(|id| self.summary_of(*id).is_some_and(|m| m.unread)) { "Mark as read" } else { "Mark as unread" });
+        item(ui, Command::Pin, if all(|m| m.pinned) { "Unpin" } else { "Pin" });
+        item(ui, Command::Star, if all(|m| m.starred) { "Unstar" } else { "Star" });
+        ui.menu_button("Label", |ui| {
+            for n in 1..=5 {
+                let keyword = format!("$label{n}");
+                let has = ids.iter().all(|id| self.summary_of(*id).is_some_and(|m| m.labels.contains(&keyword)));
+                let (name, _) = theme::label(&keyword);
+                item(ui, Command::Label(n), &if has { format!("Remove {name}") } else { name });
+            }
+        });
+        ui.separator();
+        for command in [Command::MoveTo, Command::Archive, Command::Trash] {
+            item(ui, command, command.label());
+        }
+        // Back to the Inbox where that is what makes sense, Spam elsewhere.
+        if self.can_on(Command::NotSpam, ids.to_vec()).is_ok() {
+            item(ui, Command::NotSpam, "Not spam");
+        } else {
+            item(ui, Command::Spam, "Spam");
+        }
+        if !many {
+            ui.separator();
+            item(ui, Command::TrustSender, "Trust sender");
+            item(ui, Command::BlockSender, "Block sender…");
+            item(ui, Command::ViewSource, "View source");
+        }
+        chosen
+    }
+
+    /// Shows the folder message `id` is in, with the message open there: from a search result or All inboxes.
+    fn open_in_folder(&mut self, id: MessageId) {
+        let Some(serial) = self.serial_of(id) else { return };
+        let folder = match self.hits.iter().find(|(_, h)| h.message.id == id).filter(|_| self.searching()) {
+            Some((_, hit)) => Some(hit.folder.clone()),
+            None => self.view(serial).and_then(|v| v.mailboxes.iter().find(|m| m.role == self.unified_role)).map(|m| m.name.clone()),
+        };
+        let Some(index) = folder.and_then(|f| self.view(serial)?.mailboxes.iter().position(|m| m.name == f)) else { return };
+        self.query.clear();
+        self.hits.clear();
+        self.show_suspicious = false;
+        self.select_mailbox(serial, index);
+        self.list_to_end = false;
+        self.open_when_listed = Some(id);
     }
 
     /// Moves `ids` to folder `index` of account `serial`. To the archive, the trash or Spam it is the
@@ -5608,13 +5716,18 @@ impl BeaverApp {
 
     /// Whether `command` can run now, and if not, why (shown in the palette).
     fn can(&self, command: Command) -> Result<(), &'static str> {
-        let many = self.picked.len() >= 2;
-        let one = || match self.message {
+        self.can_on(command, self.targets())
+    }
+
+    /// Whether `command` can act on messages `targets` (those of a right-click menu), and if not, why.
+    fn can_on(&self, command: Command, targets: Vec<MessageId>) -> Result<(), &'static str> {
+        let many = targets.len() >= 2;
+        let one = || match targets.first() {
             _ if many => Err("Several messages are picked"),
             None => Err("Open a message first"),
-            Some(id) => Ok(id),
+            Some(id) => Ok(*id),
         };
-        let some = || if many || self.message.is_some() { Ok(()) } else { Err("Open or pick a message first") };
+        let some = || if targets.is_empty() { Err("Open or pick a message first") } else { Ok(()) };
         // A source tab shows text, not the message: what acts on a message is for its own tab.
         if self.showing_source() && !matches!(command, Command::Palette | Command::NewMessage | Command::Settings | Command::Mail | Command::Contacts | Command::WorkOffline | Command::WorkOnline | Command::CloseTab | Command::PreviousTab | Command::NextTab | Command::AllInboxes | Command::FindInSource) {
             return Err("Not in the source of a message");
@@ -5632,7 +5745,7 @@ impl BeaverApp {
             Command::Archive | Command::Trash | Command::ToggleRead | Command::Pin | Command::Star | Command::Label(_) => some(),
             Command::MoveTo => {
                 some()?;
-                let accounts: std::collections::HashSet<u64> = self.targets().iter().filter_map(|id| self.serial_of(*id)).collect();
+                let accounts: std::collections::HashSet<u64> = targets.iter().filter_map(|id| self.serial_of(*id)).collect();
                 if accounts.len() > 1 { Err("The messages are in different accounts") } else { Ok(()) }
             }
             Command::NewFolder if self.work_offline => Err("Working offline"),
@@ -5640,8 +5753,12 @@ impl BeaverApp {
             Command::Undo => if self.pending.is_some() { Ok(()) } else { Err("Nothing to undo") },
             Command::Spam => {
                 some()?;
-                let role = if many { self.picked_role() } else { self.message.map_or(Role::Other, |id| self.role_of(id)) };
-                if role == Role::Inbox { Ok(()) } else { Err("Only for mail in the Inbox") }
+                if self.role_of_all(&targets) == Role::Inbox { Ok(()) } else { Err("Only for mail in the Inbox") }
+            }
+            Command::NotSpam => {
+                some()?;
+                let back = |id: &MessageId| matches!(self.correction(*id), Some((Correction::NotSpam | Correction::OutOfSpam, _)));
+                if targets.iter().all(back) { Ok(()) } else { Err("Only for mail in Spam or held as suspicious") }
             }
             Command::TrustSender => {
                 let id = one()?;
@@ -5666,6 +5783,7 @@ impl BeaverApp {
             Command::ViewSource => one().map(|_| ()),
             Command::FindInSource => if self.showing_source() { Ok(()) } else { Err("Only in the source of a message") },
             Command::OpenInTab => one().and(if self.in_tab { Err("Already in a tab") } else { Ok(()) }),
+            Command::OpenInFolder => one().and(if self.searching() || self.unified { Ok(()) } else { Err("Only for search results and All inboxes") }),
             Command::CloseTab => if self.in_tab { Ok(()) } else { Err("No message tab is shown") },
             Command::PreviousTab | Command::NextTab => if self.tabs.iter().any(|t| t.pinned) { Ok(()) } else { Err("No message is open in a tab") },
             Command::SelectAll => if self.in_tab || self.listed().is_empty() { Err("No list is shown") } else { Ok(()) },
@@ -5682,6 +5800,8 @@ impl BeaverApp {
     /// Runs `command`, from its key or the palette; [`Self::can`] said yes.
     fn run(&mut self, command: Command) {
         let targets = self.targets();
+        // A command for one message: the open one, or the one a right-click menu is about.
+        let one = (targets.len() == 1).then(|| targets[0]);
         let answer = |c| match c {
             Command::Reply => Action::Reply,
             Command::ReplyAll => Action::ReplyAll,
@@ -5691,7 +5811,7 @@ impl BeaverApp {
             Command::Palette => self.palette = Some(Palette::default()),
             Command::NewMessage => self.new_message(),
             Command::Reply | Command::ReplyAll | Command::Forward => {
-                if let Some(id) = self.message {
+                if let Some(id) = one {
                     self.request(self.latest_of(id), answer(command));
                 }
             }
@@ -5725,20 +5845,27 @@ impl BeaverApp {
                 let has = targets.iter().all(|id| self.summary_of(*id).is_some_and(|m| m.labels.contains(&keyword)));
                 self.request_all(targets, Action::Label(n, !has));
             }
-            Command::Spam if self.picked.len() >= 2 => self.request_all(targets, Action::Spam),
+            Command::Spam if targets.len() >= 2 => self.request_all(targets, Action::Spam),
             Command::Spam => {
-                if let Some(id) = self.message {
+                if let Some(id) = one {
                     self.correct(id, Correction::Spam);
                 }
             }
+            Command::NotSpam => {
+                for id in targets {
+                    if let Some((choice, _)) = self.correction(id) {
+                        self.correct(id, choice);
+                    }
+                }
+            }
             Command::TrustSender => {
-                if let Some(id) = self.message {
+                if let Some(id) = one {
                     self.trust(id);
                 }
             }
-            Command::BlockSender => self.confirm_block = self.message,
+            Command::BlockSender => self.confirm_block = one,
             Command::ViewSource => {
-                if let Some(id) = self.message {
+                if let Some(id) = one {
                     self.view_source(id);
                 }
             }
@@ -5748,8 +5875,13 @@ impl BeaverApp {
                 }
             }
             Command::OpenInTab => {
-                if let Some(id) = self.message {
+                if let Some(id) = one {
                     self.open_message(id, true);
+                }
+            }
+            Command::OpenInFolder => {
+                if let Some(id) = one {
+                    self.open_in_folder(id);
                 }
             }
             Command::CloseTab => {
@@ -6058,6 +6190,11 @@ impl BeaverApp {
                     }
                     self.error = None;
                     self.screen_inbox(serial, index);
+                    if let Some(id) = self.open_when_listed.filter(|id| self.messages.iter().any(|m| m.id == *id)) {
+                        self.open_when_listed = None;
+                        self.select_message(id);
+                        self.list_reveal = self.listed().iter().position(|i| self.conversations.same(*i, id) || *i == id);
+                    }
                 }
                 Err(e) => self.error = Some(e.to_string()),
             },
@@ -7027,6 +7164,8 @@ impl BeaverApp {
         let (mut chosen, mut removed, mut edit, mut add, mut suspicious, mut recheck, mut empty) = (None, None, None, false, None, None, None);
         let (mut all, mut scheduled, mut all_suspicious, mut all_spam) = (false, false, false, false);
         let (mut recheck_all, mut empty_all) = (false, false);
+        // Kept until the folder's row is drawn: an account unfolding shows it a frame later.
+        let (reveal, mut revealed) = (self.reveal_folder, false);
         let mut fold = None;
         let mut dropped = None;
         let mut new_inside = None;
@@ -7121,6 +7260,7 @@ impl BeaverApp {
                                 .icon(views::fold_arrow)
                                 .id_salt(view.serial)
                                 .default_open(!self.settings.folded.contains(&view.account.key()))
+                                .open((reveal && self.selected.is_some_and(|(s, _)| s == view.serial)).then_some(true))
                                 .show(ui, |ui| {
                                     if let Some(error) = &view.error {
                                         ui.add(egui::Label::new(RichText::new(error).size(13.0).color(t.danger)).wrap());
@@ -7173,6 +7313,10 @@ impl BeaverApp {
                                         let unread = if mailbox.role == Role::Inbox { inbox_unread(view.serial, mailbox) } else { mailbox.unread } + hidden_unread;
                                         let selected = here && !(holding && self.show_suspicious);
                                         let row = indented(ui, depth, |ui| views::folder_row(ui, t, &title, mailbox.role, unread, selected)).on_hover_text(tip);
+                                        if reveal && here {
+                                            row.scroll_to_me(None);
+                                            revealed = true;
+                                        }
                                         // The arrow sits in the margin left of the row, drawn as the accounts' own.
                                         if let Some(folded) = folding {
                                             let side = ui.spacing().icon_width;
@@ -7262,6 +7406,9 @@ impl BeaverApp {
                 });
             });
         });
+        if revealed {
+            self.reveal_folder = false;
+        }
         // Remembered for the next start; within a session egui keeps the state itself.
         if let Some(key) = fold {
             if !self.settings.folded.remove(&key) {
@@ -7281,6 +7428,10 @@ impl BeaverApp {
         let (mut pinned, mut toggled, mut ranged): (Option<MessageId>, Option<MessageId>, Option<MessageId>) = (None, None, None);
         let mut clicked_hit: Option<(u64, Hit, bool)> = None;
         let mut sorted: Option<Sort> = None;
+        // A command chosen from a row's right-click menu, with the messages it acts on.
+        let mut from_menu: Option<(Vec<MessageId>, Command)> = None;
+        // A right-click acts on the picked messages when it is on one of them, else on its own row.
+        let menu_ids = |picked: &[MessageId], id: MessageId| if picked.len() >= 2 && picked.contains(&id) { picked.to_vec() } else { vec![id] };
         let mut header = views::HeaderAction::default();
         let (reveal, view, row_h) = (self.list_reveal.take(), self.list_view, self.list_row_h());
         let (table, columns) = (self.settings.list_layout == ListLayout::Table, self.settings.columns);
@@ -7365,6 +7516,8 @@ impl BeaverApp {
                         } else {
                             views::message_row(ui, t, &hit.message, selected, Some(&hit.folder), None, 1, None)
                         };
+                        let ids = menu_ids(&self.picked, id);
+                        views::context_menu(&row, |ui| from_menu = self.message_menu(ui, &ids).map(|c| (ids.clone(), c)).or(from_menu.take()));
                         row.dnd_set_drag_payload(Dragged(if self.picked.contains(&id) { self.picked.clone() } else { vec![id] }));
                         let (ctrl, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
                         let keep = row.double_clicked() || row.triple_clicked() || row.middle_clicked();
@@ -7437,6 +7590,8 @@ impl BeaverApp {
                     } else {
                         views::message_row(ui, t, &summary, selected, None, warning, count, mark)
                     };
+                    let ids = menu_ids(&self.picked, message.id);
+                    views::context_menu(&row, |ui| from_menu = self.message_menu(ui, &ids).map(|c| (ids.clone(), c)).or(from_menu.take()));
                     // The picked messages go together when one of them is dragged.
                     row.dnd_set_drag_payload(Dragged(if self.picked.contains(&message.id) { self.picked.clone() } else { vec![message.id] }));
                     let (ctrl, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
@@ -7466,6 +7621,9 @@ impl BeaverApp {
         }
         if ended {
             self.list_to_end = false;
+        }
+        if let Some((ids, command)) = from_menu {
+            self.run_on(ids, command);
         }
         if let Some(sort) = sorted.or(header.sort) {
             self.set_sort(sort);
