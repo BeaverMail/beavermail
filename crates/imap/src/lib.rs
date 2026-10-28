@@ -37,6 +37,8 @@ type Stream = Box<dyn Conn>;
 #[derive(Default)]
 struct State {
     session: Option<Session<Stream>>,
+    /// When the session was last taken; one quiet for longer is checked before it is used again.
+    used: Option<std::time::Instant>,
 }
 
 /// What a write does to one message.
@@ -357,6 +359,8 @@ async fn tls(tcp: TcpStream, host: &str) -> Result<Stream, MailError> {
 
 /// How long a server may take to accept the connection.
 const CONNECT_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+/// How long a session may stay unused before it is checked with a NOOP.
+const QUIET_CHECK: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// A connection that could not be made, said so the user knows what to check. Still offline: a
 /// server that is down refuses too, and changes made meanwhile wait for it.
@@ -438,9 +442,17 @@ impl State {
             self.session = None; // closed, so nothing more goes over it
             return Err(MailError::Offline("working offline".into()));
         }
+        // Servers end quiet sessions (a BYE for inactivity): one that does not answer a NOOP is replaced
+        // here, instead of failing the call and showing the account offline.
+        if let Some(session) = self.session.as_mut().filter(|_| self.used.is_some_and(|t| t.elapsed() > QUIET_CHECK))
+            && !matches!(tokio::time::timeout(CONNECT_WAIT, session.noop()).await, Ok(Ok(())))
+        {
+            self.session = None;
+        }
         if self.session.is_none() {
             self.session = Some(connect_in_time(config).await?);
         }
+        self.used = Some(std::time::Instant::now());
         Ok(self.session.as_mut().expect("just connected"))
     }
 
