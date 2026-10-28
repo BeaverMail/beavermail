@@ -462,7 +462,7 @@ pub fn details(ui: &mut egui::Ui, t: &Tokens, item: &Item, calendar: &str, can: 
         ui.separator();
         ui.add_space(8.0);
         // Text from the event is untrusted, as a message is: plain, with its links cleaned.
-        url = ui.scope(|ui| views::body(ui, t, &crate::html::plain_blocks(event.description.trim()))).inner;
+        url = ui.scope(|ui| crate::body::body(ui, t, &crate::html::plain_blocks(event.description.trim()))).inner;
     }
     url
 }

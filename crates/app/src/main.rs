@@ -11,6 +11,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 
 mod actions;
 mod attachments;
+mod body;
 mod books;
 mod calendars;
 mod calview;
@@ -7973,7 +7974,7 @@ impl BeaverApp {
                             (Some(simplified), DisplayMode::Simplified) => (simplified, body.folds.1),
                             _ => (&body.plain, body.folds.0),
                         };
-                        said.url = views::reply_body(ui, t, blocks, fold, &mut body.quoted);
+                        said.url = body::reply_body(ui, t, blocks, fold, &mut body.quoted);
                     }
                 });
                 said

@@ -1030,7 +1030,7 @@ pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &
                 egui::ScrollArea::vertical().max_height(body_h).auto_shrink([false, true]).show(ui, |ui| {
                     if rich && compose.preview {
                         let blocks = crate::html::blocks(&beavermail_smtp::markdown_html(&compose.body));
-                        crate::views::body(ui, t, &blocks);
+                        crate::body::body(ui, t, &blocks);
                         return;
                     }
                     if std::mem::take(&mut compose.caret_top) {

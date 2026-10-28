@@ -7,7 +7,7 @@ use beavermail_core::{Attachment, Columns, MessageSummary, Role, Sort, SortBy};
 use eframe::egui::{self, Color32, CornerRadius, FontId, Margin, Rect, Response, Sense, Ui, pos2, vec2};
 use egui::text::{LayoutJob, TextWrapping};
 
-use crate::html::{self, Block, Kind, Run};
+use crate::html;
 use crate::icons::{self, Icon};
 use crate::theme::{self, CONTROL_H, CONTROL_RADIUS, Tokens};
 
@@ -955,60 +955,6 @@ pub fn primary_wide_fixed(ui: &mut Ui, t: &Tokens, icon: Icon, label: &str, enab
     ui.add_enabled(enabled, button)
 }
 
-fn heading_size(level: u8) -> f32 {
-    match level {
-        1 => 22.0,
-        2 => 20.0,
-        3 => 18.0,
-        _ => 16.5,
-    }
-}
-
-/// One line of runs that wraps like text. Returns the (cleaned) link the user clicked.
-/// `mono`: a code block, all of it in a fixed-width font. `strong`: a heading, all of it bold.
-fn runs_ui(ui: &mut Ui, t: &Tokens, runs: &[Run], size: f32, color: Color32, mono: bool, strong: bool) -> Option<String> {
-    let mut clicked = None;
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
-        for run in runs {
-            match run {
-                Run::Text { text, bold, italic, code, strike } => {
-                    let mut rich = egui::RichText::new(text).size(size).color(color);
-                    if *bold || strong {
-                        rich = rich.family(theme::bold());
-                    }
-                    if *italic {
-                        rich = rich.italics();
-                    }
-                    if *strike {
-                        rich = rich.strikethrough();
-                    }
-                    if mono {
-                        rich = rich.monospace();
-                    } else if *code {
-                        // Inline code stands apart from the words around it, not only by its font.
-                        rich = rich.monospace().size(size - 1.0).background_color(t.hover);
-                    }
-                    ui.label(rich);
-                }
-                Run::Link { text, url } => {
-                    let link = LinkInfo::new(ui.ctx(), text, url);
-                    let shown = if text.is_empty() { url } else { text };
-                    let tint = if link.misleading { t.danger } else { t.accent };
-                    let response = ui.add(egui::Link::new(egui::RichText::new(shown).size(size).color(tint))).on_hover_text(&link.tip);
-                    if response.clicked() {
-                        clicked = Some(link.clean.clone());
-                    }
-                    if let Some(open) = link_menu(&response, &link.clean) {
-                        clicked = Some(open);
-                    }
-                }
-            }
-        }
-    });
-    clicked
-}
-
 /// Where the extra link parameters to remove (Settings > Reading) are kept for the frame.
 fn link_params_id() -> egui::Id {
     egui::Id::new("link_params")
@@ -1069,124 +1015,6 @@ pub fn link_menu(response: &Response, clean: &str) -> Option<String> {
         }
     });
     open
-}
-
-/// A message body as blocks. Returns the link the user clicked, already cleaned of tracking parameters.
-pub fn body(ui: &mut Ui, t: &Tokens, blocks: &[Block]) -> Option<String> {
-    ui.spacing_mut().item_spacing.y = 2.0;
-    // Lines of text, not controls: the theme's 40-point control height would make every row (a list
-    // item, a line of a paragraph) that tall, with the text centred and a list's bullet left at the top.
-    ui.spacing_mut().interact_size.y = 0.0;
-    let mut clicked = None;
-    for block in blocks {
-        let indent = f32::from(block.depth) * 14.0;
-        match block.kind {
-            Kind::Rule => {
-                ui.separator();
-            }
-            Kind::Heading(level) => {
-                ui.add_space(6.0);
-                clicked = runs_ui(ui, t, &block.runs, heading_size(level), t.text, false, true).or(clicked);
-                ui.add_space(4.0);
-            }
-            Kind::Item => {
-                ui.horizontal_top(|ui| {
-                    ui.add_space(indent);
-                    // A continued line keeps the marker's room, drawn invisibly, so it lines up with the item's text.
-                    let marker_color = if block.continued { Color32::TRANSPARENT } else { t.text_dim };
-                    ui.label(egui::RichText::new(block.marker.as_deref().unwrap_or("•")).size(16.0).color(marker_color));
-                    clicked = runs_ui(ui, t, &block.runs, 16.0, t.text, false, false).or(clicked.take());
-                });
-                ui.add_space(2.0);
-            }
-            Kind::Quote => {
-                let frame = egui::Frame::new().inner_margin(Margin { left: 12 + indent as i8, right: 0, top: 0, bottom: 0 });
-                let shown = frame.show(ui, |ui| runs_ui(ui, t, &block.runs, 15.5, t.text_dim, false, false));
-                let r = shown.response.rect;
-                ui.painter().line_segment([pos2(r.left() + indent, r.top()), pos2(r.left() + indent, r.bottom())], egui::Stroke::new(2.0, t.border_strong));
-                clicked = shown.inner.or(clicked);
-            }
-            Kind::Pre => {
-                // A code block in its own box, as wide as the text column.
-                let frame = egui::Frame::new().fill(t.hover).corner_radius(CornerRadius::same(CONTROL_RADIUS)).inner_margin(Margin::symmetric(12, 8));
-                let shown = frame.show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    runs_ui(ui, t, &block.runs, 14.5, t.text, true, false)
-                });
-                clicked = shown.inner.or(clicked);
-                ui.add_space(6.0);
-            }
-            Kind::Table { header } => {
-                clicked = table(ui, t, &block.rows, header).or(clicked);
-                ui.add_space(10.0);
-            }
-            Kind::Para | Kind::Line => {
-                if block.runs.is_empty() {
-                    ui.add_space(8.0);
-                } else {
-                    clicked = runs_ui(ui, t, &block.runs, 16.0, t.text, false, false).or(clicked);
-                    if block.kind == Kind::Para {
-                        ui.add_space(8.0);
-                    }
-                }
-            }
-        }
-    }
-    clicked
-}
-
-/// A message body with the earlier messages it carries (from block `fold` on, see
-/// [`html::quoted_tail`]) folded behind "Show quoted text", which `shown` remembers. Returns the link clicked.
-pub fn reply_body(ui: &mut Ui, t: &Tokens, blocks: &[Block], fold: Option<usize>, shown: &mut bool) -> Option<String> {
-    let Some(at) = fold.filter(|&at| at < blocks.len()) else {
-        return body(ui, t, blocks);
-    };
-    // Each part in a scope of its own: the body's tight line spacing would shrink the button.
-    let mut clicked = ui.scope(|ui| body(ui, t, &blocks[..at])).inner;
-    ui.add_space(4.0);
-    let (label, tip) = if *shown { ("Hide quoted text", "Fold the earlier messages away again") } else { ("Show quoted text", "The earlier messages this one carries below it") };
-    if ui.button(label).on_hover_text(tip).clicked() {
-        *shown = !*shown;
-    }
-    if *shown {
-        ui.add_space(12.0);
-        clicked = ui.scope(|ui| body(ui, t, &blocks[at..])).inner.or(clicked);
-    }
-    clicked
-}
-
-/// A table of data: columns as wide as their longest cell asks, within the reader's width, a line
-/// under the header and between rows. Returns the link clicked.
-fn table(ui: &mut Ui, t: &Tokens, rows: &[Vec<Vec<Run>>], header: bool) -> Option<String> {
-    const GAP: f32 = 16.0;
-    const MIN_W: f32 = 48.0;
-    let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
-    let length = |cell: &[Run]| cell.iter().map(|r| match r { Run::Text { text, .. } | Run::Link { text, .. } => text.chars().count() }).sum::<usize>();
-    let wants: Vec<f32> = (0..columns).map(|c| rows.iter().filter_map(|r| r.get(c)).map(|cell| length(cell)).max().unwrap_or(0).max(4) as f32).collect();
-    let room = (ui.available_width() - GAP * (columns.saturating_sub(1)) as f32).max(MIN_W * columns as f32);
-    let total: f32 = wants.iter().sum();
-    let widths: Vec<f32> = wants.iter().map(|w| (room * w / total).max(MIN_W)).collect();
-    let mut clicked = None;
-    let line = egui::Stroke::new(1.0, t.border);
-    for (i, row) in rows.iter().enumerate() {
-        let shown = ui.horizontal_top(|ui| {
-            ui.spacing_mut().item_spacing.x = GAP;
-            for (cell, width) in row.iter().zip(&widths) {
-                ui.allocate_ui_with_layout(vec2(*width, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
-                    ui.set_width(*width);
-                    let color = if header && i == 0 { t.text_dim } else { t.text };
-                    clicked = runs_ui(ui, t, cell, 15.0, color, false, false).or(clicked.take());
-                });
-            }
-        });
-        let r = shown.response.rect;
-        if i + 1 < rows.len() {
-            let stroke = if header && i == 0 { egui::Stroke::new(1.0, t.border_strong) } else { line };
-            ui.painter().line_segment([pos2(r.left(), r.bottom() + 3.0), pos2(r.left() + widths.iter().sum::<f32>() + GAP * (columns.saturating_sub(1)) as f32, r.bottom() + 3.0)], stroke);
-            ui.add_space(6.0);
-        }
-    }
-    clicked
 }
 
 /// What the user did to an attachment's chip.

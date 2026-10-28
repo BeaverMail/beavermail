@@ -10,13 +10,13 @@ use scraper::{ElementRef, Html, Node};
 const MAX_INPUT: usize = 400_000;
 const MAX_BLOCKS: usize = 3_000;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Run {
     Text { text: String, bold: bool, italic: bool, code: bool, strike: bool },
     Link { text: String, url: String },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
     /// A paragraph: space after it.
     Para,
@@ -32,7 +32,7 @@ pub enum Kind {
     Table { header: bool },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Block {
     pub kind: Kind,
     /// Nesting depth of lists and quotes.
