@@ -44,6 +44,9 @@ pub(crate) const OFFLINE_CHANGES: &str = "offline/changes.json";
 /// How long an Archive or Move to Trash waits before going to the server, so Undo can take it back.
 pub(crate) const UNDO_SECS: u64 = 10;
 
+/// How long after the last change the server is asked for the counts, so a run of them asks once.
+pub(crate) const RECOUNT_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
+
 /// Archive or Move to Trash, shown at once but sent to the server only after [`UNDO_SECS`].
 pub(crate) struct Pending {
     /// For the bar: "Archived 3 messages".
@@ -51,6 +54,13 @@ pub(crate) struct Pending {
     pub(crate) until: std::time::Instant,
     /// Each message: (account, folder index shown, the action, the message as listed, its place in the list).
     pub(crate) items: Vec<(u64, usize, Action, MessageSummary, usize)>,
+}
+
+/// The messages gone from their list that the server, and so the archive, may still hold in the folder:
+/// waiting for Undo, on their way (`in_flight`), or waiting for a connection (`offline`).
+pub(crate) fn leaving(pending: Option<&Pending>, in_flight: &[(u64, usize, MessageId, Action)], offline: &[(u64, usize, MessageId, Action)]) -> Vec<MessageId> {
+    let changes = in_flight.iter().chain(offline).filter(|c| c.3.removes()).map(|c| c.2);
+    pending.iter().flat_map(|p| p.items.iter().map(|(_, _, _, m, _)| m.id)).chain(changes).collect()
 }
 
 /// Runs `action` on message `id` on the server.
@@ -73,6 +83,13 @@ pub(crate) async fn perform(source: Arc<ImapSource>, id: MessageId, action: Acti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_message_on_its_way_out_is_not_listed_again_and_a_flag_change_is() {
+        let in_flight = [(1, 0, MessageId(5), Action::Trash), (1, 0, MessageId(6), Action::Unread(false))];
+        let offline = [(1, 0, MessageId(7), Action::Archive), (2, 0, MessageId(8), Action::Star(true))];
+        assert_eq!(leaving(None, &in_flight, &offline), [MessageId(5), MessageId(7)]);
+    }
 
     #[test]
     fn a_move_waits_offline_with_its_folder_and_older_queues_still_read() {

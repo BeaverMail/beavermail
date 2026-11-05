@@ -45,7 +45,7 @@ use beavermail_vault::{Mode, SystemStore, Vault};
 use chrono::Datelike;
 use eframe::egui::{self, Align, Layout, RichText, pos2, vec2};
 
-use crate::actions::{Action, OFFLINE_CHANGES, Pending, UNDO_SECS, perform};
+use crate::actions::{Action, OFFLINE_CHANGES, Pending, RECOUNT_WAIT, UNDO_SECS, perform};
 use crate::commands::Command;
 use crate::icons::Icon;
 use tokio::runtime::Runtime;
@@ -80,6 +80,8 @@ enum Event {
     /// A write (read flag, archive, trash) finished; the UI already showed its result.
     /// The third field is the message and action, for a change that can wait for the connection.
     Done(u64, usize, Option<(MessageId, Action)>, Result<(), MailError>),
+    /// A run of changes may be over: the account and how many it had confirmed.
+    Recount(u64, u64),
     /// A folder was created in account `serial`, with its full name, or the server refused it.
     FolderMade(u64, Result<String, MailError>),
     /// Folder (account, old name) was renamed, to this full name, or the server refused it.
@@ -1297,6 +1299,8 @@ struct BeaverApp {
     offline_changes: Vec<(u64, usize, MessageId, Action)>,
     /// Changes sent to the server and not answered yet, as in `offline_changes`; closing waits for them.
     in_flight: Vec<(u64, usize, MessageId, Action)>,
+    /// Each account's changes confirmed so far, so only the last of a run asks for the counts.
+    confirmed: std::collections::HashMap<u64, u64>,
     /// The window was closed with changes in flight: it closes once they are answered.
     closing: bool,
     /// The pane F6 moved the keys to; `None` until then, and again after a click in the list.
@@ -1486,6 +1490,7 @@ impl BeaverApp {
             show_scheduled: false,
             offline_changes: Vec::new(),
             in_flight: Vec::new(),
+            confirmed: std::collections::HashMap::new(),
             closing: false,
             work_offline: false,
             pane: None,
@@ -2139,36 +2144,28 @@ impl BeaverApp {
         let index = self.shown().into_iter().find(|(s, _)| *s == serial).map_or(usize::MAX, |(_, i)| i);
         let Some(source) = self.view(serial).and_then(|v| v.source.clone()) else { return };
         let pos = self.messages.iter().position(|m| m.id == id);
+        let was_unread = self.summary_of(id).is_some_and(|m| m.unread);
+        // The folder it is in, shown or not (a search result, a tab).
+        let home = self.archive.locate(id).ok().flatten().and_then(|at| self.view(serial)?.mailboxes.iter().position(|m| m.name == at.folder)).unwrap_or(index);
         // Archive, Move to Trash and to another folder of a listed message wait, so Undo can put it back.
         let undoable = matches!(action, Action::Archive | Action::Trash | Action::Move(_)) && self.role_of(id) != Role::Trash;
         let kept = pos.filter(|_| undoable).map(|p| (p, self.messages[p].clone()));
         if let Some(pos) = pos {
-            let was_unread = self.messages[pos].unread;
-            let unread_change = match action {
-                Action::Unread(unread) => {
-                    self.messages[pos].unread = unread;
-                    i32::from(unread) - i32::from(was_unread)
-                }
-                Action::Pin(on) => {
-                    self.messages[pos].pinned = on;
-                    0
-                }
-                Action::Star(on) => {
-                    self.messages[pos].starred = on;
-                    0
-                }
-                Action::Label(n, on) => {
-                    set_label(&mut self.messages[pos].labels, n, on);
-                    0
-                }
-                _ => {
-                    self.messages.remove(pos);
-                    -i32::from(was_unread)
-                }
-            };
-            if let Some(mailbox) = self.accounts.iter_mut().find(|v| v.serial == serial).and_then(|v| v.mailboxes.get_mut(index)) {
-                mailbox.unread = mailbox.unread.saturating_add_signed(unread_change);
+            match action {
+                Action::Unread(unread) => self.messages[pos].unread = unread,
+                Action::Pin(on) => self.messages[pos].pinned = on,
+                Action::Star(on) => self.messages[pos].starred = on,
+                Action::Label(n, on) => set_label(&mut self.messages[pos].labels, n, on),
+                _ => drop(self.messages.remove(pos)),
             }
+        }
+        let unread_change = match action {
+            Action::Unread(unread) => i32::from(unread) - i32::from(was_unread),
+            _ if action.removes() => -i32::from(was_unread),
+            _ => 0,
+        };
+        if let Some(mailbox) = self.accounts.iter_mut().find(|v| v.serial == serial).and_then(|v| v.mailboxes.get_mut(home)) {
+            mailbox.unread = mailbox.unread.saturating_add_signed(unread_change);
         }
         if let Action::Unread(unread) = action {
             self.tabs.iter_mut().filter(|t| t.message.id == id).for_each(|t| t.message.unread = unread);
@@ -6177,6 +6174,13 @@ impl BeaverApp {
                 match result {
                     Ok(mut mailboxes) => {
                         download = fresh;
+                        // Mail waiting for Undo is still unread on the server, and already off the count here.
+                        for (_, index, _, _, _) in self.pending.iter().flat_map(|p| &p.items).filter(|i| fresh && i.0 == serial && i.3.unread) {
+                            let name = view.mailboxes.get(*index).map(|f| f.name.as_str());
+                            if let Some(folder) = mailboxes.iter_mut().find(|m| Some(m.name.as_str()) == name) {
+                                folder.unread = folder.unread.saturating_sub(1);
+                            }
+                        }
                         // New mail since the last time the server was asked (not the first answer).
                         let unread_now = mailboxes.iter().find(|m| m.role == Role::Inbox).map(|m| m.unread);
                         if fresh && let (Some(before), Some(now)) = (unread_before, unread_now) && now > before && !view.mailboxes.is_empty() {
@@ -6306,9 +6310,7 @@ impl BeaverApp {
                     let origin = &self.origin;
                     self.messages.retain(|m| origin.get(&m.id).is_some_and(|s| *s != serial));
                     self.origin.extend(messages.iter().map(|m| (m.id, serial)));
-                    // Mail waiting for Undo is still in the folder on the server and in the archive.
-                    let offline_moves = self.offline_changes.iter().filter(|c| c.3.removes()).map(|c| c.2);
-                    let waiting: Vec<MessageId> = self.pending.iter().flat_map(|p| p.items.iter().map(|(_, _, _, m, _)| m.id)).chain(offline_moves).collect();
+                    let waiting = actions::leaving(self.pending.as_ref(), &self.in_flight, &self.offline_changes);
                     self.messages.extend(messages.into_iter().filter(|m| !waiting.contains(&m.id)));
                     if self.unified {
                         self.messages.sort_by_key(|m| std::cmp::Reverse(m.timestamp));
@@ -6449,7 +6451,30 @@ impl BeaverApp {
                     self.spawn(async move { Event::Mailboxes(serial, source.mailboxes().await, true) });
                 }
             }
-            Event::Done(..) => {}
+            Event::Done(serial, _, Some(_), Ok(())) => {
+                let confirmed = self.confirmed.entry(serial).or_default();
+                *confirmed += 1;
+                let seen = *confirmed;
+                self.spawn(async move {
+                    tokio::time::sleep(RECOUNT_WAIT).await;
+                    Event::Recount(serial, seen)
+                });
+            }
+            // The run of changes is over: the list as the archive has it now, the counts as the server does,
+            // which also takes in the folders the mail went to.
+            Event::Recount(serial, seen) => {
+                if self.confirmed.get(&serial) != Some(&seen) || self.in_flight.iter().any(|c| c.0 == serial) {
+                    return; // a later change asks instead
+                }
+                let Some(source) = self.view(serial).and_then(|v| v.source.clone()) else { return };
+                if let Some((_, index)) = self.shown().into_iter().find(|(s, _)| *s == serial)
+                    && let Some(name) = self.view(serial).and_then(|v| v.mailboxes.get(index)).map(|m| m.name.clone())
+                {
+                    let local = source.clone();
+                    self.spawn(async move { Event::Messages(serial, index, local.messages(&name).await) });
+                }
+                self.spawn(async move { Event::Mailboxes(serial, source.mailboxes().await, true) });
+            }
             Event::Vault(outcome) => self.apply_vault(outcome),
             Event::Attachment(result) => match result {
                 Ok((name, bytes)) => match attachments::open(&self.open_dir, &name, &bytes) {
