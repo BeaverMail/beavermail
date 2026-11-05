@@ -345,18 +345,24 @@ impl Laid {
     /// The word at `at`, or the one character there when it is not in a word.
     fn word(&self, at: At) -> (At, At) {
         let Some(piece) = self.pieces.get(at.piece) else { return (at, at) };
-        let chars: Vec<char> = piece.galley.text().chars().collect();
-        let is_word = |k: usize| chars.get(k).is_some_and(|c| egui::text_selection::text_cursor_state::is_word_char(*c));
-        // The boundary nearest the pointer may be just after the word.
-        let k = if !is_word(at.index) && at.index > 0 && is_word(at.index - 1) { at.index - 1 } else { at.index };
-        if !is_word(k) {
-            let end = (k + 1).min(chars.len());
-            return (At { index: k.min(end), ..at }, At { index: end, ..at });
-        }
-        let start = chars[..k].iter().rposition(|c| !egui::text_selection::text_cursor_state::is_word_char(*c)).map_or(0, |p| p + 1);
-        let end = chars[k..].iter().position(|c| !egui::text_selection::text_cursor_state::is_word_char(*c)).map_or(chars.len(), |p| k + p);
-        (At { index: start, ..at }, At { index: end, ..at })
+        let span = word(piece.galley.text(), at.index);
+        (At { index: span.start, ..at }, At { index: span.end, ..at })
     }
+}
+
+/// The characters of the word at character `at` of `text`, or of the one character there when it is not in a word.
+pub fn word(text: &str, at: usize) -> Range<usize> {
+    let chars: Vec<char> = text.chars().collect();
+    let is_word = |k: usize| chars.get(k).is_some_and(|c| egui::text_selection::text_cursor_state::is_word_char(*c));
+    // The boundary nearest the pointer may be just after the word.
+    let k = if !is_word(at) && at > 0 && is_word(at - 1) { at - 1 } else { at };
+    if !is_word(k) {
+        let end = (k + 1).min(chars.len());
+        return k.min(end)..end;
+    }
+    let start = chars[..k].iter().rposition(|c| !egui::text_selection::text_cursor_state::is_word_char(*c)).map_or(0, |p| p + 1);
+    let end = chars[k..].iter().position(|c| !egui::text_selection::text_cursor_state::is_word_char(*c)).map_or(chars.len(), |p| k + p);
+    start..end
 }
 
 fn heading_size(level: u8) -> f32 {

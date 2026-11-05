@@ -2,6 +2,30 @@
 
 What changed in each version of BeaverMail, newest first.
 
+## Unreleased
+
+### Added
+
+- A right-click menu on the list's messages, acting on the picked ones or on its own row without opening it: open in a tab or in its folder, answer, mark, pin, star, label, move, archive, trash, Spam or Not spam, trust or block the sender, view the source.
+- The message list ordered per folder, by date, sender or subject either way, pinned first; oldest first opens at the bottom.
+- The list as cards or as a table of From, Subject and Date, with columns widened by dragging their edges; the message shown beside the list, below it or only in a tab.
+- Appearance in Settings, with the density of the sidebars: Compact, Normal or Comfortable.
+- A diagnostic log, turned on in Settings › Troubleshooting, that never holds the text, subject or addresses of a message.
+- The text of a message selected from end to end: dragged up or down, kept while scrolling and extended with Shift+click; a word with a double click, a paragraph with three; Copy and Select all on a right click.
+- The source of a message selected the same way, from beside a line too, and all of it with Ctrl+A.
+
+### Changed
+
+- Fewer false alarms in the spam checks.
+- All inboxes, Suspicious and Spam get the menus of an account's own folders.
+- Folders start folded in the sidebar, and those opened are remembered; a folder opened from anywhere shows in the sidebar.
+- Settings chosen from drop-downs, each saying what its choice does.
+- Scroll bars shown at rest wherever there is more to scroll.
+
+### Fixed
+
+- An account no longer shows as offline after its server ends a quiet session.
+
 ## 0.1.1 – 2026-10-23
 
 ### Added

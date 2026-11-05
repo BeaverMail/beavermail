@@ -266,6 +266,50 @@ struct SourceView {
     size: usize,
     /// The find bar, while open.
     find: Option<Find>,
+    select: Selection,
+}
+
+/// The text selected in a source tab, as (line, character) places: kept whatever is on screen, as
+/// only the lines in sight are laid out.
+#[derive(Default)]
+struct Selection {
+    /// Where it started; `head` is where it ends, moved by dragging or Shift+click.
+    anchor: Option<(usize, usize)>,
+    head: (usize, usize),
+    dragging: bool,
+}
+
+impl Selection {
+    fn all(lines: &[String]) -> Self {
+        Self { anchor: Some((0, 0)), head: (lines.len().saturating_sub(1), lines.last().map_or(0, |l| l.chars().count())), dragging: false }
+    }
+
+    /// From its first place to its last; `None` when nothing is selected.
+    fn range(&self) -> Option<((usize, usize), (usize, usize))> {
+        let anchor = self.anchor?;
+        (anchor != self.head).then(|| (anchor.min(self.head), anchor.max(self.head)))
+    }
+
+    /// The characters of line `line` it covers.
+    fn span(&self, line: usize) -> Option<std::ops::Range<usize>> {
+        let (lo, hi) = self.range()?;
+        if line < lo.0 || line > hi.0 {
+            return None;
+        }
+        Some(if line == lo.0 { lo.1 } else { 0 }..if line == hi.0 { hi.1 } else { usize::MAX })
+    }
+
+    /// The text it covers, a line break between lines.
+    fn text(&self, lines: &[String]) -> String {
+        let Some((lo, hi)) = self.range() else { return String::new() };
+        (lo.0..=hi.0.min(lines.len().saturating_sub(1)))
+            .map(|l| {
+                let span = self.span(l).unwrap_or_default();
+                lines[l].chars().skip(span.start).take(span.end - span.start).collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 /// Finding text in a source tab.
@@ -1911,10 +1955,10 @@ impl BeaverApp {
         if tab.source {
             let subject = tab.message.subject.clone();
             (self.in_tab, self.message, self.body) = (true, Some(id), None);
-            self.source_view = Some(SourceView { id, subject, lines: None, size: 0, find: None });
+            self.source_view = Some(SourceView { id, subject, lines: None, size: 0, find: None, select: Selection::default() });
             match self.view(serial).and_then(|v| v.source.clone()) {
                 Some(source) => self.spawn(async move { Event::Source(id, source.source(id).await) }),
-                None => self.source_view = Some(SourceView { id, subject: String::new(), lines: Some(Err("its account is not connected".into())), size: 0, find: None }),
+                None => self.source_view = Some(SourceView { id, subject: String::new(), lines: Some(Err("its account is not connected".into())), size: 0, find: None, select: Selection::default() }),
             }
             return;
         }
@@ -2054,6 +2098,7 @@ impl BeaverApp {
     /// Moves the selection to listed message `id`: shown in the reading pane, or without the pane only
     /// selected (Enter or a double click opens it in a tab).
     fn move_to(&mut self, id: MessageId) {
+        self.picked.clear();
         if self.settings.reading_pane {
             self.show_listed(id);
         } else {
@@ -3876,6 +3921,72 @@ impl BeaverApp {
                     if down != 0.0 || sideways != 0.0 {
                         ui.scroll_with_delta(vec2(sideways * 96.0, down));
                     }
+                    // Selected as the message's text is: from anywhere in the view, beside a line too
+                    // (egui's labels start only on their own text, and have no Select all).
+                    let select = &mut view.select;
+                    let origin = ui.cursor().min - vec2(0.0, range.start as f32 * row);
+                    let place = |ui: &egui::Ui, p: egui::Pos2| {
+                        let Some(last) = lines.len().checked_sub(1) else { return (0, 0) };
+                        let line = ((p.y - origin.y) / row).floor();
+                        if line < 0.0 {
+                            return (0, 0);
+                        }
+                        let line = (line as usize).min(last);
+                        let galley = ui.painter().layout_no_wrap(lines[line].clone(), font.clone(), t.text);
+                        (line, galley.cursor_from_pos(vec2(p.x - origin.x, row / 2.0)).index.0)
+                    };
+                    let response = ui.interact(ui.clip_rect(), egui::Id::new(("source_select", view.id.0)), egui::Sense::click_and_drag());
+                    let pointer = ui.ctx().pointer_interact_pos();
+                    let (pressed, held, shift) = ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down(), i.modifiers.shift));
+                    if let Some(p) = pointer
+                        && pressed
+                        && response.is_pointer_button_down_on()
+                    {
+                        let at = place(ui, p);
+                        if !(shift && select.anchor.is_some()) {
+                            select.anchor = Some(at);
+                        }
+                        select.head = at;
+                        select.dragging = true;
+                    } else if select.dragging
+                        && held
+                        && let Some(p) = pointer
+                    {
+                        select.head = place(ui, p);
+                        // Past the top or the bottom of the view, it scrolls on, faster the further the pointer is.
+                        let clip = ui.clip_rect();
+                        let past = if p.y < clip.top() { clip.top() - p.y } else { (clip.bottom() - p.y).min(0.0) };
+                        if past != 0.0 {
+                            ui.scroll_with_delta(vec2(0.0, past.clamp(-30.0, 30.0)));
+                            ui.ctx().request_repaint();
+                        }
+                    }
+                    if !held {
+                        select.dragging = false;
+                    }
+                    if let Some(p) = pointer {
+                        let (line, at) = place(ui, p);
+                        if response.triple_clicked() {
+                            (select.anchor, select.head) = (Some((line, 0)), (line, lines.get(line).map_or(0, |l| l.chars().count())));
+                        } else if response.double_clicked() {
+                            let word = body::word(&lines[line], at);
+                            (select.anchor, select.head) = (Some((line, word.start)), (line, word.end));
+                        }
+                    }
+                    if response.hovered() || select.dragging {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+                    }
+                    if select.range().is_some() && ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy))) && ui.memory(|m| m.focused().is_none()) {
+                        ui.ctx().copy_text(select.text(lines));
+                    }
+                    views::context_menu(&response, |ui| {
+                        if ui.add_enabled(select.range().is_some(), egui::Button::new("Copy")).clicked() {
+                            ui.ctx().copy_text(select.text(lines));
+                        }
+                        if ui.button("Select all").on_hover_text(Command::SelectAll.tip(ui.ctx())).clicked() {
+                            *select = Selection::all(lines);
+                        }
+                    });
                     let first = hits.partition_point(|h| h.0 < range.start);
                     let mut hits = hits[first..].iter().peekable();
                     for (at, line) in lines[range.clone()].iter().enumerate().map(|(i, l)| (range.start + i, l)) {
@@ -3891,7 +4002,13 @@ impl BeaverApp {
                             from = end;
                         }
                         job.append(&line[from..], 0.0, plain);
-                        ui.add(egui::Label::new(job).wrap_mode(egui::TextWrapMode::Extend));
+                        let mut galley = ui.painter().layout_job(job);
+                        let (rect, _) = ui.allocate_exact_size(vec2(galley.size().x, row), egui::Sense::hover());
+                        if let Some(span) = select.span(at) {
+                            let span = egui::text::CCursorRange::two(egui::text::CCursor::new(span.start), egui::text::CCursor::new(span.end.min(galley.end().index.0)));
+                            egui::text_selection::visuals::paint_text_selection(&mut galley, ui.visuals(), &span, None);
+                        }
+                        ui.painter().galley(rect.min, galley, t.text);
                     }
                 });
             });
@@ -5730,7 +5847,7 @@ impl BeaverApp {
         };
         let some = || if targets.is_empty() { Err("Open or pick a message first") } else { Ok(()) };
         // A source tab shows text, not the message: what acts on a message is for its own tab.
-        if self.showing_source() && !matches!(command, Command::Palette | Command::NewMessage | Command::Settings | Command::Mail | Command::Contacts | Command::WorkOffline | Command::WorkOnline | Command::CloseTab | Command::PreviousTab | Command::NextTab | Command::AllInboxes | Command::FindInSource) {
+        if self.showing_source() && !matches!(command, Command::Palette | Command::NewMessage | Command::Settings | Command::Mail | Command::Contacts | Command::WorkOffline | Command::WorkOnline | Command::CloseTab | Command::PreviousTab | Command::NextTab | Command::AllInboxes | Command::FindInSource | Command::SelectAll) {
             return Err("Not in the source of a message");
         }
         // Out of Mail the list and the reader are not on screen: what acts on them waits.
@@ -5787,7 +5904,7 @@ impl BeaverApp {
             Command::OpenInFolder => one().and(if self.searching() || self.unified { Ok(()) } else { Err("Only for search results and All inboxes") }),
             Command::CloseTab => if self.in_tab { Ok(()) } else { Err("No message tab is shown") },
             Command::PreviousTab | Command::NextTab => if self.tabs.iter().any(|t| t.pinned) { Ok(()) } else { Err("No message is open in a tab") },
-            Command::SelectAll => if self.in_tab || self.listed().is_empty() { Err("No list is shown") } else { Ok(()) },
+            Command::SelectAll => if self.showing_source() || !(self.in_tab || self.listed().is_empty()) { Ok(()) } else { Err("No list is shown") },
             Command::Refresh if self.work_offline => Err("Working offline"),
             Command::Refresh => if self.shown().is_empty() { Err("No folder is shown") } else { Ok(()) },
             Command::SwitchPane if !self.settings.reading_pane => Err("Messages open only in tabs"),
@@ -5892,6 +6009,13 @@ impl BeaverApp {
             }
             Command::PreviousTab => self.cycle_tabs(true),
             Command::NextTab => self.cycle_tabs(false),
+            Command::SelectAll if self.showing_source() => {
+                if let Some(view) = &mut self.source_view
+                    && let Some(Ok(lines)) = &view.lines
+                {
+                    view.select = Selection::all(lines);
+                }
+            }
             Command::SelectAll => self.picked = self.listed(),
             Command::Search => self.focus_search = true,
             Command::Refresh => self.refresh(),
