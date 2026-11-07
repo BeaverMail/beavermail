@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+
+[package]
+name = "beavermail-spell"
+description = "Spell checking for BeaverMail, on Hunspell dictionaries"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+spellbook = "0.4"
+# Dictionaries not in UTF-8 (their SET line names the charset); already in the tree through the HTML renderer.
+encoding_rs = "0.8"
+ureq.workspace = true

@@ -13,6 +13,7 @@ What changed in each version of BeaverMail, newest first.
 - A diagnostic log, turned on in Settings › Troubleshooting, that never holds the text, subject or addresses of a message.
 - The text of a message selected from end to end: dragged up or down, kept while scrolling and extended with Shift+click; a word with a double click, a paragraph with three; Copy and Select all on a right click.
 - The source of a message selected the same way, from beside a line too, and all of it with Ctrl+A.
+- Spell check while writing: words spelled wrong underlined, their spellings and Add to dictionary on a right click, the language chosen in Settings › Writing or per message; dictionaries from the system or downloaded on request; Check spelling (F7) going through the words marked one by one, to change, ignore or add each, optionally before sending.
 
 ### Changed
 

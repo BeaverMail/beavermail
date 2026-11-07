@@ -83,6 +83,55 @@ pub struct Compose {
     pub can_encrypt: Result<(), String>,
     /// An answer to an invitation: its iTIP part, sent beside the text.
     pub calendar: Option<String>,
+    pub spell: Spell,
+}
+
+/// The spell check of one message: its language and the words found wrong.
+#[derive(Default)]
+pub struct Spell {
+    /// The dictionary's code; empty until the app gives it the one chosen in Settings.
+    pub language: String,
+    /// Words the user chose to ignore in this message.
+    ignored: std::collections::BTreeSet<String>,
+    /// What was checked (text, language and words known, hashed) and the words found wrong, as
+    /// (bytes, characters) of the body.
+    checked: u64,
+    wrong: Vec<(std::ops::Range<usize>, std::ops::Range<usize>)>,
+    /// The word right-clicked: where it is, the word, its suggestions.
+    menu: Option<(std::ops::Range<usize>, String, Vec<String>)>,
+    /// The words marked are being gone through (F7, or Send with the check before sending).
+    pub review: Option<Review>,
+}
+
+/// Going through the words marked, one by one.
+#[derive(Default)]
+pub struct Review {
+    /// Opened by Send: Send is offered beside the words.
+    sending: bool,
+    /// The words before this byte of the body were dealt with.
+    at: usize,
+    /// The word shown (where, which) and its spellings, worked out once.
+    word: Option<(std::ops::Range<usize>, String, Vec<String>)>,
+    /// What it is changed to.
+    change_to: String,
+}
+
+/// What the spell check needs from the app.
+pub struct Spelling<'a> {
+    /// The dictionary of the message's language, once loaded; `None` with the check off.
+    pub speller: Option<&'a beavermail_spell::Speller>,
+    /// The user's own words.
+    pub known: &'a std::collections::BTreeSet<String>,
+    /// The languages that can be chosen, by code; none with the check off.
+    pub languages: &'a [String],
+    /// The message's language, when its dictionary is not on this computer but can be downloaded.
+    pub missing: Option<&'a str>,
+    /// Its dictionary is being read or downloaded.
+    pub busy: bool,
+    /// Why its dictionary could not be had.
+    pub failed: Option<&'a str>,
+    /// Ask before sending a message with words marked wrong.
+    pub before_send: bool,
 }
 
 pub enum Outcome {
@@ -97,6 +146,10 @@ pub enum Outcome {
     Undo,
     /// Send later, at this moment (seconds since the Unix epoch).
     Schedule(i64),
+    /// Add this word to the user's own, so it is never marked wrong again.
+    Learn(String),
+    /// Download the dictionary of the message's language.
+    Download,
 }
 
 /// What "send later" offers from `now`, as (label, moment): tomorrow morning and afternoon, and
@@ -225,6 +278,7 @@ impl Compose {
             encrypt_auto: true,
             can_encrypt: Err(String::new()),
             calendar: None,
+            spell: Spell::default(),
         }
         .settled()
     }
@@ -915,8 +969,9 @@ fn toolbar(ui: &mut Ui, ctx: &egui::Context, t: &Tokens, compose: &mut Compose, 
 }
 
 /// Shows the window. `senders` lists the accounts that can send, as (serial, address).
-pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &[(u64, String)], rich: bool) -> Outcome {
+pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &[(u64, String)], rich: bool, spelling: &Spelling) -> Outcome {
     let mut outcome = Outcome::Keep;
+    find_misspelled(compose, spelling);
     let waiting_for_files = compose.pending() > 0;
     let invalid = first_invalid(compose);
     let anyone = [&compose.to, &compose.cc, &compose.bcc].iter().any(|l| !addresses(l).is_empty());
@@ -1046,6 +1101,9 @@ pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &
                         .desired_width(f32::INFINITY)
                         .desired_rows(8)
                         .show(ui);
+                    if let Some(word) = spell_check(ui, t, compose, &output, spelling) {
+                        outcome = Outcome::Learn(word);
+                    }
                     // One character typed, and it was a new line: carry a list or quote on to it.
                     if output.response.changed()
                         && compose.body.chars().count() == length + 1
@@ -1064,6 +1122,47 @@ pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &
                     }
                 });
             });
+            if !spelling.languages.is_empty() || spelling.missing.is_some() {
+                ui.horizontal(|ui| {
+                    // Small and quiet under the text, as the Markdown line over it: the footer has no room.
+                    if !spelling.languages.is_empty() {
+                        let language = &mut compose.spell.language;
+                        let shown = RichText::new(format!("Spelling: {}", beavermail_spell::name(language))).size(12.5).color(t.text_dim);
+                        let button = egui::Button::new((shown, Icon::ChevronDown.image(12.0, t.text_dim))).frame(false);
+                        let look = egui::containers::menu::MenuConfig::new().style(views::menu_look);
+                        egui::containers::menu::MenuButton::from_button(button).config(look).ui(ui, |ui| {
+                            for code in spelling.languages {
+                                if ui.selectable_label(language == code, beavermail_spell::name(code)).clicked() {
+                                    *language = code.clone();
+                                    ui.close();
+                                }
+                            }
+                        }).0.on_hover_text("The language this message is checked in; more in Settings › Writing");
+                    }
+                    if spelling.speller.is_some() {
+                        let count = compose.spell.wrong.len();
+                        let text = if count == 0 { "Check spelling".to_owned() } else { format!("Check spelling · {count}") };
+                        if ui.add(egui::Button::new(RichText::new(text).size(12.5).color(t.text_dim)).frame(false)).on_hover_text("Go through the words marked, one by one (F7)").clicked() {
+                            compose.spell.review = Some(Review::default());
+                        }
+                    }
+                    let Some(code) = spelling.missing else { return };
+                    let name = beavermail_spell::name(code);
+                    if spelling.busy {
+                        ui.spinner();
+                        ui.label(RichText::new(format!("Downloading the {name} dictionary…")).size(12.5).color(t.text_dim));
+                    } else {
+                        let text = match spelling.failed {
+                            Some(error) => RichText::new(format!("Could not download the {name} dictionary: {error}")).color(t.danger),
+                            None => RichText::new(format!("No {name} dictionary on this computer to check spelling.")).color(t.text_dim),
+                        };
+                        ui.add(egui::Label::new(text.size(12.5)).truncate());
+                        if ui.small_button(if spelling.failed.is_some() { "Try again" } else { "Download" }).on_hover_text("From LibreOffice's collection of dictionaries, 1 to 10 MB").clicked() {
+                            outcome = Outcome::Download;
+                        }
+                    }
+                });
+            }
             if !compose.files.is_empty() {
                 ui.add_space(6.0);
                 let mut remove = None;
@@ -1163,8 +1262,305 @@ pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &
     if !compose.sending && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::D)) {
         outcome = Outcome::Discard;
     }
+    if let Some(speller) = spelling.speller {
+        if compose.spell.review.is_none() && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F7)) {
+            compose.spell.review = Some(Review::default());
+        }
+        if matches!(outcome, Outcome::Send) && spelling.before_send && !compose.spell.wrong.is_empty() {
+            compose.spell.review = Some(Review { sending: true, ..Default::default() });
+            outcome = Outcome::Keep;
+        }
+        match review_spelling(ctx, t, compose, speller) {
+            Some(Reviewed::Send) => outcome = Outcome::Send,
+            Some(Reviewed::Learn(word)) => outcome = Outcome::Learn(word),
+            None => {}
+        }
+    }
     compose.suggesting = suggesting;
     outcome
+}
+
+/// The review's column of actions, and its list of suggestions (five rows).
+const ACTIONS_W: f32 = 160.0;
+const SUGGESTIONS_H: f32 = 5.0 * 34.0;
+
+/// What the review of the words marked did this frame.
+enum Reviewed {
+    Send,
+    Learn(String),
+}
+
+/// The words marked, gone through one by one: the word in its sentence, its spellings, and Change,
+/// Change all, Ignore, Ignore all or Add to dictionary. Opened by Send, it offers Send too.
+fn review_spelling(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, speller: &beavermail_spell::Speller) -> Option<Reviewed> {
+    let Some(review) = &mut compose.spell.review else { return None };
+    let wrong = &compose.spell.wrong;
+    let current = wrong.iter().position(|(bytes, _)| bytes.start >= review.at);
+    // Nothing (more) to go through: no dialog, Send goes on.
+    let Some(current) = current else {
+        let sending = review.sending;
+        compose.spell.review = None;
+        return sending.then_some(Reviewed::Send);
+    };
+    let shown = Some(wrong[current].0.clone());
+    if review.word.as_ref().map(|(bytes, _, _)| bytes.clone()) != shown {
+        review.word = shown.map(|bytes| {
+            let word = compose.body[bytes.clone()].to_owned();
+            let suggestions = speller.suggest(&word);
+            review.change_to = suggestions.first().cloned().unwrap_or_else(|| word.clone());
+            (bytes, word, suggestions)
+        });
+    }
+    #[derive(Clone, Copy, PartialEq)]
+    enum Act {
+        Change,
+        ChangeAll,
+        Ignore,
+        IgnoreAll,
+        Learn,
+        Send,
+        Close,
+    }
+    let mut act = None;
+    let language = beavermail_spell::name(&compose.spell.language).to_owned();
+    let modal = egui::Modal::new(egui::Id::new("review_spelling")).show(ctx, |ui| {
+        ui.set_width(crate::FORM_WIDTH);
+        ui.heading("Check spelling");
+        ui.label(RichText::new(format!("Word {} of {} · {language}", current + 1, wrong.len())).color(t.text_dim));
+        if let Some((bytes, word, suggestions)) = &review.word {
+            ui.add_space(12.0);
+            egui::Frame::new().fill(t.input).corner_radius(egui::CornerRadius::same(theme::CONTROL_RADIUS)).inner_margin(egui::Margin::symmetric(12, 10)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(in_context(&compose.body, bytes.clone(), t));
+            });
+            ui.add_space(16.0);
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 16.0;
+                let left = ui.available_width() - ACTIONS_W - 16.0;
+                ui.vertical(|ui| {
+                    ui.set_width(left);
+                    ui.label("Change to");
+                    let field = ui.add(crate::sized_field(&mut review.change_to, left).id(egui::Id::new("review_change_to")));
+                    if field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) && review.change_to != *word {
+                        act = Some(Act::Change);
+                    }
+                    ui.add_space(12.0);
+                    ui.label(RichText::new("Suggestions").size(13.0).color(t.text_dim));
+                    // A list of fixed height, so the buttons beside it stay put from word to word.
+                    egui::Frame::new().stroke(egui::Stroke::new(1.0, t.border)).corner_radius(egui::CornerRadius::same(theme::CONTROL_RADIUS)).inner_margin(egui::Margin::same(4)).show(ui, |ui| {
+                        ui.set_width(left - 10.0);
+                        ui.set_height(SUGGESTIONS_H);
+                        if suggestions.is_empty() {
+                            ui.centered_and_justified(|ui| ui.label(RichText::new("No suggestions").color(t.text_dim)));
+                        }
+                        ui.with_layout(Layout::top_down_justified(Align::LEFT), |ui| {
+                            for suggestion in suggestions {
+                                let row = ui.selectable_label(review.change_to == *suggestion, suggestion.as_str());
+                                if row.clicked() {
+                                    review.change_to = suggestion.clone();
+                                }
+                                if row.double_clicked() {
+                                    act = Some(Act::Change);
+                                }
+                            }
+                        });
+                    });
+                });
+                ui.vertical(|ui| {
+                    ui.set_width(ACTIONS_W);
+                    // Level with the field, under its label.
+                    ui.label(" ");
+                    let size = vec2(ACTIONS_W, theme::CONTROL_H);
+                    let changes = review.change_to != *word;
+                    let why = "Type or pick a different spelling first";
+                    if ui.add_enabled(changes, egui::Button::new(RichText::new("Change").color(t.on_accent)).fill(t.accent).min_size(size)).on_hover_text("Enter").on_disabled_hover_text(why).clicked() {
+                        act = Some(Act::Change);
+                    }
+                    if ui.add_enabled(changes, egui::Button::new("Change all").min_size(size)).on_hover_text(format!("Every \"{word}\" in this message")).on_disabled_hover_text(why).clicked() {
+                        act = Some(Act::ChangeAll);
+                    }
+                    ui.add_space(12.0);
+                    if ui.add(egui::Button::new("Ignore").min_size(size)).on_hover_text("Leave it here and go on").clicked() {
+                        act = Some(Act::Ignore);
+                    }
+                    if ui.add(egui::Button::new("Ignore all").min_size(size)).on_hover_text("Not marked again in this message").clicked() {
+                        act = Some(Act::IgnoreAll);
+                    }
+                    ui.add_space(12.0);
+                    if ui.add(egui::Button::new("Add to dictionary").min_size(size)).on_hover_text("Never marked again, in any message").clicked() {
+                        act = Some(Act::Learn);
+                    }
+                });
+            });
+        }
+        ui.add_space(20.0);
+        ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
+            // Change is the action to take; these are the ways out.
+            if review.sending && ui.button("Send anyway").clicked() {
+                act = Some(Act::Send);
+            }
+            if ui.button("Back to editing").on_hover_text("Esc").clicked() {
+                act = Some(Act::Close);
+            }
+        });
+    });
+    if modal.should_close() && act.is_none() {
+        act = Some(Act::Close);
+    }
+    let (review, spell) = (compose.spell.review.as_mut()?, &mut compose.spell.ignored);
+    let mut out = None;
+    match (act, review.word.clone()) {
+        (Some(Act::Change), Some((bytes, _, _))) => {
+            review.at = bytes.start + review.change_to.len();
+            compose.body.replace_range(bytes, &review.change_to);
+        }
+        (Some(Act::ChangeAll), Some((bytes, word, _))) => {
+            let marked: Vec<_> = compose.spell.wrong.iter().map(|(b, _)| b.clone()).collect();
+            review.at = replace_all(&mut compose.body, &marked, &word, &review.change_to, bytes.start);
+        }
+        (Some(Act::Ignore), Some((bytes, _, _))) => review.at = bytes.end,
+        (Some(Act::IgnoreAll), Some((_, word, _))) => {
+            spell.insert(word);
+        }
+        (Some(Act::Learn), Some((_, word, _))) => out = Some(Reviewed::Learn(word)),
+        (Some(Act::Send), _) => out = Some(Reviewed::Send),
+        _ => {}
+    }
+    if matches!(act, Some(Act::Send | Act::Close)) {
+        // Back in the text at the word the review stopped on.
+        if let Some((bytes, _, _)) = review.word.as_ref().filter(|_| act == Some(Act::Close)) {
+            let chars = compose.body[..bytes.start].chars().count();
+            let end = chars + compose.body[bytes.clone()].chars().count();
+            let id = egui::Id::new("compose_body");
+            let mut state = egui::text_edit::TextEditState::load(ctx, id).unwrap_or_default();
+            state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(chars), egui::text::CCursor::new(end))));
+            state.store(ctx, id);
+            ctx.memory_mut(|m| m.request_focus(id));
+        }
+        compose.spell.review = None;
+    }
+    out
+}
+
+/// Replaces each of the `marked` words that is `word` with `with`; returns where the one at `at` ends
+/// once all are replaced, for the review to go on from there.
+fn replace_all(body: &mut String, marked: &[std::ops::Range<usize>], word: &str, with: &str, at: usize) -> usize {
+    let same: Vec<_> = marked.iter().filter(|b| body.get((*b).clone()) == Some(word)).cloned().collect();
+    let before = same.iter().filter(|b| b.start < at).count();
+    for b in same.into_iter().rev() {
+        body.replace_range(b, with);
+    }
+    at + before * with.len() + with.len() - before * word.len()
+}
+
+/// The line around the word at `bytes`, cut to some forty characters each side, the word in red.
+fn in_context(body: &str, bytes: std::ops::Range<usize>, t: &Tokens) -> egui::text::LayoutJob {
+    const AROUND: usize = 40;
+    let line_start = body[..bytes.start].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = body[bytes.end..].find('\n').map_or(body.len(), |i| bytes.end + i);
+    let before: String = body[line_start..bytes.start].chars().rev().take(AROUND).collect::<Vec<_>>().into_iter().rev().collect();
+    let after: String = body[bytes.end..line_end].chars().take(AROUND).collect();
+    let cut_before = before.len() < bytes.start - line_start;
+    let cut_after = after.len() < line_end - bytes.end;
+    let mut job = egui::text::LayoutJob::default();
+    let plain = egui::TextFormat { font_id: egui::FontId::proportional(14.0), color: t.text, ..Default::default() };
+    let marked = egui::TextFormat { font_id: egui::FontId::new(14.0, theme::bold()), color: t.danger, ..Default::default() };
+    job.append(&format!("{}{}", if cut_before { "…" } else { "" }, before.trim_start()), 0.0, plain.clone());
+    job.append(&body[bytes], 0.0, marked);
+    job.append(&format!("{}{}", after.trim_end(), if cut_after { "…" } else { "" }), 0.0, plain);
+    job
+}
+
+/// Finds the words of the body spelled wrong, when the text, the language or the words known changed.
+fn find_misspelled(compose: &mut Compose, spelling: &Spelling) {
+    use std::hash::{Hash, Hasher};
+    let Some(speller) = spelling.speller else { return };
+    let spell = &mut compose.spell;
+    let mut hasher = std::hash::DefaultHasher::new();
+    (&compose.body, &spell.language, spelling.known, &spell.ignored).hash(&mut hasher);
+    if spell.checked == hasher.finish() {
+        return;
+    }
+    spell.checked = hasher.finish();
+    let (known, ignored) = (spelling.known, &spell.ignored);
+    let (mut chars, mut last) = (0, 0);
+    spell.wrong = speller
+        .misspelled(&compose.body, |w| known.contains(w) || ignored.contains(w))
+        .into_iter()
+        .map(|bytes| {
+            chars += compose.body[last..bytes.start].chars().count();
+            let start = chars;
+            chars += compose.body[bytes.clone()].chars().count();
+            last = bytes.end;
+            (bytes, start..chars)
+        })
+        .collect();
+}
+
+/// Marks the words of the body spelled wrong with a wavy line, leaving out the one being typed, and
+/// offers their spellings on a right click. Returns a word the user added to their own.
+fn spell_check(ui: &Ui, t: &Tokens, compose: &mut Compose, output: &egui::text_edit::TextEditOutput, spelling: &Spelling) -> Option<String> {
+    let speller = spelling.speller?;
+    let spell = &mut compose.spell;
+    let caret = output.cursor_range.filter(|_| output.response.has_focus()).map(|r| r.primary.index.0);
+    let painter = ui.painter().with_clip_rect(output.text_clip_rect);
+    for (_, chars) in &spell.wrong {
+        if caret == Some(chars.end) {
+            continue;
+        }
+        let (a, b) = (output.galley.pos_from_cursor(egui::text::CCursor::new(chars.start)), output.galley.pos_from_cursor(egui::text::CCursor::new(chars.end)));
+        // shortcut: a word broken across two lines is not marked; egui breaks only words wider than the window.
+        if (a.min.y - b.min.y).abs() < 0.5 {
+            wavy(&painter, output.galley_pos + a.left_bottom().to_vec2(), b.min.x - a.min.x, t.danger);
+        }
+    }
+    if output.response.secondary_clicked()
+        && let Some(pointer) = output.response.interact_pointer_pos()
+    {
+        let at = output.galley.cursor_from_pos(pointer - output.galley_pos).index.0;
+        spell.menu = spell.wrong.iter().find(|(_, chars)| chars.contains(&at)).map(|(bytes, _)| {
+            let word = compose.body[bytes.clone()].to_owned();
+            (bytes.clone(), word.clone(), speller.suggest(&word))
+        });
+    }
+    let (mut learn, mut replace) = (None, None);
+    if let Some((_, word, suggestions)) = &spell.menu {
+        views::context_menu(&output.response, |ui| {
+            for suggestion in suggestions {
+                if ui.button(RichText::new(suggestion).family(theme::bold())).clicked() {
+                    replace = Some(suggestion.clone());
+                }
+            }
+            if suggestions.is_empty() {
+                ui.add_enabled(false, egui::Button::new("No suggestions"));
+            }
+            ui.separator();
+            if ui.button("Add to dictionary").on_hover_text("Never mark this word again, in any message").clicked() {
+                learn = Some(word.clone());
+            }
+            if ui.button("Ignore").on_hover_text("Do not mark this word in this message").clicked() {
+                spell.ignored.insert(word.clone());
+            }
+        });
+    }
+    if let Some(with) = replace
+        && let Some((bytes, word, _)) = spell.menu.take()
+        && compose.body.get(bytes.clone()) == Some(word.as_str())
+    {
+        let caret = compose.body[..bytes.start].chars().count() + with.chars().count();
+        compose.body.replace_range(bytes, &with);
+        let mut state = output.state.clone();
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(caret))));
+        state.store(ui.ctx(), output.response.id);
+    }
+    learn
+}
+
+/// A wavy line `width` long from `at` (the bottom left of a word), as word processors mark a spelling.
+fn wavy(painter: &egui::Painter, at: egui::Pos2, width: f32, color: egui::Color32) {
+    const STEP: f32 = 2.0;
+    let points = (0..=(width / STEP).ceil() as usize).map(|i| egui::pos2(at.x + (i as f32 * STEP).min(width), at.y + if i % 2 == 0 { 0.0 } else { -STEP })).collect();
+    painter.add(egui::Shape::line(points, egui::Stroke::new(1.0, color)));
 }
 
 /// The width of the "Pick date & time" dialog: the month, a gap, and the date and time beside it.
@@ -1238,6 +1634,98 @@ mod tests {
         assert!(rect.height() > 300.0 && rect.height() < 560.0, "weeks under each other: {rect:?}");
     }
 
+    static NO_WORDS: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    /// The spell check off.
+    const OFF: Spelling = Spelling { speller: None, known: &NO_WORDS, languages: &[], missing: None, busy: false, failed: None, before_send: false };
+
+    #[test]
+    fn words_spelled_wrong_are_found_and_a_right_click_offers_their_spellings() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let speller = beavermail_spell::Speller::load(b"SET UTF-8\nTRY ehtosu\n", b"2\nthe\nhouse\n").unwrap();
+        let known: std::collections::BTreeSet<String> = ["alice".to_owned()].into();
+        let languages = ["xx_XX".to_owned()];
+        let spelling = Spelling { speller: Some(&speller), known: &known, languages: &languages, missing: None, busy: false, failed: None, before_send: true };
+        let mut compose = Compose::new(1);
+        compose.focus_to = false;
+        compose.body = "Teh house of alice and bob".into();
+        let sent = std::cell::Cell::new(false);
+        let frame = |events: Vec<egui::Event>, compose: &mut Compose| {
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(1600.0, 1000.0))), events, ..Default::default() };
+            let mut output = ctx.run_ui(input, |ui| {
+                sent.set(matches!(window(ui.ctx(), &Tokens::dark(), compose, &[(1, "me@x.org".into())], false, &spelling), Outcome::Send));
+            });
+            output.textures_delta.clear(); // nothing is drawn here
+        };
+        for _ in 0..3 {
+            frame(Vec::new(), &mut compose); // the window settles where it is anchored
+        }
+        let wrong: Vec<&str> = compose.spell.wrong.iter().map(|(bytes, _)| &compose.body[bytes.clone()]).collect();
+        assert_eq!(wrong, ["Teh", "of", "and", "bob"], "the user's own words are not marked");
+        assert_eq!(compose.spell.wrong[1].1, 10..12, "in characters too, for the layout");
+        // A right click on "Teh", the first word of the body.
+        let body = ctx.read_response(egui::Id::new("compose_body")).expect("the body is shown").rect;
+        let at = body.left_top() + vec2(6.0, 8.0);
+        let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Secondary, pressed, modifiers: Modifiers::NONE };
+        frame(vec![egui::Event::PointerMoved(at)], &mut compose);
+        frame(vec![button(true)], &mut compose);
+        frame(vec![button(false)], &mut compose);
+        let (bytes, word, suggestions) = compose.spell.menu.clone().expect("a menu for the word");
+        assert_eq!((bytes, word.as_str()), (0..3, "Teh"));
+        assert_eq!(suggestions.first().map(String::as_str), Some("The"), "with its capital");
+        // Ignored, it is not marked in this message any more.
+        compose.spell.ignored.insert("bob".into());
+        frame(Vec::new(), &mut compose);
+        assert_eq!(compose.spell.wrong.len(), 3);
+        // Send goes through the words first: Enter in "Change to" changes the first to its best spelling.
+        compose.to = "ada@x.org, ".into();
+        let key = |key: Key, modifiers| egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers };
+        frame(vec![key(Key::Enter, Modifiers::COMMAND)], &mut compose);
+        assert!(compose.spell.review.as_ref().is_some_and(|r| r.sending), "reviewed instead of sent");
+        frame(Vec::new(), &mut compose);
+        ctx.memory_mut(|m| m.request_focus(egui::Id::new("review_change_to")));
+        frame(Vec::new(), &mut compose);
+        frame(vec![key(Key::Enter, Modifiers::NONE)], &mut compose);
+        frame(Vec::new(), &mut compose);
+        assert!(compose.body.starts_with("The house"), "{}", compose.body);
+        let shown = compose.spell.review.as_ref().and_then(|r| r.word.as_ref()).map(|(_, w, _)| w.clone());
+        assert_eq!(shown.as_deref(), Some("of"), "on to the next word");
+        // Esc goes back to the text, the word the review stopped on selected.
+        frame(vec![key(Key::Escape, Modifiers::NONE)], &mut compose);
+        assert!(compose.spell.review.is_none());
+        let state = egui::text_edit::TextEditState::load(&ctx, egui::Id::new("compose_body")).expect("the body's state");
+        let range = state.cursor.char_range().expect("a selection");
+        assert_eq!((range.secondary.index.0, range.primary.index.0), (10, 12), "of selected");
+        // From Send, once no word is left the message goes, with no dialog to say so.
+        frame(vec![key(Key::Enter, Modifiers::COMMAND)], &mut compose);
+        assert!(!sent.get() && compose.spell.review.is_some());
+        compose.spell.ignored.extend(["of".to_owned(), "and".to_owned()]);
+        frame(Vec::new(), &mut compose);
+        assert!(sent.get() && compose.spell.review.is_none(), "sent");
+    }
+
+    #[test]
+    fn change_all_replaces_each_and_goes_on_after_the_current_one() {
+        let mut body = "teh cat, teh dog, tehx, teh end".to_owned();
+        let marked = [0..3, 9..12, 18..22, 24..27];
+        let at = replace_all(&mut body, &marked, "teh", "the", 9);
+        assert_eq!(body, "the cat, the dog, tehx, the end");
+        assert_eq!(&body[..at], "the cat, the");
+        let mut body = "teh, teh".to_owned();
+        let at = replace_all(&mut body, &[0..3, 5..8], "teh", "these", 5);
+        assert_eq!((body.as_str(), at), ("these, these", 12), "a longer word shifts the rest");
+    }
+
+    #[test]
+    fn the_word_is_shown_in_its_line() {
+        let text = |job: egui::text::LayoutJob| job.sections.iter().map(|s| job.text[s.byte_range.start.0..s.byte_range.end.0].to_owned()).collect::<Vec<_>>();
+        let t = Tokens::dark();
+        assert_eq!(text(in_context("Hi\nI saw teh cat.\nBye", 9..12, &t)), ["I saw ", "teh", " cat."]);
+        let long = format!("{} teh {}", "a".repeat(60), "b".repeat(60));
+        let parts = text(in_context(&long, 61..64, &t));
+        assert!(parts[0].starts_with('…') && parts[2].ends_with('…'), "cut on both sides: {parts:?}");
+    }
+
     #[test]
     fn the_compose_window_keeps_its_size_with_chips_and_the_optional_rows() {
         let ctx = egui::Context::default();
@@ -1248,7 +1736,7 @@ mod tests {
         let size = |compose: &mut Compose| {
             for _ in 0..2 {
                 let mut output = ctx.run_ui(input(), |ui| {
-                    window(ui.ctx(), &Tokens::dark(), compose, &[(1, "me@x.org".into())], false);
+                    window(ui.ctx(), &Tokens::dark(), compose, &[(1, "me@x.org".into())], false, &OFF);
                 });
                 output.textures_delta.clear(); // nothing is drawn here
             }
@@ -1282,7 +1770,7 @@ mod tests {
         let frame = |events: Vec<egui::Event>, compose: &mut Compose| {
             let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(1600.0, 1000.0))), events, ..Default::default() };
             let mut output = ctx.run_ui(input, |ui| {
-                window(ui.ctx(), &Tokens::dark(), compose, &[(1, "me@x.org".into())], false);
+                window(ui.ctx(), &Tokens::dark(), compose, &[(1, "me@x.org".into())], false, &OFF);
             });
             output.textures_delta.clear(); // nothing is drawn here
         };
@@ -1329,7 +1817,7 @@ mod tests {
         let frame = |events: Vec<egui::Event>, compose: &mut Compose| {
             let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(1600.0, 1000.0))), events, ..Default::default() };
             let mut output = ctx.run_ui(input, |ui| {
-                window(ui.ctx(), &Tokens::dark(), compose, &[(1, "me@x.org".into())], false);
+                window(ui.ctx(), &Tokens::dark(), compose, &[(1, "me@x.org".into())], false, &OFF);
             });
             output.textures_delta.clear(); // nothing is drawn here
         };

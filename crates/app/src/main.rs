@@ -31,6 +31,7 @@ mod html;
 mod icons;
 mod learn;
 mod security;
+mod spelling;
 mod theme;
 mod threads;
 mod unsubscribe;
@@ -107,6 +108,8 @@ enum Event {
     FileStored(String, std::path::PathBuf, Result<(), String>),
     /// A one-click unsubscribe ended: (who, result).
     Unsubscribed(String, Result<(), String>),
+    /// A dictionary for the spell check was read or downloaded: (its code, result).
+    Dictionary(String, Result<Arc<beavermail_spell::Speller>, String>),
     /// A sign-in with a provider ended: (its cancel flag, which tells it from an earlier one, result).
     SignedIn(Arc<std::sync::atomic::AtomicBool>, Result<store::oauth::Grant, String>),
     /// A "Test connection" ended: (the form it is for, what was tested, IMAP's answer, SMTP's answer).
@@ -894,7 +897,7 @@ fn field(text: &mut String) -> egui::TextEdit<'_> {
 }
 
 /// A text field as tall as every other control; egui's default is a cramped 20px.
-fn sized_field(text: &mut String, width: f32) -> egui::TextEdit<'_> {
+pub(crate) fn sized_field(text: &mut String, width: f32) -> egui::TextEdit<'_> {
     egui::TextEdit::singleline(text)
         .desired_width(width)
         .min_size(vec2(width, theme::CONTROL_H))
@@ -1376,6 +1379,8 @@ struct BeaverApp {
     attach_selected: std::collections::BTreeSet<(u64, u32)>,
     /// Where private copies of opened attachments go; emptied at start and exit.
     open_dir: std::path::PathBuf,
+    /// The spell check's dictionaries.
+    dictionaries: spelling::Dictionaries,
     /// Settings and prompt state for the stored-mail protection.
     security: security::Form,
     /// A mode change rewriting files in the background.
@@ -1531,6 +1536,7 @@ impl BeaverApp {
             confirm_open: None,
             attach_selected: std::collections::BTreeSet::new(),
             open_dir: store::data_dir().unwrap_or_else(|_| std::env::temp_dir()).join("open"),
+            dictionaries: spelling::Dictionaries::new(spelling::dir(&store::data_dir().unwrap_or_else(|_| std::env::temp_dir()))),
             security: security::Form::default(),
             vault_job: None,
             unlock_skipped: false,
@@ -2914,10 +2920,27 @@ impl BeaverApp {
             self.compose_focus = Some(focused);
         }
         // Esc is Discard (asked first when there is text), unless it is meant for a menu or the question itself.
-        let esc = !self.confirm_discard && !compose.sending && !compose.picking && !compose.suggesting && !egui::Popup::is_any_open(ctx) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        let esc = !self.confirm_discard && !compose.sending && !compose.picking && compose.spell.review.is_none() && !compose.suggesting && !egui::Popup::is_any_open(ctx) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         compose.contacts = self.contacts.clone();
         self.check_encryption(&mut compose);
-        let outcome = if esc { compose::Outcome::Discard } else { compose::window(ctx, t, &mut compose, &senders, self.settings.rich_outgoing) };
+        if self.settings.spelling {
+            if compose.spell.language.is_empty() {
+                compose.spell.language = self.spell_language();
+            }
+            self.want_dictionary(&compose.spell.language.clone(), false, false);
+        }
+        let (on, language) = (self.settings.spelling, &compose.spell.language.clone());
+        let dictionaries = &self.dictionaries;
+        let spelling = compose::Spelling {
+            speller: dictionaries.speller(language).filter(|_| on),
+            known: &self.settings.spelling_words,
+            languages: if on { &dictionaries.codes } else { &[] },
+            missing: (on && !dictionaries.codes.iter().any(|c| c == language) && beavermail_spell::LANGUAGES.iter().any(|l| l.code == language)).then_some(language),
+            busy: dictionaries.busy.as_deref() == Some(language),
+            failed: dictionaries.failed.as_ref().filter(|(c, _)| on && c == language).map(|(_, e)| e.as_str()),
+            before_send: self.settings.spelling_before_send,
+        };
+        let outcome = if esc { compose::Outcome::Discard } else { compose::window(ctx, t, &mut compose, &senders, self.settings.rich_outgoing, &spelling) };
         if compose.from != compose.sig_from {
             let signature = self.view(compose.from).map(|v| v.account.signature.clone()).unwrap_or_default();
             compose.change_signature(compose.from, &signature);
@@ -2956,6 +2979,11 @@ impl BeaverApp {
                 self.queue(compose, Some(at));
                 return;
             }
+            compose::Outcome::Learn(word) => {
+                self.settings.spelling_words.insert(word);
+                self.save_settings();
+            }
+            compose::Outcome::Download => self.want_dictionary(&compose.spell.language.clone(), true, true),
         }
         if compose.send_at.is_some_and(|at| at <= std::time::Instant::now()) {
             compose.send_at = None;
@@ -3154,6 +3182,26 @@ impl BeaverApp {
         }
     }
 
+    /// The language new messages are checked in: the one chosen, or the system's.
+    fn spell_language(&self) -> String {
+        match self.settings.spelling_language.as_str() {
+            "" => self.dictionaries.default_code(),
+            code => code.to_owned(),
+        }
+    }
+
+    /// Reads dictionary `code` on a worker, or downloads it when `download`, unless it is loaded or on its
+    /// way; one that failed is tried again only with `retry`.
+    fn want_dictionary(&mut self, code: &str, download: bool, retry: bool) {
+        if let Some(job) = self.dictionaries.want(code, download, retry) {
+            let code = code.to_owned();
+            self.spawn(async move {
+                let result = tokio::task::spawn_blocking(job).await.unwrap_or_else(|e| Err(e.to_string()));
+                Event::Dictionary(code, result.map(Arc::new))
+            });
+        }
+    }
+
     fn save_settings(&mut self) {
         if let Err(e) = store::save_settings(&self.settings) {
             self.error = Some(e);
@@ -3277,6 +3325,8 @@ impl BeaverApp {
             Vec::new()
         };
         let mut key_action = None;
+        // Spelling: a language chosen (read or downloaded then), a downloaded dictionary to remove.
+        let (spell_now, mut spell_pick, mut spell_remove) = (self.spell_language(), None::<String>, None::<String>);
         // An account page edits a copy of the account; the page of a removed account falls back to the first page.
         if let SettingsPage::Account(serial) = self.settings_page {
             match self.view(serial) {
@@ -3474,6 +3524,111 @@ impl BeaverApp {
                                     }
                                 });
                                 hint(ui, "After Send the message waits here, so you can take it back. Off sends it at once.");
+                                ui.add_space(12.0);
+                                section_title(ui, "Spelling");
+                                let about = "Words spelled wrong get a wavy red line; right-click one for its spellings.";
+                                changed |= views::switch_row(ui, t, &mut self.settings.spelling, "Check spelling as you write", about).changed();
+                                if self.settings.spelling {
+                                    let dictionaries = &self.dictionaries;
+                                    ui.add_space(8.0);
+                                    ui.label("Language");
+                                    ui.horizontal(|ui| {
+                                        egui::ComboBox::from_id_salt("spelling_language").width(240.0).selected_text(beavermail_spell::name(&spell_now)).show_ui(ui, |ui| {
+                                            for code in &dictionaries.codes {
+                                                if ui.selectable_label(*code == spell_now, beavermail_spell::name(code)).clicked() {
+                                                    spell_pick = Some(code.clone());
+                                                }
+                                            }
+                                            if dictionaries.codes.is_empty() {
+                                                ui.label(RichText::new("No dictionaries on this computer yet").color(t.text_dim));
+                                            }
+                                        });
+                                        let look = egui::containers::menu::MenuConfig::new().style(views::menu_look);
+                                        egui::containers::menu::MenuButton::new("Add a language…").config(look).ui(ui, |ui| {
+                                            // What is typed stays while the menu is reopened, until a language is picked.
+                                            let id = ui.id().with("search");
+                                            let mut query: String = ui.data_mut(|d| d.get_temp(id)).unwrap_or_default();
+                                            // The box centres itself in all the height it is given: a menu would give it the screen's.
+                                            let search = ui.allocate_ui_with_layout(vec2(240.0, theme::CONTROL_H), Layout::left_to_right(Align::Center), |ui| views::search_box(ui, t, &mut query, "Search languages", 240.0, true)).inner;
+                                            let needle = query.trim().to_lowercase();
+                                            let found: Vec<_> = beavermail_spell::LANGUAGES
+                                                .iter()
+                                                .filter(|l| !dictionaries.codes.iter().any(|c| c == l.code))
+                                                .filter(|l| l.name.to_lowercase().contains(&needle) || l.code.to_lowercase().contains(&needle))
+                                                .collect();
+                                            let enter = search.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                                                for (i, language) in found.iter().enumerate() {
+                                                    if ui.button(language.name).clicked() || (enter && i == 0) {
+                                                        spell_pick = Some(language.code.to_owned());
+                                                        ui.close();
+                                                    }
+                                                }
+                                                if found.is_empty() {
+                                                    ui.label(RichText::new("No language matches").color(t.text_dim));
+                                                }
+                                            });
+                                            if spell_pick.is_some() {
+                                                query.clear();
+                                            }
+                                            ui.data_mut(|d| d.insert_temp(id, query));
+                                        }).0.on_hover_text("Download a dictionary from LibreOffice's collection, 1 to 10 MB");
+                                        if let Some(code) = &dictionaries.busy {
+                                            ui.spinner();
+                                            let doing = if dictionaries.codes.contains(code) { "Loading" } else { "Downloading" };
+                                            ui.label(RichText::new(format!("{doing} {}…", beavermail_spell::name(code))).color(t.text_dim));
+                                        } else if !dictionaries.codes.contains(&spell_now) && beavermail_spell::LANGUAGES.iter().any(|l| l.code == spell_now) && ui.button("Download").clicked() {
+                                            spell_pick = Some(spell_now.clone());
+                                        }
+                                    });
+                                    if let Some((code, error)) = &dictionaries.failed {
+                                        ui.horizontal(|ui| {
+                                            ui.add(egui::Label::new(RichText::new(format!("Could not get {}: {error}", beavermail_spell::name(code))).size(13.0).color(t.danger)).wrap());
+                                            if ui.button("Try again").clicked() {
+                                                spell_pick = Some(code.clone());
+                                            }
+                                        });
+                                    }
+                                    hint(ui, "New messages are checked in this language; a message can be switched under its text. Dictionaries are the system's, or downloaded from LibreOffice's collection (1 to 10 MB each).");
+                                    ui.add_space(8.0);
+                                    let about = "Send first goes through the words marked, one by one; off, they are checked only with Check spelling (F7).";
+                                    changed |= views::switch_row(ui, t, &mut self.settings.spelling_before_send, "Check spelling before sending", about).changed();
+                                    let downloaded: Vec<&String> = dictionaries.codes.iter().filter(|c| dictionaries.downloaded(c)).collect();
+                                    if !downloaded.is_empty() {
+                                        ui.add_space(8.0);
+                                        ui.label(RichText::new("Downloaded dictionaries").family(theme::bold()));
+                                        for code in downloaded {
+                                            ui.horizontal(|ui| {
+                                                ui.label(beavermail_spell::name(code));
+                                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                    if ui.button("Remove").clicked() {
+                                                        spell_remove = Some(code.clone());
+                                                    }
+                                                });
+                                            });
+                                        }
+                                    }
+                                    ui.add_space(8.0);
+                                    ui.label(RichText::new("Your words").family(theme::bold()));
+                                    if self.settings.spelling_words.is_empty() {
+                                        hint(ui, "None yet. Right-click a word marked wrong and choose Add to dictionary.");
+                                    }
+                                    let mut forget = None;
+                                    for word in &self.settings.spelling_words {
+                                        ui.horizontal(|ui| {
+                                            ui.label(word);
+                                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                if ui.button("Remove").clicked() {
+                                                    forget = Some(word.clone());
+                                                }
+                                            });
+                                        });
+                                    }
+                                    if let Some(word) = forget {
+                                        self.settings.spelling_words.remove(&word);
+                                        changed = true;
+                                    }
+                                }
                             }
                             SettingsPage::Spam => {
                                 let about = "Mail from a new sender that fails a check waits under Suspicious, beside the Inbox.";
@@ -3633,6 +3788,16 @@ impl BeaverApp {
         }
         if let Some(action) = key_action {
             self.key_action(action);
+        }
+        if let Some(code) = spell_pick {
+            self.settings.spelling_language = code.clone();
+            self.save_settings();
+            self.want_dictionary(&code, true, true);
+        }
+        if let Some(code) = spell_remove
+            && let Err(e) = self.dictionaries.remove(&code)
+        {
+            self.error = Some(e);
         }
         match (page_action, self.settings_page) {
             (Some(PageAction::Remove), SettingsPage::Account(serial)) => self.confirm_remove = Some(serial),
@@ -6607,6 +6772,7 @@ impl BeaverApp {
             }
             Event::Contacts(Ok(contacts)) => self.contacts = Arc::new(contacts),
             Event::Contacts(Err(_)) => {} // the fields only miss their suggestions
+            Event::Dictionary(code, result) => self.dictionaries.arrived(code, result),
             Event::Unsubscribed(who, result) => match result {
                 Ok(()) => self.notice = Some((format!("Unsubscribed from {who}. Mail already on its way may still arrive."), std::time::Instant::now())),
                 Err(e) => self.error = Some(format!("Could not unsubscribe from {who}: {e}. Try the unsubscribe link in the message.")),

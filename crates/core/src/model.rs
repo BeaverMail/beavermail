@@ -583,6 +583,18 @@ pub struct Settings {
     /// The calendars, synced over CalDAV or on this computer; passwords in the credential store.
     #[serde(default)]
     pub calendars: Vec<CalendarSource>,
+    /// Mark the words spelled wrong in the message being written.
+    #[serde(default = "yes")]
+    pub spelling: bool,
+    /// The dictionary new messages are checked with, by code ("it_IT"); empty: the system's language.
+    #[serde(default)]
+    pub spelling_language: String,
+    /// Words the user added, never marked wrong.
+    #[serde(default)]
+    pub spelling_words: std::collections::BTreeSet<String>,
+    /// Send asks first when words are marked wrong.
+    #[serde(default)]
+    pub spelling_before_send: bool,
 }
 
 fn yes() -> bool {
@@ -595,7 +607,7 @@ fn undo_secs() -> u32 {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { display: DisplayMode::default(), sender_display: Default::default(), rich_outgoing: true, undo_send_secs: undo_secs(), remote_senders: Default::default(), hold_suspicious: true, marked: Default::default(), threads: true, reading_pane: true, reader_below: false, list_layout: ListLayout::default(), columns: Columns::default(), sorts: Default::default(), folded: Default::default(), density: Density::default(), diagnostics: false, link_params: String::new(), address_books: Vec::new(), calendars: Vec::new() }
+        Self { display: DisplayMode::default(), sender_display: Default::default(), rich_outgoing: true, undo_send_secs: undo_secs(), remote_senders: Default::default(), hold_suspicious: true, marked: Default::default(), threads: true, reading_pane: true, reader_below: false, list_layout: ListLayout::default(), columns: Columns::default(), sorts: Default::default(), folded: Default::default(), density: Density::default(), diagnostics: false, link_params: String::new(), address_books: Vec::new(), calendars: Vec::new(), spelling: true, spelling_language: String::new(), spelling_words: Default::default(), spelling_before_send: false }
     }
 }
 
