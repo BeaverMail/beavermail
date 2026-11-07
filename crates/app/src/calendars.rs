@@ -40,6 +40,127 @@ pub enum CalendarAction {
     Month(i32),
 }
 
+/// The server a calendar is on, as the column and Settings name it: "This computer", or login@host.
+pub fn server(calendar: &CalendarSource) -> String {
+    if calendar.is_local() { "This computer".to_owned() } else { format!("{}@{}", calendar.user, books::host(&calendar.url)) }
+}
+
+/// A server's password being changed in Settings: what is typed, and whether it is being checked or
+/// why the server refused it.
+#[derive(Default)]
+pub struct Login {
+    pub password: String,
+    pub checking: bool,
+    pub error: Option<String>,
+}
+
+/// What the Calendars page of Settings asks for; names, colours and the default change in place.
+pub enum PageAction {
+    /// Check the password typed for this server (by [`server`]) and keep it.
+    Password(String),
+    /// Ask before no longer syncing these calendars (by URL).
+    AskRemove(Vec<String>),
+    /// Open the dialog to add calendars.
+    Add,
+}
+
+/// The Calendars page of Settings: each server with its calendars (colour, name, default, remove),
+/// its password and Remove server. Returns whether a calendar changed, and what else to do.
+pub fn page(ui: &mut egui::Ui, t: &Tokens, calendars: &mut [CalendarSource], logins: &mut std::collections::HashMap<String, Login>) -> (bool, Option<PageAction>) {
+    let (mut changed, mut action) = (false, None);
+    let mut servers: Vec<String> = Vec::new();
+    for c in calendars.iter().filter(|c| c.is_local()).chain(calendars.iter().filter(|c| !c.is_local())) {
+        if !servers.contains(&server(c)) {
+            servers.push(server(c));
+        }
+    }
+    let mut make_default = None;
+    for name in servers {
+        ui.add_space(20.0);
+        ui.label(RichText::new(&name).size(theme::SUBTITLE).family(theme::bold()));
+        ui.add_space(4.0);
+        let urls: Vec<String> = calendars.iter().filter(|c| server(c) == name).map(|c| c.url.clone()).collect();
+        for (at, calendar) in calendars.iter_mut().enumerate().filter(|(_, c)| server(c) == name) {
+            ui.horizontal(|ui| {
+                let (swatch, _) = ui.allocate_exact_size(vec2(theme::CONTROL_H, theme::CONTROL_H), Sense::hover());
+                let pick = ui.interact(swatch, ui.id().with(("swatch", &calendar.url)), Sense::click()).on_hover_text("Colour").on_hover_cursor(egui::CursorIcon::PointingHand);
+                ui.painter().rect_filled(Rect::from_center_size(swatch.center(), vec2(18.0, 18.0)), CornerRadius::same(4), color(calendar, at));
+                egui::Popup::menu(&pick).style(crate::views::menu_look).show(|ui| {
+                    ui.horizontal(|ui| {
+                        for hex in theme::CALENDAR_COLORS {
+                            let fill = theme::calendar_color(hex).unwrap_or(t.accent);
+                            let (r, chip) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::click());
+                            ui.painter().rect_filled(r.shrink(3.0), CornerRadius::same(4), fill);
+                            if calendar.color.eq_ignore_ascii_case(hex) {
+                                ui.painter().rect_stroke(r, CornerRadius::same(6), egui::Stroke::new(2.0, t.text), egui::StrokeKind::Inside);
+                            }
+                            if chip.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                calendar.color = hex.to_owned();
+                                changed = true;
+                                ui.close();
+                            }
+                        }
+                    });
+                });
+                let width = (ui.available_width() - 230.0).max(160.0);
+                changed |= ui.add(crate::sized_field(&mut calendar.name, width).id(ui.id().with(("calendar_name", &calendar.url)))).changed();
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if !calendar.is_local() && ui.button("Remove").on_hover_text("Stop syncing it: its events leave BeaverMail, nothing changes on the server").clicked() {
+                        action = Some(PageAction::AskRemove(vec![calendar.url.clone()]));
+                    }
+                    if calendar.default {
+                        ui.label(RichText::new("Default").color(t.text_dim)).on_hover_text("Accepted invitations and new events go here");
+                    } else if calendar.read_only {
+                        ui.label(RichText::new("Read-only").color(t.text_dim)).on_hover_text("Shared with you or a subscription: nothing can be written there");
+                    } else if ui.button("Make default").on_hover_text("Accepted invitations and new events go here").clicked() {
+                        make_default = Some(calendar.url.clone());
+                    }
+                });
+            });
+        }
+        if name == "This computer" {
+            continue;
+        }
+        ui.add_space(8.0);
+        let login = logins.entry(name.clone()).or_default();
+        ui.horizontal(|ui| {
+            ui.label("Password");
+            let field = ui.add_enabled(!login.checking, crate::sized_field(&mut login.password, 220.0).password(true).hint_text("New password"));
+            if field.changed() {
+                login.error = None;
+            }
+            let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let can = !login.password.is_empty() && !login.checking;
+            if ui.add_enabled(can, egui::Button::new("Save password")).on_hover_text("Checked on the server first").on_disabled_hover_text("Type the new password first").clicked() || (can && enter) {
+                action = Some(PageAction::Password(name.clone()));
+            }
+            if login.checking {
+                ui.spinner();
+            }
+        });
+        if let Some(error) = &login.error {
+            ui.add(egui::Label::new(RichText::new(error).size(13.0).color(t.danger)).wrap());
+        }
+        ui.add_space(4.0);
+        let count = urls.len();
+        let label = if count == 1 { "Remove server…".to_owned() } else { format!("Remove server and its {count} calendars…") };
+        if ui.button(RichText::new(label).color(t.danger)).clicked() {
+            action = Some(PageAction::AskRemove(urls));
+        }
+    }
+    if let Some(url) = make_default {
+        for c in calendars.iter_mut() {
+            c.default = c.url == url;
+        }
+        changed = true;
+    }
+    ui.add_space(20.0);
+    if ui.button("Add calendar…").clicked() {
+        action = Some(PageAction::Add);
+    }
+    (changed, action)
+}
+
 /// The colour of a calendar: its own, or one of the app's by its place in the list.
 pub fn color(calendar: &CalendarSource, at: usize) -> Color32 {
     theme::calendar_color(&calendar.color).unwrap_or_else(|| theme::account_color(at))
@@ -109,7 +230,6 @@ pub fn mini_month(ui: &mut egui::Ui, t: &Tokens, month: NaiveDate, picked: Naive
 pub fn section(ui: &mut egui::Ui, t: &Tokens, calendars: &[CalendarSource], syncing: &HashSet<String>, folded: &BTreeSet<String>) -> Option<CalendarAction> {
     let mut action = None;
     ui.label(RichText::new("CALENDARS").size(12.0).color(t.text_dim));
-    let server = |c: &CalendarSource| if c.is_local() { "This computer".to_owned() } else { format!("{}@{}", c.user, books::host(&c.url)) };
     let mut servers: Vec<String> = Vec::new();
     for c in calendars.iter().filter(|c| c.is_local()).chain(calendars.iter().filter(|c| !c.is_local())) {
         if !servers.contains(&server(c)) {
@@ -179,6 +299,36 @@ fn calendar_row(ui: &mut egui::Ui, t: &Tokens, name: &str, color: Color32, shown
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_settings_page_lists_each_server_with_its_calendars_within_the_page() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let calendar = |name: &str, url: &str, user: &str| CalendarSource { name: name.into(), url: url.into(), user: user.into(), color: String::new(), shown: true, default: false, read_only: false };
+        let mut calendars = vec![
+            calendar("On this computer", CalendarSource::LOCAL, ""),
+            calendar("Work", "https://dav.example.org/ada/work/", "ada"),
+            calendar("A calendar with a rather long name for the field", "https://dav.example.org/ada/home/", "ada"),
+            calendar("Family", "https://cal.example.com/bob/family/", "bob"),
+        ];
+        calendars[1].default = true;
+        assert_eq!(server(&calendars[0]), "This computer");
+        assert_eq!(server(&calendars[3]), "bob@cal.example.com");
+        let mut logins = std::collections::HashMap::new();
+        let mut result = (true, Some(PageAction::Add));
+        let mut used = egui::Rect::NOTHING;
+        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(1200.0, 1600.0))), ..Default::default() };
+        let mut output = ctx.run_ui(input, |ui| {
+            ui.allocate_ui(vec2(480.0, 1500.0), |ui| {
+                result = page(ui, &Tokens::dark(), &mut calendars, &mut logins);
+                used = ui.min_rect();
+            });
+        });
+        output.textures_delta.clear(); // nothing is drawn here
+        assert!(!result.0 && result.1.is_none(), "nothing changes by itself");
+        assert!(used.width() <= 481.0, "within the page: {used:?}");
+        assert_eq!(logins.len(), 2, "a password row for each server, none for this computer");
+    }
 
     #[test]
     fn a_week_starts_on_monday_and_colours_come_from_the_server_or_the_app() {

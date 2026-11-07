@@ -126,6 +126,8 @@ enum Event {
     CalendarWritten(Result<(), MailError>),
     /// "Find calendars" answered.
     CalendarsFound(Result<Vec<beavermail_carddav::Found>, String>),
+    /// A new password for a calendar server was checked on it: (the server, as Settings names it, result).
+    CalendarLogin(String, Result<(), String>),
     /// "Find address books" answered: (URL, name) of each, or why none.
     BooksFound(Result<Vec<beavermail_carddav::Found>, String>),
     /// Everyone the user has written to, for the address fields.
@@ -826,6 +828,7 @@ enum SettingsPage {
     Appearance,
     Reading,
     Writing,
+    Calendars,
     Spam,
     Encryption,
     Storage,
@@ -835,13 +838,14 @@ enum SettingsPage {
 }
 
 impl SettingsPage {
-    const ALL: [Self; 7] = [Self::Appearance, Self::Reading, Self::Writing, Self::Spam, Self::Encryption, Self::Storage, Self::Troubleshooting];
+    const ALL: [Self; 8] = [Self::Appearance, Self::Reading, Self::Writing, Self::Calendars, Self::Spam, Self::Encryption, Self::Storage, Self::Troubleshooting];
 
     fn title(self) -> &'static str {
         match self {
             Self::Reading => "Reading",
             Self::Appearance => "Appearance",
             Self::Writing => "Writing",
+            Self::Calendars => "Calendars",
             Self::Spam => "Suspicious mail",
             Self::Storage => "Stored mail",
             Self::Encryption => "Encryption",
@@ -855,6 +859,7 @@ impl SettingsPage {
             Self::Reading => Some(Icon::MailOpen),
             Self::Appearance => Some(Icon::Palette),
             Self::Writing => Some(Icon::Pencil),
+            Self::Calendars => Some(Icon::Calendar),
             Self::Spam => Some(Icon::Spam),
             Self::Storage => Some(Icon::Lock),
             Self::Encryption => Some(Icon::Key),
@@ -868,6 +873,7 @@ impl SettingsPage {
             Self::Reading => "Most unwanted mail and tracking arrives as HTML, so messages start as text.",
             Self::Appearance => "How the app looks.",
             Self::Writing => "How messages you write are composed and sent.",
+            Self::Calendars => "The calendars synced from a server, and the one on this computer.",
             Self::Spam => "Mail from people you know is never held. Nothing moves on the server.",
             Self::Storage => "How downloaded messages are kept on this computer.",
             Self::Encryption => "Your keys, to read encrypted mail and to send it encrypted.",
@@ -1337,8 +1343,10 @@ struct BeaverApp {
     calendar_morning: bool,
     add_calendar: Option<books::AddBook>,
     calendars_syncing: std::collections::HashSet<String>,
-    /// Stop syncing was asked for this calendar (by URL), until confirmed.
-    confirm_calendar_remove: Option<String>,
+    /// Stop syncing was asked for these calendars (by URL), until confirmed.
+    confirm_calendar_remove: Option<Vec<String>>,
+    /// Passwords being changed on the Calendars page of Settings, by server.
+    calendar_logins: std::collections::HashMap<String, calendars::Login>,
     /// The dialog to add or change an event, while open.
     event_form: Option<event_form::EventForm>,
     /// Asking whether to delete the event with this UID.
@@ -1522,6 +1530,7 @@ impl BeaverApp {
             add_calendar: None,
             calendars_syncing: Default::default(),
             confirm_calendar_remove: None,
+            calendar_logins: Default::default(),
             event_form: None,
             confirm_event_delete: None,
             unfolded: Vec::new(),
@@ -3330,6 +3339,7 @@ impl BeaverApp {
         let mut key_action = None;
         // Spelling: a language chosen (read or downloaded then), a downloaded dictionary to remove.
         let (spell_now, mut spell_pick, mut spell_remove) = (self.spell_language(), None::<String>, None::<String>);
+        let mut calendar_page = None;
         // An account page edits a copy of the account; the page of a removed account falls back to the first page.
         if let SettingsPage::Account(serial) = self.settings_page {
             match self.view(serial) {
@@ -3514,6 +3524,15 @@ impl BeaverApp {
                                     (ListLayout::Table, "Table", "One line per message, in columns: click a title to order by it, drag the edge between two to make them wider."),
                                 ];
                                 changed |= views::choice(ui, t, "Message list", &mut self.settings.list_layout, &layouts);
+                            }
+                            SettingsPage::Calendars => {
+                                self.ensure_local_calendar();
+                                let (edited, action) = calendars::page(ui, t, &mut self.settings.calendars, &mut self.calendar_logins);
+                                if edited {
+                                    changed = true;
+                                    self.calendar_version += 1;
+                                }
+                                calendar_page = action;
                             }
                             SettingsPage::Writing => {
                                 let about = "Bold, lists, links and quotes. The plain-text part is always sent, readable as written. Off: plain text only.";
@@ -3791,6 +3810,12 @@ impl BeaverApp {
         }
         if let Some(action) = key_action {
             self.key_action(action);
+        }
+        match calendar_page {
+            Some(calendars::PageAction::Password(server)) => self.check_calendar_login(&server),
+            Some(calendars::PageAction::AskRemove(urls)) => self.confirm_calendar_remove = Some(urls),
+            Some(calendars::PageAction::Add) => self.calendar_action(calendars::CalendarAction::Add),
+            None => {}
         }
         if let Some(code) = spell_pick {
             self.settings.spelling_language = code.clone();
@@ -4353,6 +4378,18 @@ impl BeaverApp {
     }
 
     /// Asks the server in the "Add calendar" dialog for its calendars.
+    /// The add dialog filled with the login of mail account `serial`, most often the same for its
+    /// calendars and contacts: its address, the domain as the server (found on Find), its password.
+    fn dav_login(&self, serial: Option<u64>) -> books::AddBook {
+        let Some(account) = serial.and_then(|s| self.view(s)).map(|v| &v.account) else {
+            return books::AddBook { focus_first: true, ..Default::default() };
+        };
+        let user = if account.email.is_empty() { account.user.clone() } else { account.email.clone() };
+        let server = user.rsplit_once('@').map(|(_, d)| d.to_owned()).unwrap_or_default();
+        let password = store::password(account).unwrap_or_default();
+        books::AddBook { from: serial, server, user, password, focus_first: true, ..Default::default() }
+    }
+
     fn find_calendars(&mut self) {
         let Some(form) = self.add_calendar.as_mut() else { return };
         let (server, user, password) = (form.server.trim().to_owned(), form.user.trim().to_owned(), form.password.clone());
@@ -4360,6 +4397,20 @@ impl BeaverApp {
         self.spawn(async move {
             let found = tokio::task::spawn_blocking(move || beavermail_carddav::calendar::Calendar::discover_all(&server, &user, &password).map_err(|e| e.to_string())).await.unwrap_or_else(|e| Err(e.to_string()));
             Event::CalendarsFound(found)
+        });
+    }
+
+    /// Checks the password typed in Settings for calendar server `server` (as [`calendars::server`]
+    /// names it) by asking it for its calendars; kept once the server takes it.
+    fn check_calendar_login(&mut self, server: &str) {
+        let Some(calendar) = self.settings.calendars.iter().find(|c| calendars::server(c) == server) else { return };
+        let Some(login) = self.calendar_logins.get_mut(server) else { return };
+        let (host, user, password) = (books::host(&calendar.url).to_owned(), calendar.user.clone(), login.password.clone());
+        (login.checking, login.error) = (true, None);
+        let server = server.to_owned();
+        self.spawn(async move {
+            let found = tokio::task::spawn_blocking(move || beavermail_carddav::calendar::Calendar::discover_all(&host, &user, &password).map(drop).map_err(|e| e.to_string())).await.unwrap_or_else(|e| Err(e.to_string()));
+            Event::CalendarLogin(server, found)
         });
     }
 
@@ -4377,14 +4428,7 @@ impl BeaverApp {
     fn calendar_action(&mut self, action: calendars::CalendarAction) {
         use calendars::CalendarAction as A;
         match action {
-            A::Add => {
-                // Most often the server and login of a mail account: offered filled in, found on Find.
-                let account = self.accounts.first().map(|v| v.account.clone());
-                let user = account.as_ref().map(|a| if a.email.is_empty() { a.user.clone() } else { a.email.clone() }).unwrap_or_default();
-                let server = user.rsplit_once('@').map(|(_, d)| d.to_owned()).unwrap_or_default();
-                let password = account.as_ref().and_then(|a| store::password(a).ok()).unwrap_or_default();
-                self.add_calendar = Some(books::AddBook { server, user, password, focus_first: true, ..Default::default() });
-            }
+            A::Add => self.add_calendar = Some(self.dav_login(self.accounts.first().map(|v| v.serial))),
             A::Added(chosen) => {
                 let Some(form) = self.add_calendar.take() else { return };
                 for found in chosen {
@@ -4412,7 +4456,7 @@ impl BeaverApp {
                 self.save_settings();
             }
             A::SyncNow => self.sync_calendars(None),
-            A::AskRemove(url) => self.confirm_calendar_remove = Some(url),
+            A::AskRemove(url) => self.confirm_calendar_remove = Some(vec![url]),
             A::Fold(key) => {
                 if !self.settings.folded.remove(&key) {
                     self.settings.folded.insert(key);
@@ -4451,13 +4495,19 @@ impl BeaverApp {
     }
 
     fn calendar_remove_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
-        let Some(url) = self.confirm_calendar_remove.clone() else { return };
-        let name = self.settings.calendars.iter().find(|c| c.url == url).map(|c| c.name.clone()).unwrap_or_default();
+        let Some(urls) = self.confirm_calendar_remove.clone() else { return };
+        let chosen: Vec<&beavermail_core::CalendarSource> = self.settings.calendars.iter().filter(|c| urls.contains(&c.url)).collect();
+        let name = match chosen.as_slice() {
+            [one] => one.name.clone(),
+            [first, ..] => format!("the {} calendars of {}", chosen.len(), calendars::server(first)),
+            [] => String::new(),
+        };
         let (mut confirm, mut cancel) = (false, false);
         let modal = egui::Modal::new(egui::Id::new("confirm_calendar_remove")).show(ctx, |ui| {
             ui.set_width(FORM_WIDTH * 0.85);
             ui.heading(format!("Stop syncing {name}?"));
-            ui.label(RichText::new("Its events leave BeaverMail. Nothing changes on the server.").color(t.text_dim));
+            let what = if urls.len() == 1 { "Its events leave" } else { "Their events and the saved password leave" };
+            ui.label(RichText::new(format!("{what} BeaverMail. Nothing changes on the server.")).color(t.text_dim));
             ui.add_space(12.0);
             ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
                 confirm = ui.add(egui::Button::new(RichText::new("Stop syncing").color(t.on_accent)).fill(t.danger)).clicked();
@@ -4465,7 +4515,9 @@ impl BeaverApp {
             });
         });
         if confirm {
-            self.remove_calendar(&url);
+            for url in &urls {
+                self.remove_calendar(url);
+            }
         }
         if confirm || cancel || modal.should_close() {
             self.confirm_calendar_remove = None;
@@ -4928,12 +4980,9 @@ impl BeaverApp {
     fn book_action(&mut self, action: books::BookAction) {
         use books::BookAction as A;
         match action {
-            A::Open => {
-                // The login is most often the address of a mail account.
-                let user = self.accounts.first().map(|v| &v.account).map(|a| if a.email.is_empty() { a.user.clone() } else { a.email.clone() }).unwrap_or_default();
-                self.add_book = Some(books::AddBook { user, focus_first: true, ..Default::default() });
-            }
+            A::Open => self.add_book = Some(self.dav_login(self.accounts.first().map(|v| v.serial))),
             A::Find => self.find_books(),
+            A::Login(serial) => self.add_book = Some(self.dav_login(serial)),
             A::Show(url) => self.contacts_shown = url,
             A::Fold(key) => {
                 if !self.settings.folded.remove(&key) {
@@ -6741,6 +6790,22 @@ impl BeaverApp {
                     Ok(()) => {}
                     Err(MailError::Offline(_)) => self.error = Some("The calendar's server cannot be reached: the event is not in it yet. Answer again once online.".into()),
                     Err(e) => self.error = Some(format!("The calendar could not be changed: {e}")),
+                }
+            }
+            Event::CalendarLogin(server, result) => {
+                let Some(login) = self.calendar_logins.get_mut(&server) else { return };
+                login.checking = false;
+                let kept = result.map_err(|e| format!("The server did not take it: {e}")).and_then(|()| {
+                    let calendar = self.settings.calendars.iter().find(|c| calendars::server(c) == server).ok_or("The server is no longer in the list")?;
+                    store::set_calendar_password(calendar, &login.password)
+                });
+                match kept {
+                    Ok(()) => {
+                        self.calendar_logins.remove(&server);
+                        self.notice = Some((format!("Password saved for {server}"), std::time::Instant::now()));
+                        self.sync_calendars(None);
+                    }
+                    Err(e) => login.error = Some(e),
                 }
             }
             Event::CalendarsFound(found) => {
@@ -8685,16 +8750,18 @@ impl eframe::App for BeaverApp {
         self.book_remove_dialog(ui.ctx(), &t);
         self.calendar_remove_dialog(ui.ctx(), &t);
         self.event_dialogs(ui.ctx(), &t);
+        let logins: Vec<(u64, String)> = self.accounts.iter().map(|v| (v.serial, v.account.address().to_owned())).collect();
         let added: Vec<String> = self.settings.calendars.iter().map(|c| c.url.clone()).collect();
-        if let Some(action) = books::add_dialog(ui.ctx(), &t, &mut self.add_calendar, &added.iter().map(String::as_str).collect::<Vec<_>>(), &calendars::CALENDARS) {
+        if let Some(action) = books::add_dialog(ui.ctx(), &t, &mut self.add_calendar, &added.iter().map(String::as_str).collect::<Vec<_>>(), &calendars::CALENDARS, &logins) {
             match action {
                 books::BookAction::Find => self.find_calendars(),
+                books::BookAction::Login(serial) => self.add_calendar = Some(self.dav_login(serial)),
                 books::BookAction::Add(chosen) => self.calendar_action(calendars::CalendarAction::Added(chosen)),
                 _ => {}
             }
         }
         let added: Vec<String> = self.settings.address_books.iter().map(|b| b.url.clone()).collect();
-        if let Some(action) = books::add_dialog(ui.ctx(), &t, &mut self.add_book, &added.iter().map(String::as_str).collect::<Vec<_>>(), &books::BOOKS) {
+        if let Some(action) = books::add_dialog(ui.ctx(), &t, &mut self.add_book, &added.iter().map(String::as_str).collect::<Vec<_>>(), &books::BOOKS, &logins) {
             self.book_action(action);
         }
         if let Some(action) = encryption::dialogs(ui.ctx(), &t, &mut self.key_dialogs) {

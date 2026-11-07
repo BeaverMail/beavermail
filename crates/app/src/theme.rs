@@ -219,6 +219,9 @@ pub fn calendar_color(hex: &str) -> Option<Color32> {
     Some(rgb(value))
 }
 
+/// The colours a calendar can be given, as stored (`#RRGGBB`).
+pub const CALENDAR_COLORS: [&str; 8] = ["#3B82F6", "#22A06B", "#F59E0B", "#EC4899", "#8B5CF6", "#06B6D4", "#EF4444", "#64748B"];
+
 /// The colour marking an account's mail in All inboxes and beside its name, by its place in the list.
 pub fn account_color(at: usize) -> Color32 {
     const HUES: [u32; 6] = [0x3B82F6, 0xF59E0B, 0x22A06B, 0xEC4899, 0x8B5CF6, 0x06B6D4];

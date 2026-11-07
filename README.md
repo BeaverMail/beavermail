@@ -16,7 +16,7 @@ computer, remote content stays blocked, and it works offline. Written in Rust wi
 - Writing: Markdown, address chips, drafts kept locally and on the server, undo send, send later, signatures, spell check.
 - Undo: Archive and Move to Trash wait 10 s before reaching the server.
 - Contacts: cards, address books synced over CardDAV.
-- Calendar: week, month and agenda over CalDAV or on this computer; events made and changed here; invitations answered from mail.
+- Calendar: week, month and agenda over CalDAV or on this computer; events made and changed here; invitations answered from mail; calendars renamed, recoloured and their servers' passwords changed in Settings.
 
 Keys (Ctrl+K lists every command): Up/Down, Page Up/Down, Home/End (with Shift, pick a range), F6, Enter,
 E, Delete, V (move to folder), U, P, S, 1–5, `!`, C or Ctrl+N, R, A, F, `/`, Ctrl+Z, Ctrl+U, Ctrl+W, Ctrl+Tab; in the calendar

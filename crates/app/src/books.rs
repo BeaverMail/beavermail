@@ -14,6 +14,8 @@ use beavermail_carddav::Found;
 /// The "Add address book" dialog.
 #[derive(Default)]
 pub struct AddBook {
+    /// The mail account whose login fills the form; `None`: another login, typed.
+    pub from: Option<u64>,
     pub server: String,
     pub user: String,
     pub password: String,
@@ -32,6 +34,8 @@ pub enum BookAction {
     Show(Option<String>),
     /// Ask the server in the dialog for its address books.
     Find,
+    /// Fill the form with the login of this mail account, or empty it for another (`None`).
+    Login(Option<u64>),
     /// Sync these address books from now on, with the dialog's login.
     Add(Vec<Found>),
     /// New contacts go to this one.
@@ -145,7 +149,9 @@ pub const BOOKS: Words = Words { id: "add_book", one: "address book", many: "add
 /// The dialog to add address books or calendars: the server and login, then, when it has more than
 /// one, which to add. One primary action: find them, then add those ticked. `added`: the URLs of
 /// those already added.
-pub fn add_dialog(ctx: &egui::Context, t: &Tokens, state: &mut Option<AddBook>, added: &[&str], words: &Words) -> Option<BookAction> {
+/// The dialog to add address books or calendars. `accounts`: the mail accounts whose login can be
+/// used, as (serial, address).
+pub fn add_dialog(ctx: &egui::Context, t: &Tokens, state: &mut Option<AddBook>, added: &[&str], words: &Words, accounts: &[(u64, String)]) -> Option<BookAction> {
     let form = state.as_mut()?;
     let mut action = None;
     let mut close = false;
@@ -156,6 +162,22 @@ pub fn add_dialog(ctx: &egui::Context, t: &Tokens, state: &mut Option<AddBook>, 
         ui.add_space(12.0);
         let mut edited = false;
         crate::form_grid(ui, "add_book_form", |ui| {
+            if !accounts.is_empty() {
+                ui.label("Login");
+                let shown = accounts.iter().find(|(s, _)| Some(*s) == form.from).map_or("Another login", |(_, a)| a.as_str()).to_owned();
+                egui::ComboBox::from_id_salt("add_book_login").width(crate::FIELD_WIDTH).selected_text(shown).show_ui(ui, |ui| {
+                    for (serial, address) in accounts {
+                        if ui.selectable_label(form.from == Some(*serial), address).clicked() && form.from != Some(*serial) {
+                            action = Some(BookAction::Login(Some(*serial)));
+                        }
+                    }
+                    ui.separator();
+                    if ui.selectable_label(form.from.is_none(), "Another login").clicked() && form.from.is_some() {
+                        action = Some(BookAction::Login(None));
+                    }
+                });
+                ui.end_row();
+            }
             ui.label("Server");
             let server = ui.add(crate::field(&mut form.server).hint_text("dav.example.com, or example.com"));
             if std::mem::take(&mut form.focus_first) {
@@ -170,9 +192,10 @@ pub fn add_dialog(ctx: &egui::Context, t: &Tokens, state: &mut Option<AddBook>, 
             ui.end_row();
             edited = server.changed() || user.changed() || password.changed();
         });
-        // Another server or login: what was found belongs to the old one.
+        // Another server or login: what was found belongs to the old one, and it is no account's any more.
         if edited && !form.finding {
             form.found = None;
+            form.from = None;
         }
         match &mut form.found {
             Some(Ok(found)) => {
@@ -258,12 +281,12 @@ mod tests {
         let added = [AddressBook { name: "Personal".into(), url: "https://dav.example.org/ada/personal/".into(), user: "ada".into(), default: true, read_only: false }];
         let book = |url: &str, name: &str, writable| (Found { url: url.into(), name: name.into(), writable, color: String::new() }, writable);
         let found = vec![book(&added[0].url, "Personal", true), book("https://dav.example.org/ada/recent/", "Recently contacted", false)];
-        let mut state = Some(AddBook { server: "example.org".into(), user: "ada".into(), password: "pw".into(), finding: false, focus_first: true, found: Some(Ok(found)) });
+        let mut state = Some(AddBook { from: None, server: "example.org".into(), user: "ada".into(), password: "pw".into(), finding: false, focus_first: true, found: Some(Ok(found)) });
         for _ in 0..2 {
             let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(1200.0, 900.0))), ..Default::default() };
             let mut output = ctx.run_ui(input, |ui| {
                 assert!(section(ui, &Tokens::dark(), &added, &Default::default(), None, &Default::default(), 0, &Default::default()).is_none(), "nothing pressed");
-                assert!(add_dialog(ui.ctx(), &Tokens::dark(), &mut state, &[added[0].url.as_str()], &BOOKS).is_none());
+                assert!(add_dialog(ui.ctx(), &Tokens::dark(), &mut state, &[added[0].url.as_str()], &BOOKS, &[(1, "ada@example.org".into())]).is_none());
             });
             output.textures_delta.clear();
         }
