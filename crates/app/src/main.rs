@@ -2150,7 +2150,8 @@ impl BeaverApp {
         let index = self.shown().into_iter().find(|(s, _)| *s == serial).map_or(usize::MAX, |(_, i)| i);
         let Some(source) = self.view(serial).and_then(|v| v.source.clone()) else { return };
         let pos = self.messages.iter().position(|m| m.id == id);
-        let was_unread = self.summary_of(id).is_some_and(|m| m.unread);
+        let summary = self.summary_of(id);
+        let (known, was_unread) = (summary.is_some(), summary.is_some_and(|m| m.unread));
         // The folder it is in, shown or not (a search result, a tab).
         let home = self.archive.locate(id).ok().flatten().and_then(|at| self.view(serial)?.mailboxes.iter().position(|m| m.name == at.folder)).unwrap_or(index);
         // Archive, Move to Trash and to another folder of a listed message wait, so Undo can put it back.
@@ -2172,6 +2173,9 @@ impl BeaverApp {
         };
         if let Some(mailbox) = self.accounts.iter_mut().find(|v| v.serial == serial).and_then(|v| v.mailboxes.get_mut(home)) {
             mailbox.unread = mailbox.unread.saturating_add_signed(unread_change);
+            if known && action.removes() {
+                mailbox.total = mailbox.total.saturating_sub(1);
+            }
         }
         if let Action::Unread(unread) = action {
             self.tabs.iter_mut().filter(|t| t.message.id == id).for_each(|t| t.message.unread = unread);
@@ -2329,10 +2333,9 @@ impl BeaverApp {
         let Some(pending) = self.pending.take() else { return };
         let first = pending.items.first().map(|(_, _, _, m, _)| m.id);
         for (serial, index, _, message, pos) in pending.items.into_iter().rev() {
-            if message.unread
-                && let Some(mailbox) = self.accounts.iter_mut().find(|v| v.serial == serial).and_then(|v| v.mailboxes.get_mut(index))
-            {
-                mailbox.unread += 1;
+            if let Some(mailbox) = self.accounts.iter_mut().find(|v| v.serial == serial).and_then(|v| v.mailboxes.get_mut(index)) {
+                mailbox.unread += u32::from(message.unread);
+                mailbox.total += 1;
             }
             let at = pos.min(self.messages.len());
             self.messages.insert(at, message);
@@ -6339,11 +6342,12 @@ impl BeaverApp {
                 match result {
                     Ok(mut mailboxes) => {
                         download = fresh;
-                        // Mail waiting for Undo is still unread on the server, and already off the count here.
-                        for (_, index, _, _, _) in self.pending.iter().flat_map(|p| &p.items).filter(|i| fresh && i.0 == serial && i.3.unread) {
+                        // Mail waiting for Undo is still in the folder on the server, and already off the counts here.
+                        for (_, index, _, message, _) in self.pending.iter().flat_map(|p| &p.items).filter(|i| fresh && i.0 == serial) {
                             let name = view.mailboxes.get(*index).map(|f| f.name.as_str());
                             if let Some(folder) = mailboxes.iter_mut().find(|m| Some(m.name.as_str()) == name) {
-                                folder.unread = folder.unread.saturating_sub(1);
+                                folder.unread = folder.unread.saturating_sub(u32::from(message.unread));
+                                folder.total = folder.total.saturating_sub(1);
                             }
                         }
                         // New mail since the last time the server was asked (not the first answer).

@@ -28,6 +28,7 @@ What changed in each version of BeaverMail, newest first.
 - An account no longer shows as offline after its server ends a quiet session.
 - A message deleted or moved no longer comes back in a list opened before the server has made the change.
 - The unread counts follow a message read or moved from a search result or a tab, and are asked of the server again after each run of changes.
+- A folder's message count drops at once when a message is deleted or moved, and comes back with Undo.
 
 ## 0.1.1 – 2026-10-23
 
