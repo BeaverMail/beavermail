@@ -883,6 +883,21 @@ impl SettingsPage {
     }
 }
 
+/// The calendars offered in the event dialog: by server (this computer first), each named with its
+/// server when there is more than one, so two calendars called "Calendar" can be told apart.
+fn event_targets(calendars: &[beavermail_core::CalendarSource]) -> Vec<(String, String, bool)> {
+    let mut sorted: Vec<&beavermail_core::CalendarSource> = calendars.iter().collect();
+    sorted.sort_by_key(|c| (!c.is_local(), calendars::server(c)));
+    let servers: std::collections::HashSet<String> = calendars.iter().map(calendars::server).collect();
+    sorted
+        .into_iter()
+        .map(|c| {
+            let name = if servers.len() > 1 && !c.is_local() { format!("{}  ·  {}", c.name, calendars::server(c)) } else { c.name.clone() };
+            (c.url.clone(), name, !c.read_only)
+        })
+        .collect()
+}
+
 pub(crate) const FORM_WIDTH: f32 = 460.0;
 const SETTINGS_WIDTH: f32 = 780.0;
 const PALETTE_WIDTH: f32 = 560.0;
@@ -4560,7 +4575,7 @@ impl BeaverApp {
 
     /// The new-event dialog and the question before deleting one.
     fn event_dialogs(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
-        let targets: Vec<(String, String)> = self.settings.calendars.iter().filter(|c| !c.read_only).map(|c| (c.url.clone(), c.name.clone())).collect();
+        let targets = event_targets(&self.settings.calendars);
         if let Some((form, draft)) = event_form::dialog(ctx, t, &mut self.event_form, &targets) {
             let (uid, old) = match &form.uid {
                 Some(uid) => (uid.clone(), self.archive.events_with_uid(uid).unwrap_or_default().into_iter().next().map(|k| k.ics)),
@@ -9109,6 +9124,26 @@ mod tests {
         for bad in ["bob", "bob@", "@", "@localhost", "a b@x.org", "bob@.org"] {
             assert_eq!(trusted_key(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn the_event_dialog_offers_every_calendar_named_with_its_server() {
+        let calendar = |name: &str, url: &str, user: &str, read_only| beavermail_core::CalendarSource { name: name.into(), url: url.into(), user: user.into(), color: String::new(), shown: true, default: false, read_only };
+        let calendars = [
+            calendar("Calendar", "https://dav.example.org/bob/cal/", "bob", false),
+            calendar("Holidays", "https://dav.example.org/bob/holidays/", "bob", true),
+            calendar("On this computer", beavermail_core::CalendarSource::LOCAL, "", false),
+            calendar("Calendar", "https://cal.example.com/ada/cal/", "ada", false),
+        ];
+        let names: Vec<(String, bool)> = event_targets(&calendars).into_iter().map(|(_, n, w)| (n, w)).collect();
+        assert_eq!(names, [
+            ("On this computer".to_owned(), true),
+            ("Calendar  ·  ada@cal.example.com".to_owned(), true),
+            ("Calendar  ·  bob@dav.example.org".to_owned(), true),
+            ("Holidays  ·  bob@dav.example.org".to_owned(), false),
+        ]);
+        let alone = [calendar("Calendar", "https://dav.example.org/bob/cal/", "bob", false)];
+        assert_eq!(event_targets(&alone)[0].1, "Calendar", "one server: the name alone");
     }
 
     #[test]

@@ -77,8 +77,8 @@ impl EventForm {
     }
 }
 
-/// The calendars a new event can go to, as (URL, name).
-pub type Targets<'a> = &'a [(String, String)];
+/// The calendars, as (URL, how it is named, writable): a new event goes to a writable one.
+pub type Targets<'a> = &'a [(String, String, bool)];
 
 /// The dialog. Returns the form and what to write when the user saves; closes on Cancel and Esc.
 pub fn dialog(ctx: &egui::Context, t: &Tokens, state: &mut Option<EventForm>, targets: Targets) -> Option<(EventForm, Draft)> {
@@ -111,14 +111,15 @@ pub fn dialog(ctx: &egui::Context, t: &Tokens, state: &mut Option<EventForm>, ta
             ui.add(crate::field(&mut form.location).hint_text("A place or a link"));
             ui.end_row();
             ui.label("Calendar");
-            if form.uid.is_some() || targets.len() < 2 {
-                let name = targets.iter().find(|(url, _)| *url == form.calendar).map_or("", |(_, name)| name.as_str());
-                ui.label(RichText::new(name).color(t.text_dim));
+            let name = targets.iter().find(|(url, ..)| *url == form.calendar).map_or("", |(_, name, _)| name.as_str()).to_owned();
+            if form.uid.is_some() {
+                ui.label(RichText::new(name).color(t.text_dim)).on_hover_text("An event stays in its calendar");
             } else {
-                let name = targets.iter().find(|(url, _)| *url == form.calendar).map_or("", |(_, name)| name.as_str()).to_owned();
                 egui::ComboBox::from_id_salt("event_calendar").width(crate::FIELD_WIDTH).selected_text(name).show_ui(ui, |ui| {
-                    for (url, name) in targets {
-                        ui.selectable_value(&mut form.calendar, url.clone(), name);
+                    for (url, name, writable) in targets {
+                        ui.add_enabled_ui(*writable, |ui| ui.selectable_value(&mut form.calendar, url.clone(), name))
+                            .response
+                            .on_disabled_hover_text("Read-only: shared with you or a subscription, nothing can be written there");
                     }
                 });
             }
@@ -217,7 +218,7 @@ mod tests {
         crate::theme::apply(&ctx);
         let input = || egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(1600.0, 1000.0))), ..Default::default() };
         let mut state = Some(EventForm::new(at(12, 0, 0).date(), 9 * 60, "local:"));
-        let targets = [("local:".to_owned(), "On this computer".to_owned()), ("https://dav.example.org/work/".to_owned(), "Work".to_owned())];
+        let targets = [("local:".to_owned(), "On this computer".to_owned(), true), ("https://dav.example.org/work/".to_owned(), "Work".to_owned(), true)];
         // Two passes: the first one measures.
         for _ in 0..2 {
             let mut output = ctx.run_ui(input(), |ui| assert!(dialog(ui.ctx(), &Tokens::dark(), &mut state, &targets).is_none()));

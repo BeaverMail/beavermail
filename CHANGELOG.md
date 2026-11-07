@@ -31,6 +31,7 @@ What changed in each version of BeaverMail, newest first.
 - The unread counts follow a message read or moved from a search result or a tab, and are asked of the server again after each run of changes.
 - A folder's message count drops at once when a message is deleted or moved, and comes back with Undo.
 - Adding calendars or address books offers the login of any mail account, not only the first one's.
+- A new event's Calendar list shows every calendar, by server and named with it, the read-only ones dimmed with the reason.
 
 ## 0.1.1 – 2026-10-23
 
