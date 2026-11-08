@@ -10,6 +10,7 @@ What changed in each version of BeaverMail, newest first.
 - The message list ordered per folder, by date, sender or subject either way, pinned first; oldest first opens at the bottom.
 - The list as cards or as a table of From, Subject and Date, with columns widened by dragging their edges; the message shown beside the list, below it or only in a tab.
 - Appearance in Settings, with the density of the sidebars: Compact, Normal or Comfortable.
+- Settings in a window that can be moved and resized, its place and size kept, closed with Esc or its X.
 - A diagnostic log, turned on in Settings › Troubleshooting, that never holds the text, subject or addresses of a message.
 - The text of a message selected from end to end: dragged up or down, kept while scrolling and extended with Shift+click; a word with a double click, a paragraph with three; Copy and Select all on a right click.
 - The source of a message selected the same way, from beside a line too, and all of it with Ctrl+A.

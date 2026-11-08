@@ -3480,12 +3480,28 @@ impl BeaverApp {
         let (mut save, mut discard, mut add) = (false, false, false);
         let mut page_action = None;
         let (mode, locked, job) = (self.vault.mode(), self.vault.is_locked(), self.vault_job.clone());
-        // The same height on every page, so the window does not jump when the page changes.
+        // Opens centred at a height that fits; moved and resized by the user from there, and remembered.
         let height = (ctx.content_rect().height() - 120.0).clamp(380.0, 640.0);
         let frame = egui::Frame::window(&ctx.global_style()).inner_margin(0);
-        let modal = egui::Modal::new(egui::Id::new("settings")).frame(frame).show(ctx, |ui| {
-            ui.set_width(SETTINGS_WIDTH);
+        let mut close = false;
+        egui::Window::new("Settings")
+            .id(egui::Id::new("settings"))
+            .frame(frame)
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(true)
+            .constrain(true)
+            // No smaller than it opens: it only grows.
+            .min_size(vec2(SETTINGS_WIDTH, height))
+            .default_size(vec2(SETTINGS_WIDTH, height))
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
+            .show(ctx, |ui| {
+            // The same height on every page, so the window does not jump when the page changes.
+            let (width, height) = (ui.available_width().max(SETTINGS_WIDTH), ui.available_height().max(height));
+            ui.set_width(width);
             ui.set_height(height);
+            let corner = egui::Rect::from_min_size(ui.max_rect().right_top() + vec2(-12.0 - theme::CONTROL_H, 12.0), vec2(theme::CONTROL_H, theme::CONTROL_H));
             // Painted once the sidebar's width is known, behind it and down to the window's bottom edge.
             let nav_fill = ui.painter().add(egui::Shape::Noop);
             ui.horizontal_top(|ui| {
@@ -3527,10 +3543,11 @@ impl BeaverApp {
                 ui.painter().set(nav_fill, egui::epaint::RectShape::filled(side, egui::CornerRadius { nw: 14, sw: 14, ne: 0, se: 0 }, t.bg));
                 ui.painter().vline(side.right(), side.y_range(), egui::Stroke::new(1.0, t.border));
                 egui::Frame::new().inner_margin(egui::Margin { left: 28, right: 24, top: 26, bottom: 20 }).show(ui, |ui| ui.vertical(|ui| {
-                    ui.set_width(SETTINGS_WIDTH - SETTINGS_NAV - 52.0);
+                    ui.set_width(width - SETTINGS_NAV - 52.0);
                     ui.set_height(height - 46.0);
                     ui.spacing_mut().item_spacing.x = 8.0;
-                    match &account {
+                    // The title wraps short of the close button in the corner.
+                    ui.scope(|ui| { ui.set_max_width(ui.available_width() - theme::CONTROL_H); match &account {
                         Some(account) => {
                             ui.horizontal(|ui| {
                                 let (rect, _) = ui.allocate_exact_size(vec2(views::AVATAR, views::AVATAR), egui::Sense::hover());
@@ -3547,7 +3564,7 @@ impl BeaverApp {
                             ui.label(RichText::new(self.settings_page.title()).heading());
                             ui.label(RichText::new(self.settings_page.about()).color(t.text_dim));
                         }
-                    }
+                    } });
                     ui.add_space(14.0);
                     // What is left once the footer, its gap and the spacing around both are taken off.
                     let body = (ui.available_height() - theme::CONTROL_H - 8.0 - 2.0 * ui.spacing().item_spacing.y).max(0.0);
@@ -3901,8 +3918,11 @@ impl BeaverApp {
                     });
                 }));
             });
+            close = ui.scope_builder(egui::UiBuilder::new().max_rect(corner), |ui| icons::button(ui, t, Icon::X, "Close settings (Esc)", true, false)).inner.clicked();
         });
-        if modal.should_close() {
+        // Esc closes it unless a dialog or a menu over it takes the key.
+        let esc = || ctx.memory(|m| m.top_modal_layer()).is_none() && !egui::Popup::is_any_open(ctx) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        if close || (self.settings_leave.is_none() && esc()) {
             goto = Some(None);
         }
         if let Some(target) = goto {
