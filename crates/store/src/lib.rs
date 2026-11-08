@@ -378,6 +378,16 @@ fn db(e: impl std::fmt::Display) -> MailError {
     MailError::Backend(format!("local archive: {e}"))
 }
 
+/// The words `in:` takes for the usual folders, which find each account's whatever its server calls
+/// it ("Sent Items", "INBOX.Sent"); "junk" also means Spam.
+pub const ROLE_WORDS: [(&str, Role); 7] =
+    [("inbox", Role::Inbox), ("starred", Role::Starred), ("drafts", Role::Drafts), ("sent", Role::Sent), ("archive", Role::Archive), ("spam", Role::Junk), ("trash", Role::Trash)];
+
+fn role_named(word: &str) -> Option<Role> {
+    let word = if word.eq_ignore_ascii_case("junk") { "spam" } else { word };
+    ROLE_WORDS.iter().find(|(w, _)| w.eq_ignore_ascii_case(word)).map(|(_, r)| *r)
+}
+
 fn role_to_int(role: Role) -> i64 {
     match role {
         Role::Inbox => 0,
@@ -448,6 +458,8 @@ struct Query {
     after: Option<i64>,
     before: Option<i64>,
     folders: Vec<String>,
+    /// `in:all`: Spam and Trash too, which a search without `in:` leaves out.
+    all: bool,
     unread: bool,
     attachment: bool,
 }
@@ -462,7 +474,7 @@ impl Query {
                 Some(("after", v)) if day_start(v).is_some() => query.after = day_start(v),
                 Some(("before", v)) if day_start(v).is_some() => query.before = day_start(v),
                 Some(("subject", v)) if !v.is_empty() => query.subject.push(v.to_owned()),
-                Some(("in", v)) if v.eq_ignore_ascii_case("all") => {}
+                Some(("in", v)) if v.eq_ignore_ascii_case("all") => query.all = true,
                 Some(("in", v)) if !v.is_empty() => query.folders.push(v.to_owned()),
                 Some(("is", v)) if v.eq_ignore_ascii_case("unread") => query.unread = true,
                 Some(("has", v)) if v.eq_ignore_ascii_case("attachment") => query.attachment = true,
@@ -472,8 +484,9 @@ impl Query {
         query
     }
 
+    /// Nothing asked for: `in:all` alone only says where, not what.
     fn is_empty(&self) -> bool {
-        *self == Self::default()
+        *self == Self { all: self.all, ..Self::default() }
     }
 }
 
@@ -1715,8 +1728,21 @@ impl Store {
             conditions.push(format!("id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH {p})"));
         }
         for folder in &query.folders {
+            // The whole name, or its last level: "testing" finds "INBOX/testing" and "INBOX.testing".
             let p = arg(folder.to_lowercase(), &mut args);
-            conditions.push(format!("LOWER(folder) = {p}"));
+            let by_name = format!("LOWER(folder) = {p} OR substr(LOWER(folder), -length({p}) - 1) IN ('/' || {p}, '.' || {p})");
+            match role_named(folder) {
+                Some(role) => {
+                    let r = arg(role_to_int(role).to_string(), &mut args);
+                    conditions.push(format!("({by_name} OR folder IN (SELECT name FROM folders WHERE account = ?1 AND role = CAST({r} AS INTEGER)))"));
+                }
+                None => conditions.push(format!("({by_name})")),
+            }
+        }
+        if query.folders.is_empty() && !query.all {
+            // Like the folder lists: what was thrown away or is spam does not come back in a search.
+            let (junk, trash) = (arg(role_to_int(Role::Junk).to_string(), &mut args), arg(role_to_int(Role::Trash).to_string(), &mut args));
+            conditions.push(format!("folder NOT IN (SELECT name FROM folders WHERE account = ?1 AND role IN (CAST({junk} AS INTEGER), CAST({trash} AS INTEGER)))"));
         }
         if query.unread {
             conditions.push("unread = 1".to_owned());
@@ -2167,11 +2193,24 @@ mod tests {
         assert_eq!(found(&store, "is:unread"), ["Budget review"]);
         assert_eq!(found(&store, "has:attachment budget"), ["Budget review"]);
         assert_eq!(found(&store, "in:archive budget"), ["Old budget"]);
-        assert_eq!(found(&store, "in:all budget").len(), found(&store, "budget").len(), "in:all is every folder");
+        store.set_folders("me", &[("INBOX".into(), Role::Inbox), ("Archive".into(), Role::Archive), ("Junk".into(), Role::Junk), ("Trash".into(), Role::Trash)]).unwrap();
+        store.add_headers("me", "Junk", &[header(4, "Budget offer", 0, false)]).unwrap();
+        store.add_headers("me", "Trash", &[header(5, "Budget draft", 0, false)]).unwrap();
+        assert_eq!(found(&store, "budget").len(), 3, "not in Spam or Trash");
+        assert_eq!(found(&store, "in:junk budget"), ["Budget offer"], "unless asked for");
+        assert_eq!(found(&store, "in:all budget").len(), 5, "in:all is every folder");
+        assert!(found(&store, "in:all").is_empty(), "where alone is no search");
         assert_eq!(found(&store, "\"budget notes\""), ["Budget notes"], "a phrase stays together");
         assert!(found(&store, "from:").len() <= 3, "an empty operator is just text");
         let hits = store.search("me", "in:archive", 10).unwrap();
         assert_eq!(hits[0].folder, "Archive");
+        store.add_headers("me", "INBOX/Testing", &[header(6, "Budget test", 0, false)]).unwrap();
+        assert_eq!(found(&store, "in:testing"), ["Budget test"], "a folder inside another, by its own name");
+        assert!(found(&store, "in:sting").is_empty(), "not by part of it");
+        store.set_folders("me", &[("INBOX".into(), Role::Inbox), ("Sent Items".into(), Role::Sent), ("Junk".into(), Role::Junk)]).unwrap();
+        store.add_headers("me", "Sent Items", &[header(7, "Budget sent", 0, false)]).unwrap();
+        assert_eq!(found(&store, "in:sent"), ["Budget sent"], "the usual folders by what they are, not their name");
+        assert_eq!(found(&store, "in:spam"), ["Budget offer"]);
     }
 
     #[test]

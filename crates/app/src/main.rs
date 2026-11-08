@@ -201,6 +201,51 @@ struct NewFolder {
 /// Messages being dragged from the list onto a folder.
 struct Dragged(Vec<MessageId>);
 
+/// Whether a search names the folder it looks in (`in:inbox`, `in:all`), over the labels under the box.
+fn names_folder(query: &str) -> bool {
+    query.split_whitespace().any(|w| w.len() > 3 && w.is_char_boundary(3) && w[..3].eq_ignore_ascii_case("in:"))
+}
+
+/// Where `in:` starts in a query and what follows it, while a folder name is still being typed
+/// there (`in:tes`, `in:"My fo`); `None` once it is finished by a space or a closing quote.
+fn typing_folder(query: &str) -> Option<(usize, &str)> {
+    let at = query.char_indices().filter(|(i, _)| query.get(*i..i + 3).is_some_and(|w| w.eq_ignore_ascii_case("in:")) && query[..*i].chars().next_back().is_none_or(char::is_whitespace)).map(|(i, _)| i).next_back()?;
+    let rest = &query[at + 3..];
+    match rest.strip_prefix('"') {
+        Some(inner) => (!inner.contains('"')).then_some((at, inner)),
+        None => (!rest.contains(char::is_whitespace)).then_some((at, rest)),
+    }
+}
+
+/// The query without its `in:` words, quoted ones included, then `in:"folder"`.
+fn in_folder(query: &str, folder: &str) -> String {
+    let mut out = String::new();
+    let mut rest = query;
+    while let Some(at) = rest.char_indices().find(|(i, _)| rest.get(*i..i + 3).is_some_and(|w| w.eq_ignore_ascii_case("in:")) && rest[..*i].chars().next_back().is_none_or(char::is_whitespace)).map(|(i, _)| i) {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 3..];
+        let end = match after.strip_prefix('"') {
+            Some(inner) => inner.find('"').map_or(after.len(), |e| e + 2),
+            None => after.find(char::is_whitespace).unwrap_or(after.len()),
+        };
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    let words = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    let folder = if folder.contains([' ', '"']) { format!("\"{folder}\"") } else { folder.to_owned() };
+    format!("{words}{}in:{folder} ", if words.is_empty() { "" } else { " " })
+}
+
+/// Where a search looks, picked under the search box: the folder shown unless the user widens it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Scope {
+    #[default]
+    Folder,
+    /// Every folder of the account shown.
+    Account,
+    Everywhere,
+}
+
 /// Which pane the keys act on: the list (arrows move through it) or the reader (arrows scroll it).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pane {
@@ -1222,6 +1267,8 @@ struct BeaverApp {
     confirm_empty: Vec<(u64, usize)>,
     /// Text of the search box; filters the loaded messages by sender and subject.
     query: String,
+    /// Where the search looks; back to the folder shown when the box is emptied.
+    search_scope: Scope,
     /// The query the results below belong to, which search they are, and what was found: (account, hit).
     searched: String,
     search_seq: u64,
@@ -1466,6 +1513,7 @@ impl BeaverApp {
             confirm_spam: false,
             confirm_empty: Vec::new(),
             query: String::new(),
+            search_scope: Scope::Folder,
             searched: String::new(),
             search_seq: 0,
             hits_seq: 0,
@@ -2709,13 +2757,17 @@ impl BeaverApp {
         let (seq, query) = (self.search_seq, self.query.trim().to_owned());
         if query.is_empty() {
             self.hits.clear();
+            self.search_scope = Scope::Folder;
             return;
         }
-        // The folder shown (every account's, in All inboxes), unless the query names one: "in:all" is everywhere.
-        let named = query.split_whitespace().any(|w| w.len() > 3 && w[..3].eq_ignore_ascii_case("in:"));
+        // Where the labels under the box say (the folder shown: every account's, in All inboxes), unless
+        // the query names a folder itself: "in:all" is everywhere.
+        let named = names_folder(&query);
+        let scope = if named { Scope::Everywhere } else { self.search_scope };
         let shown: std::collections::HashMap<u64, String> =
-            if named || self.show_scheduled { Default::default() } else { self.shown().into_iter().filter_map(|(s, i)| Some((s, self.view(s)?.mailboxes.get(i)?.name.clone()))).collect() };
-        let sources: Vec<(u64, Arc<ImapSource>)> = self.accounts.iter().filter_map(|v| Some((v.serial, v.source.clone()?))).collect();
+            if scope != Scope::Folder || self.show_scheduled { Default::default() } else { self.shown().into_iter().filter_map(|(s, i)| Some((s, self.view(s)?.mailboxes.get(i)?.name.clone()))).collect() };
+        let only = self.selected.map(|(s, _)| s).filter(|_| scope == Scope::Account && !self.unified);
+        let sources: Vec<(u64, Arc<ImapSource>)> = self.accounts.iter().filter(|v| only.is_none_or(|s| s == v.serial)).filter_map(|v| Some((v.serial, v.source.clone()?))).collect();
         for (serial, source) in sources {
             let query = match shown.get(&serial) {
                 Some(folder) => format!("{query} in:\"{folder}\""),
@@ -2724,6 +2776,55 @@ impl BeaverApp {
             };
             self.spawn(async move { Event::Found(seq, serial, source.search(&query, 200).await) });
         }
+    }
+
+    /// The labels under the search box, as (where, label, what it means): the folder shown, its
+    /// account (not in All inboxes, which is every account's), and everywhere.
+    fn scopes(&self) -> Vec<(Scope, String, &'static str)> {
+        let folder = if self.unified {
+            Some(if self.unified_role == Role::Junk { "Spam, every account".to_owned() } else { "All inboxes".to_owned() })
+        } else {
+            self.selected.and_then(|(s, i)| {
+                let view = self.view(s)?;
+                let m = view.mailboxes.get(i)?;
+                Some(views::folder_title(&m.name, m.role, m.delimiter))
+            })
+        };
+        let account = self.selected.filter(|_| !self.unified).and_then(|(s, _)| self.view(s)).map(|v| v.account.address().to_owned());
+        let mut out = Vec::new();
+        if let Some(folder) = folder {
+            out.push((Scope::Folder, folder, "Only the folder shown"));
+        }
+        if let Some(account) = account.filter(|_| self.accounts.len() > 1) {
+            out.push((Scope::Account, account, "Every folder of this account"));
+        }
+        out.push((Scope::Everywhere, if self.accounts.len() > 1 { "Everywhere".to_owned() } else { "All folders".to_owned() }, "Every folder of every account, but Spam and Trash (in:all looks there too)"));
+        out
+    }
+
+    /// The folders `in:` can name, as (what it takes, the folder as read, where): the usual ones once,
+    /// by what they are ("in:sent", each account's whatever its server calls it), then the others by
+    /// name with their account when there are several. A name two accounts share is one entry: `in:`
+    /// means it in both.
+    fn search_folders(&self) -> Vec<(String, String, Option<String>)> {
+        let several = self.accounts.len() > 1;
+        let mut out: Vec<(String, String, Option<String>)> = beavermail_store::ROLE_WORDS
+            .iter()
+            .filter(|(_, role)| self.accounts.iter().any(|v| v.mailboxes.iter().any(|m| m.role == *role)))
+            .map(|(word, _)| (word.to_string(), format!("{}{}", word[..1].to_uppercase(), &word[1..]), several.then(|| "every account".to_owned())))
+            .collect();
+        let roles = out.len();
+        for view in &self.accounts {
+            let mut folders: Vec<&Mailbox> = view.mailboxes.iter().filter(|m| m.role == Role::Other).collect();
+            folders.sort_by_key(|m| m.name.to_lowercase());
+            for m in folders {
+                match out[roles..].iter_mut().find(|(n, ..)| *n == m.name) {
+                    Some(seen) => seen.2 = None,
+                    None => out.push((m.name.clone(), views::folder_path(&m.name, m.role, m.delimiter), several.then(|| view.account.address().to_owned()))),
+                }
+            }
+        }
+        out
     }
 
     /// A search result was clicked: show its folder with the message open.
@@ -7844,18 +7945,120 @@ impl BeaverApp {
                 return;
             }
             ui.add_space(12.0);
+            // The folders `in:` may mean, under the box while one is typed: Up and Down choose, Enter or a
+            // click takes one, Esc hides them. The keys are taken before the box sees them, when they were shown.
+            let hints_id = egui::Id::new("search folders");
+            let (was_shown, last_pick, hidden_for) = ui.data(|d| d.get_temp::<(bool, usize, String)>(hints_id)).unwrap_or_default();
+            let (step, take, esc) = if was_shown {
+                ui.input_mut(|i| (isize::from(i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) - isize::from(i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)), i.consume_key(egui::Modifiers::NONE, egui::Key::Enter), i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)))
+            } else {
+                (0, false, false)
+            };
+            let mut field = None;
             ui.horizontal(|ui| {
                 ui.add_space(12.0);
                 let width = ui.available_width() - theme::CONTROL_H - 20.0;
                 let focus = std::mem::take(&mut self.focus_search);
-                views::search_box(ui, t, &mut self.query, "Search mail  ( / )", width, focus)
-                    .on_hover_text(format!("Search the folder shown, as stored on this computer; in:all searches every folder.\nWords, \"a phrase\", from:ada, to:bob, subject:invoice, in:inbox, is:unread, has:attachment, after:2026-09-01, before:2026-10\n\nAll commands and their keys: {}", Command::Palette.keys(ui.ctx())));
+                field = Some(views::search_box(ui, t, &mut self.query, "Search mail  ( / )", width, focus)
+                    .on_hover_text(format!("Search the folder shown, as stored on this computer; the labels under the box look further.\nWords, \"a phrase\", from:ada, to:bob, subject:invoice, in:inbox (in: lists the folders), is:unread, has:attachment, after:2026-09-01, before:2026-10\n\nAll commands and their keys: {}", Command::Palette.keys(ui.ctx()))));
                 if self.syncing > 0 {
                     ui.add_sized([theme::CONTROL_H - 4.0, theme::CONTROL_H - 4.0], egui::Spinner::new().size(16.0)).on_hover_text("Syncing…");
                 } else {
                     refresh = icons::button(ui, t, Icon::Refresh, "Refresh", true, false).clicked();
                 }
             });
+            if let Some(field) = field.filter(|f| f.has_focus() || f.lost_focus()) {
+                let typed = typing_folder(&self.query).map(|(at, typed)| (at, typed.to_lowercase()));
+                let hidden = esc || hidden_for == self.query;
+                let found: Vec<_> = match &typed {
+                    Some((_, typed)) if !hidden => self.search_folders().into_iter().filter(|(name, path, _)| path.to_lowercase().contains(typed.as_str()) || name.to_lowercase().contains(typed.as_str())).take(8).collect(),
+                    _ => Vec::new(),
+                };
+                let pick = if was_shown { last_pick.saturating_add_signed(step).min(found.len().saturating_sub(1)) } else { 0 };
+                let mut picked = take.then_some(pick).filter(|_| !found.is_empty());
+                if !found.is_empty() {
+                    egui::Popup::from_response(&field).open(true).width(field.rect.width().min(360.0)).style(views::menu_look).show(|ui| {
+                        ui.spacing_mut().interact_size.y = 28.0; // a list, not a row of 40-point controls
+                        for (i, (_, path, account)) in found.iter().enumerate() {
+                            let mut job = egui::text::LayoutJob::default();
+                            job.append(path, 0.0, egui::TextFormat::simple(egui::FontId::proportional(14.0), t.text));
+                            if let Some(account) = account {
+                                job.append(account, 8.0, egui::TextFormat::simple(egui::FontId::proportional(13.0), t.text_dim));
+                            }
+                            // Taken on the press, before the box lets go of the keys.
+                            let row = ui.add(egui::Button::selectable(i == pick, job).truncate().min_size(vec2(ui.available_width(), 0.0)).sense(egui::Sense::CLICK));
+                            if row.clicked() || row.is_pointer_button_down_on() {
+                                picked = Some(i);
+                            }
+                        }
+                    });
+                }
+                if let (Some(i), Some((at, _))) = (picked, typing_folder(&self.query)) {
+                    self.query = format!("{}{}", &self.query[..at], in_folder("", &found[i].0));
+                    field.request_focus();
+                    // The cursor after the folder, ready for the next word.
+                    if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), field.id) {
+                        state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(self.query.chars().count()))));
+                        state.store(ui.ctx(), field.id);
+                    }
+                }
+                let shown = !found.is_empty() && picked.is_none();
+                ui.data_mut(|d| d.insert_temp(hints_id, (shown, pick, if esc { self.query.clone() } else if hidden_for == self.query { hidden_for } else { String::new() })));
+                // The box keeps Esc for the list while they are shown, and arrows move through them.
+                ui.memory_mut(|m| m.set_focus_lock_filter(field.id, egui::EventFilter { vertical_arrows: shown, escape: shown, ..Default::default() }));
+            } else if was_shown {
+                ui.data_mut(|d| d.insert_temp(hints_id, (false, 0, hidden_for)));
+            }
+            if self.searching() && !self.show_scheduled {
+                ui.add_space(8.0);
+                let mut scope = self.search_scope;
+                let mut other = None;
+                ui.horizontal(|ui| {
+                    ui.add_space(16.0);
+                    ui.label(RichText::new("Search in").size(13.0).color(t.text_dim));
+                    let named = names_folder(&self.query);
+                    for (choice, label, tip) in self.scopes() {
+                        let button = ui.add_enabled(!named, egui::Button::selectable(scope == choice && !named, label));
+                        if button.on_hover_text(tip).on_disabled_hover_text("The search names its folder itself (in:…)").clicked() {
+                            scope = choice;
+                        }
+                    }
+                    let look = egui::containers::menu::MenuConfig::new().style(views::menu_look);
+                    egui::containers::menu::MenuButton::new("Other folder…").config(look).ui(ui, |ui| {
+                        // What is typed stays while the menu is reopened, until a folder is picked.
+                        let id = ui.id().with("search");
+                        let mut filter: String = ui.data_mut(|d| d.get_temp(id)).unwrap_or_default();
+                        // The box centres itself in all the height it is given: a menu would give it the screen's.
+                        let search = ui.allocate_ui_with_layout(vec2(240.0, theme::CONTROL_H), Layout::left_to_right(Align::Center), |ui| views::search_box(ui, t, &mut filter, "Search folders", 240.0, true)).inner;
+                        let needle = filter.trim().to_lowercase();
+                        let found: Vec<_> = self.search_folders().into_iter().filter(|(name, path, _)| path.to_lowercase().contains(&needle) || name.to_lowercase().contains(&needle)).collect();
+                        let enter = search.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                            for (i, (name, path, account)) in found.iter().enumerate() {
+                                let label = account.as_ref().map_or_else(|| path.clone(), |a| format!("{path}  ·  {a}"));
+                                if ui.button(label).clicked() || (enter && i == 0) {
+                                    other = Some(name.clone());
+                                    ui.close();
+                                }
+                            }
+                            if found.is_empty() {
+                                ui.label(RichText::new("No folder matches").color(t.text_dim));
+                            }
+                        });
+                        if other.is_some() {
+                            filter.clear();
+                        }
+                        ui.data_mut(|d| d.insert_temp(id, filter));
+                    }).0.on_hover_text("Search one folder of your choice; writes in:… in the box");
+                });
+                if let Some(folder) = other {
+                    self.query = in_folder(&self.query, &folder);
+                }
+                if scope != self.search_scope {
+                    self.search_scope = scope;
+                    self.searched.clear(); // asked again, there
+                }
+            }
             let shown = self.visible();
             let can_move = self.show_suspicious && self.holding() && !shown.is_empty();
             // The table orders by its column titles; the cards by a menu at the end of this line.
@@ -7899,7 +8102,15 @@ impl BeaverApp {
             }
             if self.searching() {
                 if self.hits.is_empty() {
-                    views::empty_state(ui, t, "No results", "Nothing stored on this computer matches. Try fewer words.", None);
+                    // Not found where it looked: offer the widest place before the user thinks it is gone.
+                    let scopes = self.scopes();
+                    let here = scopes.iter().find(|(s, ..)| *s == self.search_scope).filter(|_| self.search_scope != Scope::Everywhere && !names_folder(&self.query));
+                    let wider = here.map(|_| if self.accounts.len() > 1 { "Search everywhere" } else { "Search all folders" });
+                    let title = here.map_or("No results".to_owned(), |(_, l, _)| format!("Not in {l}"));
+                    if views::empty_state(ui, t, &title, "Nothing stored on this computer matches. Try fewer words.", wider) {
+                        self.search_scope = Scope::Everywhere;
+                        self.searched.clear();
+                    }
                     return;
                 }
                 ui.spacing_mut().item_spacing.y = 0.0; // rows touch, so row `i` starts at `i` times the row height
@@ -9124,6 +9335,27 @@ mod tests {
         for bad in ["bob", "bob@", "@", "@localhost", "a b@x.org", "bob@.org"] {
             assert_eq!(trusted_key(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn a_folder_being_typed_after_in_is_found_and_replaced() {
+        assert_eq!(typing_folder("budget in:tes"), Some((7, "tes")));
+        assert_eq!(typing_folder("in:\"My fo"), Some((0, "My fo")));
+        assert_eq!(typing_folder("IN:"), Some((0, "")));
+        assert_eq!(typing_folder("in:tes budget"), None, "finished by a space");
+        assert_eq!(typing_folder("in:\"My folder\""), None, "finished by its quote");
+        assert_eq!(typing_folder("join:x"), None, "not inside a word");
+        assert_eq!(typing_folder("éé in:a"), Some((5, "a")));
+        assert_eq!(in_folder("budget in:inbox from:ada", "INBOX/Testing"), "budget from:ada in:INBOX/Testing ");
+        assert_eq!(in_folder("in:\"Old stuff\" budget", "sent"), "budget in:sent ");
+        assert_eq!(in_folder("", "Old stuff"), "in:\"Old stuff\" ");
+    }
+
+    #[test]
+    fn a_search_naming_its_folder_is_told_from_one_that_does_not() {
+        assert!(names_folder("budget in:all") && names_folder("IN:inbox"));
+        assert!(!names_folder("in: budget") && !names_folder("inbox") && !names_folder("ìn:x"));
+        assert!(!names_folder("éé àà"), "a word whose third byte is inside a letter");
     }
 
     #[test]

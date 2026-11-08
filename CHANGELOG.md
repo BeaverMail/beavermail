@@ -13,6 +13,7 @@ What changed in each version of BeaverMail, newest first.
 - A diagnostic log, turned on in Settings › Troubleshooting, that never holds the text, subject or addresses of a message.
 - The text of a message selected from end to end: dragged up or down, kept while scrolling and extended with Shift+click; a word with a double click, a paragraph with three; Copy and Select all on a right click.
 - The source of a message selected the same way, from beside a line too, and all of it with Ctrl+A.
+- Search in the folder shown, its account or everywhere, picked from labels under the search box instead of typing in:all; a search that finds nothing offers to look everywhere. Searching every folder leaves out Spam and Trash; in:all looks there too. Typing in: lists the folders to pick from, Other folder… among the labels searches any one, in:sent, in:spam and the other usual folders find each account's whatever its server calls it, and in:testing finds a folder inside another by its own name.
 - Calendars in Settings: each server with its calendars, renamed, recoloured, made default or removed, its password changed once the server takes it, or all of it removed.
 - Spell check while writing: words spelled wrong underlined, their spellings and Add to dictionary on a right click, the language chosen in Settings › Writing or per message; dictionaries from the system or downloaded on request; Check spelling (F7) going through the words marked one by one, to change, ignore or add each, optionally before sending.
 
@@ -31,6 +32,7 @@ What changed in each version of BeaverMail, newest first.
 - The unread counts follow a message read or moved from a search result or a tab, and are asked of the server again after each run of changes.
 - A folder's message count drops at once when a message is deleted or moved, and comes back with Undo.
 - Adding calendars or address books offers the login of any mail account, not only the first one's.
+- A search word with an accented letter where in: would be no longer closes the app.
 - A new event's Calendar list shows every calendar, by server and named with it, the read-only ones dimmed with the reason.
 
 ## 0.1.1 – 2026-10-23
