@@ -1174,6 +1174,16 @@ impl Store {
         rows.collect::<Result<_, _>>().map_err(db)
     }
 
+    /// The folder's messages above UID `above`, oldest first, as (UID, message, To and Cc addresses):
+    /// what the filters have not seen yet.
+    pub fn arrived(&self, account: &str, folder: &str, above: u32) -> Result<Vec<(u32, MessageSummary, String)>, MailError> {
+        let conn = self.read();
+        let sql = format!("SELECT {SUMMARY_COLUMNS}, uid, recipients FROM messages WHERE account = ?1 AND folder = ?2 AND uid > ?3 ORDER BY uid");
+        let mut stmt = conn.prepare(&sql).map_err(db)?;
+        let rows = stmt.query_map(params![account, folder, i64::from(above)], |r| Ok((r.get::<_, i64>(16)? as u32, summary(r)?, r.get::<_, Option<String>>(17)?.unwrap_or_default()))).map_err(db)?;
+        rows.collect::<Result<_, _>>().map_err(db)
+    }
+
     /// (lowest UID, highest UID, count) of the folder's cached messages.
     pub fn uid_range(&self, account: &str, folder: &str) -> Result<Option<(u32, u32, u32)>, MailError> {
         let conn = self.read();
@@ -2399,6 +2409,17 @@ mod tests {
         store.add_headers("me", "INBOX", &[header(1, "Quarterly zeppelin budget", 5, true)]).unwrap();
         let id = store.id_of("me", "INBOX", 1).unwrap().unwrap();
         store.index_body(id, "the quokka said hello").unwrap();
+    }
+
+    #[test]
+    fn what_arrived_above_a_uid_comes_oldest_first_with_its_recipients() {
+        let store = store();
+        let mut late = header(9, "Second", 20, true);
+        late.recipients = "team@example.org".into();
+        store.add_headers("me", "INBOX", &[header(3, "Seen", 5, false), late, header(7, "First", 10, true)]).unwrap();
+        let arrived = store.arrived("me", "INBOX", 3).unwrap();
+        let got: Vec<(u32, &str, &str)> = arrived.iter().map(|(uid, m, to)| (*uid, m.subject.as_str(), to.as_str())).collect();
+        assert_eq!(got, [(7, "First", ""), (9, "Second", "team@example.org")]);
     }
 
     #[test]

@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Stable identifier of a message within one source.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct MessageId(pub u64);
 
 /// What a folder is for, when the UI must treat it specially.
@@ -36,7 +36,7 @@ pub struct Mailbox {
 }
 
 /// What the message list needs to show a row. The body is loaded separately.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MessageSummary {
     pub id: MessageId,
     pub from: String,
@@ -608,6 +608,52 @@ pub struct Settings {
     /// A folder the data is to be moved to at the next start; empty when none.
     #[serde(default)]
     pub moving_to: String,
+    /// The rules applied to new mail in each account's Inbox, in order.
+    #[serde(default)]
+    pub filters: Vec<Filter>,
+    /// By account key, the highest Inbox UID the filters have seen: mail above it is new to them.
+    #[serde(default)]
+    pub filtered_upto: std::collections::BTreeMap<String, u32>,
+}
+
+/// A rule for new mail in an account's Inbox: when its conditions hold, its actions are taken.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Filter {
+    /// The account's key (see [`Account::key`]).
+    pub account: String,
+    pub name: String,
+    pub enabled: bool,
+    /// Every condition must hold (`true`), or any one of them.
+    pub all: bool,
+    pub conditions: Vec<Condition>,
+    pub actions: Vec<FilterAction>,
+    /// The filters after this one are not tried on a message it matched.
+    pub stop: bool,
+}
+
+/// What a filter looks for; texts match ignoring case, anywhere in the field.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Condition {
+    /// The sender's name or address.
+    From(String),
+    /// An address in To or Cc.
+    To(String),
+    Subject(String),
+    Attachment,
+}
+
+/// What a filter does to a message it matched.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FilterAction {
+    /// To another folder of the account, by its name on the server.
+    Move(String),
+    Read,
+    Star,
+    /// One of the standard labels, `$label1` to `$label5`.
+    Label(u8),
+    Trash,
 }
 
 fn yes() -> bool {
@@ -620,7 +666,7 @@ fn undo_secs() -> u32 {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { display: DisplayMode::default(), sender_display: Default::default(), rich_outgoing: true, undo_send_secs: undo_secs(), remote_senders: Default::default(), hold_suspicious: true, marked: Default::default(), threads: true, reading_pane: true, reader_below: false, list_layout: ListLayout::default(), columns: Columns::default(), sorts: Default::default(), folded: Default::default(), density: Density::default(), diagnostics: false, link_params: String::new(), address_books: Vec::new(), calendars: Vec::new(), spelling: true, spelling_language: String::new(), spelling_words: Default::default(), spelling_before_send: false, data_folder: String::new(), moving_to: String::new() }
+        Self { display: DisplayMode::default(), sender_display: Default::default(), rich_outgoing: true, undo_send_secs: undo_secs(), remote_senders: Default::default(), hold_suspicious: true, marked: Default::default(), threads: true, reading_pane: true, reader_below: false, list_layout: ListLayout::default(), columns: Columns::default(), sorts: Default::default(), folded: Default::default(), density: Density::default(), diagnostics: false, link_params: String::new(), address_books: Vec::new(), calendars: Vec::new(), spelling: true, spelling_language: String::new(), spelling_words: Default::default(), spelling_before_send: false, data_folder: String::new(), moving_to: String::new(), filters: Vec::new(), filtered_upto: Default::default() }
     }
 }
 

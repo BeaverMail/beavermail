@@ -15,6 +15,7 @@ computer, remote content stays blocked, and it works offline. Written in Rust wi
 - Encryption: OpenPGP (with Autocrypt) and S/MIME, signed and encrypted mail.
 - Writing: Markdown, address chips, drafts kept locally and on the server, undo send, send later, signatures, spell check.
 - Undo: Archive and Move to Trash wait 10 s before reaching the server.
+- Filters: rules that move, star, label or mark new Inbox mail as it arrives.
 - Contacts: cards, address books synced over CardDAV.
 - Calendar: week, month and agenda over CalDAV or on this computer; events made and changed here; invitations answered from mail; calendars renamed, recoloured and their servers' passwords changed in Settings.
 

@@ -19,6 +19,7 @@ What changed in each version of BeaverMail, newest first.
 - Search on the server, beside the results or when nothing is found, for mail older than what is kept on this computer or never downloaded: folder by folder with its results shown as they come, stopped at once with Stop; what it finds is kept and opens like the rest.
 - Archive into any folder of the account, chosen in its settings, and optionally into a folder for each year inside it, made when first needed.
 - Search options beside the search box: from, to, subject, words, dates, attachment and unread as fields, written into the box as the words they stand for, and read back from it.
+- Filters in Settings › Filters: rules on the sender, recipients, subject or attachments that move, star, label, mark as read or trash new mail in the Inbox as it arrives, in order, each stopping the rest when asked; Run now applies one to the mail already there, and Create filter… on a message starts one from its sender.
 - Calendars in Settings: each server with its calendars, renamed, recoloured, made default or removed, its password changed once the server takes it, or all of it removed.
 - Spell check while writing: words spelled wrong underlined, their spellings and Add to dictionary on a right click, the language chosen in Settings › Writing or per message; dictionaries from the system or downloaded on request; Check spelling (F7) going through the words marked one by one, to change, ignore or add each, optionally before sending.
 

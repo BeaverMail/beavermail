@@ -28,6 +28,8 @@ pub enum Command {
     NotSpam,
     TrustSender,
     BlockSender,
+    /// A filter for mail like this one, made in Settings › Filters with its sender filled in.
+    CreateFilter,
     ViewSource,
     FindInSource,
     OpenInTab,
@@ -64,7 +66,7 @@ const CTRL_SHIFT: Modifiers = Modifiers::COMMAND.plus(Modifiers::SHIFT);
 
 impl Command {
     /// In the order the keys are tried (Ctrl+Shift+Tab before Ctrl+Tab) and the palette lists them.
-    pub const ALL: [Self; 40] = [
+    pub const ALL: [Self; 41] = [
         Self::Palette,
         Self::NewMessage,
         Self::Reply,
@@ -87,6 +89,7 @@ impl Command {
         Self::NotSpam,
         Self::TrustSender,
         Self::BlockSender,
+        Self::CreateFilter,
         Self::ViewSource,
         Self::FindInSource,
         Self::OpenInTab,
@@ -131,6 +134,7 @@ impl Command {
             Self::NotSpam => "Not spam",
             Self::TrustSender => "Trust sender",
             Self::BlockSender => "Block sender",
+            Self::CreateFilter => "Create filter…",
             Self::ViewSource => "View source",
             Self::FindInSource => "Find in source",
             Self::OpenInTab => "Open in a tab",
@@ -182,7 +186,7 @@ impl Command {
             Self::SelectAll => &[Trigger::Shortcut(CTRL, Key::A, false)],
             Self::Search => &[Trigger::Text("/")],
             Self::SwitchPane => &[Trigger::Key(Key::F6)],
-            Self::NewFolder | Self::NotSpam | Self::OpenInFolder | Self::TrustSender | Self::BlockSender | Self::Refresh | Self::AllInboxes | Self::Mail | Self::Calendar | Self::Contacts | Self::WorkOffline | Self::WorkOnline | Self::Settings => &[],
+            Self::NewFolder | Self::NotSpam | Self::OpenInFolder | Self::TrustSender | Self::BlockSender | Self::CreateFilter | Self::Refresh | Self::AllInboxes | Self::Mail | Self::Calendar | Self::Contacts | Self::WorkOffline | Self::WorkOnline | Self::Settings => &[],
         }
     }
 

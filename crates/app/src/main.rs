@@ -21,6 +21,7 @@ mod compose;
 mod diag;
 mod drafts;
 mod event_form;
+mod filters;
 mod encryption;
 mod original;
 mod relocate;
@@ -40,7 +41,7 @@ mod unsubscribe;
 mod views;
 
 use beavermail_accounts as store;
-use beavermail_core::{OAuthProvider, Account, Density, DisplayMode, Hit, Keep, MailError, MailSender, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Progress, Role, Server, Settings, Sort, SortBy, SyncReport, Tls, ListLayout};
+use beavermail_core::{OAuthProvider, Account, Filter, Density, DisplayMode, Hit, Keep, MailError, MailSender, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Progress, Role, Server, Settings, Sort, SortBy, SyncReport, Tls, ListLayout};
 use beavermail_imap::ImapSource;
 use beavermail_smtp::{SmtpSender, render_draft};
 use beavermail_store::Store;
@@ -68,6 +69,9 @@ enum Event {
     Found(u64, u64, Result<Vec<Hit>, MailError>),
     /// One sync of the selected folder finished; more history may remain.
     Synced(u64, usize, Result<SyncReport, MailError>),
+    /// The filters ran on an account's Inbox: (account, the highest UID they went through when they
+    /// ran on new mail, `None` for Run now, messages they matched, messages moved, what failed).
+    Filtered(u64, Option<u32>, usize, usize, Option<String>),
     /// A folder's messages from the archive, with the spam checks' verdicts kept for them when its
     /// account's were not loaded yet (an Inbox where suspicious mail is held).
     Messages(u64, usize, Result<Vec<MessageSummary>, MailError>, Vec<(MessageId, screen::Screened)>),
@@ -894,6 +898,7 @@ enum SettingsPage {
     Writing,
     Calendars,
     Spam,
+    Filters,
     Encryption,
     Storage,
     Troubleshooting,
@@ -902,7 +907,7 @@ enum SettingsPage {
 }
 
 impl SettingsPage {
-    const ALL: [Self; 8] = [Self::Appearance, Self::Reading, Self::Writing, Self::Calendars, Self::Spam, Self::Encryption, Self::Storage, Self::Troubleshooting];
+    const ALL: [Self; 9] = [Self::Appearance, Self::Reading, Self::Writing, Self::Calendars, Self::Spam, Self::Filters, Self::Encryption, Self::Storage, Self::Troubleshooting];
 
     fn title(self) -> &'static str {
         match self {
@@ -911,6 +916,7 @@ impl SettingsPage {
             Self::Writing => "Writing",
             Self::Calendars => "Calendars",
             Self::Spam => "Suspicious mail",
+            Self::Filters => "Filters",
             Self::Storage => "Stored mail",
             Self::Encryption => "Secure mail",
             Self::Troubleshooting => "Troubleshooting",
@@ -925,6 +931,7 @@ impl SettingsPage {
             Self::Writing => Some(Icon::Pencil),
             Self::Calendars => Some(Icon::Calendar),
             Self::Spam => Some(Icon::Spam),
+            Self::Filters => Some(Icon::Sliders),
             Self::Storage => Some(Icon::Lock),
             Self::Encryption => Some(Icon::Key),
             Self::Troubleshooting => Some(Icon::LifeBuoy),
@@ -939,6 +946,7 @@ impl SettingsPage {
             Self::Writing => "How messages you write are composed and sent.",
             Self::Calendars => "The calendars synced from a server, and the one on this computer.",
             Self::Spam => "Mail from people you know is never held. Nothing moves on the server.",
+            Self::Filters => "Rules that sort new mail as it arrives: move it, star it, label it or mark it as read.",
             Self::Storage => "How downloaded messages are kept on this computer, and whether they are encrypted there.",
             Self::Encryption => "Your OpenPGP and S/MIME keys, to read encrypted mail and to send mail encrypted or signed.",
             Self::Troubleshooting => "What to send when something is slow or does not work.",
@@ -1528,6 +1536,14 @@ struct BeaverApp {
     held_counts: std::collections::HashMap<u64, (u32, u32)>,
     /// The spam checks are running over the Inbox being shown.
     checking: bool,
+    /// The account whose filters Settings › Filters shows, by key.
+    filter_account: String,
+    /// The filter being made or changed: (its place in the settings, `None` for a new one; the filter).
+    filter_edit: Option<(Option<usize>, Filter)>,
+    /// The filter Run now is applying, by its place in the settings.
+    running_filter: Option<usize>,
+    /// Accounts whose filters are running, so a sync meanwhile does not start them twice.
+    filtering: std::collections::HashSet<u64>,
 }
 
 impl BeaverApp {
@@ -1657,6 +1673,10 @@ impl BeaverApp {
             list_view: (0.0, 0.0),
             confirm_forget_marks: false,
             known: KnownCache::default(),
+            filtering: Default::default(),
+            filter_account: String::new(),
+            filter_edit: None,
+            running_filter: None,
             last_asked: None,
             visible_order: Default::default(),
             data_move: None,
@@ -1903,6 +1923,127 @@ impl BeaverApp {
         if matches!(action, views::DraftAction::SendNow) {
             self.send_outbox(serial);
         }
+    }
+
+    fn filter_page_action(&mut self, action: filters::PageAction) {
+        use filters::PageAction;
+        let filters = &mut self.settings.filters;
+        match action {
+            PageAction::Account(key) => self.filter_account = key,
+            PageAction::New => self.filter_edit = Some((None, Filter { account: self.filter_account.clone(), enabled: true, all: true, ..Filter::default() })),
+            PageAction::Edit(at) => self.filter_edit = filters.get(at).map(|f| (Some(at), f.clone())),
+            PageAction::Toggle(at) => {
+                if let Some(f) = filters.get_mut(at) {
+                    f.enabled = !f.enabled;
+                }
+                self.save_settings();
+            }
+            PageAction::Delete(at) => {
+                if at < filters.len() {
+                    filters.remove(at);
+                }
+                self.save_settings();
+            }
+            PageAction::Up(at, up) => {
+                // Past the filters of other accounts in between, to the next one of the same account.
+                let account = filters.get(at).map(|f| f.account.clone()).unwrap_or_default();
+                let other = if up { (0..at).rev().find(|&i| filters[i].account == account) } else { (at + 1..filters.len()).find(|&i| filters[i].account == account) };
+                if let Some(other) = other {
+                    filters.swap(at, other);
+                    self.save_settings();
+                }
+            }
+            PageAction::RunNow(at) => {
+                if let Some(serial) = self.accounts.iter().find(|v| self.settings.filters.get(at).is_some_and(|f| f.account == v.account.key())).map(|v| v.serial) {
+                    // Shown as running only once it has started (it does not while another run goes on).
+                    let idle = !self.filtering.contains(&serial);
+                    self.run_filters(serial, Some(at));
+                    if idle && self.filtering.contains(&serial) {
+                        self.running_filter = Some(at);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The dialog that makes or changes a filter.
+    fn filter_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
+        let Some((at, filter)) = &mut self.filter_edit else { return };
+        let view = self.accounts.iter().find(|v| v.account.key() == filter.account);
+        let folders: Vec<(String, String)> = view.map(|v| v.mailboxes.iter().filter(|m| m.role != Role::Inbox).map(|m| (m.name.clone(), views::folder_path(&m.name, m.role, m.delimiter))).collect()).unwrap_or_default();
+        let serial = view.map(|v| v.serial);
+        match filters::editor(ctx, t, filter, &folders) {
+            Some(true) => {
+                let filter = filter.clone();
+                match *at {
+                    Some(at) if at < self.settings.filters.len() => self.settings.filters[at] = filter,
+                    _ => self.settings.filters.push(filter),
+                }
+                self.filter_edit = None;
+                self.save_settings();
+                // The first filter of an account marks where new mail starts for it.
+                if let Some(serial) = serial {
+                    self.run_filters(serial, None);
+                }
+            }
+            Some(false) => self.filter_edit = None,
+            None => {}
+        }
+    }
+
+    /// Runs account `serial`'s filters in the background: on the Inbox mail they have not seen, or with
+    /// `only` (Run now) that one filter on all of the Inbox. The first time an account has filters, the
+    /// mail already there counts as seen: filters are for what arrives.
+    fn run_filters(&mut self, serial: u64, only: Option<usize>) {
+        let Some(view) = self.view(serial) else { return };
+        let key = view.account.key();
+        let filters: Vec<Filter> = match only {
+            Some(at) => self.settings.filters.get(at).filter(|f| f.account == key).map(|f| Filter { enabled: true, ..f.clone() }).into_iter().collect(),
+            None => self.settings.filters.iter().filter(|f| f.account == key && f.enabled).cloned().collect(),
+        };
+        let (Some(source), Some(inbox)) = (view.source.clone(), view.mailboxes.iter().find(|m| m.role == Role::Inbox).map(|m| m.name.clone())) else { return };
+        if filters.is_empty() || self.filtering.contains(&serial) {
+            return;
+        }
+        let highest = self.archive.uid_range(&key, &inbox).ok().flatten().map_or(0, |(_, hi, _)| hi);
+        let above = match (only, self.settings.filtered_upto.get(&key)) {
+            (Some(_), _) => 0,
+            // A folder emptied and numbered anew on the server (UIDVALIDITY) starts over from its newest.
+            (None, Some(&upto)) if upto <= highest => upto,
+            (None, _) => {
+                self.settings.filtered_upto.insert(key, highest);
+                self.save_settings();
+                return;
+            }
+        };
+        // Mail held as suspicious waits for the user's word, not for a rule.
+        let held: std::collections::HashSet<MessageId> = self.screening.iter().filter(|(_, s)| s.place == screen::Place::Spam).map(|(id, _)| *id).collect();
+        let archive = self.archive.clone();
+        self.filtering.insert(serial);
+        self.spawn(async move {
+            let arrived = match archive.arrived(&key, &inbox, above) {
+                Ok(arrived) => arrived,
+                Err(e) => return Event::Filtered(serial, None, 0, 0, Some(e.to_string())),
+            };
+            let (mut upto, mut matched, mut moved, mut error) = (above, 0, 0, None);
+            for (uid, message, recipients) in arrived {
+                if !held.contains(&message.id) {
+                    let actions = filters::actions(&filters, &message, &recipients);
+                    matched += usize::from(!actions.is_empty());
+                    for action in actions {
+                        let removes = action.removes();
+                        match perform(source.clone(), message.id, action).await {
+                            Ok(()) => moved += usize::from(removes),
+                            // Tried again with the next sync, from this message on.
+                            Err(MailError::Offline(_)) => return Event::Filtered(serial, only.is_none().then_some(upto), matched, moved, None),
+                            Err(e) => error = Some(e.to_string()),
+                        }
+                    }
+                }
+                upto = uid;
+            }
+            Event::Filtered(serial, only.is_none().then_some(upto), matched, moved, error)
+        });
     }
 
     /// Reads the messages of `folder` (folder `index` of account `serial`) from the archive, in the
@@ -2932,7 +3073,7 @@ impl BeaverApp {
         let folder = self.server_progress.iter().find_map(|(serial, p)| {
             let name = p.activity();
             let m = self.view(*serial).and_then(|v| v.mailboxes.iter().find(|m| m.name == name));
-            (!name.is_empty()).then(|| m.map_or_else(|| name.clone(), |m| views::folder_title(&m.name, m.role, m.delimiter)))
+            (!name.is_empty()).then(|| m.map_or_else(|| name.clone(), |m| views::folder_path(&m.name, m.role, m.delimiter)))
         });
         (folder.unwrap_or_default(), done, total)
     }
@@ -3665,6 +3806,7 @@ impl BeaverApp {
         };
         let dirty = account.as_ref().zip(self.account_edit.as_ref()).is_some_and(|(a, form)| form.changed(a));
         let mut changed = false;
+        let mut filter_action = None;
         let mut rescreen = false;
         let mut vault_request = None;
         let mut unlock_again = false;
@@ -3770,7 +3912,7 @@ impl BeaverApp {
                                 if let Some(form) = &mut self.account_edit {
                                     let waiting = self.signing_in.as_ref().is_some_and(|s| s.editing.is_some() && s.editing == form.editing);
                                     let folders: Vec<(String, String)> = form.editing.and_then(|serial| self.accounts.iter().find(|v| v.serial == serial)).map(|v| {
-                                        v.mailboxes.iter().filter(|m| matches!(m.role, Role::Archive | Role::Other)).map(|m| (m.name.clone(), views::folder_title(&m.name, m.role, m.delimiter))).collect()
+                                        v.mailboxes.iter().filter(|m| matches!(m.role, Role::Archive | Role::Other)).map(|m| (m.name.clone(), views::folder_path(&m.name, m.role, m.delimiter))).collect()
                                     }).unwrap_or_default();
                                     page_action = account_page(ui, t, form, waiting, &folders);
                                 }
@@ -3980,6 +4122,16 @@ impl BeaverApp {
                                         changed = true;
                                     }
                                 }
+                            }
+                            SettingsPage::Filters => {
+                                let accounts: Vec<(String, String)> = self.accounts.iter().map(|v| (v.account.key(), v.account.address().to_owned())).collect();
+                                if !accounts.iter().any(|(k, _)| *k == self.filter_account) {
+                                    self.filter_account = accounts.first().map(|(k, _)| k.clone()).unwrap_or_default();
+                                }
+                                let view = self.accounts.iter().find(|v| v.account.key() == self.filter_account);
+                                let title = |name: &str| view.and_then(|v| v.mailboxes.iter().find(|m| m.name == name)).map_or_else(|| name.to_owned(), |m| views::folder_path(&m.name, m.role, m.delimiter));
+                                let busy = view.is_some_and(|v| self.filtering.contains(&v.serial));
+                                filter_action = filters::page(ui, t, &accounts, &self.filter_account, &self.settings.filters, &title, busy.then_some(self.running_filter).flatten(), busy);
                             }
                             SettingsPage::Spam => {
                                 let about = "Mail from a new sender that fails a check waits under Suspicious, beside the Inbox.";
@@ -4193,6 +4345,9 @@ impl BeaverApp {
             self.form = Some(NewAccount::default());
         }
         self.leave_dialog(ctx, t);
+        if let Some(action) = filter_action {
+            self.filter_page_action(action);
+        }
         if changed {
             self.save_settings();
         }
@@ -6112,6 +6267,7 @@ impl BeaverApp {
             ui.separator();
             item(ui, Command::TrustSender, "Trust sender");
             item(ui, Command::BlockSender, "Block sender…");
+            item(ui, Command::CreateFilter, "Create filter…");
             item(ui, Command::ViewSource, "View source");
         }
         chosen
@@ -6489,6 +6645,14 @@ impl BeaverApp {
                     _ => Ok(()),
                 }
             }
+            Command::CreateFilter => {
+                let id = one()?;
+                match self.role_of(id) {
+                    Role::Sent | Role::Drafts => Err("Your own mail"),
+                    _ if self.summary_of(id).is_none_or(|m| m.address.is_empty()) => Err("The message has no sender address"),
+                    _ => Ok(()),
+                }
+            }
             Command::BlockSender => {
                 let id = one()?;
                 match self.role_of(id) {
@@ -6582,6 +6746,16 @@ impl BeaverApp {
                 }
             }
             Command::BlockSender => self.confirm_block = one,
+            Command::CreateFilter => {
+                // Settings › Filters for the message's account, with a filter on its sender to finish.
+                let found = one.and_then(|id| Some((self.view(self.serial_of(id)?)?.account.key(), self.summary_of(id)?.address.clone())));
+                if let Some((account, address)) = found {
+                    self.filter_account.clone_from(&account);
+                    self.filter_edit = Some((None, Filter { account, enabled: true, all: true, conditions: vec![beavermail_core::Condition::From(address)], ..Filter::default() }));
+                    self.show_settings = true;
+                    self.settings_page = SettingsPage::Filters;
+                }
+            }
             Command::ViewSource => {
                 if let Some(id) = one {
                     self.view_source(id);
@@ -6899,8 +7073,43 @@ impl BeaverApp {
                     self.spawn(async move { Event::Mailboxes(serial, counts.cached_mailboxes().await, false) });
                 }
             }
+            Event::Filtered(serial, upto, matched, moved, error) => {
+                self.filtering.remove(&serial);
+                // Run now says what it did, even when nothing matched or nothing moved.
+                let ran_now = upto.is_none() && self.running_filter.take().is_some();
+                if let (Some(upto), Some(key)) = (upto, self.view(serial).map(|v| v.account.key())) {
+                    self.settings.filtered_upto.insert(key, upto);
+                    self.save_settings();
+                }
+                if let Some(error) = error {
+                    self.error = Some(format!("A filter could not finish: {error}"));
+                }
+                let plural = |n: usize| if n == 1 { "" } else { "s" };
+                if ran_now {
+                    let text = match (matched, moved) {
+                        (0, _) => "No mail in the Inbox matches the filter".to_owned(),
+                        (n, 0) => format!("Filter applied to {n} message{}", plural(n)),
+                        (n, m) => format!("Filter applied to {n} message{}, {m} moved", plural(n)),
+                    };
+                    self.notice = Some((text, std::time::Instant::now()));
+                } else if moved > 0 {
+                    self.notice = Some((format!("Filters moved {moved} message{}", plural(moved)), std::time::Instant::now()));
+                }
+                // What they changed shows in the list and the counts.
+                if let Some((_, index)) = self.shown().into_iter().find(|(s, _)| *s == serial)
+                    && let Some(view) = self.view(serial)
+                    && let (Some(source), Some(name)) = (view.source.clone(), view.mailboxes.get(index).map(|m| m.name.clone()))
+                {
+                    let counts = source.clone();
+                    self.list(serial, index, source, name);
+                    self.spawn(async move { Event::Mailboxes(serial, counts.cached_mailboxes().await, false) });
+                }
+            }
             Event::Synced(serial, index, result) => {
                 self.syncing = self.syncing.saturating_sub(1);
+                if result.is_ok() && self.view(serial).and_then(|v| v.mailboxes.get(index)).is_some_and(|m| m.role == Role::Inbox) {
+                    self.run_filters(serial, None);
+                }
                 if !self.shows(serial, index) {
                     return;
                 }
@@ -9333,6 +9542,7 @@ impl eframe::App for BeaverApp {
         self.book_remove_dialog(ui.ctx(), &t);
         self.calendar_remove_dialog(ui.ctx(), &t);
         self.data_move_dialog(ui.ctx(), &t);
+        self.filter_dialog(ui.ctx(), &t);
         self.event_dialogs(ui.ctx(), &t);
         let logins: Vec<(u64, String)> = self.accounts.iter().map(|v| (v.serial, v.account.address().to_owned())).collect();
         let added: Vec<String> = self.settings.calendars.iter().map(|c| c.url.clone()).collect();

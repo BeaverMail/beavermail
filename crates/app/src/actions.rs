@@ -8,7 +8,7 @@ use std::sync::Arc;
 use beavermail_core::{MailError, MailSource, MessageId, MessageSummary, Role};
 use beavermail_imap::ImapSource;
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Action {
     Unread(bool),
     /// Kept at the top of its folder (`true`), or not any more.
