@@ -484,6 +484,27 @@ impl Query {
         query
     }
 
+    /// The IMAP `SEARCH` criteria (RFC 9051 6.4.4) for what this asks, `in:` aside.
+    fn imap(&self) -> String {
+        let quote = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
+        let date = |t: i64| chrono::DateTime::from_timestamp(t, 0).map(|d| d.with_timezone(&chrono::Local).format("%-d-%b-%Y").to_string());
+        let mut parts: Vec<String> = self.words.iter().map(|w| format!("TEXT {}", quote(w))).collect();
+        parts.extend(self.from.iter().map(|w| format!("FROM {}", quote(w))));
+        parts.extend(self.to.iter().map(|w| format!("OR TO {0} CC {0}", quote(w))));
+        parts.extend(self.subject.iter().map(|w| format!("SUBJECT {}", quote(w))));
+        parts.extend(self.after.and_then(date).map(|d| format!("SINCE {d}")));
+        parts.extend(self.before.and_then(date).map(|d| format!("BEFORE {d}")));
+        if self.unread {
+            parts.push("UNSEEN".into());
+        }
+        // shortcut: IMAP cannot ask for attachments; a mixed message nearly always carries one.
+        if self.attachment {
+            parts.push("HEADER Content-Type \"multipart/mixed\"".into());
+        }
+        let text = if parts.is_empty() { "ALL".to_owned() } else { parts.join(" ") };
+        if text.is_ascii() { text } else { format!("CHARSET UTF-8 {text}") }
+    }
+
     /// Nothing asked for: `in:all` alone only says where, not what.
     fn is_empty(&self) -> bool {
         *self == Self { all: self.all, ..Self::default() }
@@ -1757,6 +1778,39 @@ impl Store {
         rows.collect::<Result<_, _>>().map_err(db)
     }
 
+    /// What `query` asks the server, for mail not on this computer: the folders [`Store::search`] would
+    /// look in, and the IMAP `SEARCH` criteria. `None` when it asks for nothing.
+    pub fn server_search(&self, account: &str, query: &str) -> Result<Option<(Vec<String>, String)>, MailError> {
+        let query = Query::parse(query);
+        if query.is_empty() {
+            return Ok(None);
+        }
+        let named = |name: &str, role: Role, word: &str| {
+            let (name, word) = (name.to_lowercase(), word.to_lowercase());
+            name == word || name.ends_with(&format!("/{word}")) || name.ends_with(&format!(".{word}")) || role_named(&word) == Some(role)
+        };
+        let folders = self
+            .folders(account)?
+            .into_iter()
+            .filter(|f| if query.folders.is_empty() { query.all || !matches!(f.role, Role::Junk | Role::Trash) } else { query.folders.iter().any(|w| named(&f.name, f.role, w)) })
+            .map(|f| f.name)
+            .collect();
+        Ok(Some((folders, query.imap())))
+    }
+
+    /// The messages of `folder` with these UIDs that are in the archive, newest first.
+    pub fn found(&self, account: &str, folder: &str, uids: &[u32]) -> Result<Vec<Hit>, MailError> {
+        if uids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let list = uids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT {SUMMARY_COLUMNS}, folder FROM messages WHERE account = ?1 AND folder = ?2 AND uid IN ({list}) ORDER BY timestamp DESC");
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&sql).map_err(db)?;
+        let rows = stmt.query_map(params![account, folder], |r| Ok(Hit { message: summary(r)?, folder: r.get(16)? })).map_err(db)?;
+        rows.collect::<Result<_, _>>().map_err(db)
+    }
+
     /// The id of the message with this UID, if it is cached.
     pub fn id_of(&self, account: &str, folder: &str, uid: u32) -> Result<Option<MessageId>, MailError> {
         let conn = self.conn();
@@ -2174,6 +2228,24 @@ mod tests {
         store.index_body(waiting[0].0, "text").unwrap();
         store.mark_indexed(waiting[1].0).unwrap();
         assert!(store.unindexed("me", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_search_asks_the_server_in_the_same_folders() {
+        let store = store();
+        store.set_folders("me", &[("INBOX".into(), Role::Inbox), ("INBOX/Testing".into(), Role::Other), ("Junk".into(), Role::Junk), ("Trash".into(), Role::Trash)]).unwrap();
+        let ask = |q: &str| store.server_search("me", q).unwrap().map(|(mut f, c)| {
+            f.sort();
+            (f, c)
+        });
+        assert_eq!(ask("in:all"), None);
+        assert_eq!(ask("budget from:ada"), Some((vec!["INBOX".into(), "INBOX/Testing".into()], r#"TEXT "budget" FROM "ada""#.into())));
+        assert_eq!(ask("in:testing is:unread").unwrap(), (vec!["INBOX/Testing".into()], "UNSEEN".into()));
+        assert_eq!(ask("in:spam x").unwrap().0, vec!["Junk".to_owned()]);
+        assert_eq!(ask(r#"in:all "say \"hi\"""#).unwrap().0.len(), 4);
+        assert_eq!(ask("caffè to:bob").unwrap().1, r#"CHARSET UTF-8 TEXT "caffè" OR TO "bob" CC "bob""#);
+        assert!(ask("after:2026-10-01 x").unwrap().1.ends_with("SINCE 1-Oct-2026"));
+        assert_eq!(store.found("me", "INBOX", &[]).unwrap(), Vec::new());
     }
 
     #[test]

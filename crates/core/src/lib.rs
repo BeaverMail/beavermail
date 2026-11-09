@@ -56,6 +56,11 @@ pub trait MailSource {
     /// `from:`, `subject:`, `in:<folder>`, `is:unread`, `has:attachment`. Newest first.
     fn search(&self, query: &str, limit: usize) -> impl Future<Output = Result<Vec<Hit>, MailError>> + Send;
 
+    /// The same search asked of the server, folder by folder, for what is not on this computer: what
+    /// each folder finds is added to the local archive (headers only) and given to `found`, newest first.
+    /// `progress` counts the folders and names the one asked; its `cancel` stops it at once.
+    fn search_server(&self, query: &str, limit: usize, progress: &Progress, found: &(dyn Fn(Vec<Hit>) + Send + Sync)) -> impl Future<Output = Result<(), MailError>> + Send;
+
     /// Asks the server for the mailboxes, remembers them locally and returns them.
     fn mailboxes(&self) -> impl Future<Output = Result<Vec<Mailbox>, MailError>> + Send;
 

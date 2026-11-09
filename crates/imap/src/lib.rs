@@ -1178,6 +1178,53 @@ impl MailSource for ImapSource {
         self.store.search(&self.account, query, limit)
     }
 
+    async fn search_server(&self, query: &str, limit: usize, progress: &Progress, found: &(dyn Fn(Vec<Hit>) + Send + Sync)) -> Result<(), MailError> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some((folders, criteria)) = self.store.server_search(&self.account, query)? else { return Ok(()) };
+        progress.total.store(folders.len() as u32, Relaxed);
+        for folder in folders {
+            if progress.cancel.load(Relaxed) {
+                return Ok(());
+            }
+            progress.set_activity(folder.as_str());
+            let mut state = self.state.lock().await;
+            let session = state.session(&self.config).await?;
+            let asked = async {
+                session.examine(&folder).await?;
+                let mut uids: Vec<u32> = session.uid_search(&criteria).await?.into_iter().collect();
+                // The highest UIDs are the latest to arrive: the newest, near enough.
+                uids.sort_unstable_by(|a, b| b.cmp(a));
+                uids.truncate(limit);
+                let missing: Vec<String> = uids.iter().filter(|u| matches!(self.store.id_of(&self.account, &folder, **u), Ok(None))).map(u32::to_string).collect();
+                let headers = if missing.is_empty() { Vec::new() } else { Self::fetch_headers(session, &missing.join(","), true).await? };
+                Ok::<_, async_imap::error::Error>((uids, headers))
+            };
+            // IMAP cannot take back a command: stopping drops the connection, made again when next needed.
+            let stopped = async {
+                while !progress.cancel.load(Relaxed) {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+            };
+            let answer = tokio::select! {
+                answer = asked => Some(answer),
+                () = stopped => None,
+            };
+            let Some(answer) = answer else {
+                state.session = None;
+                return Ok(());
+            };
+            let (uids, headers) = answer.map_err(|e| state.failed(e))?;
+            drop(state);
+            self.store.add_headers(&self.account, &folder, &headers)?;
+            let hits = self.store.found(&self.account, &folder, &uids)?;
+            if !hits.is_empty() {
+                found(hits);
+            }
+            progress.done.fetch_add(1, Relaxed);
+        }
+        Ok(())
+    }
+
     async fn mailboxes(&self) -> Result<Vec<Mailbox>, MailError> {
         let mut state = self.state.lock().await;
         let result = async {

@@ -60,6 +60,11 @@ fn read_only() -> MailError {
 }
 
 impl MailSource for SampleSource {
+    async fn search_server(&self, query: &str, limit: usize, _progress: &Progress, found: &(dyn Fn(Vec<Hit>) + Send + Sync)) -> Result<(), MailError> {
+        found(self.search(query, limit).await?);
+        Ok(())
+    }
+
     async fn cached_mailboxes(&self) -> Result<Vec<Mailbox>, MailError> {
         self.mailboxes().await
     }

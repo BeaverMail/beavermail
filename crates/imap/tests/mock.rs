@@ -765,3 +765,31 @@ async fn messages_stored_before_indexing_existed_get_indexed_by_the_next_run() {
     mock.source.download(Keep::Opened, &Progress::default()).await.unwrap();
     assert_eq!(mock.source.search("there", 10).await.unwrap().len(), 1, "the stored file was read again");
 }
+
+#[tokio::test]
+async fn a_server_search_brings_what_is_not_here() {
+    let mock = start(true).await;
+    mock.source.mailboxes().await.expect("list folders");
+    assert!(mock.source.search("hello", 10).await.unwrap().is_empty(), "nothing stored yet");
+    let (progress, hits) = (beavermail_core::Progress::default(), Mutex::new(Vec::new()));
+    mock.source.search_server("hello in:inbox", 10, &progress, &|found| hits.lock().unwrap().extend(found)).await.expect("server search");
+    let hits = hits.into_inner().unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!((progress.done.load(std::sync::atomic::Ordering::Relaxed), progress.total.load(std::sync::atomic::Ordering::Relaxed)), (1, 1));
+    assert_eq!(hits[0].folder, "INBOX");
+    let commands = mock.commands();
+    assert!(commands.iter().any(|c| c == "UID SEARCH TEXT \"hello\""), "{commands:?}");
+    assert!(commands.iter().any(|c| c.starts_with("UID FETCH 9,5 ")), "{commands:?}");
+    // Kept here now: found again without the server.
+    assert_eq!(mock.store.found(&mock.account.key(), "INBOX", &[5]).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_stopped_server_search_asks_nothing_more() {
+    let mock = start(true).await;
+    mock.source.mailboxes().await.expect("list folders");
+    let progress = beavermail_core::Progress::default();
+    progress.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    mock.source.search_server("hello", 10, &progress, &|_| panic!("nothing found once stopped")).await.unwrap();
+    assert!(!mock.commands().iter().any(|c| c.starts_with("UID SEARCH")));
+}

@@ -101,6 +101,10 @@ enum Event {
     Attachment(Result<(String, Vec<u8>), MailError>),
     /// Saving attachments through a file dialog ended: `None` when the user cancelled, else what to tell them.
     Saved(Result<Option<String>, String>),
+    /// What one folder on a server holds for search `seq`, added to what the archive found.
+    FoundOnServer(u64, u64, Vec<Hit>),
+    /// An account's server was searched to the end, or stopped.
+    ServerSearched(u64, u64, Result<(), MailError>),
     /// A new place for the data folder was chosen and checked; `None` when the user cancelled.
     DataFolder(Option<Result<relocate::Plan, String>>),
     /// Files chosen in the "attach" dialog.
@@ -1277,6 +1281,9 @@ struct BeaverApp {
     search_seq: u64,
     hits_seq: u64,
     hits: Vec<(u64, Hit)>,
+    /// The search the server was asked for too, and the accounts still searching it, folder by folder.
+    server_seq: u64,
+    server_progress: Vec<(u64, Arc<Progress>)>,
     focus_search: bool,
     compose: Option<compose::Compose>,
     /// Drafts on this computer for the account being shown (filled while a Drafts folder is open).
@@ -1525,6 +1532,8 @@ impl BeaverApp {
             search_seq: 0,
             hits_seq: 0,
             hits: Vec::new(),
+            server_seq: 0,
+            server_progress: Vec::new(),
             focus_search: false,
             compose: None,
             drafts: Vec::new(),
@@ -2453,7 +2462,8 @@ impl BeaverApp {
         let view = self.view(serial)?;
         let folder = view.mailboxes.get(index)?;
         if self.searching() {
-            return Some(format!("{} result{}", views::thousands(self.hits.len() as u32), if self.hits.len() == 1 { "" } else { "s" }));
+            let server = if self.server_seq == self.search_seq && self.server_progress.is_empty() { "  ·  here and on the server" } else { "" };
+            return Some(format!("{} result{}{server}", views::thousands(self.hits.len() as u32), if self.hits.len() == 1 { "" } else { "s" }));
         }
         let total = folder.total.max(self.messages.len() as u32);
         let mut parts = vec![format!("{} message{}", views::thousands(total), if total == 1 { "" } else { "s" })];
@@ -2763,12 +2773,70 @@ impl BeaverApp {
     fn run_search(&mut self) {
         self.searched.clone_from(&self.query);
         self.search_seq += 1;
-        let (seq, query) = (self.search_seq, self.query.trim().to_owned());
-        if query.is_empty() {
+        self.stop_server_search();
+        if self.query.trim().is_empty() {
             self.hits.clear();
             self.search_scope = Scope::Folder;
             return;
         }
+        let seq = self.search_seq;
+        for (serial, source, query) in self.search_targets() {
+            self.spawn(async move { Event::Found(seq, serial, source.search(&query, 200).await) });
+        }
+    }
+
+    /// Asks the servers too, for the search shown, as the archive was asked.
+    fn search_server(&mut self) {
+        let seq = self.search_seq;
+        self.server_seq = seq;
+        for (serial, source, query) in self.search_targets() {
+            let progress = Arc::new(Progress::default());
+            self.server_progress.push((serial, progress.clone()));
+            let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+            self.spawn(async move {
+                let found = move |hits| {
+                    let _ = tx.send(Event::FoundOnServer(seq, serial, hits));
+                    ctx.request_repaint();
+                };
+                Event::ServerSearched(seq, serial, source.search_server(&query, 100, &progress, &found).await)
+            });
+        }
+    }
+
+    /// Stops asking the servers; what they found so far stays.
+    fn stop_server_search(&mut self) {
+        for (_, progress) in self.server_progress.drain(..) {
+            progress.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.server_seq = 0;
+    }
+
+    /// The servers being searched: the folder asked now, as the sidebar names it, and the folders
+    /// asked so far and in all, every account's together.
+    fn server_searching(&self) -> (String, u32, u32) {
+        let load = |n: &std::sync::atomic::AtomicU32| n.load(std::sync::atomic::Ordering::Relaxed);
+        let (done, total) = self.server_progress.iter().fold((0, 0), |(d, t), (_, p)| (d + load(&p.done), t + load(&p.total)));
+        let folder = self.server_progress.iter().find_map(|(serial, p)| {
+            let name = p.activity();
+            let m = self.view(*serial).and_then(|v| v.mailboxes.iter().find(|m| m.name == name));
+            (!name.is_empty()).then(|| m.map_or_else(|| name.clone(), |m| views::folder_title(&m.name, m.role, m.delimiter)))
+        });
+        (folder.unwrap_or_default(), done, total)
+    }
+
+    /// How much of the mail is on this computer, the least kept of any account.
+    fn kept_here(&self) -> &'static str {
+        match self.accounts.iter().map(|v| v.account.keep).max_by_key(|k| *k as u8) {
+            Some(Keep::Opened) => "Only the messages you opened are on this computer",
+            Some(Keep::Month) => "Only the last 30 days of mail are on this computer",
+            Some(Keep::Year) => "Only the last 12 months of mail are on this computer",
+            _ => "Searched the mail on this computer",
+        }
+    }
+
+    /// The accounts to search for the query in the box, each with the query it is asked.
+    fn search_targets(&self) -> Vec<(u64, Arc<ImapSource>, String)> {
+        let query = self.query.trim().to_owned();
         // Where the labels under the box say (the folder shown: every account's, in All inboxes), unless
         // the query names a folder itself: "in:all" is everywhere.
         let named = names_folder(&query);
@@ -2776,15 +2844,18 @@ impl BeaverApp {
         let shown: std::collections::HashMap<u64, String> =
             if scope != Scope::Folder || self.show_scheduled { Default::default() } else { self.shown().into_iter().filter_map(|(s, i)| Some((s, self.view(s)?.mailboxes.get(i)?.name.clone()))).collect() };
         let only = self.selected.map(|(s, _)| s).filter(|_| scope == Scope::Account && !self.unified);
-        let sources: Vec<(u64, Arc<ImapSource>)> = self.accounts.iter().filter(|v| only.is_none_or(|s| s == v.serial)).filter_map(|v| Some((v.serial, v.source.clone()?))).collect();
-        for (serial, source) in sources {
-            let query = match shown.get(&serial) {
-                Some(folder) => format!("{query} in:\"{folder}\""),
-                None if shown.is_empty() => query.clone(),
-                None => continue,
-            };
-            self.spawn(async move { Event::Found(seq, serial, source.search(&query, 200).await) });
-        }
+        self.accounts
+            .iter()
+            .filter(|v| only.is_none_or(|s| s == v.serial))
+            .filter_map(|v| {
+                let query = match shown.get(&v.serial) {
+                    Some(folder) => format!("{query} in:\"{folder}\""),
+                    None if shown.is_empty() => query.clone(),
+                    None => return None,
+                };
+                Some((v.serial, v.source.clone()?, query))
+            })
+            .collect()
     }
 
     /// The labels under the search box, as (where, label, what it means): the folder shown, its
@@ -6644,6 +6715,17 @@ impl BeaverApp {
                 }
                 self.apply(Event::Mailboxes(serial, result, true));
             }
+            Event::FoundOnServer(seq, serial, found) => self.apply(Event::Found(seq, serial, Ok(found))),
+            Event::ServerSearched(seq, serial, result) => {
+                if seq != self.server_seq {
+                    return; // stopped, or another search since
+                }
+                self.server_progress.retain(|(s, _)| *s != serial);
+                if let Err(e) = result {
+                    let name = self.view(serial).map_or_else(String::new, |v| format!(" for {}", v.account.address()));
+                    self.error = Some(format!("Could not search the server{name}: {e}"));
+                }
+            }
             Event::Found(seq, serial, result) => {
                 if seq != self.search_seq {
                     return; // an answer to a query that has been changed since
@@ -6658,7 +6740,8 @@ impl BeaverApp {
                         let want = if self.show_suspicious { screen::Place::Spam } else { screen::Place::Inbox };
                         let holding = self.holding();
                         let fits = |h: &Hit| !holding || self.screening.get(&h.message.id).map_or(!self.show_suspicious, |s| s.place == want);
-                        let found: Vec<Hit> = found.into_iter().filter(fits).collect();
+                        // The servers answer with what the archive found too.
+                        let found: Vec<Hit> = found.into_iter().filter(|h| fits(h) && !self.hits.iter().any(|(s, x)| *s == serial && x.message.id == h.message.id)).collect();
                         self.hits.extend(found.into_iter().map(|h| (serial, h)));
                         self.hits.sort_by_key(|(_, h)| std::cmp::Reverse(h.message.timestamp));
                         self.hits.truncate(300);
@@ -8193,11 +8276,46 @@ impl BeaverApp {
                     let here = scopes.iter().find(|(s, ..)| *s == self.search_scope).filter(|_| self.search_scope != Scope::Everywhere && !names_folder(&self.query));
                     let wider = here.map(|_| if self.accounts.len() > 1 { "Search everywhere" } else { "Search all folders" });
                     let title = here.map_or("No results".to_owned(), |(_, l, _)| format!("Not in {l}"));
-                    if views::empty_state(ui, t, &title, "Nothing stored on this computer matches. Try fewer words.", wider) {
-                        self.search_scope = Scope::Everywhere;
-                        self.searched.clear();
+                    // Then the servers, for what is not on this computer.
+                    let asked = self.server_seq == self.search_seq;
+                    if asked && !self.server_progress.is_empty() {
+                        let (folder, done, total) = self.server_searching();
+                        if views::server_searching(ui, t, &folder, done, total) {
+                            self.stop_server_search();
+                        }
+                        return;
+                    }
+                    let (hint, action) = match (wider, asked) {
+                        (Some(_), _) => ("Nothing stored on this computer matches. Try fewer words.".to_owned(), wider),
+                        (None, false) => (format!("{}. Older mail, or mail never downloaded, may be on the server.", self.kept_here()), Some("Search on the server")),
+                        (None, true) => ("Nothing matches, here or on the server. Try fewer words.".to_owned(), None),
+                    };
+                    if views::empty_state(ui, t, &title, &hint, action) {
+                        if wider.is_some() {
+                            self.search_scope = Scope::Everywhere;
+                            self.searched.clear();
+                        } else {
+                            self.search_server();
+                        }
                     }
                     return;
+                }
+                // Asked of the server, or being asked; once it has answered the count above says so.
+                let state = if self.server_seq != self.search_seq {
+                    Some(views::ServerSearch::Offer(self.kept_here()))
+                } else if !self.server_progress.is_empty() {
+                    let (folder, done, total) = self.server_searching();
+                    Some(views::ServerSearch::Running(folder, done, total))
+                } else {
+                    None
+                };
+                if let Some(state) = state
+                    && views::server_bar(ui, t, &state)
+                {
+                    match state {
+                        views::ServerSearch::Offer(_) => self.search_server(),
+                        views::ServerSearch::Running(..) => self.stop_server_search(),
+                    }
                 }
                 ui.spacing_mut().item_spacing.y = 0.0; // rows touch, so row `i` starts at `i` times the row height
                 if table {

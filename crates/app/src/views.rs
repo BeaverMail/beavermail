@@ -924,6 +924,83 @@ pub fn remote_bar(ui: &mut Ui, t: &Tokens, loaded: bool, sender: &str) -> Option
     choice
 }
 
+/// Where a search stands with the server: offered, with what is kept on this computer, or running.
+pub enum ServerSearch<'a> {
+    Offer(&'a str),
+    /// The folder asked now, as shown, and the folders asked so far and in all.
+    Running(String, u32, u32),
+}
+
+impl ServerSearch<'_> {
+    fn running(folder: &str, done: u32, total: u32) -> (String, f32) {
+        let at = (done + 1).min(total.max(1));
+        let line = if folder.is_empty() { "Connecting…".to_owned() } else { format!("{folder}  ·  folder {at} of {}", total.max(1)) };
+        (line, done as f32 / total.max(1) as f32)
+    }
+}
+
+/// The bar above search results that asks the server too, or shows it being asked. True when its
+/// button (Search on the server, or Stop) is clicked.
+pub fn server_bar(ui: &mut Ui, t: &Tokens, state: &ServerSearch) -> bool {
+    let mut clicked = false;
+    egui::Frame::new().outer_margin(egui::Margin { left: 16, right: 12, top: 2, bottom: 8 }).show(ui, |ui| {
+        egui::Frame::new().fill(t.input).stroke(egui::Stroke::new(1.0, t.border)).corner_radius(egui::CornerRadius::same(crate::theme::CONTROL_RADIUS)).inner_margin(egui::Margin::symmetric(12, 10)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let fraction = ui.horizontal(|ui| {
+                let (title, detail, fraction) = match state {
+                    ServerSearch::Offer(kept) => {
+                        ui.add(Icon::Search.image(icons::SIZE, t.text_dim));
+                        ((*kept).to_owned(), "Older mail, or mail never downloaded, may be on the server.".to_owned(), None)
+                    }
+                    ServerSearch::Running(folder, done, total) => {
+                        ui.add(egui::Spinner::new().size(icons::SIZE).color(t.accent));
+                        let (line, fraction) = ServerSearch::running(folder, *done, *total);
+                        ("Searching the server…".to_owned(), line, Some(fraction))
+                    }
+                };
+                ui.add_space(4.0);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.label(egui::RichText::new(title).size(13.5).color(t.text));
+                    ui.label(egui::RichText::new(detail).size(13.0).color(t.text_dim));
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    clicked = match state {
+                        ServerSearch::Offer(_) => ui.add(egui::Button::image_and_text(Icon::Search.image(16.0, t.text), "Search on the server")).on_hover_text("Ask the server too, folder by folder; what it finds is kept here").clicked(),
+                        ServerSearch::Running(..) => ui.button("Stop").on_hover_text("Keep what was found so far").clicked(),
+                    };
+                });
+                fraction
+            });
+            if let Some(fraction) = fraction.inner {
+                ui.add_space(8.0);
+                ui.add(egui::ProgressBar::new(fraction).desired_height(4.0).fill(t.accent));
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+            }
+        });
+    });
+    clicked
+}
+
+/// The search asking the server while nothing is found yet, centred as an empty view. True on Stop.
+pub fn server_searching(ui: &mut Ui, t: &Tokens, folder: &str, done: u32, total: u32) -> bool {
+    let (line, fraction) = ServerSearch::running(folder, done, total);
+    let mut clicked = false;
+    ui.vertical_centered(|ui| {
+        ui.add_space((ui.available_height() * 0.35).max(24.0));
+        ui.add(egui::Spinner::new().size(28.0).color(t.accent));
+        ui.add_space(8.0);
+        ui.heading("Searching the server");
+        ui.label(egui::RichText::new(line).color(t.text_dim));
+        ui.add_space(12.0);
+        ui.add(egui::ProgressBar::new(fraction).desired_width(260.0).desired_height(4.0).fill(t.accent));
+        ui.add_space(12.0);
+        clicked = ui.button("Stop").on_hover_text("Keep what was found so far").clicked();
+    });
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+    clicked
+}
+
 /// The one filled button of a group.
 pub fn primary_button(ui: &mut Ui, t: &Tokens, label: &str, enabled: bool) -> Response {
     let button = egui::Button::new(egui::RichText::new(label).color(t.on_accent)).fill(t.accent);
