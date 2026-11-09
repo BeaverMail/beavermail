@@ -24,6 +24,7 @@ mod event_form;
 mod encryption;
 mod original;
 mod relocate;
+mod search_form;
 mod remote;
 mod screen;
 mod sender;
@@ -1312,6 +1313,8 @@ struct BeaverApp {
     search_seq: u64,
     hits_seq: u64,
     hits: Vec<(u64, Hit)>,
+    /// The search options form while it is open; see [`search_form`].
+    search_fields: search_form::Fields,
     /// The search the server was asked for too, and the accounts still searching it, folder by folder.
     server_seq: u64,
     server_progress: Vec<(u64, Arc<Progress>)>,
@@ -1570,6 +1573,7 @@ impl BeaverApp {
             hits: Vec::new(),
             server_seq: 0,
             server_progress: Vec::new(),
+            search_fields: search_form::Fields::default(),
             focus_search: false,
             compose: None,
             drafts: Vec::new(),
@@ -8241,10 +8245,23 @@ impl BeaverApp {
             let mut field = None;
             ui.horizontal(|ui| {
                 ui.add_space(12.0);
-                let width = ui.available_width() - theme::CONTROL_H - 20.0;
+                let width = ui.available_width() - 2.0 * theme::CONTROL_H - 24.0;
                 let focus = std::mem::take(&mut self.focus_search);
                 field = Some(views::search_box(ui, t, &mut self.query, "Search mail  ( / )", width, focus)
                     .on_hover_text(format!("Search the folder shown, as stored on this computer; the labels under the box look further.\nWords, \"a phrase\", from:ada, to:bob, subject:invoice, in:inbox (in: lists the folders), is:unread, has:attachment, after:2026-09-01, before:2026-10\n\nAll commands and their keys: {}", Command::Palette.keys(ui.ctx()))));
+                // The same search from fields, read from the box and written back to it.
+                let options = icons::button(ui, t, Icon::Sliders, "Search options: from, to, subject, dates…", true, false);
+                if options.clicked() {
+                    self.search_fields = search_form::Fields::parse(&self.query);
+                }
+                let frame = egui::Frame::popup(ui.style()).inner_margin(egui::Margin::same(20));
+                egui::Popup::from_toggle_button_response(&options).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).align(egui::RectAlign::BOTTOM_END).frame(frame).show(|ui| {
+                    ui.set_width(400.0);
+                    if search_form::panel(ui, t, &mut self.search_fields) {
+                        self.query = self.search_fields.query();
+                        ui.close();
+                    }
+                });
                 if self.syncing > 0 {
                     ui.allocate_ui(vec2(theme::CONTROL_H - 4.0, theme::CONTROL_H - 4.0), |ui| ui.centered_and_justified(|ui| views::slow_spinner(ui, 16.0))).response.on_hover_text("Syncing…");
                 } else {

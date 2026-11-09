@@ -543,7 +543,7 @@ fn day_start(text: &str) -> Option<i64> {
 }
 
 /// Splits on spaces; a double-quoted run stays one token (without its quotes).
-fn tokens(text: &str) -> Vec<String> {
+pub fn tokens(text: &str) -> Vec<String> {
     let (mut out, mut current, mut quoted) = (Vec::new(), String::new(), false);
     for c in text.chars() {
         match c {
