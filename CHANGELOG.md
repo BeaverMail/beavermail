@@ -25,6 +25,7 @@ What changed in each version of BeaverMail, newest first.
 
 ### Changed
 
+- On servers that keep mod-sequences (CONDSTORE: Gmail, Dovecot, Fastmail and others), a folder that did not change since the last sync is not asked again, and one where only flags changed is asked only for those, across the whole folder.
 - Settings › Encryption is now Secure mail, set apart from Stored mail, where mail on this computer is encrypted.
 - Fewer false alarms in the spam checks.
 - All inboxes, Suspicious and Spam get the menus of an account's own folders.

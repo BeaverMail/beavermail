@@ -40,6 +40,8 @@ struct Mock {
     broken: Arc<Mutex<bool>>,
     /// The server refuses LOGIN before TLS and says so (LOGINDISABLED).
     tls_only: Arc<Mutex<bool>>,
+    /// The server keeps mod-sequences (CONDSTORE) and its folders are at this one.
+    modseq: Arc<Mutex<Option<u64>>>,
 }
 
 impl Mock {
@@ -76,8 +78,8 @@ async fn start_opts(move_works: bool, attachment: bool, idle: bool) -> Mock {
     let log = Arc::new(Mutex::new(Vec::new()));
     let message = Arc::new(Mutex::new(MESSAGE.to_owned()));
     let list = Arc::new(Mutex::new(LIST.to_owned()));
-    let (bye, broken, tls_only) = (Arc::new(Mutex::new(None)), Arc::new(Mutex::new(false)), Arc::new(Mutex::new(false)));
-    let (served, replies) = (log.clone(), Replies { message: message.clone(), list: list.clone(), bye: bye.clone(), broken: broken.clone(), tls_only: tls_only.clone() });
+    let (bye, broken, tls_only, modseq) = (Arc::new(Mutex::new(None)), Arc::new(Mutex::new(false)), Arc::new(Mutex::new(false)), Arc::new(Mutex::new(None)));
+    let (served, replies) = (log.clone(), Replies { message: message.clone(), list: list.clone(), bye: bye.clone(), broken: broken.clone(), tls_only: tls_only.clone(), modseq: modseq.clone() });
     tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
             tokio::spawn(serve(socket, served.clone(), move_works, attachment, idle, replies.clone()));
@@ -87,7 +89,7 @@ async fn start_opts(move_works: bool, attachment: bool, idle: bool) -> Mock {
     let account = Account { name: "mock".into(), user: "u".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true, keep: beavermail_core::Keep::default(), signature: String::new(), oauth: None, smtp_user: None, archive: String::new(), archive_by_year: false };
     let store = Arc::new(Store::in_memory().unwrap());
     let files = Arc::new(Vault::in_memory());
-    Mock { source: ImapSource::new(&account, "p".into(), store.clone(), files.clone()), account, store, files, log, message, list, bye, broken, tls_only }
+    Mock { source: ImapSource::new(&account, "p".into(), store.clone(), files.clone()), account, store, files, log, message, list, bye, broken, tls_only, modseq }
 }
 
 /// What a test can change in the server's answers while it runs; see [`Mock`].
@@ -98,10 +100,11 @@ struct Replies {
     bye: Arc<Mutex<Option<&'static str>>>,
     broken: Arc<Mutex<bool>>,
     tls_only: Arc<Mutex<bool>>,
+    modseq: Arc<Mutex<Option<u64>>>,
 }
 
 async fn serve(socket: TcpStream, log: Arc<Mutex<Vec<String>>>, move_works: bool, attachment: bool, idle: bool, replies: Replies) {
-    let Replies { message, list, bye, broken, tls_only } = replies;
+    let Replies { message, list, bye, broken, tls_only, modseq } = replies;
     let (read, mut write) = socket.into_split();
     let mut read = BufReader::new(read);
     let _ = write.write_all(b"* OK ready\r\n").await;
@@ -120,7 +123,7 @@ async fn serve(socket: TcpStream, log: Arc<Mutex<Vec<String>>>, move_works: bool
         }
         let verb = command.to_ascii_uppercase();
         let reply = if verb.starts_with("CAPABILITY") {
-            let extra = format!("{}{}", if idle { " IDLE" } else { "" }, if *tls_only.lock().unwrap() { " STARTTLS LOGINDISABLED" } else { "" });
+            let extra = format!("{}{}{}", if idle { " IDLE" } else { "" }, if *tls_only.lock().unwrap() { " STARTTLS LOGINDISABLED" } else { "" }, if modseq.lock().unwrap().is_some() { " ENABLE CONDSTORE" } else { "" });
             format!("* CAPABILITY IMAP4rev1{extra}\r\n{tag} OK done\r\n")
         } else if verb.starts_with("AUTHENTICATE XOAUTH2") {
             // The client's answer to the challenge is a line of its own, kept in the log to check.
@@ -159,7 +162,8 @@ async fn serve(socket: TcpStream, log: Arc<Mutex<Vec<String>>>, move_works: bool
             let name = command.split(' ').nth(1).unwrap_or("\"INBOX\"");
             format!("* STATUS {name} (MESSAGES 1240 UNSEEN 1)\r\n{tag} OK done\r\n")
         } else if verb.starts_with("SELECT") || verb.starts_with("EXAMINE") {
-            format!("* 1 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 1] ok\r\n* OK [PERMANENTFLAGS (\\Seen \\Flagged \\Deleted \\*)] ok\r\n{tag} OK [READ-WRITE] done\r\n")
+            let modseq = modseq.lock().unwrap().map_or_else(String::new, |m| format!("* OK [HIGHESTMODSEQ {m}] ok\r\n* OK [UIDNEXT 6] ok\r\n"));
+            format!("* 1 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 1] ok\r\n{modseq}* OK [PERMANENTFLAGS (\\Seen \\Flagged \\Deleted \\*)] ok\r\n{tag} OK [READ-WRITE] done\r\n")
         } else if verb.contains("BODY.PEEK[]") {
             let message = message.lock().unwrap().clone();
             let n = message.len();
@@ -844,4 +848,26 @@ async fn archive_by_year_makes_the_year_folder_once() {
     let id = message_in(&mock, "INBOX").await;
     let error = mock.source.archive(id).await.expect_err("not there").to_string();
     assert!(error.contains("no folder Missing"), "{error}");
+}
+
+#[tokio::test]
+async fn a_folder_that_did_not_change_is_not_asked_again() {
+    let mock = start(true).await;
+    *mock.modseq.lock().unwrap() = Some(10);
+    mock.source.mailboxes().await.expect("list folders");
+    mock.source.sync("INBOX").await.unwrap();
+    assert!(mock.commands().iter().any(|c| c == "ENABLE CONDSTORE"), "{:?}", mock.commands());
+    let after = |mock: &Mock| {
+        let commands = mock.commands();
+        let last = commands.iter().rposition(|c| c.starts_with("EXAMINE")).unwrap();
+        commands[last + 1..].iter().filter(|c| c.contains("FETCH")).cloned().collect::<Vec<_>>()
+    };
+    // The same mod-sequence, UIDNEXT and count: nothing is asked.
+    mock.source.sync("INBOX").await.unwrap();
+    assert_eq!(after(&mock), Vec::<String>::new());
+    // Only the mod-sequence moved: only what changed since is asked, across the folder.
+    *mock.modseq.lock().unwrap() = Some(12);
+    mock.source.sync("INBOX").await.unwrap();
+    assert_eq!(after(&mock), ["UID FETCH 1:* (UID FLAGS) (CHANGEDSINCE 10)"]);
+    assert_eq!(mock.source.messages("INBOX").await.unwrap().len(), 1, "not taken for gone by its absence");
 }

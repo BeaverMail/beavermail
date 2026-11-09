@@ -370,6 +370,17 @@ fn learn_key(message_id: &str, folder: &str, uid: u32) -> String {
 pub struct FolderState {
     pub uidvalidity: Option<u32>,
     pub floor_uid: Option<u32>,
+    /// What the server said of the folder at the last complete sync, where it keeps mod-sequences.
+    pub seen: Option<Seen>,
+}
+
+/// A folder as the server described it when chosen (RFC 7162): equal at the next sync, nothing in it
+/// changed; with only `modseq` different, only flags did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Seen {
+    pub modseq: u64,
+    pub uid_next: u32,
+    pub exists: u32,
 }
 
 /// A folder with the counts the sidebar shows.
@@ -835,6 +846,16 @@ fn migrate(conn: &Connection) -> Result<(), MailError> {
             let add = if have { "" } else { "ALTER TABLE folders ADD COLUMN delimiter TEXT;" };
             conn.execute_batch(&format!("{add} PRAGMA user_version = 23;")).map_err(db)?;
         }
+        // Version 24: what the server said of a folder at the last sync (HIGHESTMODSEQ, UIDNEXT, count).
+        if version < 24 {
+            let mut add = String::new();
+            for column in ["modseq", "uid_next", "server_exists"] {
+                if conn.prepare(&format!("SELECT {column} FROM folders LIMIT 0")).is_err() {
+                    add += &format!("ALTER TABLE folders ADD COLUMN {column} INTEGER;");
+                }
+            }
+            conn.execute_batch(&format!("{add} PRAGMA user_version = 24;")).map_err(db)?;
+        }
     Ok(())
 }
 
@@ -1104,12 +1125,25 @@ impl Store {
     pub fn folder_state(&self, account: &str, folder: &str) -> Result<FolderState, MailError> {
         let conn = self.read();
         let state = conn
-            .query_row("SELECT uidvalidity, floor_uid FROM folders WHERE account = ?1 AND name = ?2", params![account, folder], |r| {
-                Ok(FolderState { uidvalidity: r.get::<_, Option<i64>>(0)?.map(|v| v as u32), floor_uid: r.get::<_, Option<i64>>(1)?.map(|v| v as u32) })
+            .query_row("SELECT uidvalidity, floor_uid, modseq, uid_next, server_exists FROM folders WHERE account = ?1 AND name = ?2", params![account, folder], |r| {
+                let seen = match (r.get::<_, Option<i64>>(2)?, r.get::<_, Option<i64>>(3)?, r.get::<_, Option<i64>>(4)?) {
+                    (Some(modseq), Some(uid_next), Some(exists)) => Some(Seen { modseq: modseq as u64, uid_next: uid_next as u32, exists: exists as u32 }),
+                    _ => None,
+                };
+                Ok(FolderState { uidvalidity: r.get::<_, Option<i64>>(0)?.map(|v| v as u32), floor_uid: r.get::<_, Option<i64>>(1)?.map(|v| v as u32), seen })
             })
             .optional()
             .map_err(db)?;
-        Ok(state.unwrap_or(FolderState { uidvalidity: None, floor_uid: None }))
+        Ok(state.unwrap_or(FolderState { uidvalidity: None, floor_uid: None, seen: None }))
+    }
+
+    /// Remembers what the server said of the folder at a complete sync, or forgets it (`None`).
+    pub fn set_seen(&self, account: &str, folder: &str, seen: Option<Seen>) -> Result<(), MailError> {
+        let (modseq, uid_next, exists) = seen.map_or((None, None, None), |s| (Some(s.modseq as i64), Some(i64::from(s.uid_next)), Some(i64::from(s.exists))));
+        self.conn()
+            .execute("UPDATE folders SET modseq = ?3, uid_next = ?4, server_exists = ?5 WHERE account = ?1 AND name = ?2", params![account, folder, modseq, uid_next, exists])
+            .map(|_| ())
+            .map_err(db)
     }
 
     /// The server's UIDVALIDITY changed (or this is the first sync): every cached UID is meaningless.
@@ -1118,7 +1152,7 @@ impl Store {
         let tx = conn.transaction().map_err(db)?;
         tx.execute("DELETE FROM messages WHERE account = ?1 AND folder = ?2", params![account, folder]).map_err(db)?;
         tx.execute(
-            "UPDATE folders SET uidvalidity = ?3, floor_uid = NULL WHERE account = ?1 AND name = ?2",
+            "UPDATE folders SET uidvalidity = ?3, floor_uid = NULL, modseq = NULL, uid_next = NULL, server_exists = NULL WHERE account = ?1 AND name = ?2",
             params![account, folder, i64::from(uidvalidity)],
         )
         .map_err(db)?;
@@ -1995,7 +2029,7 @@ mod tests {
         store.add_headers("me", "INBOX", &[header(1, "a", 1, false)]).unwrap();
         store.reset_folder("me", "INBOX", 7).unwrap();
         assert!(store.messages("me", "INBOX").unwrap().is_empty());
-        assert_eq!(store.folder_state("me", "INBOX").unwrap(), FolderState { uidvalidity: Some(7), floor_uid: None });
+        assert_eq!(store.folder_state("me", "INBOX").unwrap(), FolderState { uidvalidity: Some(7), floor_uid: None, seen: None });
     }
 
     #[test]

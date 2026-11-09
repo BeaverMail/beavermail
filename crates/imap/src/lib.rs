@@ -11,7 +11,7 @@ use async_imap::imap_proto::{AttributeValue, MailboxDatum, Response, Status};
 use async_imap::types::{Fetch, Flag, NameAttribute};
 use async_imap::{Client, Session};
 use beavermail_core::{AuthCheck, AuthResult, Account, Attachment, Encryption, Hit, Keep, MailError, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Progress, Role, Server, SignedWith, SyncReport, Tls};
-use beavermail_store::{Flags, Header, Location, Store};
+use beavermail_store::{Flags, Header, Location, Seen, Store};
 use beavermail_vault::{Vault, folder_path, message_path};
 use futures::TryStreamExt;
 use mail_parser::{MessageParser, MimeHeaders};
@@ -512,7 +512,13 @@ impl State {
         }
         if self.session.is_none() {
             self.folder = None;
-            self.session = Some(connect_in_time(config).await?);
+            let mut session = connect_in_time(config).await?;
+            // Folders then say their HIGHESTMODSEQ when chosen (RFC 7162), so a sync can tell that
+            // nothing changed, or only flags did. A server that refuses is synced as before.
+            if session.capabilities().await.is_ok_and(|c| c.has_str("CONDSTORE")) {
+                let _ = session.run_command_and_check_ok("ENABLE CONDSTORE").await;
+            }
+            self.session = Some(session);
         }
         self.used = Some(std::time::Instant::now());
         Ok(self.session.as_mut().expect("just connected"))
@@ -913,7 +919,14 @@ impl ImapSource {
             store.reset_folder(account, folder, validity)?;
             self.files.remove_dir(&folder_path(account, folder))?;
             cached.floor_uid = None;
+            cached.seen = None;
         }
+        // What the server says of the folder now, against the last complete sync: the same UIDNEXT and
+        // count mean no message came or went; the same mod-sequence too, that nothing changed at all.
+        let now = selected.highest_modseq.zip(selected.uid_next).map(|(modseq, uid_next)| Seen { modseq, uid_next, exists: selected.exists });
+        let same_list = matches!((cached.seen, now), (Some(before), Some(now)) if before.uid_next == now.uid_next && before.exists == now.exists);
+        let changed_since = cached.seen.filter(|_| same_list).map(|before| before.modseq);
+        let untouched = same_list && cached.seen == now;
         if selected.exists == 0 {
             let all: Vec<u32> = store.flags_since(account, folder, 0)?.into_iter().map(|(u, ..)| u).collect();
             self.drop_files(folder, &all);
@@ -924,6 +937,7 @@ impl ImapSource {
         // New messages. The first sync takes the newest few by sequence number.
         let range = store.uid_range(account, folder)?;
         let fresh = match range {
+            Some(_) if same_list => Vec::new(),
             Some((_, highest, _)) => Self::fetch_headers(session, &format!("{}:*", highest + 1), true, structure).await?.into_iter().filter(|h| h.uid > highest).collect(),
             None => Self::fetch_headers(session, &format!("{}:*", selected.exists.saturating_sub(FIRST_CHUNK - 1).max(1)), false, structure).await?,
         };
@@ -990,10 +1004,17 @@ impl ImapSource {
             }
         }
 
-        // Flags and deletions among the newest cached messages.
-        if let Some(from) = store.nth_newest_uid(account, folder, RECONCILE_WINDOW)?.or(store.uid_range(account, folder)?.map(|(lo, _, _)| lo)) {
+        // Flags and deletions: nothing to ask when nothing changed; only what changed when only flags
+        // did (anywhere in the folder); else those of the newest cached messages.
+        let reconcile = match changed_since {
+            _ if untouched => None,
+            Some(modseq) => Some((1, format!("UID FETCH 1:* (UID FLAGS) (CHANGEDSINCE {modseq})"), false)),
+            None => store.nth_newest_uid(account, folder, RECONCILE_WINDOW)?.or(store.uid_range(account, folder)?.map(|(lo, _, _)| lo)).map(|from| (from, format!("UID FETCH {from}:* (UID FLAGS)"), true)),
+        };
+        // `complete`: the answer lists every message from `from` up, so one missing from it is gone.
+        if let Some((from, command, complete)) = reconcile {
             // What is missing from the answer is forgotten here, so only a complete one counts.
-            let fetches: Vec<(u32, Vec<Flag>)> = answered(session, &format!("UID FETCH {from}:* (UID FLAGS)"), |r| match r {
+            let fetches: Vec<(u32, Vec<Flag>)> = answered(session, &command, |r| match r {
                 Response::Fetch(_, attributes) => {
                     let uid = attributes.iter().find_map(|a| match a { AttributeValue::Uid(uid) => Some(*uid), _ => None })?;
                     let flags = attributes.iter().find_map(|a| match a { AttributeValue::Flags(f) => Some(f.iter().map(|f| Flag::from(f.to_string())).collect()), _ => None });
@@ -1019,7 +1040,8 @@ impl ImapSource {
                     (*uid, Flags { unread: !has(Flag::Seen), pinned, starred: has(Flag::Flagged), labels })
                 })
                 .collect();
-            let gone: Vec<u32> = local.iter().filter(|(uid, _)| !server.contains_key(uid)).map(|(uid, _)| *uid).collect();
+            let deleted: std::collections::HashSet<u32> = fetches.iter().filter(|(_, flags)| flags.contains(&Flag::Deleted)).map(|(uid, _)| *uid).collect();
+            let gone: Vec<u32> = local.iter().filter(|(uid, _)| if complete { !server.contains_key(uid) } else { deleted.contains(uid) }).map(|(uid, _)| *uid).collect();
             // One being written now keeps what it was set to here.
             let writing = self.writing.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
             let changed: Vec<(u32, Flags)> = local
@@ -1047,6 +1069,8 @@ impl ImapSource {
                 break;
             }
         }
+        // Kept only now that everything above went through: an interrupted sync compares in full next time.
+        store.set_seen(account, folder, now)?;
         let have = store.uid_range(account, folder)?.map_or(0, |(_, _, count)| count);
         Ok(SyncReport { remaining: if floor <= 1 { 0 } else { selected.exists.saturating_sub(have) } })
     }
