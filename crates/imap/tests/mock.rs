@@ -203,7 +203,18 @@ async fn serve(socket: TcpStream, log: Arc<Mutex<Vec<String>>>, move_works: bool
             let mut rest = String::new();
             let _ = read.read_line(&mut rest).await; // the CRLF that ends the command
             log.lock().unwrap().push(format!("APPEND-DATA {}", String::from_utf8_lossy(&data)));
-            format!("{tag} OK [APPENDUID 1 1] done\r\n")
+            // A folder that is not listed does not exist: the server asks the client to make it.
+            let folder = command.split('"').nth(1).unwrap_or_default().to_owned();
+            if !list.lock().unwrap().contains(&format!("\"{folder}\"")) {
+                format!("{tag} NO [TRYCREATE] Mailbox does not exist\r\n")
+            } else {
+                format!("{tag} OK [APPENDUID 1 1] done\r\n")
+            }
+        } else if verb.starts_with("CREATE") {
+            // Made, and listed from now on.
+            let folder = command.split('"').nth(1).unwrap_or_default().to_owned();
+            list.lock().unwrap().push_str(&format!("* LIST (\\HasNoChildren) \"/\" \"{folder}\"\r\n"));
+            format!("{tag} OK CREATE completed\r\n")
         } else if verb.starts_with("UID MOVE") && !move_works {
             format!("{tag} NO [CANNOT] MOVE is not supported\r\n")
         } else if verb.starts_with("UID SEARCH DELETED") {
@@ -892,4 +903,21 @@ async fn with_qresync_the_server_names_what_was_expunged() {
     mock.source.sync("INBOX").await.unwrap();
     assert!(mock.commands().iter().any(|c| c == "UID FETCH 1:* (UID FLAGS) (CHANGEDSINCE 10 VANISHED)"), "{:?}", mock.commands());
     assert!(mock.source.messages("INBOX").await.unwrap().is_empty(), "the expunged message is gone");
+}
+
+#[tokio::test]
+async fn a_folder_the_server_lacks_is_made_before_mail_goes_in() {
+    let mock = start(true).await;
+    // A new account: no Sent folder yet.
+    *mock.list.lock().unwrap() = "* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n".into();
+    mock.source.mailboxes().await.expect("list folders");
+    mock.source.save_sent(b"Subject: Hi\r\n\r\nHello".to_vec()).await.expect("the copy is kept");
+    let commands = mock.commands();
+    assert!(commands.iter().any(|c| c == "CREATE \"Sent\""), "{commands:?}");
+    assert!(commands.iter().any(|c| c.starts_with("APPEND \"Sent\"")), "{commands:?}");
+    // Listed, but gone from the server since: NO [TRYCREATE] makes it again.
+    *mock.list.lock().unwrap() = "* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n".into();
+    mock.source.save_sent(b"Subject: Again\r\n\r\nHello".to_vec()).await.expect("made again and kept");
+    let appends = mock.commands().iter().filter(|c| c.starts_with("APPEND \"Sent\"")).count();
+    assert_eq!(appends, 3, "the second copy was refused once, then taken");
 }

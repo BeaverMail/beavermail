@@ -329,6 +329,23 @@ fn backend(e: impl fmt::Display) -> MailError {
 
 /// An IMAP error as the app tells it: a connection that ended (the server restarting, the network
 /// gone) is being offline for a while, to be tried again, not a failure.
+/// The server refused because the folder is missing, and would take it once made (`NO [TRYCREATE]`,
+/// RFC 9051 7.1): a CREATE and the command again.
+fn try_create(e: &async_imap::error::Error) -> bool {
+    matches!(e, async_imap::error::Error::No(why) if why.contains("TryCreate"))
+}
+
+/// APPENDs `raw` to `folder`, making the folder first if the server says it is missing.
+async fn append_creating(session: &mut Session<Stream>, folder: &str, flags: &str, raw: &[u8]) -> Result<(), async_imap::error::Error> {
+    match session.append(folder, Some(flags), None, raw).await {
+        Err(e) if try_create(&e) => {
+            let _ = session.create(folder).await; // one made meanwhile is as good
+            session.append(folder, Some(flags), None, raw).await
+        }
+        done => done,
+    }
+}
+
 /// The UID of the message whose answer the library could not parse (a server's malformed description
 /// of it), or `None` for any other error. Only the UID: the answer also holds the message's headers.
 fn unreadable(e: &async_imap::error::Error) -> Option<String> {
@@ -699,6 +716,33 @@ impl ImapSource {
         self.store.folder_with_role(&self.account, role)
     }
 
+    /// The folder for `role` among those this client writes to (Drafts, Sent, Trash), made with its
+    /// usual name where the server has none yet, as on a new account.
+    async fn own_folder(&self, role: Role) -> Result<String, MailError> {
+        if let Some(folder) = self.folder_with_role(role).await? {
+            return Ok(folder);
+        }
+        let name = match role {
+            Role::Drafts => "Drafts",
+            Role::Sent => "Sent",
+            Role::Trash => "Trash",
+            _ => return Err(backend(format!("this account has no {role:?} folder"))),
+        };
+        {
+            let mut state = self.state.lock().await;
+            let session = state.session(&self.config).await?;
+            match session.create(name).await {
+                // "Already there" (made meanwhile, or not listed) is no harm: the listing below tells.
+                Ok(()) | Err(async_imap::error::Error::No(_)) => {}
+                Err(e) => return Err(state.failed(e)),
+            }
+            let _ = state.session(&self.config).await?.subscribe(name).await;
+        }
+        // Listed again, so the new folder is known here with its role (by its usual name).
+        self.mailboxes().await?;
+        self.store.folder_with_role(&self.account, role)?.ok_or_else(|| backend(format!("this account has no {name} folder, and the server did not make one")))
+    }
+
     /// Archives into `folder` (empty for the server's archive folder), into a folder for each year
     /// inside it when `by_year`; for the account's settings changed while connected.
     pub fn set_archive(&self, folder: &str, by_year: bool) {
@@ -746,7 +790,7 @@ impl ImapSource {
         let target = match &op {
             Op::Seen(_) | Op::Pinned(_) | Op::Starred(_) | Op::Label(..) | Op::Erase => None,
             Op::Archive => Some(self.archive_folder(id).await?),
-            Op::Trash => Some(self.folder_with_role(Role::Trash).await?.ok_or_else(|| backend("this account has no trash folder"))?),
+            Op::Trash => Some(self.own_folder(Role::Trash).await?),
             Op::Move(role) => Some(self.folder_with_role(*role).await?.ok_or_else(|| backend(format!("this account has no {role:?} folder")))?),
             // One removed or renamed meanwhile (on the server, or from another client) is not created again.
             Op::Folder(name) => {
@@ -821,8 +865,20 @@ impl ImapSource {
                     session.uid_store(&uid, query).await?.try_collect::<Vec<_>>().await?;
                 }
                 (_, Some(dest)) => {
-                    if session.uid_mv(&uid, &dest).await.is_err() {
-                        session.uid_copy(&uid, &dest).await?;
+                    let mut moved = session.uid_mv(&uid, &dest).await;
+                    if moved.as_ref().is_err_and(try_create) {
+                        let _ = session.create(&dest).await;
+                        moved = session.uid_mv(&uid, &dest).await;
+                    }
+                    if moved.is_err() {
+                        // Without MOVE: a copy, then the original goes.
+                        if let Err(e) = session.uid_copy(&uid, &dest).await {
+                            if !try_create(&e) {
+                                return Err(e);
+                            }
+                            let _ = session.create(&dest).await;
+                            session.uid_copy(&uid, &dest).await?;
+                        }
                         session.uid_store(&uid, "+FLAGS.SILENT (\\Deleted)").await?.try_collect::<Vec<_>>().await?;
                         session.uid_expunge(&uid).await?.try_collect::<Vec<_>>().await?;
                     }
@@ -1659,11 +1715,11 @@ impl MailSource for ImapSource {
     }
 
     async fn save_draft(&self, id: &str, raw: Vec<u8>) -> Result<(), MailError> {
-        let folder = self.folder_with_role(Role::Drafts).await?.ok_or_else(|| backend("this account has no Drafts folder"))?;
+        let folder = self.own_folder(Role::Drafts).await?;
         let mut state = self.state.lock().await;
         let session = state.session(&self.config).await?;
         let result = async {
-            session.append(&folder, Some("(\\Draft \\Seen)"), None, &raw).await?;
+            append_creating(session, &folder, "(\\Draft \\Seen)", &raw).await?;
             session.select(&folder).await?;
             let found = session.uid_search(format!("HEADER X-BeaverMail-Draft {id}")).await?;
             // The newest copy is the one just stored; any older copies of the same draft are dropped.
@@ -1710,10 +1766,10 @@ impl MailSource for ImapSource {
     }
 
     async fn save_sent(&self, raw: Vec<u8>) -> Result<(), MailError> {
-        let sent = self.folder_with_role(Role::Sent).await?.ok_or_else(|| backend("this account has no Sent folder"))?;
+        let sent = self.own_folder(Role::Sent).await?;
         let mut state = self.state.lock().await;
         let session = state.session(&self.config).await?;
-        let result = session.append(&sent, Some("(\\Seen)"), None, &raw).await;
+        let result = append_creating(session, &sent, "(\\Seen)", &raw).await;
         result.map_err(|e| state.failed(e))
     }
 

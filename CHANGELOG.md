@@ -36,6 +36,7 @@ What changed in each version of BeaverMail, newest first.
 
 ### Fixed
 
+- On an account whose server has no Drafts, Sent or Trash folder yet, the first draft, sent copy or deletion makes it, instead of failing; a folder the server says is missing when mail is saved or moved into it (NO [TRYCREATE]) is made and the mail goes in.
 - Labels show in the table layout of the list too, as in the cards.
 - A folder keeps syncing when the server describes one of its messages in a way that cannot be read, instead of the account showing as offline.
 - With no encryption set, a server that signs in only over an encrypted connection gets no password, and says to choose STARTTLS or SSL/TLS instead of "sign-in refused".
