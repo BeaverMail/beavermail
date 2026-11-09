@@ -23,6 +23,8 @@ pub enum Command {
     Star,
     /// One of the five standard labels, `$label1` to `$label5`, on or off, by its number.
     Label(u8),
+    /// Every label off the messages.
+    ClearLabels,
     Spam,
     /// Back to the Inbox: from the Spam folder, or held as suspicious.
     NotSpam,
@@ -66,7 +68,7 @@ const CTRL_SHIFT: Modifiers = Modifiers::COMMAND.plus(Modifiers::SHIFT);
 
 impl Command {
     /// In the order the keys are tried (Ctrl+Shift+Tab before Ctrl+Tab) and the palette lists them.
-    pub const ALL: [Self; 41] = [
+    pub const ALL: [Self; 42] = [
         Self::Palette,
         Self::NewMessage,
         Self::Reply,
@@ -85,6 +87,7 @@ impl Command {
         Self::Label(3),
         Self::Label(4),
         Self::Label(5),
+        Self::ClearLabels,
         Self::Spam,
         Self::NotSpam,
         Self::TrustSender,
@@ -129,7 +132,9 @@ impl Command {
             Self::Label(2) => "Label Work",
             Self::Label(3) => "Label Personal",
             Self::Label(4) => "Label To Do",
-            Self::Label(_) => "Label Later",
+            Self::Label(5) => "Label Later",
+            Self::Label(_) => "Label",
+            Self::ClearLabels => "Remove all labels",
             Self::Spam => "Spam",
             Self::NotSpam => "Not spam",
             Self::TrustSender => "Trust sender",
@@ -175,7 +180,10 @@ impl Command {
             Self::Label(2) => &[Trigger::Text("2")],
             Self::Label(3) => &[Trigger::Text("3")],
             Self::Label(4) => &[Trigger::Text("4")],
-            Self::Label(_) => &[Trigger::Text("5")],
+            Self::Label(5) => &[Trigger::Text("5")],
+            // The user's own labels have no key; 0 takes every label off.
+            Self::Label(_) => &[],
+            Self::ClearLabels => &[Trigger::Text("0")],
             Self::Spam => &[Trigger::Text("!")],
             Self::ViewSource => &[Trigger::Shortcut(CTRL, Key::U, false)],
             Self::FindInSource => &[Trigger::Shortcut(CTRL, Key::F, true)],

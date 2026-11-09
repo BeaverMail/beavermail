@@ -20,6 +20,7 @@ What changed in each version of BeaverMail, newest first.
 - Archive into any folder of the account, chosen in its settings, and optionally into a folder for each year inside it, made when first needed.
 - Search options beside the search box: from, to, subject, words, dates, attachment and unread as fields, written into the box as the words they stand for, and read back from it.
 - Filters in Settings › Filters: rules on the sender, recipients, subject or attachments that move, star, label, mark as read or trash new mail in the Inbox as it arrives, in order, each stopping the rest when asked; Run now applies one to the mail already there, and Create filter… on a message starts one from its sender.
+- Labels in Settings › Labels: the five standard ones renamed and recoloured, labels of your own made and deleted, names and colours kept on this computer; every label in the Label menu and in filters, 0 to take them all off, label:work in a search, and a Labels section in the sidebar showing each one's mail everywhere.
 - Calendars in Settings: each server with its calendars, renamed, recoloured, made default or removed, its password changed once the server takes it, or all of it removed.
 - Spell check while writing: words spelled wrong underlined, their spellings and Add to dictionary on a right click, the language chosen in Settings › Writing or per message; dictionaries from the system or downloaded on request; Check spelling (F7) going through the words marked one by one, to change, ignore or add each, optionally before sending.
 
@@ -35,6 +36,7 @@ What changed in each version of BeaverMail, newest first.
 
 ### Fixed
 
+- Labels show in the table layout of the list too, as in the cards.
 - A folder keeps syncing when the server describes one of its messages in a way that cannot be read, instead of the account showing as offline.
 - With no encryption set, a server that signs in only over an encrypted connection gets no password, and says to choose STARTTLS or SSL/TLS instead of "sign-in refused".
 - Messages open in a twentieth of a second: over a connection of their own, without waiting for the background download or its writes to the archive, and without checking again what was checked when they arrived.

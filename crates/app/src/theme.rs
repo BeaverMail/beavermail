@@ -198,18 +198,42 @@ pub fn role_color(role: Role) -> Color32 {
     }
 }
 
-/// A label's name and colour: the five standard keywords `$label1` to `$label5` with their usual names
-/// and colours; any other keyword is a label of the user's own, named as written (`_` for a space), in
-/// a neutral grey.
-pub fn label(keyword: &str) -> (String, Color32) {
-    match keyword {
-        "$label1" => ("Important".into(), rgb(0xFF3B30)),
-        "$label2" => ("Work".into(), rgb(0xFF9900)),
-        "$label3" => ("Personal".into(), rgb(0x2EA043)),
-        "$label4" => ("To Do".into(), rgb(0x4B5CFF)),
-        "$label5" => ("Later".into(), rgb(0xA855C7)),
-        other => (other.replace('_', " "), rgb(0x8E8E99)),
+/// The five standard labels (Thunderbird's tags) with their usual names and colours.
+pub const STANDARD_LABELS: [(&str, &str, u32); 5] =
+    [("$label1", "Important", 0xFF3B30), ("$label2", "Work", 0xFF9900), ("$label3", "Personal", 0x2EA043), ("$label4", "To Do", 0x4B5CFF), ("$label5", "Later", 0xA855C7)];
+
+/// The names and colours the user gave labels (Settings › Labels), for every view that draws one.
+static LABELS: std::sync::RwLock<Vec<beavermail_core::Label>> = std::sync::RwLock::new(Vec::new());
+
+/// Shows labels with these names and colours from now on.
+pub fn set_labels(labels: &[beavermail_core::Label]) {
+    if LABELS.read().is_ok_and(|kept| *kept != labels)
+        && let Ok(mut kept) = LABELS.write()
+    {
+        *kept = labels.to_vec();
     }
+}
+
+/// A label's name and colour: as the user named it here; else the five standard keywords `$label1`
+/// to `$label5` with their usual names and colours; any other keyword is a label of another client,
+/// named as written (`_` for a space), in a neutral grey.
+pub fn label(keyword: &str) -> (String, Color32) {
+    if let Some(own) = LABELS.read().ok().and_then(|l| l.iter().find(|l| l.keyword == keyword).cloned()) {
+        return (own.name, calendar_color(&own.color).unwrap_or(rgb(0x8E8E99)));
+    }
+    match STANDARD_LABELS.iter().find(|(k, ..)| *k == keyword) {
+        Some((_, name, color)) => ((*name).to_owned(), rgb(*color)),
+        None => (keyword.replace('_', " "), rgb(0x8E8E99)),
+    }
+}
+
+/// Every label to offer, as (keyword, name, colour): the five standard ones, then the user's own.
+pub fn labels() -> Vec<(String, String, Color32)> {
+    let own: Vec<String> = LABELS.read().map(|l| l.iter().map(|l| l.keyword.clone()).filter(|k| !STANDARD_LABELS.iter().any(|(s, ..)| s == k)).collect()).unwrap_or_default();
+    STANDARD_LABELS.iter().map(|(k, ..)| (*k).to_owned()).chain(own).map(|k| {
+        let (name, color) = label(&k);
+        (k, name, color)
+    }).collect()
 }
 
 /// A calendar's colour as the server keeps it (`#RRGGBB`); `None` when it has none or it cannot be read.

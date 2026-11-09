@@ -614,6 +614,20 @@ pub struct Settings {
     /// By account key, the highest Inbox UID the filters have seen: mail above it is new to them.
     #[serde(default)]
     pub filtered_upto: std::collections::BTreeMap<String, u32>,
+    /// Labels named and coloured here: the five standard ones renamed or recoloured, and the user's
+    /// own, in the order shown. The server keeps only their keywords.
+    #[serde(default)]
+    pub labels: Vec<Label>,
+}
+
+/// A label as this computer shows it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Label {
+    /// The IMAP keyword on the messages: `$label1` to `$label5`, or one made from the name.
+    pub keyword: String,
+    pub name: String,
+    /// `#RRGGBB`.
+    pub color: String,
 }
 
 /// A rule for new mail in an account's Inbox: when its conditions hold, its actions are taken.
@@ -651,8 +665,10 @@ pub enum FilterAction {
     Move(String),
     Read,
     Star,
-    /// One of the standard labels, `$label1` to `$label5`.
+    /// One of the standard labels, `$label1` to `$label5`: filters saved before [`Self::Keyword`].
     Label(u8),
+    /// Any label, by its keyword.
+    Keyword(String),
     Trash,
 }
 
@@ -666,7 +682,7 @@ fn undo_secs() -> u32 {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { display: DisplayMode::default(), sender_display: Default::default(), rich_outgoing: true, undo_send_secs: undo_secs(), remote_senders: Default::default(), hold_suspicious: true, marked: Default::default(), threads: true, reading_pane: true, reader_below: false, list_layout: ListLayout::default(), columns: Columns::default(), sorts: Default::default(), folded: Default::default(), density: Density::default(), diagnostics: false, link_params: String::new(), address_books: Vec::new(), calendars: Vec::new(), spelling: true, spelling_language: String::new(), spelling_words: Default::default(), spelling_before_send: false, data_folder: String::new(), moving_to: String::new(), filters: Vec::new(), filtered_upto: Default::default() }
+        Self { display: DisplayMode::default(), sender_display: Default::default(), rich_outgoing: true, undo_send_secs: undo_secs(), remote_senders: Default::default(), hold_suspicious: true, marked: Default::default(), threads: true, reading_pane: true, reader_below: false, list_layout: ListLayout::default(), columns: Columns::default(), sorts: Default::default(), folded: Default::default(), density: Density::default(), diagnostics: false, link_params: String::new(), address_books: Vec::new(), calendars: Vec::new(), spelling: true, spelling_language: String::new(), spelling_words: Default::default(), spelling_before_send: false, data_folder: String::new(), moving_to: String::new(), filters: Vec::new(), filtered_upto: Default::default(), labels: Vec::new() }
     }
 }
 

@@ -22,6 +22,8 @@ pub struct Fields {
     pub before: String,
     pub attachment: bool,
     pub unread: bool,
+    /// A label's name as shown, or empty for any.
+    pub label: String,
 }
 
 impl Fields {
@@ -36,6 +38,7 @@ impl Fields {
                 Some(("subject", v)) if fields.subject.is_empty() && !v.is_empty() => Some((&mut fields.subject, v)),
                 Some(("after", v)) if fields.after.is_empty() && day(v) => Some((&mut fields.after, v)),
                 Some(("before", v)) if fields.before.is_empty() && day(v) => Some((&mut fields.before, v)),
+                Some(("label", v)) if fields.label.is_empty() && !v.is_empty() => Some((&mut fields.label, v)),
                 Some(("has", v)) if v.eq_ignore_ascii_case("attachment") => {
                     fields.attachment = true;
                     continue;
@@ -59,7 +62,7 @@ impl Fields {
     pub fn query(&self) -> String {
         // The fields first: an operator asked twice stays in the words, after the one the field shows.
         let mut parts: Vec<String> = Vec::new();
-        for (operator, value) in [("from", &self.from), ("to", &self.to), ("subject", &self.subject), ("after", &self.after), ("before", &self.before)] {
+        for (operator, value) in [("from", &self.from), ("to", &self.to), ("subject", &self.subject), ("label", &self.label), ("after", &self.after), ("before", &self.before)] {
             if !value.trim().is_empty() {
                 parts.push(format!("{operator}:{}", quoted(value.trim())));
             }
@@ -93,7 +96,7 @@ fn day(text: &str) -> bool {
 }
 
 /// A value that stays one word in the search box: in quotes when it holds spaces.
-fn quoted(value: &str) -> String {
+pub(crate) fn quoted(value: &str) -> String {
     match value.split_once(':') {
         Some((operator, v)) if v.contains(char::is_whitespace) => format!("{operator}:\"{v}\""),
         _ if value.contains(char::is_whitespace) => format!("\"{value}\""),
@@ -101,9 +104,17 @@ fn quoted(value: &str) -> String {
     }
 }
 
-/// The form, under the search box. True when Search is chosen (or Enter pressed in a field) with
-/// fields that can be searched for.
-pub fn panel(ui: &mut egui::Ui, t: &Tokens, fields: &mut Fields) -> bool {
+/// What the form asks of the search box.
+pub enum Done {
+    /// Search for what the fields say.
+    Search,
+    /// Empty the box and close the form: no search any more.
+    Clear,
+}
+
+/// The form, under the search box: Search (or Enter in a field) with fields that can be searched
+/// for, or Clear.
+pub fn panel(ui: &mut egui::Ui, t: &Tokens, fields: &mut Fields) -> Option<Done> {
     let mut enter = false;
     let mut row = |ui: &mut egui::Ui, label: &str, text: &mut String, hint: &str| {
         ui.label(label);
@@ -118,6 +129,22 @@ pub fn panel(ui: &mut egui::Ui, t: &Tokens, fields: &mut Fields) -> bool {
         row(ui, "Has the words", &mut fields.words, "Anywhere in the message");
         row(ui, "After", &mut fields.after, "2026-09-01, 2026-09 or 2026");
         row(ui, "Before", &mut fields.before, "Up to the day before this one");
+        ui.label("Label");
+        // By name, as the sidebar and the Label menu show them; one typed that is not listed stays.
+        let shown = if fields.label.is_empty() { "Any label".to_owned() } else { fields.label.clone() };
+        egui::ComboBox::from_id_salt("search_form_label").width(FIELD - 2.0 * ui.spacing().button_padding.x).height(320.0).selected_text(shown).show_ui(ui, |ui| {
+            ui.selectable_value(&mut fields.label, String::new(), "Any label");
+            for (_, name, color) in theme::labels() {
+                let selected = fields.label.eq_ignore_ascii_case(&name);
+                let mut text = egui::text::LayoutJob::default();
+                text.append("● ", 0.0, egui::TextFormat::simple(egui::FontId::proportional(13.0), color));
+                text.append(&name, 0.0, egui::TextFormat::simple(egui::FontId::proportional(15.0), t.text));
+                if ui.selectable_label(selected, text).clicked() {
+                    fields.label = name;
+                }
+            }
+        });
+        ui.end_row();
     });
     ui.add_space(4.0);
     crate::views::switch_row(ui, t, &mut fields.attachment, "Has an attachment", "");
@@ -127,15 +154,20 @@ pub fn panel(ui: &mut egui::Ui, t: &Tokens, fields: &mut Fields) -> bool {
         ui.label(RichText::new(problem).size(13.0).color(t.danger));
     }
     ui.add_space(8.0);
-    let mut search = false;
+    let (mut search, mut clear) = (false, false);
     ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
         let why = problem.or_else(|| fields.query().is_empty().then_some("Fill in at least one field"));
         search = crate::views::primary_button(ui, t, "Search", why.is_none()).on_disabled_hover_text(why.unwrap_or_default()).clicked();
-        if ui.button("Clear").clicked() {
+        if ui.button("Clear").on_hover_text("Empty the fields and the search box, and close").clicked() {
             *fields = Fields::default();
+            clear = true;
         }
     });
-    (search || enter) && problem.is_none() && !fields.query().is_empty()
+    if clear {
+        Some(Done::Clear)
+    } else {
+        ((search || enter) && problem.is_none() && !fields.query().is_empty()).then_some(Done::Search)
+    }
 }
 
 #[cfg(test)]
@@ -144,7 +176,9 @@ mod tests {
 
     #[test]
     fn the_box_and_the_form_say_the_same_search() {
-        let fields = Fields::parse(r#"budget from:"Ada Lovelace" in:inbox has:attachment after:2026-09 from:bob"#);
+        let fields = Fields::parse(r#"budget from:"Ada Lovelace" in:inbox has:attachment after:2026-09 from:bob label:"to do""#);
+        assert_eq!(fields.label, "to do");
+        let fields = Fields { label: String::new(), ..fields };
         assert_eq!(fields.from, "Ada Lovelace");
         assert_eq!(fields.after, "2026-09");
         assert!(fields.attachment && !fields.unread);

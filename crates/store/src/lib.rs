@@ -493,6 +493,8 @@ struct Query {
     all: bool,
     unread: bool,
     attachment: bool,
+    /// IMAP keywords the message must carry, from `label:`.
+    labels: Vec<String>,
 }
 
 impl Query {
@@ -509,6 +511,7 @@ impl Query {
                 Some(("in", v)) if !v.is_empty() => query.folders.push(v.to_owned()),
                 Some(("is", v)) if v.eq_ignore_ascii_case("unread") => query.unread = true,
                 Some(("has", v)) if v.eq_ignore_ascii_case("attachment") => query.attachment = true,
+                Some(("label", v)) if !v.is_empty() => query.labels.push(v.to_owned()),
                 _ => query.words.push(token),
             }
         }
@@ -532,6 +535,8 @@ impl Query {
         if self.attachment {
             parts.push("HEADER Content-Type \"multipart/mixed\"".into());
         }
+        // A keyword is an atom: anything that could not be one is left out rather than sent.
+        parts.extend(self.labels.iter().filter(|k| k.chars().all(|c| c.is_ascii_graphic() && !"(){%*\"\\]".contains(c))).map(|k| format!("KEYWORD {k}")));
         let text = if parts.is_empty() { "ALL".to_owned() } else { parts.join(" ") };
         if text.is_ascii() { text } else { format!("CHARSET UTF-8 {text}") }
     }
@@ -1886,6 +1891,11 @@ impl Store {
         if query.attachment {
             conditions.push("attach = 1".to_owned());
         }
+        for keyword in &query.labels {
+            // The keywords are one space-separated text: % and _ are taken literally.
+            let p = arg(format!("% {} %", keyword.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")), &mut args);
+            conditions.push(format!("(' ' || labels || ' ') LIKE {p} ESCAPE '\\'"));
+        }
         let sql = format!("SELECT {SUMMARY_COLUMNS}, folder FROM messages WHERE {} ORDER BY timestamp DESC LIMIT {}", conditions.join(" AND "), limit.min(1000));
         let conn = self.read();
         let mut stmt = conn.prepare(&sql).map_err(db)?;
@@ -2443,6 +2453,20 @@ mod tests {
         store.add_headers("me", "INBOX", &[header(1, "Quarterly zeppelin budget", 5, true)]).unwrap();
         let id = store.id_of("me", "INBOX", 1).unwrap().unwrap();
         store.index_body(id, "the quokka said hello").unwrap();
+    }
+
+    #[test]
+    fn a_label_is_searched_by_its_keyword_whole() {
+        let store = store();
+        let mut tagged = header(4, "Tagged", 5, false);
+        tagged.labels = "$label2 my_tag".into();
+        store.add_headers("me", "INBOX", &[tagged, header(5, "Plain", 6, false)]).unwrap();
+        let found = |q: &str| store.search("me", q, 10).unwrap().len();
+        assert_eq!(found("label:my_tag"), 1);
+        assert_eq!(found("label:$label2"), 1);
+        assert_eq!(found("label:my"), 0, "a whole keyword, not a part");
+        assert_eq!(found("label:myXtag"), 0, "_ is not a wildcard");
+        assert_eq!(store.server_search("me", "label:my_tag").unwrap().unwrap().1, "KEYWORD my_tag");
     }
 
     #[test]

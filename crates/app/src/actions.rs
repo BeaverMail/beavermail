@@ -15,8 +15,11 @@ pub(crate) enum Action {
     Pin(bool),
     /// The star every client shows, on or off.
     Star(bool),
-    /// The standard label `$label<n>`, on or off.
+    /// The standard label `$label<n>`, on or off. Kept so changes saved by an earlier version still
+    /// read; new ones are [`Self::Keyword`].
     Label(u8, bool),
+    /// A label, by its keyword, on or off.
+    Keyword(String, bool),
     Archive,
     Trash,
     /// To the server's Spam folder.
@@ -32,6 +35,15 @@ pub(crate) enum Action {
 }
 
 impl Action {
+    /// The label it puts on or takes off, as (keyword, on).
+    pub(crate) fn label(&self) -> Option<(String, bool)> {
+        match self {
+            Self::Label(n, on) => Some((format!("$label{n}"), *on)),
+            Self::Keyword(keyword, on) => Some((keyword.clone(), *on)),
+            _ => None,
+        }
+    }
+
     /// Whether the message leaves the folder being shown.
     pub(crate) fn removes(&self) -> bool {
         matches!(self, Self::Archive | Self::Trash | Self::Spam | Self::NotSpam | Self::Move(_) | Self::Erase)
@@ -70,6 +82,7 @@ pub(crate) async fn perform(source: Arc<ImapSource>, id: MessageId, action: Acti
         Action::Pin(on) => source.set_pinned(id, on).await,
         Action::Star(on) => source.set_starred(id, on).await,
         Action::Label(n, on) => source.set_label(id, &format!("$label{n}"), on).await,
+        Action::Keyword(keyword, on) => source.set_label(id, &keyword, on).await,
         Action::Archive => source.archive(id).await,
         Action::Trash => source.trash(id).await,
         Action::Spam => source.move_to(id, Role::Junk).await,

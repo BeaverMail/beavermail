@@ -22,6 +22,7 @@ mod diag;
 mod drafts;
 mod event_form;
 mod filters;
+mod labels;
 mod encryption;
 mod original;
 mod relocate;
@@ -321,6 +322,8 @@ struct SidebarOutcome {
     /// "Rename…" or "Delete folder…" was chosen in this (account, folder index)'s menu.
     rename: Option<(u64, usize)>,
     delete: Option<(u64, usize)>,
+    /// A label was clicked: its mail, searched for everywhere.
+    label: Option<String>,
 }
 
 /// A message as the server holds it, shown in a source tab.
@@ -899,6 +902,7 @@ enum SettingsPage {
     Calendars,
     Spam,
     Filters,
+    Labels,
     Encryption,
     Storage,
     Troubleshooting,
@@ -907,7 +911,7 @@ enum SettingsPage {
 }
 
 impl SettingsPage {
-    const ALL: [Self; 9] = [Self::Appearance, Self::Reading, Self::Writing, Self::Calendars, Self::Spam, Self::Filters, Self::Encryption, Self::Storage, Self::Troubleshooting];
+    const ALL: [Self; 10] = [Self::Appearance, Self::Reading, Self::Writing, Self::Calendars, Self::Spam, Self::Filters, Self::Labels, Self::Encryption, Self::Storage, Self::Troubleshooting];
 
     fn title(self) -> &'static str {
         match self {
@@ -917,6 +921,7 @@ impl SettingsPage {
             Self::Calendars => "Calendars",
             Self::Spam => "Suspicious mail",
             Self::Filters => "Filters",
+            Self::Labels => "Labels",
             Self::Storage => "Stored mail",
             Self::Encryption => "Secure mail",
             Self::Troubleshooting => "Troubleshooting",
@@ -932,6 +937,7 @@ impl SettingsPage {
             Self::Calendars => Some(Icon::Calendar),
             Self::Spam => Some(Icon::Spam),
             Self::Filters => Some(Icon::Sliders),
+            Self::Labels => Some(Icon::Tag),
             Self::Storage => Some(Icon::Lock),
             Self::Encryption => Some(Icon::Key),
             Self::Troubleshooting => Some(Icon::LifeBuoy),
@@ -947,6 +953,7 @@ impl SettingsPage {
             Self::Calendars => "The calendars synced from a server, and the one on this computer.",
             Self::Spam => "Mail from people you know is never held. Nothing moves on the server.",
             Self::Filters => "Rules that sort new mail as it arrives: move it, star it, label it or mark it as read.",
+            Self::Labels => "The labels you can put on messages, with their names and colours.",
             Self::Storage => "How downloaded messages are kept on this computer, and whether they are encrypted there.",
             Self::Encryption => "Your OpenPGP and S/MIME keys, to read encrypted mail and to send mail encrypted or signed.",
             Self::Troubleshooting => "What to send when something is slow or does not work.",
@@ -1323,6 +1330,7 @@ struct BeaverApp {
     hits: Vec<(u64, Hit)>,
     /// The search options form while it is open; see [`search_form`].
     search_fields: search_form::Fields,
+    search_options: bool,
     /// The search the server was asked for too, and the accounts still searching it, folder by folder.
     server_seq: u64,
     server_progress: Vec<(u64, Arc<Progress>)>,
@@ -1590,6 +1598,7 @@ impl BeaverApp {
             server_seq: 0,
             server_progress: Vec::new(),
             search_fields: search_form::Fields::default(),
+            search_options: false,
             focus_search: false,
             compose: None,
             drafts: Vec::new(),
@@ -2470,7 +2479,11 @@ impl BeaverApp {
                 Action::Unread(unread) => self.messages[pos].unread = unread,
                 Action::Pin(on) => self.messages[pos].pinned = on,
                 Action::Star(on) => self.messages[pos].starred = on,
-                Action::Label(n, on) => set_label(&mut self.messages[pos].labels, n, on),
+                Action::Label(..) | Action::Keyword(..) => {
+                    if let Some((keyword, on)) = action.label() {
+                        set_label(&mut self.messages[pos].labels, &keyword, on);
+                    }
+                }
                 _ => drop(self.messages.remove(pos)),
             }
         }
@@ -2489,9 +2502,9 @@ impl BeaverApp {
             self.tabs.iter_mut().filter(|t| t.message.id == id).for_each(|t| t.message.unread = unread);
             self.hits.iter_mut().filter(|(_, h)| h.message.id == id).for_each(|(_, h)| h.message.unread = unread);
         }
-        if let Action::Label(n, on) = action {
-            self.tabs.iter_mut().filter(|t| t.message.id == id).for_each(|t| set_label(&mut t.message.labels, n, on));
-            self.hits.iter_mut().filter(|(_, h)| h.message.id == id).for_each(|(_, h)| set_label(&mut h.message.labels, n, on));
+        if let Some((keyword, on)) = action.label() {
+            self.tabs.iter_mut().filter(|t| t.message.id == id).for_each(|t| set_label(&mut t.message.labels, &keyword, on));
+            self.hits.iter_mut().filter(|(_, h)| h.message.id == id).for_each(|(_, h)| set_label(&mut h.message.labels, &keyword, on));
         }
         if let Action::Star(on) = action {
             self.tabs.iter_mut().filter(|t| t.message.id == id).for_each(|t| t.message.starred = on);
@@ -3090,7 +3103,7 @@ impl BeaverApp {
 
     /// The accounts to search for the query in the box, each with the query it is asked.
     fn search_targets(&self) -> Vec<(u64, Arc<ImapSource>, String)> {
-        let query = self.query.trim().to_owned();
+        let query = label_keywords(self.query.trim());
         // Where the labels under the box say (the folder shown: every account's, in All inboxes), unless
         // the query names a folder itself: "in:all" is everywhere.
         let named = names_folder(&query);
@@ -4122,6 +4135,9 @@ impl BeaverApp {
                                         changed = true;
                                     }
                                 }
+                            }
+                            SettingsPage::Labels => {
+                                changed |= labels::page(ui, t, &mut self.settings.labels);
                             }
                             SettingsPage::Filters => {
                                 let accounts: Vec<(String, String)> = self.accounts.iter().map(|v| (v.account.key(), v.account.address().to_owned())).collect();
@@ -6246,12 +6262,12 @@ impl BeaverApp {
         item(ui, Command::Pin, if all(|m| m.pinned) { "Unpin" } else { "Pin" });
         item(ui, Command::Star, if all(|m| m.starred) { "Unstar" } else { "Star" });
         ui.menu_button("Label", |ui| {
-            for n in 1..=5 {
-                let keyword = format!("$label{n}");
+            for (n, (keyword, name, _)) in theme::labels().into_iter().enumerate().take(usize::from(u8::MAX)) {
                 let has = ids.iter().all(|id| self.summary_of(*id).is_some_and(|m| m.labels.contains(&keyword)));
-                let (name, _) = theme::label(&keyword);
-                item(ui, Command::Label(n), &if has { format!("Remove {name}") } else { name });
+                item(ui, Command::Label(n as u8 + 1), &if has { format!("Remove {name}") } else { name });
             }
+            ui.separator();
+            item(ui, Command::ClearLabels, "Remove all labels");
         });
         ui.separator();
         for command in [Command::MoveTo, Command::Archive, Command::Trash] {
@@ -6617,6 +6633,11 @@ impl BeaverApp {
             // A message only selected, or still loading, is answered once its text is there.
             Command::Reply | Command::ReplyAll | Command::Forward => one().map(|_| ()),
             Command::Archive | Command::Trash | Command::ToggleRead | Command::Pin | Command::Star | Command::Label(_) => some(),
+            Command::ClearLabels => {
+                some()?;
+                let any = targets.iter().any(|id| self.summary_of(*id).is_some_and(|m| !m.labels.is_empty()));
+                if any { Ok(()) } else { Err("No labels on it") }
+            }
             Command::MoveTo => {
                 some()?;
                 let accounts: std::collections::HashSet<u64> = targets.iter().filter_map(|id| self.serial_of(*id)).collect();
@@ -6723,9 +6744,18 @@ impl BeaverApp {
             }
             // On unless every one has it already.
             Command::Label(n) => {
-                let keyword = format!("$label{n}");
+                let Some((keyword, ..)) = theme::labels().into_iter().nth(usize::from(n).saturating_sub(1)) else { return };
                 let has = targets.iter().all(|id| self.summary_of(*id).is_some_and(|m| m.labels.contains(&keyword)));
-                self.request_all(targets, Action::Label(n, !has));
+                self.request_all(targets, Action::Keyword(keyword, !has));
+            }
+            Command::ClearLabels => {
+                let mut keywords: Vec<String> = targets.iter().filter_map(|id| self.summary_of(*id)).flat_map(|m| m.labels.clone()).collect();
+                keywords.sort();
+                keywords.dedup();
+                for keyword in keywords {
+                    let with: Vec<MessageId> = targets.iter().copied().filter(|id| self.summary_of(*id).is_some_and(|m| m.labels.contains(&keyword))).collect();
+                    self.request_all(with, Action::Keyword(keyword, false));
+                }
             }
             Command::Spam if targets.len() >= 2 => self.request_all(targets, Action::Spam),
             Command::Spam => {
@@ -8168,6 +8198,7 @@ impl BeaverApp {
         let mut dropped = None;
         let mut new_inside = None;
         let (mut rename, mut delete) = (None, None);
+        let mut label = None;
         // shortcut: only the Inboxes being shown have verdicts; the others keep the count of their last
         // check (All inboxes, shown at start, checks every one). Checking every account in the background
         // during sync would keep them all current.
@@ -8399,6 +8430,16 @@ impl BeaverApp {
                         }
                         if self.accounts.is_empty() {
                             ui.label(RichText::new("No accounts yet").color(t.text_dim));
+                        } else {
+                            ui.add_space(12.0);
+                            ui.label(RichText::new("LABELS").size(12.0).color(t.text_dim));
+                            for (_, name, color) in theme::labels() {
+                                let query = search_form::quoted(&format!("label:{name}"));
+                                let shown = self.searching() && self.query.trim() == query;
+                                if views::label_row(ui, t, &name, color, shown).on_hover_text("Its mail in every folder of every account").clicked() {
+                                    label = Some(query);
+                                }
+                            }
                         }
                     });
                 });
@@ -8414,7 +8455,7 @@ impl BeaverApp {
             }
             self.save_settings();
         }
-        SidebarOutcome { chosen, suspicious, recheck, empty, recheck_all, empty_all, removed, edit, add, all, scheduled, all_suspicious, all_spam, dropped, new_inside, rename, delete }
+        SidebarOutcome { chosen, suspicious, recheck, empty, recheck_all, empty_all, removed, edit, add, all, scheduled, all_suspicious, all_spam, dropped, new_inside, rename, delete, label }
     }
 
     /// Search, refresh and the message list. Returns the message the user clicked and whether to add an account.
@@ -8457,20 +8498,44 @@ impl BeaverApp {
                 let width = ui.available_width() - 2.0 * theme::CONTROL_H - 24.0;
                 let focus = std::mem::take(&mut self.focus_search);
                 field = Some(views::search_box(ui, t, &mut self.query, "Search mail  ( / )", width, focus)
-                    .on_hover_text(format!("Search the folder shown, as stored on this computer; the labels under the box look further.\nWords, \"a phrase\", from:ada, to:bob, subject:invoice, in:inbox (in: lists the folders), is:unread, has:attachment, after:2026-09-01, before:2026-10\n\nAll commands and their keys: {}", Command::Palette.keys(ui.ctx()))));
+                    .on_hover_text(format!("Search the folder shown, as stored on this computer; the labels under the box look further.\nWords, \"a phrase\", from:ada, to:bob, subject:invoice, in:inbox (in: lists the folders), is:unread, has:attachment, label:work, after:2026-09-01, before:2026-10\n\nAll commands and their keys: {}", Command::Palette.keys(ui.ctx()))));
                 // The same search from fields, read from the box and written back to it.
-                let options = icons::button(ui, t, Icon::Sliders, "Search options: from, to, subject, dates…", true, false);
+                let options = icons::button(ui, t, Icon::Sliders, "Search options: from, to, subject, dates…", true, self.search_options);
+                // Not a popup: egui keeps one open at a time, so the label list inside would close it.
                 if options.clicked() {
-                    self.search_fields = search_form::Fields::parse(&self.query);
-                }
-                let frame = egui::Frame::popup(ui.style()).inner_margin(egui::Margin::same(20));
-                egui::Popup::from_toggle_button_response(&options).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).align(egui::RectAlign::BOTTOM_END).frame(frame).show(|ui| {
-                    ui.set_width(400.0);
-                    if search_form::panel(ui, t, &mut self.search_fields) {
-                        self.query = self.search_fields.query();
-                        ui.close();
+                    self.search_options = !self.search_options;
+                    if self.search_options {
+                        self.search_fields = search_form::Fields::parse(&self.query);
                     }
-                });
+                }
+                if self.search_options {
+                    let frame = egui::Frame::popup(ui.style()).inner_margin(egui::Margin::same(20));
+                    let width = 400.0 + 40.0;
+                    let form = egui::Area::new(egui::Id::new("search_options")).order(egui::Order::Foreground).fixed_pos(pos2(options.rect.right() - width, options.rect.bottom() + 6.0)).show(ui.ctx(), |ui| {
+                        frame.show(ui, |ui| {
+                            ui.set_width(400.0);
+                            match search_form::panel(ui, t, &mut self.search_fields) {
+                                Some(search_form::Done::Search) => {
+                                    self.query = self.search_fields.query();
+                                    self.search_options = false;
+                                }
+                                Some(search_form::Done::Clear) => {
+                                    self.query.clear();
+                                    self.search_options = false;
+                                }
+                                None => {}
+                            }
+                        });
+                    });
+                    // Closed by a click outside it, as a menu, but not by one in a list it opened (the
+                    // labels), which lies over the window as it does; and by Esc.
+                    let (clicked, at, esc) = ui.input(|i| (i.pointer.primary_clicked(), i.pointer.interact_pos(), i.key_pressed(egui::Key::Escape)));
+                    let outside = clicked
+                        && at.is_some_and(|at| !form.response.rect.contains(at) && !options.rect.contains(at) && ui.ctx().layer_id_at(at).is_none_or(|layer| layer.order < egui::Order::Foreground));
+                    if outside || (esc && !egui::Popup::is_any_open(ui.ctx())) {
+                        self.search_options = false;
+                    }
+                }
                 if self.syncing > 0 {
                     ui.allocate_ui(vec2(theme::CONTROL_H - 4.0, theme::CONTROL_H - 4.0), |ui| ui.centered_and_justified(|ui| views::slow_spinner(ui, 16.0))).response.on_hover_text("Syncing…");
                 } else {
@@ -9284,6 +9349,7 @@ impl eframe::App for BeaverApp {
         }
         slow.mark("events");
         views::set_link_params(ui.ctx(), &self.settings.link_params);
+        theme::set_labels(&self.settings.labels);
         // Address books at start, then every quarter of an hour (changes made here go at once).
         if self.contacts_synced.is_none_or(|at| at.elapsed() > std::time::Duration::from_secs(15 * 60)) {
             self.contacts_synced = Some(std::time::Instant::now());
@@ -9348,7 +9414,7 @@ impl eframe::App for BeaverApp {
                 _ => {}
             }
         }
-        let SidebarOutcome { chosen, suspicious, recheck, empty, recheck_all, empty_all, removed, edit, mut add, all, scheduled, all_suspicious, all_spam, dropped, new_inside, rename, delete } =
+        let SidebarOutcome { chosen, suspicious, recheck, empty, recheck_all, empty_all, removed, edit, mut add, all, scheduled, all_suspicious, all_spam, dropped, new_inside, rename, delete, label } =
             if self.in_tab || contacts { SidebarOutcome::default() } else { self.sidebar(ui, &t) };
         slow.mark("sidebar");
         if let Some((serial, index)) = new_inside {
@@ -9389,6 +9455,10 @@ impl eframe::App for BeaverApp {
         if all_spam {
             self.show_suspicious = false;
             self.show_all(Role::Junk);
+        }
+        if let Some(query) = label {
+            self.query = query;
+            self.search_scope = Scope::Everywhere;
         }
         if scheduled {
             self.show_scheduled_list();
@@ -9642,11 +9712,27 @@ fn folder_menu(ui: &mut egui::Ui, role: Role, count: (usize, u32, usize), holdin
 }
 
 /// Puts the standard label `$label<n>` in a message's labels, or takes it out.
-fn set_label(labels: &mut Vec<String>, n: u8, on: bool) {
-    let keyword = format!("$label{n}");
-    labels.retain(|l| *l != keyword);
+/// The query with each `label:` naming a label as the user knows it ("label:work", "label:\"to do\"")
+/// turned into the keyword the messages carry, which is what the archive and the server look for.
+fn label_keywords(query: &str) -> String {
+    let labels = theme::labels();
+    beavermail_store::tokens(query)
+        .into_iter()
+        .map(|token| match token.split_once(':') {
+            Some(("label", v)) => match labels.iter().find(|(keyword, name, _)| name.eq_ignore_ascii_case(v) || keyword.eq_ignore_ascii_case(v)) {
+                Some((keyword, ..)) => format!("label:{keyword}"),
+                None => search_form::quoted(&token),
+            },
+            _ => search_form::quoted(&token),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn set_label(labels: &mut Vec<String>, keyword: &str, on: bool) {
+    labels.retain(|l| l != keyword);
     if on {
-        labels.push(keyword);
+        labels.push(keyword.to_owned());
     }
 }
 

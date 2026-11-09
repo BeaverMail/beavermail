@@ -159,30 +159,48 @@ fn role_icon(role: Role) -> Icon {
 
 /// A folder in the sidebar: coloured icon, name, and the unread count in a pill.
 pub fn folder_row(ui: &mut Ui, t: &Tokens, title: &str, role: Role, unread: u32, selected: bool) -> Response {
-    nav_row(ui, t, title, Some((role_icon(role), theme::role_color(role))), unread, selected)
+    nav_row(ui, t, title, Lead::Icon(role_icon(role), theme::role_color(role)), unread, selected)
 }
 
 /// Under an Inbox: the mail held apart as suspicious, with how many messages in the pill.
 pub fn suspicious_row(ui: &mut Ui, t: &Tokens, held: u32, selected: bool) -> Response {
-    nav_row(ui, t, "Suspicious", Some((Icon::Spam, t.danger)), held, selected)
+    nav_row(ui, t, "Suspicious", Lead::Icon(Icon::Spam, t.danger), held, selected)
 }
 
 /// A page in the settings sidebar: its icon, or with none the initials of `title` (an account).
 pub fn settings_row(ui: &mut Ui, t: &Tokens, title: &str, icon: Option<Icon>, selected: bool) -> Response {
-    let response = nav_row(ui, t, title, icon.map(|i| (i, if selected { t.accent } else { t.text_dim })), 0, selected);
+    let lead = icon.map_or(Lead::Avatar, |i| Lead::Icon(i, if selected { t.accent } else { t.text_dim }));
+    let response = nav_row(ui, t, title, lead, 0, selected);
     response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, title));
     response
 }
 
-fn nav_row(ui: &mut Ui, t: &Tokens, title: &str, icon: Option<(Icon, Color32)>, unread: u32, selected: bool) -> Response {
+/// What a sidebar row starts with.
+enum Lead {
+    Icon(Icon, Color32),
+    /// The initial of its title, as for a person or an address book.
+    Avatar,
+    /// A label's colour.
+    Dot(Color32),
+}
+
+/// A label in the sidebar: its colour and name; a click shows its mail.
+pub fn label_row(ui: &mut Ui, t: &Tokens, name: &str, color: Color32, selected: bool) -> Response {
+    nav_row(ui, t, name, Lead::Dot(color), 0, selected)
+}
+
+fn nav_row(ui: &mut Ui, t: &Tokens, title: &str, lead_with: Lead, unread: u32, selected: bool) -> Response {
     // A sidebar made denser (see [`theme::dense`]) lowers it.
     let height = FOLDER_ROW_H.min(ui.spacing().interact_size.y);
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
     row_background(ui, rect, &response, selected, t);
     let lead = pos2(rect.left() + 22.0, rect.center().y);
-    match icon {
-        Some((icon, color)) => icon.image(icons::SIZE, color).paint_at(ui, Rect::from_center_size(lead, vec2(icons::SIZE, icons::SIZE))),
-        None => avatar(ui, t, title, lead, 24.0),
+    match lead_with {
+        Lead::Icon(icon, color) => icon.image(icons::SIZE, color).paint_at(ui, Rect::from_center_size(lead, vec2(icons::SIZE, icons::SIZE))),
+        Lead::Avatar => avatar(ui, t, title, lead, 24.0),
+        Lead::Dot(color) => {
+            ui.painter().circle_filled(lead, 5.0, color);
+        }
     }
     if response.has_focus() {
         ui.painter().rect_stroke(rect, CornerRadius::same(CONTROL_RADIUS), egui::Stroke::new(1.0, t.accent), egui::StrokeKind::Inside);
@@ -665,6 +683,19 @@ pub fn table_row(ui: &mut Ui, t: &Tokens, message: &MessageSummary, selected: bo
     }
     if message.priority != 0 {
         x += 20.0;
+    }
+    // Labels as in the cards: a pill each at the subject's end, as many as leave the subject room.
+    for keyword in message.labels.iter().rev() {
+        let (name, color) = theme::label(keyword);
+        let text = ui.painter().layout_no_wrap(name, FontId::proportional(12.0), t.text_dim);
+        let pill = Rect::from_min_size(pos2(right - text.size().x - 22.0, y - 9.0), vec2(text.size().x + 22.0, 18.0));
+        if pill.left() < x + 80.0 {
+            break;
+        }
+        ui.painter().rect_filled(pill, CornerRadius::same(9), t.hover);
+        ui.painter().circle_filled(pos2(pill.left() + 9.0, y), 3.5, color);
+        ui.painter().galley(pos2(pill.left() + 16.0, y - text.size().y / 2.0), text, t.text_dim);
+        right = pill.left() - 6.0;
     }
     let subject = truncated(ui, &message.subject, font, primary, right - x);
     ui.painter().galley(pos2(x, y - subject.size().y / 2.0), subject, primary);
@@ -1240,7 +1271,7 @@ pub fn draft_row(ui: &mut Ui, t: &Tokens, draft: &crate::drafts::DraftData) -> D
 
 /// A row of the sidebar that is not a folder: its icon, title and count.
 pub fn icon_row(ui: &mut Ui, t: &Tokens, title: &str, icon: Icon, count: u32, selected: bool) -> Response {
-    nav_row(ui, t, title, Some((icon, if selected { t.accent } else { t.text_dim })), count, selected)
+    nav_row(ui, t, title, Lead::Icon(icon, if selected { t.accent } else { t.text_dim }), count, selected)
 }
 
 /// 1240 as "1,240".

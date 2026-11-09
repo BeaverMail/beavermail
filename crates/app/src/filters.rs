@@ -37,7 +37,8 @@ pub(crate) fn actions(filters: &[Filter], m: &MessageSummary, recipients: &str) 
             let flag = match action {
                 FilterAction::Read => Action::Unread(false),
                 FilterAction::Star => Action::Star(true),
-                FilterAction::Label(n) => Action::Label(*n, true),
+                FilterAction::Label(n) => Action::Keyword(format!("$label{n}"), true),
+                FilterAction::Keyword(keyword) => Action::Keyword(keyword.clone(), true),
                 FilterAction::Move(folder) => {
                     moved = moved.or(Some(Action::Move(folder.clone())));
                     continue;
@@ -79,6 +80,7 @@ pub(crate) fn describe(filter: &Filter, folder_title: impl Fn(&str) -> String) -
             FilterAction::Read => "Mark as read".to_owned(),
             FilterAction::Star => "Star".to_owned(),
             FilterAction::Label(n) => format!("Label {}", crate::theme::label(&format!("$label{n}")).0),
+            FilterAction::Keyword(keyword) => format!("Label {}", crate::theme::label(keyword).0),
             FilterAction::Trash => "Move to Trash".to_owned(),
         })
         .collect();
@@ -230,8 +232,12 @@ pub(crate) fn editor(ctx: &egui::Context, t: &Tokens, filter: &mut Filter, folde
         }
         let mut remove = None;
         for (i, action) in filter.actions.iter_mut().enumerate() {
+            // A standard label as filters saved it before any label could be chosen.
+            if let FilterAction::Label(n) = action {
+                *action = FilterAction::Keyword(format!("$label{n}"));
+            }
             ui.horizontal(|ui| {
-                let kinds = [("Move to", FilterAction::Move(String::new())), ("Mark as read", FilterAction::Read), ("Star", FilterAction::Star), ("Label", FilterAction::Label(1)), ("Move to Trash", FilterAction::Trash)];
+                let kinds = [("Move to", FilterAction::Move(String::new())), ("Mark as read", FilterAction::Read), ("Star", FilterAction::Star), ("Label", FilterAction::Keyword("$label1".into())), ("Move to Trash", FilterAction::Trash)];
                 let shown = kinds.iter().find(|(_, k)| std::mem::discriminant(k) == std::mem::discriminant(action)).map_or("", |(l, _)| l);
                 egui::ComboBox::from_id_salt(("filter_action", i)).width(KIND).selected_text(shown).show_ui(ui, |ui| {
                     for (label, kind) in kinds {
@@ -250,10 +256,10 @@ pub(crate) fn editor(ctx: &egui::Context, t: &Tokens, filter: &mut Filter, folde
                             }
                         });
                     }
-                    FilterAction::Label(n) => {
-                        egui::ComboBox::from_id_salt(("filter_label", i)).width(rest - 2.0 * ui.spacing().button_padding.x).selected_text(theme::label(&format!("$label{n}")).0).show_ui(ui, |ui| {
-                            for k in 1..=5u8 {
-                                ui.selectable_value(n, k, theme::label(&format!("$label{k}")).0);
+                    FilterAction::Keyword(keyword) => {
+                        egui::ComboBox::from_id_salt(("filter_label", i)).width(rest - 2.0 * ui.spacing().button_padding.x).selected_text(theme::label(keyword).0).show_ui(ui, |ui| {
+                            for (k, name, _) in theme::labels() {
+                                ui.selectable_value(keyword, k, name);
                             }
                         });
                     }
@@ -361,7 +367,7 @@ mod tests {
         let got = actions(&[star.clone(), read.clone()], &m, "");
         assert!(matches!(got.as_slice(), [Action::Star(true), Action::Move(f)] if f == "Receipts"), "the second filter is not tried");
         let stop = Filter { stop: true, actions: vec![FilterAction::Label(2)], ..star.clone() };
-        assert!(matches!(actions(&[stop, read.clone()], &m, "").as_slice(), [Action::Label(2, true)]));
+        assert!(matches!(actions(&[stop, read.clone()], &m, "").as_slice(), [Action::Keyword(k, true)] if k == "$label2"));
         let off = Filter { enabled: false, ..star };
         assert!(matches!(actions(&[off, read], &m, "").as_slice(), [Action::Unread(false), Action::Trash]));
     }
