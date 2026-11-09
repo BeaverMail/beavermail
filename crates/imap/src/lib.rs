@@ -42,6 +42,8 @@ struct State {
     /// The folder last chosen on the session, kept only where one caller alone chooses folders (the
     /// reader's connection), so choosing it again can be skipped.
     folder: Option<String>,
+    /// QRESYNC is on for the session: a fetch of what changed also names the messages expunged.
+    qresync: bool,
 }
 
 /// What a write does to one message.
@@ -514,8 +516,12 @@ impl State {
             self.folder = None;
             let mut session = connect_in_time(config).await?;
             // Folders then say their HIGHESTMODSEQ when chosen (RFC 7162), so a sync can tell that
-            // nothing changed, or only flags did. A server that refuses is synced as before.
-            if session.capabilities().await.is_ok_and(|c| c.has_str("CONDSTORE")) {
+            // nothing changed, or only flags did; with QRESYNC (which takes CONDSTORE in) the server
+            // also names the messages expunged since. A server that refuses is synced as before.
+            let caps = session.capabilities().await.ok();
+            let has = |cap: &str| caps.as_ref().is_some_and(|c| c.has_str(cap));
+            self.qresync = has("QRESYNC") && session.run_command_and_check_ok("ENABLE QRESYNC").await.is_ok();
+            if !self.qresync && has("CONDSTORE") {
                 let _ = session.run_command_and_check_ok("ENABLE CONDSTORE").await;
             }
             self.session = Some(session);
@@ -884,8 +890,10 @@ impl ImapSource {
     async fn sync_folder(&self, folder: &str) -> Result<SyncReport, MailError> {
         let mut state = self.state.lock().await;
         loop {
-            let session = state.session(&self.config).await?;
-            let result = self.sync_with(session, folder).await;
+            state.session(&self.config).await?;
+            let qresync = state.qresync;
+            let session = state.session.as_mut().expect("just connected");
+            let result = self.sync_with(session, folder, qresync).await;
             return match result {
                 Ok(report) => Ok(report),
                 Err(SyncError::Archive(e)) => Err(e),
@@ -909,7 +917,8 @@ impl ImapSource {
         !self.plain.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(folder)
     }
 
-    async fn sync_with(&self, session: &mut Session<Stream>, folder: &str) -> Result<SyncReport, SyncError> {
+    /// `qresync`: the session has QRESYNC on (see [`State::qresync`]).
+    async fn sync_with(&self, session: &mut Session<Stream>, folder: &str, qresync: bool) -> Result<SyncReport, SyncError> {
         let (account, store) = (self.account.as_str(), &*self.store);
         let structure = self.structured(folder);
         let selected = session.examine(folder).await?;
@@ -1005,24 +1014,33 @@ impl ImapSource {
         }
 
         // Flags and deletions: nothing to ask when nothing changed; only what changed when only flags
-        // did (anywhere in the folder); else those of the newest cached messages.
-        let reconcile = match changed_since {
+        // did (anywhere in the folder); with QRESYNC, what changed and what was expunged, whatever came
+        // or went; else those of the newest cached messages.
+        let reconcile = match (changed_since, cached.seen.filter(|_| qresync)) {
             _ if untouched => None,
-            Some(modseq) => Some((1, format!("UID FETCH 1:* (UID FLAGS) (CHANGEDSINCE {modseq})"), false)),
-            None => store.nth_newest_uid(account, folder, RECONCILE_WINDOW)?.or(store.uid_range(account, folder)?.map(|(lo, _, _)| lo)).map(|from| (from, format!("UID FETCH {from}:* (UID FLAGS)"), true)),
+            (Some(modseq), _) => Some((1, format!("UID FETCH 1:* (UID FLAGS) (CHANGEDSINCE {modseq})"), false)),
+            (None, Some(before)) => Some((1, format!("UID FETCH 1:* (UID FLAGS) (CHANGEDSINCE {} VANISHED)", before.modseq), false)),
+            (None, None) => store.nth_newest_uid(account, folder, RECONCILE_WINDOW)?.or(store.uid_range(account, folder)?.map(|(lo, _, _)| lo)).map(|from| (from, format!("UID FETCH {from}:* (UID FLAGS)"), true)),
         };
         // `complete`: the answer lists every message from `from` up, so one missing from it is gone.
         if let Some((from, command, complete)) = reconcile {
             // What is missing from the answer is forgotten here, so only a complete one counts.
+            // Messages the server says were expunged (QRESYNC's VANISHED) count as flagged deleted; only
+            // those this computer has matter.
+            let highest = store.uid_range(account, folder)?.map_or(0, |(_, hi, _)| hi);
             let fetches: Vec<(u32, Vec<Flag>)> = answered(session, &command, |r| match r {
                 Response::Fetch(_, attributes) => {
                     let uid = attributes.iter().find_map(|a| match a { AttributeValue::Uid(uid) => Some(*uid), _ => None })?;
                     let flags = attributes.iter().find_map(|a| match a { AttributeValue::Flags(f) => Some(f.iter().map(|f| Flag::from(f.to_string())).collect()), _ => None });
-                    Some((uid, flags.unwrap_or_default()))
+                    Some(vec![(uid, flags.unwrap_or_default())])
                 }
+                Response::Vanished { uids, .. } => Some(uids.iter().flat_map(|r| *r.start()..=(*r.end()).min(highest)).map(|uid| (uid, vec![Flag::Deleted])).collect()),
                 _ => None,
             })
-            .await?;
+            .await?
+            .into_iter()
+            .flatten()
+            .collect();
             // One flagged deleted is gone as if expunged.
             // Where the server keeps no keywords, the pins and labels made here stay as they are.
             let keywords = takes_keywords(&selected.permanent_flags);
