@@ -99,6 +99,11 @@ impl Conversations {
         };
     }
 
+    /// What they were worked out from; changes when they may have.
+    pub fn key(&self) -> u64 {
+        self.key
+    }
+
     /// The messages of `id`'s conversation, oldest first; empty when it is in none.
     pub fn members(&self, id: MessageId) -> &[MessageId] {
         self.of.get(&id).map_or(&[], |&n| self.members[n].as_slice())

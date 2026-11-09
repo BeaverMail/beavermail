@@ -67,7 +67,9 @@ enum Event {
     Found(u64, u64, Result<Vec<Hit>, MailError>),
     /// One sync of the selected folder finished; more history may remain.
     Synced(u64, usize, Result<SyncReport, MailError>),
-    Messages(u64, usize, Result<Vec<MessageSummary>, MailError>),
+    /// A folder's messages from the archive, with the spam checks' verdicts kept for them when its
+    /// account's were not loaded yet (an Inbox where suspicious mail is held).
+    Messages(u64, usize, Result<Vec<MessageSummary>, MailError>, Vec<(MessageId, screen::Screened)>),
     /// The Sent folder of the account shown, for the user's replies in its conversations: (account, folder index shown, messages).
     SentList(u64, usize, Result<Vec<MessageSummary>, MailError>),
     Body(u64, MessageId, Result<Box<Prepared>, MailError>),
@@ -982,7 +984,8 @@ pub(crate) fn sized_field(text: &mut String, width: f32) -> egui::TextEdit<'_> {
 /// frame: (offset, height).
 /// `to_end`: the number of rows, to start at the last one.
 fn list_area(reveal: Option<usize>, (offset, height): (f32, f32), row_h: f32, to_end: Option<usize>) -> egui::ScrollArea {
-    let area = egui::ScrollArea::vertical().auto_shrink([false, false]);
+    // Named: the reader of a message tab takes the same place, and would otherwise share its scroll.
+    let area = egui::ScrollArea::vertical().id_salt("message_list").auto_shrink([false, false]);
     match to_end.map(|rows| rows as f32 * row_h).or_else(|| reveal.and_then(|row| reveal_offset(row, offset, height, row_h))) {
         Some(to) => area.vertical_scroll_offset(to),
         None => area,
@@ -1444,6 +1447,11 @@ struct BeaverApp {
     list_view: (f32, f32),
     /// Asking whether to forget the senders and messages marked as spam or not spam.
     confirm_forget_marks: bool,
+    known: KnownCache,
+    /// When the last message was asked for, to tell paging through the list from a single opening.
+    last_asked: Option<std::time::Instant>,
+    /// The list shown, as places in `messages` in its order, and the hash it was worked out under; see [`Self::visible`].
+    visible_order: std::cell::RefCell<Option<(u64, Vec<usize>)>>,
     /// The new place chosen for the data folder: a move to confirm, or why it cannot go there.
     data_move: Option<Result<relocate::Plan, String>>,
     /// A place for the data folder is being chosen or checked.
@@ -1616,6 +1624,9 @@ impl BeaverApp {
             folded_anchor: false,
             list_view: (0.0, 0.0),
             confirm_forget_marks: false,
+            known: KnownCache::default(),
+            last_asked: None,
+            visible_order: Default::default(),
             data_move: None,
             data_checking: false,
             trust_input: String::new(),
@@ -1656,7 +1667,18 @@ impl BeaverApp {
         }
         app.count_outbox(); // what waited from the last session shows at once
         app.load_offline();
+        app.warm_known();
         app
+    }
+
+    /// Loads in the background what the checks know of each account, so the first message opened
+    /// does not wait for it.
+    fn warm_known(&self) {
+        let own: Vec<String> = self.accounts.iter().map(|v| v.account.address().to_owned()).collect();
+        for view in &self.accounts {
+            let (cache, archive, account, own, settings) = (self.known.clone(), self.archive.clone(), view.account.clone(), own.clone(), self.settings.clone());
+            self.runtime.spawn_blocking(move || cache.get(&archive, &account, &own, &settings));
+        }
     }
 
     /// Keeps the changes waiting for the server in the vault, encrypted like the mail, so they are
@@ -1851,6 +1873,21 @@ impl BeaverApp {
         }
     }
 
+    /// Reads the messages of `folder` (folder `index` of account `serial`) from the archive, in the
+    /// background. In an Inbox where suspicious mail is held, the verdicts kept from before come with
+    /// them the first time, so held mail never shows and the window does not wait to read them.
+    fn list(&self, serial: u64, index: usize, source: Arc<ImapSource>, folder: String) {
+        let inbox = self.view(serial).and_then(|v| v.mailboxes.get(index)).is_some_and(|m| m.role == Role::Inbox);
+        let loaded = self.screening.keys().any(|id| self.origin.get(id) == Some(&serial));
+        let verdicts = (inbox && self.settings.hold_suspicious && !loaded).then(|| (self.archive.clone(), self.view(serial).map(|v| v.account.key()).unwrap_or_default()));
+        self.spawn(async move {
+            let messages = source.messages(&folder).await;
+            let kept = verdicts.and_then(|(archive, key)| archive.verdicts(&key, &folder).ok()).unwrap_or_default();
+            let kept = kept.into_iter().filter_map(|(id, json)| Some((id, serde_json::from_str(&json).ok()?))).collect();
+            Event::Messages(serial, index, messages, kept)
+        });
+    }
+
     /// Reads folder `index` of account `serial` from the archive, its Sent folder for conversations,
     /// and brings it up to date from the server.
     fn load_folder(&mut self, serial: u64, index: usize) {
@@ -1858,9 +1895,7 @@ impl BeaverApp {
         let (Some(source), Some(mailbox)) = (view.source.clone(), view.mailboxes.get(index)) else { return };
         let name = mailbox.name.clone();
         let sent_folder = view.mailboxes.iter().find(|m| m.role == Role::Sent && m.name != name).map(|m| m.name.clone());
-        let local = source.clone();
-        let folder = name.clone();
-        self.spawn(async move { Event::Messages(serial, index, local.messages(&folder).await) });
+        self.list(serial, index, source.clone(), name.clone());
         if let Some(sent) = sent_folder {
             let local = source.clone();
             self.spawn(async move { Event::SentList(serial, index, local.messages(&sent).await) });
@@ -2005,7 +2040,11 @@ impl BeaverApp {
         let view = self.view(serial)?;
         let (source, account) = (view.source.clone()?, view.account.clone());
         let own: Vec<String> = self.accounts.iter().map(|v| v.account.address().to_owned()).collect();
-        let (archive, settings) = (self.archive.clone(), self.settings.clone());
+        let (archive, settings, cache) = (self.archive.clone(), self.settings.clone(), self.known.clone());
+        // The user's own mail is not checked; mail checked whole when it arrived keeps those findings,
+        // unless its sender has been marked since.
+        let own_mail = matches!(self.role_of(message.id), Role::Sent | Role::Drafts);
+        let kept = self.screening.get(&message.id).filter(|s| s.whole && self.settings.mark_of(&s.key).is_none()).map(|s| s.findings.clone());
         Some(async move {
             let started = std::time::Instant::now();
             let body = source.body(message.id).await?;
@@ -2013,9 +2052,11 @@ impl BeaverApp {
             // The checks load what the account knows and train the spam model: seconds on a big mailbox, never on the UI thread.
             let prepared = tokio::task::spawn_blocking(move || {
                 let checks = std::time::Instant::now();
-                let findings = screen::Known::load(&archive, &account, &own, &settings)
-                    .map(|known| screen::findings(&known, &message.from, &message.address, &body, &source.auth_server()))
-                    .unwrap_or_default();
+                let findings = match kept {
+                    _ if own_mail => Vec::new(),
+                    Some(findings) => findings,
+                    None => cache.get(&archive, &account, &own, &settings).map(|known| screen::findings(&known, &message.from, &message.address, &body, &source.auth_server())).unwrap_or_default(),
+                };
                 let checks = checks.elapsed();
                 let prepared = Box::new(Prepared::new(body, findings));
                 log::debug!("message {}: read in {read:.0?}, checked in {checks:.0?}, ready in {:.0?}", message.id.0, started.elapsed());
@@ -2082,9 +2123,13 @@ impl BeaverApp {
         self.attach_selected.clear();
         wanted.store(id.0, std::sync::atomic::Ordering::Relaxed);
         let asked = std::time::Instant::now();
+        // Paging through the list asks for many messages in a row: only the one it stops on is read. A
+        // message asked for on its own (a click, the first key) is read at once.
+        let paging = self.last_asked.replace(asked).is_some_and(|last| asked - last < std::time::Duration::from_millis(150));
         self.spawn(async move {
-            // Paging through the list asks for many messages in a row: only the one it stops on is read.
-            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            if paging {
+                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            }
             if wanted.load(std::sync::atomic::Ordering::Relaxed) != id.0 {
                 return Event::Body(serial, id, Err(MailError::NotFound)); // dropped: another message is shown now
             }
@@ -2494,6 +2539,40 @@ impl BeaverApp {
         if self.searching() {
             return Vec::new();
         }
+        // Filtering and ordering a big folder takes tens of milliseconds: worked out again only when
+        // something it depends on changed, which a hash of those finds in a fraction of that.
+        let key = self.visible_key();
+        if let Some((kept, order)) = &*self.visible_order.borrow()
+            && *kept == key
+        {
+            return order.iter().filter_map(|&i| self.messages.get(i)).collect();
+        }
+        let shown = self.compute_visible();
+        let index: std::collections::HashMap<MessageId, usize> = self.messages.iter().enumerate().map(|(i, m)| (m.id, i)).collect();
+        *self.visible_order.borrow_mut() = Some((key, shown.iter().filter_map(|m| index.get(&m.id).copied()).collect()));
+        shown
+    }
+
+    /// Everything that decides which messages the list shows and in what order; see [`Self::visible`].
+    fn visible_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let holding = self.holding();
+        for m in &self.messages {
+            (m.id, m.timestamp, m.pinned).hash(&mut h);
+            if holding {
+                self.screening.get(&m.id).map(|s| s.place == screen::Place::Spam).hash(&mut h);
+            }
+        }
+        (self.messages.len(), self.screening.len(), self.origin.len(), self.sent.len(), self.conversations.key()).hash(&mut h);
+        (self.sort(), self.show_suspicious, holding, self.threaded(), self.role() == Role::Drafts).hash(&mut h);
+        if self.role() == Role::Drafts {
+            self.drafts.iter().map(|d| &d.id).chain(self.compose.as_ref().map(|c| &c.id)).for_each(|id| id.hash(&mut h));
+        }
+        h.finish()
+    }
+
+    fn compute_visible(&self) -> Vec<&MessageSummary> {
         // In the Drafts folder, the copy of a draft that is also kept here is shown once, from here.
         let ours: Vec<String> = if self.role() == Role::Drafts {
             self.drafts.iter().map(|d| d.id.clone()).chain(self.compose.iter().map(|c| c.id.clone())).map(|id| beavermail_smtp::draft_message_id(&id)).collect()
@@ -2616,10 +2695,11 @@ impl BeaverApp {
         // Mail already held is part of the campaigns the new mail is compared with.
         let held: Vec<MessageSummary> = self.messages.iter().filter(|m| mine(&m.id) && self.screening.get(&m.id).is_some_and(|s| s.place == screen::Place::Spam)).cloned().collect();
         let own: Vec<String> = self.accounts.iter().map(|v| v.account.address().to_owned()).collect();
-        let (archive, settings) = (self.archive.clone(), self.settings.clone());
+        let (archive, settings, cache) = (self.archive.clone(), self.settings.clone(), self.known.clone());
         self.checking = true;
         self.spawn(async move {
-            let verdicts = screen::Known::load(&archive, &account, &own, &settings).and_then(|known| {
+            // New mail to check: what the account knows now, kept for the messages opened next.
+            let verdicts = cache.load(&archive, &account, &own, &settings).and_then(|known| {
                 let verdicts: std::collections::HashMap<MessageId, screen::Screened> = fresh.iter().map(|m| m.id).zip(screen::screen_all(&source, &known, &settings, &source.auth_server(), &fresh, &held)).collect();
                 archive.set_verdicts(&kept(&verdicts))?;
                 Ok(verdicts)
@@ -2695,6 +2775,7 @@ impl BeaverApp {
             // A message without a Message-ID is told apart by sender and subject.
             let id = if m.message_id.is_empty() { format!("{}|{}", m.address, m.subject) } else { m.message_id.clone() };
             let (text, domain) = screen::example(m);
+            self.known.forget();
             if let Err(e) = self.archive.add_example(account, &id, spam, &text, &domain) {
                 self.error = Some(format!("Could not keep this for the spam checks to learn: {e}"));
             }
@@ -3939,6 +4020,7 @@ impl BeaverApp {
                                     ui.horizontal(|ui| {
                                         if ui.add(egui::Button::new(RichText::new("Forget").color(t.on_accent)).fill(t.danger)).clicked() {
                                             self.settings.marked.clear();
+                                            self.known.forget();
                                             match self.archive.clear_examples() {
                                                 Ok(()) => (changed, rescreen) = (true, true),
                                                 Err(e) => self.error = Some(e.to_string()),
@@ -6775,7 +6857,7 @@ impl BeaverApp {
                     && let (Some(source), Some(name)) = (view.source.clone(), view.mailboxes.get(index).map(|m| m.name.clone()))
                 {
                     let counts = source.clone();
-                    self.spawn(async move { Event::Messages(serial, index, source.messages(&name).await) });
+                    self.list(serial, index, source, name);
                     self.spawn(async move { Event::Mailboxes(serial, counts.cached_mailboxes().await, false) });
                 }
             }
@@ -6791,8 +6873,7 @@ impl BeaverApp {
                         }
                         let Some(view) = self.view(serial) else { return };
                         let (Some(source), Some(name)) = (view.source.clone(), view.mailboxes.get(index).map(|m| m.name.clone())) else { return };
-                        let (local, folder) = (source.clone(), name.clone());
-                        self.spawn(async move { Event::Messages(serial, index, local.messages(&folder).await) });
+                        self.list(serial, index, source.clone(), name.clone());
                         let counts = source.clone();
                         self.spawn(async move { Event::Mailboxes(serial, counts.cached_mailboxes().await, false) });
                         if report.remaining > 0 {
@@ -6803,8 +6884,9 @@ impl BeaverApp {
                     Err(e) => self.error = Some(e.to_string()),
                 }
             }
-            Event::Messages(serial, index, result) if self.shows(serial, index) => match result {
+            Event::Messages(serial, index, result, kept) if self.shows(serial, index) => match result {
                 Ok(messages) => {
+                    self.screening.extend(kept);
                     // This account's part of the list is replaced; the others' stay (All inboxes).
                     let origin = &self.origin;
                     self.messages.retain(|m| origin.get(&m.id).is_some_and(|s| *s != serial));
@@ -6969,8 +7051,7 @@ impl BeaverApp {
                 if let Some((_, index)) = self.shown().into_iter().find(|(s, _)| *s == serial)
                     && let Some(name) = self.view(serial).and_then(|v| v.mailboxes.get(index)).map(|m| m.name.clone())
                 {
-                    let local = source.clone();
-                    self.spawn(async move { Event::Messages(serial, index, local.messages(&name).await) });
+                    self.list(serial, index, source.clone(), name);
                 }
                 self.spawn(async move { Event::Mailboxes(serial, source.mailboxes().await, true) });
             }
@@ -7582,7 +7663,7 @@ impl BeaverApp {
                         ui.label(dim("Paused".to_owned()));
                     }
                 } else if running || self.syncing > 0 {
-                    ui.add(egui::Spinner::new().size(12.0));
+                    views::slow_spinner(ui, 12.0);
                     ui.label(dim(if activity.is_empty() { "Syncing…".to_owned() } else { format!("{activity}…") }));
                 } else if self.accounts.iter().any(|v| v.offline.is_some()) {
                     let names: Vec<&str> = self.accounts.iter().filter(|v| v.offline.is_some()).map(|v| v.account.address()).collect();
@@ -8131,7 +8212,7 @@ impl BeaverApp {
                 field = Some(views::search_box(ui, t, &mut self.query, "Search mail  ( / )", width, focus)
                     .on_hover_text(format!("Search the folder shown, as stored on this computer; the labels under the box look further.\nWords, \"a phrase\", from:ada, to:bob, subject:invoice, in:inbox (in: lists the folders), is:unread, has:attachment, after:2026-09-01, before:2026-10\n\nAll commands and their keys: {}", Command::Palette.keys(ui.ctx()))));
                 if self.syncing > 0 {
-                    ui.add_sized([theme::CONTROL_H - 4.0, theme::CONTROL_H - 4.0], egui::Spinner::new().size(16.0)).on_hover_text("Syncing…");
+                    ui.allocate_ui(vec2(theme::CONTROL_H - 4.0, theme::CONTROL_H - 4.0), |ui| ui.centered_and_justified(|ui| views::slow_spinner(ui, 16.0))).response.on_hover_text("Syncing…");
                 } else {
                     refresh = icons::button(ui, t, Icon::Refresh, "Refresh", true, false).clicked();
                 }
@@ -8916,19 +8997,32 @@ impl eframe::App for BeaverApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // A frame that keeps the window from answering goes in the diagnostic log.
-        struct SlowFrame(std::time::Instant);
+        // A frame that keeps the window from answering goes in the diagnostic log, with where its time went.
+        struct SlowFrame(std::time::Instant, Vec<(&'static str, std::time::Instant)>, String);
+        impl SlowFrame {
+            fn mark(&mut self, part: &'static str) {
+                self.1.push((part, std::time::Instant::now()));
+            }
+        }
         impl Drop for SlowFrame {
             fn drop(&mut self) {
                 if self.0.elapsed() > std::time::Duration::from_millis(100) {
-                    log::warn!("a frame took {:.0?}", self.0.elapsed());
+                    let mut from = self.0;
+                    let parts: Vec<String> = self.1.iter().map(|(part, at)| format!("{part} {:.0?}", at.duration_since(std::mem::replace(&mut from, *at)))).collect();
+                    log::warn!("a frame took {:.0?}: {}{}", self.0.elapsed(), parts.join(", "), self.2);
                 }
             }
         }
-        let _slow = SlowFrame(std::time::Instant::now());
+        let mut slow = SlowFrame(std::time::Instant::now(), Vec::new(), String::new());
         while let Ok(event) = self.rx.try_recv() {
+            // A slow one is named in the log by its place in `Event` (Discriminant(n)).
+            let (kind, started) = (std::mem::discriminant(&event), std::time::Instant::now());
             self.apply(event);
+            if started.elapsed() > std::time::Duration::from_millis(30) {
+                log::debug!("event {kind:?} took {:.0?}", started.elapsed());
+            }
         }
+        slow.mark("events");
         views::set_link_params(ui.ctx(), &self.settings.link_params);
         // Address books at start, then every quarter of an hour (changes made here go at once).
         if self.contacts_synced.is_none_or(|at| at.elapsed() > std::time::Duration::from_secs(15 * 60)) {
@@ -8954,6 +9048,7 @@ impl eframe::App for BeaverApp {
         if self.settings.threads {
             self.conversations.update(&self.messages, &self.sent);
         }
+        slow.mark("conversations");
         self.send_scheduled(ui.ctx());
         // The last scheduled message went (or was taken back): the view goes with its row.
         if self.show_scheduled && self.scheduled.is_empty() {
@@ -8967,6 +9062,7 @@ impl eframe::App for BeaverApp {
         self.error_banner(ui, &t);
         self.status_bar(ui, &t);
         self.rail(ui, &t);
+        slow.mark("bars");
         // Out of Mail, its tabs, folders, list and reader give the window to the section.
         let contacts = self.section != Section::Mail;
         match self.section {
@@ -8974,6 +9070,7 @@ impl eframe::App for BeaverApp {
             Section::Calendar => self.calendar_section(ui, &t),
             Section::Mail => {}
         }
+        slow.mark("section");
 
         if self.in_tab && self.open_tab().is_none() {
             self.show_mail(); // its tab went with its folder or account
@@ -8993,6 +9090,7 @@ impl eframe::App for BeaverApp {
         }
         let SidebarOutcome { chosen, suspicious, recheck, empty, recheck_all, empty_all, removed, edit, mut add, all, scheduled, all_suspicious, all_spam, dropped, new_inside, rename, delete } =
             if self.in_tab || contacts { SidebarOutcome::default() } else { self.sidebar(ui, &t) };
+        slow.mark("sidebar");
         if let Some((serial, index)) = new_inside {
             let parent = self.view(serial).and_then(|v| v.mailboxes.get(index)).map(|m| m.name.clone());
             self.new_folder = Some(NewFolder { serial, parent, name: String::new(), busy: false, error: None, renaming: None });
@@ -9080,11 +9178,14 @@ impl eframe::App for BeaverApp {
         }
         self.confirm_remove = removed.or(self.confirm_remove);
 
+        slow.mark("outcomes");
         self.handle_keys(ui.ctx());
+        slow.mark("keys");
         // Without the reading pane only a message tab has a reader.
         let shows_reader = !contacts && (self.in_tab || self.settings.reading_pane);
         let ReaderOutcome { action, url, mode, remember, attachment, save_many, allow_sender, mark, bulk, move_to, unsubscribe, block, unfold, collapse, expand, trust, card, retry, source, invite } =
             if shows_reader { self.reader(ui, &t) } else { ReaderOutcome::default() };
+        slow.mark("reader");
         if retry && let Some(at) = self.active() {
             self.activate(at);
         }
@@ -9154,6 +9255,7 @@ impl eframe::App for BeaverApp {
             self.save_settings();
         }
         let (opened, add_from_list) = if self.in_tab || contacts { (None, false) } else { self.message_list(ui, &t) };
+        slow.mark("list");
         add |= add_from_list;
 
         // A click shows the message beside the list; without that pane it only selects, and a double
@@ -9216,6 +9318,12 @@ impl eframe::App for BeaverApp {
         self.drop_files_on_the_app(ui.ctx(), &t);
         self.compose_window(ui.ctx(), &t);
         self.closing_dialog(ui.ctx(), &t);
+        slow.mark("dialogs");
+        // What asked for the next frame, for the log: something animating, or a background task.
+        let causes: Vec<String> = ui.ctx().repaint_causes().iter().map(|c| format!("{}:{} {}", c.file.rsplit('/').next().unwrap_or(c.file), c.line, c.reason)).collect();
+        if !causes.is_empty() {
+            slow.2 = format!("; repaint asked by {}", causes.join(", "));
+        }
         if add {
             self.form = Some(NewAccount::default());
         }
@@ -9295,6 +9403,53 @@ fn accelerated(label: &str, at: usize, color: egui::Color32) -> egui::text::Layo
         job.append(&c.to_string(), 0.0, egui::text::TextFormat { font_id: font.clone(), color, underline, ..Default::default() });
     }
     job
+}
+
+/// What the sender and spam checks know of each account, by account key. Loading it trains the spam
+/// model, half a second on a big mailbox, so it is kept: until a mark or an example changes it, or new
+/// mail is checked, which loads it afresh. After a few minutes it is loaded again in the background
+/// while the old one still serves.
+#[derive(Clone, Default)]
+struct KnownCache(Arc<std::sync::Mutex<std::collections::HashMap<String, KnownAt>>>);
+
+/// What an account knew, when it was loaded, and the marks it was loaded with.
+type KnownAt = (std::time::Instant, u64, Arc<screen::Known>);
+
+impl KnownCache {
+    const FOR: std::time::Duration = std::time::Duration::from_secs(300);
+
+    fn marks(settings: &Settings) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        settings.marked.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn get(&self, archive: &Arc<Store>, account: &Account, own: &[String], settings: &Settings) -> Result<Arc<screen::Known>, MailError> {
+        let marks = Self::marks(settings);
+        let kept = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&account.key()).filter(|(_, m, _)| *m == marks).map(|(at, _, k)| (*at, k.clone()));
+        let Some((at, known)) = kept else { return self.load(archive, account, own, settings) };
+        if at.elapsed() > Self::FOR {
+            // Marked fresh at once, so only one reload runs.
+            if let Some(entry) = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_mut(&account.key()) {
+                entry.0 = std::time::Instant::now();
+            }
+            let (cache, archive, account, own, settings) = (self.clone(), archive.clone(), account.clone(), own.to_vec(), settings.clone());
+            std::thread::spawn(move || cache.load(&archive, &account, &own, &settings));
+        }
+        Ok(known)
+    }
+
+    fn load(&self, archive: &Store, account: &Account, own: &[String], settings: &Settings) -> Result<Arc<screen::Known>, MailError> {
+        let known = Arc::new(screen::Known::load(archive, account, own, settings)?);
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(account.key(), (std::time::Instant::now(), Self::marks(settings), known.clone()));
+        Ok(known)
+    }
+
+    /// After an example was kept or forgotten: loaded again when next needed.
+    fn forget(&self) {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+    }
 }
 
 /// Set when the app closes to start again, as after choosing a new data folder.
@@ -9475,6 +9630,21 @@ fn range(ids: &[MessageId], anchor: MessageId, to: MessageId) -> Option<Vec<Mess
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_an_account_knows_is_loaded_again_only_when_its_marks_change() {
+        let archive = Arc::new(Store::in_memory().unwrap());
+        let server = Server { host: "mail.example.org".into(), port: 993, tls: Tls::Tls };
+        let account = Account { name: "Ada".into(), user: "ada@example.org".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true, keep: Keep::default(), signature: String::new(), oauth: None, smtp_user: None };
+        let (cache, mut settings) = (KnownCache::default(), Settings::default());
+        let first = cache.get(&archive, &account, &[], &settings).unwrap();
+        assert!(Arc::ptr_eq(&first, &cache.get(&archive, &account, &[], &settings).unwrap()), "kept");
+        settings.set_mark("bob@example.com", Some(false));
+        let marked = cache.get(&archive, &account, &[], &settings).unwrap();
+        assert!(!Arc::ptr_eq(&first, &marked), "a new mark loads it again");
+        cache.forget();
+        assert!(!Arc::ptr_eq(&marked, &cache.get(&archive, &account, &[], &settings).unwrap()), "forgotten after an example");
+    }
 
     #[test]
     fn find_in_source_ignores_case_and_keeps_each_matchs_place() {

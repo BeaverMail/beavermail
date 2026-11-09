@@ -388,7 +388,14 @@ fn show(ui: &mut Ui, t: &Tokens, blocks: &[Block], gap: Option<(usize, f32)>) ->
         state.anchor = None;
     }
     let width = ui.available_width();
-    let laid = Laid::new(ui, t, blocks, width, gap, state.hovered);
+    // Laying out a long message takes tens of milliseconds: kept until what it depends on changes.
+    let key = egui::Id::new((width.to_bits(), gap.map(|(at, room)| (at, room.to_bits())), state.hovered, ui.visuals().dark_mode, ui.ctx().pixels_per_point().to_bits()));
+    let kept = ui.data(|d| d.get_temp::<(egui::Id, Arc<Laid>)>(id.with("laid"))).filter(|(k, _)| *k == key).map(|(_, l)| l);
+    let laid = kept.unwrap_or_else(|| {
+        let laid = Arc::new(Laid::new(ui, t, blocks, width, gap, state.hovered));
+        ui.data_mut(|d| d.insert_temp(id.with("laid"), (key, laid.clone())));
+        laid
+    });
     let (rect, response) = ui.allocate_exact_size(vec2(width, laid.height), Sense::click_and_drag());
     let origin = rect.min.to_vec2();
     let pointer = ui.ctx().pointer_interact_pos().map(|p| p - origin);

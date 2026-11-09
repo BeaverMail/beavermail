@@ -479,7 +479,7 @@ pub enum Density {
 }
 
 /// What a folder's list is ordered by.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SortBy {
     #[default]
@@ -489,7 +489,7 @@ pub enum SortBy {
 }
 
 /// How a folder's list is ordered; newest first unless the user chose otherwise.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Sort {
     pub by: SortBy,
     #[serde(default)]

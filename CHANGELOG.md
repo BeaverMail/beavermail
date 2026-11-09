@@ -31,6 +31,11 @@ What changed in each version of BeaverMail, newest first.
 
 ### Fixed
 
+- A folder keeps syncing when the server describes one of its messages in a way that cannot be read, instead of the account showing as offline.
+- With no encryption set, a server that signs in only over an encrypted connection gets no password, and says to choose STARTTLS or SSL/TLS instead of "sign-in refused".
+- Messages open in a twentieth of a second: over a connection of their own, without waiting for the background download or its writes to the archive, and without checking again what was checked when they arrived.
+- The window stays responsive while mail downloads: the list and the open message are no longer worked out again at every frame.
+- Closing a message tab leaves the list where it was, instead of at the top.
 - An account no longer shows as offline after its server ends a quiet session.
 - A message deleted or moved no longer comes back in a list opened before the server has made the change.
 - The unread counts follow a message read or moved from a search result or a tab, and are asked of the server again after each run of changes.

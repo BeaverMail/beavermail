@@ -36,6 +36,10 @@ struct Mock {
     list: Arc<Mutex<String>>,
     /// A command the server answers with BYE before closing the connection, as when shutting down.
     bye: Arc<Mutex<Option<&'static str>>>,
+    /// The server describes its message's structure in a way that breaks the protocol.
+    broken: Arc<Mutex<bool>>,
+    /// The server refuses LOGIN before TLS and says so (LOGINDISABLED).
+    tls_only: Arc<Mutex<bool>>,
 }
 
 impl Mock {
@@ -72,8 +76,8 @@ async fn start_opts(move_works: bool, attachment: bool, idle: bool) -> Mock {
     let log = Arc::new(Mutex::new(Vec::new()));
     let message = Arc::new(Mutex::new(MESSAGE.to_owned()));
     let list = Arc::new(Mutex::new(LIST.to_owned()));
-    let bye = Arc::new(Mutex::new(None));
-    let (served, replies) = (log.clone(), Replies { message: message.clone(), list: list.clone(), bye: bye.clone() });
+    let (bye, broken, tls_only) = (Arc::new(Mutex::new(None)), Arc::new(Mutex::new(false)), Arc::new(Mutex::new(false)));
+    let (served, replies) = (log.clone(), Replies { message: message.clone(), list: list.clone(), bye: bye.clone(), broken: broken.clone(), tls_only: tls_only.clone() });
     tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
             tokio::spawn(serve(socket, served.clone(), move_works, attachment, idle, replies.clone()));
@@ -83,7 +87,7 @@ async fn start_opts(move_works: bool, attachment: bool, idle: bool) -> Mock {
     let account = Account { name: "mock".into(), user: "u".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true, keep: beavermail_core::Keep::default(), signature: String::new(), oauth: None, smtp_user: None };
     let store = Arc::new(Store::in_memory().unwrap());
     let files = Arc::new(Vault::in_memory());
-    Mock { source: ImapSource::new(&account, "p".into(), store.clone(), files.clone()), account, store, files, log, message, list, bye }
+    Mock { source: ImapSource::new(&account, "p".into(), store.clone(), files.clone()), account, store, files, log, message, list, bye, broken, tls_only }
 }
 
 /// What a test can change in the server's answers while it runs; see [`Mock`].
@@ -92,10 +96,12 @@ struct Replies {
     message: Arc<Mutex<String>>,
     list: Arc<Mutex<String>>,
     bye: Arc<Mutex<Option<&'static str>>>,
+    broken: Arc<Mutex<bool>>,
+    tls_only: Arc<Mutex<bool>>,
 }
 
 async fn serve(socket: TcpStream, log: Arc<Mutex<Vec<String>>>, move_works: bool, attachment: bool, idle: bool, replies: Replies) {
-    let Replies { message, list, bye } = replies;
+    let Replies { message, list, bye, broken, tls_only } = replies;
     let (read, mut write) = socket.into_split();
     let mut read = BufReader::new(read);
     let _ = write.write_all(b"* OK ready\r\n").await;
@@ -114,7 +120,7 @@ async fn serve(socket: TcpStream, log: Arc<Mutex<Vec<String>>>, move_works: bool
         }
         let verb = command.to_ascii_uppercase();
         let reply = if verb.starts_with("CAPABILITY") {
-            let extra = if idle { " IDLE" } else { "" };
+            let extra = format!("{}{}", if idle { " IDLE" } else { "" }, if *tls_only.lock().unwrap() { " STARTTLS LOGINDISABLED" } else { "" });
             format!("* CAPABILITY IMAP4rev1{extra}\r\n{tag} OK done\r\n")
         } else if verb.starts_with("AUTHENTICATE XOAUTH2") {
             // The client's answer to the challenge is a line of its own, kept in the log to check.
@@ -162,6 +168,8 @@ async fn serve(socket: TcpStream, log: Arc<Mutex<Vec<String>>>, move_works: bool
             let n = HEADER.len();
             let structure = match (verb.contains("BODYSTRUCTURE"), attachment) {
                 (false, _) => "",
+                // A parameter without a value (NIL), which the protocol does not allow.
+                (true, _) if *broken.lock().unwrap() => "BODYSTRUCTURE (\"TEXT\" \"PLAIN\" (\"NAME\" NIL) NIL NIL \"7BIT\" 9 1 NIL NIL NIL) ",
                 (true, false) => PLAIN_STRUCTURE,
                 (true, true) => MIXED_STRUCTURE,
             };
@@ -757,7 +765,13 @@ async fn the_text_of_downloaded_messages_is_searchable_and_so_are_the_headers() 
 async fn messages_stored_before_indexing_existed_get_indexed_by_the_next_run() {
     let mock = start(true).await;
     let id = message_in(&mock, "INBOX").await;
-    mock.source.body(id).await.unwrap(); // stores the file and indexes the text
+    mock.source.body(id).await.unwrap(); // stores the file and indexes the text, the text just after
+    for _ in 0..100 {
+        if !mock.source.search("there", 10).await.unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
     assert_eq!(mock.source.search("there", 10).await.unwrap().len(), 1);
     // Forget the index, as a database from an earlier version would not have it.
     mock.store.forget_index_for_tests();
@@ -792,4 +806,26 @@ async fn a_stopped_server_search_asks_nothing_more() {
     progress.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
     mock.source.search_server("hello", 10, &progress, &|_| panic!("nothing found once stopped")).await.unwrap();
     assert!(!mock.commands().iter().any(|c| c.starts_with("UID SEARCH")));
+}
+
+#[tokio::test]
+async fn one_unreadable_message_does_not_stop_its_folder() {
+    let mock = start(true).await;
+    *mock.broken.lock().unwrap() = true;
+    mock.source.mailboxes().await.expect("list folders");
+    mock.source.sync("INBOX").await.expect("the folder syncs without the descriptions");
+    assert_eq!(mock.source.messages("INBOX").await.unwrap().len(), 1, "the message is listed");
+    mock.source.sync("INBOX").await.expect("and keeps syncing");
+    let fetches: Vec<String> = mock.commands().into_iter().filter(|c| c.starts_with("FETCH") || c.starts_with("UID FETCH")).collect();
+    assert!(fetches.first().is_some_and(|c| c.contains("BODYSTRUCTURE")), "{fetches:?}");
+    assert!(fetches[1..].iter().all(|c| !c.contains("BODYSTRUCTURE")), "asked once: {fetches:?}");
+}
+
+#[tokio::test]
+async fn no_password_goes_unencrypted_to_a_server_that_refuses_it() {
+    let mock = start(true).await;
+    *mock.tls_only.lock().unwrap() = true;
+    let error = mock.source.check().await.expect_err("not signed in").to_string();
+    assert!(error.contains("encrypted connection"), "{error}");
+    assert!(!mock.commands().iter().any(|c| c.starts_with("LOGIN")), "{:?}", mock.commands());
 }

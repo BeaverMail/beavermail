@@ -924,6 +924,24 @@ pub fn remote_bar(ui: &mut Ui, t: &Tokens, loaded: bool, sender: &str) -> Option
     choice
 }
 
+/// A spinner for work that lasts (a sync, a download): it turns ten times a second instead of at
+/// every frame the screen can show, so a long download does not keep the window redrawing.
+pub fn slow_spinner(ui: &mut Ui, size: f32) -> Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(size, size), Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let radius = size / 2.0 - 2.0;
+        let time = ui.input(|i| i.time);
+        let (start, sweep) = (time * std::f64::consts::TAU, 240f64.to_radians() * time.sin());
+        let points: Vec<egui::Pos2> = (0..16).map(|i| {
+            let (sin, cos) = (start + sweep * f64::from(i) / 16.0).sin_cos();
+            rect.center() + radius * vec2(cos as f32, sin as f32)
+        }).collect();
+        ui.painter().add(egui::Shape::line(points, egui::Stroke::new(2.0, ui.visuals().strong_text_color())));
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+    }
+    response
+}
+
 /// Where a search stands with the server: offered, with what is kept on this computer, or running.
 pub enum ServerSearch<'a> {
     Offer(&'a str),

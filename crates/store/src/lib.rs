@@ -65,6 +65,26 @@ END;
 
 pub struct Store {
     inner: Mutex<Inner>,
+    /// A second connection to the same file, for reading only: in WAL mode it reads while `inner`
+    /// writes, so what the user asks for never waits behind the background download's writes. `None`
+    /// for a database in memory (a second connection would be another database) and while locked.
+    reader: Mutex<Option<Connection>>,
+}
+
+/// A connection to read with: the reader's, or the main one where there is none.
+enum Reading<'a> {
+    Reader(std::sync::MutexGuard<'a, Option<Connection>>),
+    Main(std::sync::MutexGuard<'a, Inner>),
+}
+
+impl std::ops::Deref for Reading<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        match self {
+            Self::Reader(guard) => guard.as_ref().expect("checked when taken"),
+            Self::Main(guard) => &guard.conn,
+        }
+    }
 }
 
 /// The open database and what is known about how it is kept on disk.
@@ -842,7 +862,9 @@ impl Store {
             std::fs::create_dir_all(dir).map_err(db)?;
         }
         let conn = open_file(path, key)?;
-        Self::with(conn, Some(path.to_path_buf()), key.copied())
+        let store = Self::with(conn, Some(path.to_path_buf()), key.copied())?;
+        store.open_reader();
+        Ok(store)
     }
 
     /// An empty stand-in for the archive at `path`, for as long as its key is not known. Call
@@ -860,7 +882,7 @@ impl Store {
 
     fn with(conn: Connection, path: Option<PathBuf>, key: Option<[u8; 32]>) -> Result<Self, MailError> {
         migrate(&conn)?;
-        Ok(Self { inner: Mutex::new(Inner { conn, path, key, locked: false }) })
+        Ok(Self { inner: Mutex::new(Inner { conn, path, key, locked: false }), reader: Mutex::new(None) })
     }
 
     /// Whether this is still the empty stand-in made by [`Store::locked`].
@@ -870,18 +892,29 @@ impl Store {
 
     /// Opens the real archive of a [`Store::locked`] one, with its key.
     pub fn unlock(&self, key: Option<&[u8; 32]>) -> Result<(), MailError> {
-        let mut inner = self.conn();
-        let Some(path) = inner.path.clone() else { return Ok(()) };
-        let conn = open_file(&path, key)?;
-        migrate(&conn)?;
-        *inner = Inner { conn, path: Some(path), key: key.copied(), locked: false };
+        {
+            let mut inner = self.conn();
+            let Some(path) = inner.path.clone() else { return Ok(()) };
+            let conn = open_file(&path, key)?;
+            migrate(&conn)?;
+            *inner = Inner { conn, path: Some(path), key: key.copied(), locked: false };
+        }
+        self.open_reader();
         Ok(())
     }
 
     /// Changes how the file is kept: plain to encrypted, encrypted to plain, or under another key. A
     /// no-op for a database in memory and when nothing changes.
     pub fn rekey(&self, key: Option<&[u8; 32]>) -> Result<(), MailError> {
+        let result = self.rekey_main(key);
+        self.open_reader();
+        result
+    }
+
+    fn rekey_main(&self, key: Option<&[u8; 32]>) -> Result<(), MailError> {
         let mut inner = self.conn();
+        // The reader holds the file under the old key: closed first, opened again after.
+        self.close_reader();
         let Some(path) = inner.path.clone() else { return Ok(()) };
         if inner.key.as_ref() == key {
             return Ok(());
@@ -904,14 +937,52 @@ impl Store {
 
     /// Throws the archive away and starts an empty one (the key was lost: the mail is downloaded again).
     pub fn reset(&self, key: Option<&[u8; 32]>) -> Result<(), MailError> {
-        let mut inner = self.conn();
-        let Some(path) = inner.path.clone() else { return Ok(()) };
-        inner.conn = Connection::open_in_memory().map_err(db)?;
-        remove_database(&path);
-        let conn = open_file(&path, key)?;
-        migrate(&conn)?;
-        *inner = Inner { conn, path: Some(path), key: key.copied(), locked: false };
+        {
+            let mut inner = self.conn();
+            let Some(path) = inner.path.clone() else { return Ok(()) };
+            self.close_reader();
+            inner.conn = Connection::open_in_memory().map_err(db)?;
+            remove_database(&path);
+            let conn = open_file(&path, key)?;
+            migrate(&conn)?;
+            *inner = Inner { conn, path: Some(path), key: key.copied(), locked: false };
+        }
+        self.open_reader();
         Ok(())
+    }
+
+    /// Opens the reading connection on the file in use, if there is one. Without it everything goes
+    /// through the main connection, as before, only slower when the background writes.
+    fn open_reader(&self) {
+        let (path, key) = {
+            let inner = self.conn();
+            match (&inner.path, inner.locked) {
+                (Some(path), false) => (path.clone(), inner.key),
+                _ => return,
+            }
+        };
+        let opened = open_file(&path, key.as_ref()).and_then(|conn| {
+            conn.execute_batch("PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;").map_err(db)?;
+            Ok(conn)
+        });
+        match opened {
+            Ok(conn) => *self.reader.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(conn),
+            Err(e) => log::warn!("the archive is read through one connection only: {e}"),
+        }
+    }
+
+    fn close_reader(&self) {
+        *self.reader.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    /// The connection to read with; see [`Store::reader`].
+    fn read(&self) -> Reading<'_> {
+        let reader = self.reader.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if reader.is_some() {
+            return Reading::Reader(reader);
+        }
+        drop(reader);
+        Reading::Main(self.conn())
     }
 
     fn conn(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -961,7 +1032,7 @@ impl Store {
 
     /// The account's folders with unread counts from the archive, in no particular order.
     pub fn folders(&self, account: &str) -> Result<Vec<FolderRow>, MailError> {
-        let conn = self.conn();
+        let conn = self.read();
         let mut stmt = conn
             .prepare(
                 "SELECT f.name, f.role,
@@ -1031,7 +1102,7 @@ impl Store {
     }
 
     pub fn folder_state(&self, account: &str, folder: &str) -> Result<FolderState, MailError> {
-        let conn = self.conn();
+        let conn = self.read();
         let state = conn
             .query_row("SELECT uidvalidity, floor_uid FROM folders WHERE account = ?1 AND name = ?2", params![account, folder], |r| {
                 Ok(FolderState { uidvalidity: r.get::<_, Option<i64>>(0)?.map(|v| v as u32), floor_uid: r.get::<_, Option<i64>>(1)?.map(|v| v as u32) })
@@ -1096,7 +1167,7 @@ impl Store {
 
     /// Newest first.
     pub fn messages(&self, account: &str, folder: &str) -> Result<Vec<MessageSummary>, MailError> {
-        let conn = self.conn();
+        let conn = self.read();
         let sql = format!("SELECT {SUMMARY_COLUMNS} FROM messages WHERE account = ?1 AND folder = ?2 ORDER BY timestamp DESC, uid DESC");
         let mut stmt = conn.prepare(&sql).map_err(db)?;
         let rows = stmt.query_map(params![account, folder], summary).map_err(db)?;
@@ -1105,7 +1176,7 @@ impl Store {
 
     /// (lowest UID, highest UID, count) of the folder's cached messages.
     pub fn uid_range(&self, account: &str, folder: &str) -> Result<Option<(u32, u32, u32)>, MailError> {
-        let conn = self.conn();
+        let conn = self.read();
         conn.query_row("SELECT MIN(uid), MAX(uid), COUNT(*) FROM messages WHERE account = ?1 AND folder = ?2", params![account, folder], |r| {
             Ok(r.get::<_, Option<i64>>(0)?.zip(r.get::<_, Option<i64>>(1)?).map(|(lo, hi)| (lo as u32, hi as u32, r.get::<_, i64>(2).unwrap_or(0) as u32)))
         })
@@ -1115,7 +1186,7 @@ impl Store {
     /// The cached UIDs of a folder at or above `from`, with their unread flag.
     /// The cached messages of a folder from UID `from` up, as (uid, [`Flags`]).
     pub fn flags_since(&self, account: &str, folder: &str, from: u32) -> Result<Vec<(u32, Flags)>, MailError> {
-        let conn = self.conn();
+        let conn = self.read();
         let mut stmt = conn.prepare("SELECT uid, unread, pinned, starred, labels FROM messages WHERE account = ?1 AND folder = ?2 AND uid >= ?3").map_err(db)?;
         let rows = stmt
             .query_map(params![account, folder, i64::from(from)], |r| {
@@ -1150,7 +1221,7 @@ impl Store {
 
     /// UIDs of a folder whose attachment flag was never set from the server's answer.
     pub fn unknown_attachments(&self, account: &str, folder: &str, limit: usize) -> Result<Vec<u32>, MailError> {
-        let conn = self.conn();
+        let conn = self.read();
         let mut stmt = conn
             .prepare("SELECT uid FROM messages WHERE account = ?1 AND folder = ?2 AND attach_known = 0 ORDER BY timestamp DESC LIMIT ?3")
             .map_err(db)?;
@@ -1171,7 +1242,7 @@ impl Store {
 
     /// UIDs of a folder whose recipients were never read (rows from before they were kept).
     pub fn unknown_recipients(&self, account: &str, folder: &str, limit: usize) -> Result<Vec<u32>, MailError> {
-        let conn = self.conn();
+        let conn = self.read();
         let mut stmt = conn.prepare("SELECT uid FROM messages WHERE account = ?1 AND folder = ?2 AND recipients IS NULL ORDER BY timestamp DESC LIMIT ?3").map_err(db)?;
         let rows = stmt.query_map(params![account, folder, limit as i64], |r| r.get::<_, i64>(0).map(|u| u as u32)).map_err(db)?;
         rows.collect::<Result<_, _>>().map_err(db)
@@ -1199,7 +1270,7 @@ impl Store {
 
     /// UIDs of a folder whose header fields were never kept (rows from before they were).
     pub fn unknown_headers(&self, account: &str, folder: &str, limit: usize) -> Result<Vec<u32>, MailError> {
-        let conn = self.conn();
+        let conn = self.read();
         let mut stmt = conn.prepare("SELECT uid FROM messages WHERE account = ?1 AND folder = ?2 AND headers IS NULL ORDER BY timestamp DESC LIMIT ?3").map_err(db)?;
         let rows = stmt.query_map(params![account, folder, limit as i64], |r| r.get::<_, i64>(0).map(|u| u as u32)).map_err(db)?;
         rows.collect::<Result<_, _>>().map_err(db)
@@ -1214,7 +1285,7 @@ impl Store {
 
     /// The sender and kept header fields of an account's latest messages, newest first.
     pub fn recent_headers(&self, account: &str, limit: usize) -> Result<Vec<(String, Vec<u8>)>, MailError> {
-        let conn = self.conn();
+        let conn = self.read();
         let mut stmt = conn.prepare("SELECT from_addr, headers FROM messages WHERE account = ?1 AND length(headers) > 0 ORDER BY timestamp DESC LIMIT ?2").map_err(db)?;
         let rows = stmt.query_map(params![account, limit as i64], |r| Ok((r.get(0)?, r.get(1)?))).map_err(db)?;
         rows.collect::<Result<_, _>>().map_err(db)
@@ -1222,12 +1293,12 @@ impl Store {
 
     /// The header fields kept for a message; `None` when they were not read yet.
     pub fn headers(&self, id: MessageId) -> Result<Option<Vec<u8>>, MailError> {
-        self.conn().query_row("SELECT headers FROM messages WHERE id = ?1", [id.0 as i64], |r| r.get(0)).optional().map(Option::flatten).map_err(db)
+        self.read().query_row("SELECT headers FROM messages WHERE id = ?1", [id.0 as i64], |r| r.get(0)).optional().map(Option::flatten).map_err(db)
     }
 
     /// The spam checks' verdicts kept for the messages of a folder. The archive does not read them.
     pub fn verdicts(&self, account: &str, folder: &str) -> Result<Vec<(MessageId, String)>, MailError> {
-        let conn = self.conn();
+        let conn = self.read();
         let mut stmt = conn.prepare("SELECT id, verdict FROM messages WHERE account = ?1 AND folder = ?2 AND verdict IS NOT NULL").map_err(db)?;
         let rows = stmt.query_map(params![account, folder], |r| Ok((MessageId(r.get::<_, i64>(0)? as u64), r.get(1)?))).map_err(db)?;
         rows.collect::<Result<_, _>>().map_err(db)
@@ -1266,7 +1337,7 @@ impl Store {
 
     /// The training examples of an account: (message id, spam, text, sender domain).
     pub fn examples(&self, account: &str) -> Result<Vec<(String, bool, String, String)>, MailError> {
-        let conn = self.conn();
+        let conn = self.read();
         let mut stmt = conn.prepare("SELECT message_id, spam, text, domain FROM examples WHERE account = ?1").map_err(db)?;
         let rows = stmt.query_map([account], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0, r.get(2)?, r.get(3)?))).map_err(db)?;
         rows.collect::<Result<_, _>>().map_err(db)
@@ -1275,7 +1346,7 @@ impl Store {
     /// Everyone the user has written to, from any of their accounts: the recipients of every Sent
     /// folder, lower case. Someone written to from work is not a stranger at home.
     pub fn correspondents(&self) -> Result<std::collections::HashSet<String>, MailError> {
-        let conn = self.conn();
+        let conn = self.read();
         let mut stmt = conn
             .prepare("SELECT m.recipients FROM messages m JOIN folders f ON f.account = m.account AND f.name = m.folder WHERE f.role = ?1 AND m.recipients IS NOT NULL")
             .map_err(db)?;
@@ -1291,7 +1362,7 @@ impl Store {
     /// from any account, those this account writes to most first, then those written to most, then the
     /// latest. Senders never written to are not here: one may be a stranger or a spammer.
     pub fn contacts(&self, account: &str) -> Result<Vec<Contact>, MailError> {
-        let conn = self.conn();
+        let conn = self.read();
         let mut stmt = conn
             .prepare(
                 "SELECT c.name, c.address, c.folded FROM contacts c
@@ -1324,7 +1395,7 @@ impl Store {
 
     /// The OpenPGP key `address` was first seen with, to check what they sign.
     pub fn peer_key(&self, address: &str) -> Result<Option<Vec<u8>>, MailError> {
-        self.conn().query_row("SELECT key FROM peer_keys WHERE address = ?1", [address.trim().to_lowercase()], |r| r.get(0)).optional().map_err(db)
+        self.read().query_row("SELECT key FROM peer_keys WHERE address = ?1", [address.trim().to_lowercase()], |r| r.get(0)).optional().map_err(db)
     }
 
     /// Keeps `key` for `address` unless one is kept already: the first key seen is the one trusted, so
@@ -1338,7 +1409,7 @@ impl Store {
 
     /// The S/MIME certificate `address` last signed with.
     pub fn peer_cert(&self, address: &str) -> Result<Option<Vec<u8>>, MailError> {
-        self.conn().query_row("SELECT cert FROM peer_certs WHERE address = ?1", [address.trim().to_lowercase()], |r| r.get(0)).optional().map_err(db)
+        self.read().query_row("SELECT cert FROM peer_certs WHERE address = ?1", [address.trim().to_lowercase()], |r| r.get(0)).optional().map_err(db)
     }
 
     /// Keeps the certificate a valid signature from `address` was made with. Unlike an OpenPGP key it
@@ -1496,7 +1567,7 @@ impl Store {
 
     /// Someone's card: as the address book or mail knows them; `None` for someone never written to nor saved.
     pub fn contact_card(&self, address: &str) -> Result<Option<ContactCard>, MailError> {
-        self.conn()
+        self.read()
             .query_row(
                 "SELECT c.name, c.address, c.saved, c.notes, COALESCE(SUM(a.sent), 0), MAX(a.last) FROM contacts c LEFT JOIN contact_accounts a ON a.address = c.address WHERE c.address = ?1 GROUP BY c.address",
                 [address.trim().to_lowercase()],
@@ -1531,7 +1602,7 @@ impl Store {
 
     /// The address book: the contacts the user saved, by name.
     pub fn saved_contacts(&self) -> Result<Vec<Contact>, MailError> {
-        let conn = self.conn();
+        let conn = self.read();
         let mut stmt = conn.prepare("SELECT name, address, folded FROM contacts WHERE saved = 1 ORDER BY CASE WHEN name = '' THEN address ELSE lower(name) END").map_err(db)?;
         let rows = stmt.query_map([], |r| Ok(Contact { name: r.get(0)?, address: r.get(1)?, folded: r.get(2)? })).map_err(db)?;
         rows.collect::<Result<_, _>>().map_err(db)
@@ -1540,7 +1611,7 @@ impl Store {
     /// The latest messages from someone, or sent to them, in every account, as (account, where it
     /// is); Spam and Trash are left out.
     pub fn messages_with(&self, address: &str, limit: usize) -> Result<Vec<(String, Hit)>, MailError> {
-        let conn = self.conn();
+        let conn = self.read();
         let sql = format!(
             "SELECT {SUMMARY_COLUMNS}, folder, account FROM messages m
              WHERE (lower(from_addr) = ?1 OR instr(' ' || COALESCE(recipients, '') || ' ', ' ' || ?1 || ' ') > 0)
@@ -1557,7 +1628,7 @@ impl Store {
     /// Messages of `folder` that answer one the user sent: their In-Reply-To or References name a
     /// message of the Sent folder.
     pub fn replies_to_sent(&self, account: &str, folder: &str) -> Result<std::collections::HashSet<MessageId>, MailError> {
-        let conn = self.conn();
+        let conn = self.read();
         let mut stmt = conn
             .prepare("SELECT m.message_id FROM messages m JOIN folders f ON f.account = m.account AND f.name = m.folder WHERE m.account = ?1 AND f.role = ?2 AND m.message_id != ''")
             .map_err(db)?;
@@ -1576,7 +1647,7 @@ impl Store {
 
     /// Every (display name, lower-case address) the account has received mail from, once each.
     pub fn senders(&self, account: &str) -> Result<Vec<(String, String)>, MailError> {
-        let conn = self.conn();
+        let conn = self.read();
         let mut stmt = conn.prepare("SELECT DISTINCT from_name, lower(from_addr) FROM messages WHERE account = ?1 AND from_addr != ''").map_err(db)?;
         let rows = stmt.query_map([account], |r| Ok((r.get(0)?, r.get(1)?))).map_err(db)?;
         rows.collect::<Result<_, _>>().map_err(db)
@@ -1584,7 +1655,7 @@ impl Store {
 
     /// Messages dated `since` or later whose file is not stored, newest first.
     pub fn pending(&self, account: &str, folder: &str, since: i64, limit: usize) -> Result<Vec<Pending>, MailError> {
-        let conn = self.conn();
+        let conn = self.read();
         let mut stmt = conn
             .prepare("SELECT uid, size FROM messages WHERE account = ?1 AND folder = ?2 AND stored = 0 AND timestamp >= ?3 ORDER BY timestamp DESC, uid DESC LIMIT ?4")
             .map_err(db)?;
@@ -1594,7 +1665,7 @@ impl Store {
 
     /// How many messages [`Store::pending`] would list in all.
     pub fn count_pending(&self, account: &str, folder: &str, since: i64) -> Result<u32, MailError> {
-        let conn = self.conn();
+        let conn = self.read();
         conn.query_row("SELECT COUNT(*) FROM messages WHERE account = ?1 AND folder = ?2 AND stored = 0 AND timestamp >= ?3", params![account, folder, since], |r| r.get::<_, i64>(0).map(|n| n as u32)).map_err(db)
     }
 
@@ -1608,13 +1679,13 @@ impl Store {
 
     /// The date of the oldest cached message of a folder.
     pub fn oldest_timestamp(&self, account: &str, folder: &str) -> Result<Option<i64>, MailError> {
-        let conn = self.conn();
+        let conn = self.read();
         conn.query_row("SELECT MIN(timestamp) FROM messages WHERE account = ?1 AND folder = ?2", params![account, folder], |r| r.get(0)).map_err(db)
     }
 
     /// The UID of the `n`-th newest cached message (1 is the newest) of a folder.
     pub fn nth_newest_uid(&self, account: &str, folder: &str, n: u32) -> Result<Option<u32>, MailError> {
-        let conn = self.conn();
+        let conn = self.read();
         conn.query_row(
             "SELECT uid FROM messages WHERE account = ?1 AND folder = ?2 ORDER BY uid DESC LIMIT 1 OFFSET ?3",
             params![account, folder, i64::from(n.saturating_sub(1))],
@@ -1626,13 +1697,13 @@ impl Store {
 
     /// The name of the account's folder with this role, if it has one.
     pub fn folder_with_role(&self, account: &str, role: Role) -> Result<Option<String>, MailError> {
-        let conn = self.conn();
+        let conn = self.read();
         conn.query_row("SELECT name FROM folders WHERE account = ?1 AND role = ?2 LIMIT 1", params![account, role_to_int(role)], |r| r.get(0)).optional().map_err(db)
     }
 
     /// Where the message lives on the server.
     pub fn locate(&self, id: MessageId) -> Result<Option<Location>, MailError> {
-        let conn = self.conn();
+        let conn = self.read();
         conn.query_row("SELECT account, folder, uid FROM messages WHERE id = ?1", [id.0 as i64], |r| {
             Ok(Location { account: r.get(0)?, folder: r.get(1)?, uid: r.get::<_, i64>(2)? as u32 })
         })
@@ -1686,7 +1757,7 @@ impl Store {
 
     /// Messages whose file is stored but whose text is not searchable yet: (id, folder, uid).
     pub fn unindexed(&self, account: &str, limit: usize) -> Result<Vec<(MessageId, String, u32)>, MailError> {
-        let conn = self.conn();
+        let conn = self.read();
         let mut stmt = conn.prepare("SELECT id, folder, uid FROM messages WHERE account = ?1 AND stored = 1 AND indexed = 0 LIMIT ?2").map_err(db)?;
         let rows = stmt.query_map(params![account, limit as i64], |r| Ok((MessageId(r.get::<_, i64>(0)? as u64), r.get(1)?, r.get::<_, i64>(2)? as u32))).map_err(db)?;
         rows.collect::<Result<_, _>>().map_err(db)
@@ -1772,7 +1843,7 @@ impl Store {
             conditions.push("attach = 1".to_owned());
         }
         let sql = format!("SELECT {SUMMARY_COLUMNS}, folder FROM messages WHERE {} ORDER BY timestamp DESC LIMIT {}", conditions.join(" AND "), limit.min(1000));
-        let conn = self.conn();
+        let conn = self.read();
         let mut stmt = conn.prepare(&sql).map_err(db)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |r| Ok(Hit { message: summary(r)?, folder: r.get(16)? })).map_err(db)?;
         rows.collect::<Result<_, _>>().map_err(db)
@@ -1805,7 +1876,7 @@ impl Store {
         }
         let list = uids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
         let sql = format!("SELECT {SUMMARY_COLUMNS}, folder FROM messages WHERE account = ?1 AND folder = ?2 AND uid IN ({list}) ORDER BY timestamp DESC");
-        let conn = self.conn();
+        let conn = self.read();
         let mut stmt = conn.prepare(&sql).map_err(db)?;
         let rows = stmt.query_map(params![account, folder], |r| Ok(Hit { message: summary(r)?, folder: r.get(16)? })).map_err(db)?;
         rows.collect::<Result<_, _>>().map_err(db)
@@ -1813,7 +1884,7 @@ impl Store {
 
     /// The id of the message with this UID, if it is cached.
     pub fn id_of(&self, account: &str, folder: &str, uid: u32) -> Result<Option<MessageId>, MailError> {
-        let conn = self.conn();
+        let conn = self.read();
         conn.query_row("SELECT id FROM messages WHERE account = ?1 AND folder = ?2 AND uid = ?3", params![account, folder, i64::from(uid)], |r| {
             r.get::<_, i64>(0).map(|i| MessageId(i as u64))
         })
@@ -2319,6 +2390,32 @@ mod tests {
         store.add_headers("me", "INBOX", &[header(1, "Quarterly zeppelin budget", 5, true)]).unwrap();
         let id = store.id_of("me", "INBOX", 1).unwrap().unwrap();
         store.index_body(id, "the quokka said hello").unwrap();
+    }
+
+    #[test]
+    fn reading_does_not_wait_for_a_write_and_follows_a_new_key() {
+        let path = temp_file("reader");
+        let store = Store::open(&path, Some(&[7u8; 32])).unwrap();
+        fill(&store);
+        assert!(store.reader.lock().unwrap().is_some(), "a file has its reading connection");
+        // A write in progress holds the main connection; a read goes on beside it.
+        let mut writing = store.conn();
+        let tx = writing.transaction().unwrap();
+        tx.execute("UPDATE messages SET subject = 'changing'", []).unwrap();
+        let (done, read) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            s.spawn(|| done.send(store.search("me", "zeppelin", 10).unwrap().len()).unwrap());
+            assert_eq!(read.recv_timeout(std::time::Duration::from_secs(2)).unwrap(), 1, "read while the write is open");
+        });
+        tx.commit().unwrap();
+        drop(writing);
+        // Under another key, and plain, it still reads what was written.
+        store.rekey(Some(&[9u8; 32])).unwrap();
+        assert_eq!(store.messages("me", "INBOX").unwrap()[0].subject, "changing");
+        store.rekey(None).unwrap();
+        assert_eq!(store.search("me", "quokka", 10).unwrap().len(), 1);
+        drop(store);
+        remove_database(&path);
     }
 
     #[test]

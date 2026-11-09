@@ -39,6 +39,9 @@ struct State {
     session: Option<Session<Stream>>,
     /// When the session was last taken; one quiet for longer is checked before it is used again.
     used: Option<std::time::Instant>,
+    /// The folder last chosen on the session, kept only where one caller alone chooses folders (the
+    /// reader's connection), so choosing it again can be skipped.
+    folder: Option<String>,
 }
 
 /// What a write does to one message.
@@ -73,6 +76,12 @@ pub struct ImapSource {
     /// Where the downloaded messages live, encrypted.
     files: Arc<Vault>,
     state: Mutex<State>,
+    /// A connection of its own for the messages the user opens, so they never wait behind the
+    /// background work on `state`.
+    reader: Mutex<State>,
+    /// Folders where the server describes a message's structure in a way that cannot be read: their
+    /// headers are fetched without it, so that one message does not stop the whole folder.
+    plain: std::sync::Mutex<std::collections::HashSet<String>>,
     /// What [`Self::auth_server`] found, and whether it was learned (then it is final) and when not.
     auth_server: std::sync::Mutex<Option<(String, Option<std::time::Instant>)>>,
     /// Messages as (folder, uid) whose flags were changed here and are on their way to the server: a
@@ -149,7 +158,7 @@ impl ImapSource {
     /// Creates the source over the shared archive; the connection is opened on first use.
     pub fn new(account: &Account, password: String, store: Arc<Store>, files: Arc<Vault>) -> Self {
         let config = Config { server: account.imap.clone(), user: account.user.clone(), password, offline: Default::default(), token: None };
-        Self { config, poll_interval: std::time::Duration::from_secs(180), account: account.key(), address: account.address().to_lowercase(), store, files, state: Mutex::new(State::default()), auth_server: std::sync::Mutex::new(None), writing: Default::default() }
+        Self { config, poll_interval: std::time::Duration::from_secs(180), account: account.key(), address: account.address().to_lowercase(), store, files, state: Mutex::new(State::default()), reader: Mutex::new(State::default()), plain: Default::default(), auth_server: std::sync::Mutex::new(None), writing: Default::default() }
     }
 
     /// Changes how often a server without IDLE is polled (3 minutes by default).
@@ -315,6 +324,16 @@ fn backend(e: impl fmt::Display) -> MailError {
 
 /// An IMAP error as the app tells it: a connection that ended (the server restarting, the network
 /// gone) is being offline for a while, to be tried again, not a failure.
+/// The UID of the message whose answer the library could not parse (a server's malformed description
+/// of it), or `None` for any other error. Only the UID: the answer also holds the message's headers.
+fn unreadable(e: &async_imap::error::Error) -> Option<String> {
+    let async_imap::error::Error::Io(io) = e else { return None };
+    let text = io.to_string();
+    let (_, answer) = text.split_once("during parsing of")?;
+    let (_, after) = answer.split_once("UID ")?;
+    Some(after.chars().take_while(char::is_ascii_digit).collect())
+}
+
 fn imap_error(e: async_imap::error::Error) -> MailError {
     match e {
         async_imap::error::Error::ConnectionLost | async_imap::error::Error::Io(_) => MailError::Offline(e.to_string()),
@@ -403,7 +422,12 @@ async fn connect(c: &Config) -> Result<Session<Stream>, MailError> {
     };
     if *mode != Tls::StartTls {
         // LOGIN skips the greeting, but AUTHENTICATE would take it for the server's challenge and wait.
-        client.read_response().await.map_err(backend)?;
+        let greeting = client.read_response().await.map_err(backend)?;
+        // Credentials never go unencrypted to a server that refuses them so (RFC 9051 6.2.3).
+        let said = greeting.as_ref().and_then(|g| greeting_says(g.parsed()));
+        if *mode == Tls::None && login_disabled(&mut client, said).await? {
+            return Err(encryption_required(host));
+        }
     }
     match &c.token {
         // Asked off the async threads: getting a token may ask the provider for a new one.
@@ -412,8 +436,42 @@ async fn connect(c: &Config) -> Result<Session<Stream>, MailError> {
             let access = tokio::task::spawn_blocking(move || token()).await.map_err(backend)??;
             client.authenticate("XOAUTH2", XOAuth2 { user: c.user.clone(), token: access, answered: false }).await.map_err(|(e, _)| MailError::Auth(e.to_string()))
         }
-        None => client.login(&c.user, &c.password).await.map_err(|(e, _)| MailError::Auth(e.to_string())),
+        None => client.login(&c.user, &c.password).await.map_err(|(e, _)| match e.to_string() {
+            // The server's code for "sign in over an encrypted connection", not a wrong password.
+            why if why.contains("PRIVACYREQUIRED") || why.contains("PrivacyRequired") => encryption_required(host),
+            why => MailError::Auth(why),
+        }),
     }
+}
+
+fn encryption_required(host: &str) -> MailError {
+    MailError::Backend(format!("{host} signs in only over an encrypted connection: choose STARTTLS or SSL/TLS for incoming mail"))
+}
+
+fn refuses_plain_login(caps: &[async_imap::imap_proto::Capability<'_>]) -> bool {
+    caps.iter().any(|c| matches!(c, async_imap::imap_proto::Capability::Atom(a) if a.eq_ignore_ascii_case("LOGINDISABLED")))
+}
+
+/// What a greeting says of LOGINDISABLED, when it lists the server's capabilities.
+fn greeting_says(greeting: &Response<'_>) -> Option<bool> {
+    match greeting {
+        Response::Data { outcome, .. } => match &outcome.code {
+            Some(async_imap::imap_proto::ResponseCode::Capabilities(caps)) => Some(refuses_plain_login(caps)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Whether the server refuses to sign in over this unencrypted connection (LOGINDISABLED): as its
+/// greeting `said`, or else asked.
+async fn login_disabled(client: &mut Client<Stream>, said: Option<bool>) -> Result<bool, MailError> {
+    if let Some(said) = said {
+        return Ok(said);
+    }
+    let (tx, rx) = async_channel::unbounded();
+    client.run_command_and_check_ok("CAPABILITY", Some(tx)).await.map_err(backend)?;
+    Ok(std::iter::from_fn(|| rx.try_recv().ok()).any(|r| matches!(r, async_imap::types::UnsolicitedResponse::Other(d) if matches!(d.parsed(), Response::Capabilities(caps) if refuses_plain_login(caps)))))
 }
 
 /// The XOAUTH2 answer to the server's challenge. If the server refuses the token it sends a second
@@ -450,6 +508,7 @@ impl State {
             self.session = None;
         }
         if self.session.is_none() {
+            self.folder = None;
             self.session = Some(connect_in_time(config).await?);
         }
         self.used = Some(std::time::Instant::now());
@@ -725,8 +784,10 @@ impl ImapSource {
         result.map_err(|e| state.failed(e))
     }
 
-    async fn fetch_headers(session: &mut Session<Stream>, set: &str, by_uid: bool) -> Result<Vec<Header>, async_imap::error::Error> {
-        let query = format!("(UID FLAGS INTERNALDATE RFC822.SIZE BODYSTRUCTURE {HEADER_FIELDS})");
+    /// `structure`: with the server's description of each message's parts, which tells attachments
+    /// exactly; without it they are guessed from the Content-Type.
+    async fn fetch_headers(session: &mut Session<Stream>, set: &str, by_uid: bool, structure: bool) -> Result<Vec<Header>, async_imap::error::Error> {
+        let query = format!("(UID FLAGS INTERNALDATE RFC822.SIZE {}{HEADER_FIELDS})", if structure { "BODYSTRUCTURE " } else { "" });
         let fetches: Vec<Fetch> = if by_uid {
             session.uid_fetch(set, &query).await?.try_collect().await?
         } else {
@@ -772,17 +833,35 @@ impl ImapSource {
     /// The synchronisation itself; see [`MailSource::sync`].
     async fn sync_folder(&self, folder: &str) -> Result<SyncReport, MailError> {
         let mut state = self.state.lock().await;
-        let session = state.session(&self.config).await?;
-        let result = self.sync_with(session, folder).await;
-        match result {
-            Ok(report) => Ok(report),
-            Err(SyncError::Archive(e)) => Err(e),
-            Err(SyncError::Imap(e)) => Err(state.failed(e)),
+        loop {
+            let session = state.session(&self.config).await?;
+            let result = self.sync_with(session, folder).await;
+            return match result {
+                Ok(report) => Ok(report),
+                Err(SyncError::Archive(e)) => Err(e),
+                // A message the server describes in a way that cannot be read: the folder is read again,
+                // on a new connection (the old one is stuck on that answer), without descriptions.
+                Err(SyncError::Imap(e)) if self.structured(folder) && let Some(uid) = unreadable(&e) => {
+                    // Only the parser's code: the answer it quotes holds the message's headers.
+                    let code = e.to_string().split_once("code: ").map(|(_, c)| c.chars().take_while(char::is_ascii_alphanumeric).collect::<String>()).unwrap_or_default();
+                    log::warn!("{folder}: the server's description of message {uid} cannot be read ({code}), so this folder is read without them");
+                    self.plain.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(folder.to_owned());
+                    state.session = None;
+                    continue;
+                }
+                Err(SyncError::Imap(e)) => Err(state.failed(e)),
+            };
         }
+    }
+
+    /// Whether the headers of `folder` are fetched with each message's structure.
+    fn structured(&self, folder: &str) -> bool {
+        !self.plain.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(folder)
     }
 
     async fn sync_with(&self, session: &mut Session<Stream>, folder: &str) -> Result<SyncReport, SyncError> {
         let (account, store) = (self.account.as_str(), &*self.store);
+        let structure = self.structured(folder);
         let selected = session.examine(folder).await?;
         let validity = selected.uid_validity.unwrap_or(0);
         let mut cached = store.folder_state(account, folder)?;
@@ -801,8 +880,8 @@ impl ImapSource {
         // New messages. The first sync takes the newest few by sequence number.
         let range = store.uid_range(account, folder)?;
         let fresh = match range {
-            Some((_, highest, _)) => Self::fetch_headers(session, &format!("{}:*", highest + 1), true).await?.into_iter().filter(|h| h.uid > highest).collect(),
-            None => Self::fetch_headers(session, &format!("{}:*", selected.exists.saturating_sub(FIRST_CHUNK - 1).max(1)), false).await?,
+            Some((_, highest, _)) => Self::fetch_headers(session, &format!("{}:*", highest + 1), true, structure).await?.into_iter().filter(|h| h.uid > highest).collect(),
+            None => Self::fetch_headers(session, &format!("{}:*", selected.exists.saturating_sub(FIRST_CHUNK - 1).max(1)), false, structure).await?,
         };
         if cached.floor_uid.is_none() {
             let lowest = fresh.iter().map(|h| h.uid).min().or(range.map(|(lo, _, _)| lo));
@@ -814,7 +893,7 @@ impl ImapSource {
         store.add_headers(account, folder, &fresh)?;
 
         // Rows from before attachments were tracked: ask the server about a chunk of them.
-        for _ in 0..20 {
+        for _ in 0..if structure { 20 } else { 0 } {
             let unknown = store.unknown_attachments(account, folder, 300)?;
             if unknown.is_empty() {
                 break;
@@ -916,7 +995,7 @@ impl ImapSource {
                 break;
             }
             let start = floor.saturating_sub(BACKFILL_SPAN).max(1);
-            let older = Self::fetch_headers(session, &format!("{start}:{}", floor - 1), true).await?;
+            let older = Self::fetch_headers(session, &format!("{start}:{}", floor - 1), true, structure).await?;
             store.add_headers(account, folder, &older)?;
             floor = start;
             store.set_floor(account, folder, floor)?;
@@ -1155,17 +1234,36 @@ fn auth_result(value: &str) -> AuthResult {
 
 impl ImapSource {
     /// The complete message from the server.
+    /// A whole message, for the user to read, over the reader's connection.
     async fn download(&self, at: &Location) -> Result<Vec<u8>, MailError> {
-        let mut state = self.state.lock().await;
-        let session = state.session(&self.config).await?;
+        let started = std::time::Instant::now();
+        let mut state = self.reader.lock().await;
+        state.session(&self.config).await?; // a new connection has no folder chosen
+        let connected = started.elapsed();
+        let chosen = state.folder.as_deref() == Some(&at.folder);
+        let session = state.session.as_mut().expect("just connected");
         let result = async {
-            session.examine(&at.folder).await?;
-            let fetches: Vec<Fetch> = session.uid_fetch(at.uid.to_string(), "BODY.PEEK[]").await?.try_collect().await?;
-            Ok(fetches)
+            // The folder is chosen again when it was not, or when the message is not found where it was
+            // chosen before (mail arrived since).
+            for choose in if chosen { [false, true] } else { [true, false] } {
+                if choose {
+                    session.examine(&at.folder).await?;
+                }
+                let fetches: Vec<Fetch> = session.uid_fetch(at.uid.to_string(), "BODY.PEEK[]").await?.try_collect().await?;
+                if let Some(raw) = fetches.iter().find_map(|f| f.body().map(<[u8]>::to_vec)) {
+                    return Ok(Some(raw));
+                }
+                if choose {
+                    break;
+                }
+            }
+            Ok(None)
         }
         .await;
-        let fetches = result.map_err(|e| state.failed(e))?;
-        fetches.iter().find_map(|f| f.body().map(<[u8]>::to_vec)).ok_or(MailError::NotFound)
+        log::debug!("download: connection ready at {connected:.0?}, fetched at {:.0?}{}", started.elapsed(), if chosen { ", folder already chosen" } else { "" });
+        let raw = result.map_err(|e| state.failed(e))?;
+        state.folder = Some(at.folder.clone());
+        raw.ok_or(MailError::NotFound)
     }
 }
 
@@ -1191,12 +1289,13 @@ impl MailSource for ImapSource {
             let session = state.session(&self.config).await?;
             let asked = async {
                 session.examine(&folder).await?;
+                let structured = self.structured(&folder);
                 let mut uids: Vec<u32> = session.uid_search(&criteria).await?.into_iter().collect();
                 // The highest UIDs are the latest to arrive: the newest, near enough.
                 uids.sort_unstable_by(|a, b| b.cmp(a));
                 uids.truncate(limit);
                 let missing: Vec<String> = uids.iter().filter(|u| matches!(self.store.id_of(&self.account, &folder, **u), Ok(None))).map(u32::to_string).collect();
-                let headers = if missing.is_empty() { Vec::new() } else { Self::fetch_headers(session, &missing.join(","), true).await? };
+                let headers = if missing.is_empty() { Vec::new() } else { Self::fetch_headers(session, &missing.join(","), true, structured).await? };
                 Ok::<_, async_imap::error::Error>((uids, headers))
             };
             // IMAP cannot take back a command: stopping drops the connection, made again when next needed.
@@ -1409,33 +1508,53 @@ impl MailSource for ImapSource {
     }
 
     async fn body(&self, id: MessageId) -> Result<MessageBody, MailError> {
+        /// For the diagnostic log, once the message is kept: how long reading it took, and keeping it.
+        struct Logged(MessageId, std::time::Instant, std::time::Duration);
+        impl Drop for Logged {
+            fn drop(&mut self) {
+                log::debug!("message {}: read in {:.0?}, kept in {:.0?}", self.0.0, self.2, self.1.elapsed() - self.2);
+            }
+        }
         let at = self.store.locate(id)?.ok_or(MailError::NotFound)?;
         let path = self.file_of(&at.account, &at.folder, at.uid)?;
         // A file that cannot be read (damaged, written under another key, or the vault is locked) is
         // downloaded again.
+        let opening = std::time::Instant::now();
         match self.files.read(&path) {
-            Ok(Some(raw)) => return self.read(&raw),
+            Ok(Some(raw)) => {
+                let opened = opening.elapsed();
+                let body = self.read(&raw);
+                log::debug!("message {}: file opened in {opened:.0?}, read in {:.0?}", id.0, opening.elapsed() - opened);
+                return body;
+            }
             Ok(None) => {}
             Err(e) => log::warn!("message {}: its stored file cannot be read ({e}), so it is downloaded again", id.0),
         }
         let started = std::time::Instant::now();
         let raw = self.download(&at).await?;
         log::debug!("message {}: downloaded in {:.0?}, {} bytes", id.0, started.elapsed(), raw.len());
+        let parsing = std::time::Instant::now();
         let body = self.read(&raw)?;
+        let parsed = parsing.elapsed();
+        let _logged = Logged(id, parsing, parsed);
         // Not being able to keep the file (a locked vault) must not stop the message from opening.
-        let kept = self.files.write(&path, &raw);
-        if let Err(e) = &kept {
+        if let Err(e) = self.files.write(&path, &raw) {
             log::warn!("message {}: cannot be kept on this computer ({e}), so it is downloaded at every opening", id.0);
+            return Ok(body);
         }
-        if kept.is_ok() {
-            self.store.mark_stored(&at.account, &at.folder, at.uid)?;
+        // Recorded and indexed after the message is shown: the database may be busy with the
+        // background download, and the reader need not wait for it.
+        let (store, plain) = (self.store.clone(), body.encryption.is_none().then(|| (body.text.clone(), !body.attachments.is_empty())));
+        tokio::task::spawn_blocking(move || {
+            store.mark_stored(&at.account, &at.folder, at.uid)?;
             // What was decrypted is never kept: an encrypted message is indexed by its subject and sender only.
-            if body.encryption.is_none() {
-                self.store.set_preview(id, &body.text)?;
-                self.store.set_attachments(&at.account, &at.folder, at.uid, !body.attachments.is_empty())?;
-                self.store.index_body(id, &body.text)?;
+            if let Some((text, attachments)) = plain {
+                store.set_preview(id, &text)?;
+                store.set_attachments(&at.account, &at.folder, at.uid, attachments)?;
+                store.index_body(id, &text)?;
             }
-        }
+            Ok::<_, MailError>(())
+        });
         Ok(body)
     }
 

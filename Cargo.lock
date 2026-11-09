@@ -638,6 +638,7 @@ dependencies = [
 name = "beavermail-imap"
 version = "0.1.1"
 dependencies = [
+ "async-channel 2.5.0",
  "async-imap",
  "beavermail-core",
  "beavermail-crypto",
@@ -678,6 +679,7 @@ version = "0.1.1"
 dependencies = [
  "beavermail-core",
  "chrono",
+ "log",
  "rusqlite",
 ]
 

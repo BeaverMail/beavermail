@@ -41,9 +41,12 @@ pub fn set(dir: Option<&Path>) {
 }
 
 impl log::Log for Logger {
-    /// Everything of this app's own crates; of the libraries under it, only their warnings and errors.
+    /// Everything of this app's own crates; of the libraries under it, only their warnings and errors,
+    /// less those that only describe their own limits: the HTML reader on malformed tables, the window
+    /// system's event loop on Wayland.
     fn enabled(&self, meta: &log::Metadata) -> bool {
-        meta.target().starts_with("beavermail") || meta.level() <= log::Level::Warn
+        const NOISE: [&str; 2] = ["html5ever", "calloop"];
+        meta.target().starts_with("beavermail") || (meta.level() <= log::Level::Warn && !NOISE.iter().any(|n| meta.target().starts_with(n)))
     }
 
     fn log(&self, record: &log::Record) {
