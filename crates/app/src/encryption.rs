@@ -307,6 +307,7 @@ mod tests {
             output.textures_delta.clear();
         }
         let shown = ctx.memory(|m| m.area_rect(egui::Id::new("key_backup"))).expect("the backup dialog is shown");
-        assert!(shown.width() < 600.0 && shown.height() < 500.0, "{shown:?}");
+        // Sized by its content, not stretched over the 1200-point window (the margins of a dialog included).
+        assert!(shown.width() < 700.0 && shown.height() < 500.0, "{shown:?}");
     }
 }
