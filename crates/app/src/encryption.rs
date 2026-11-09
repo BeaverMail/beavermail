@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Settings > Encryption: each account's own key, made here or imported, and its backup.
+//! Settings > Secure mail: each account's own key, made here or imported, and its backup.
 
 use eframe::egui::{self, Align, Layout, RichText, vec2};
 

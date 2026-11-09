@@ -864,7 +864,7 @@ pub fn encryption_line(encryption: &beavermail_core::Encryption) -> (String, boo
     use beavermail_core::Encryption as E;
     match encryption {
         E::Opened(_) => ("Encrypted: only you and the other recipients can read it".to_owned(), false),
-        E::NoKey(_) => ("Encrypted for a key not on this computer. Turn on encryption or import your key in Settings > Encryption".to_owned(), false),
+        E::NoKey(_) => ("Encrypted for a key not on this computer. Turn on encryption or import your key in Settings > Secure mail".to_owned(), false),
         E::Failed(_, why) => (format!("Encrypted, but it could not be opened: {why}"), true),
     }
 }

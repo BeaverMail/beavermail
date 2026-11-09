@@ -893,7 +893,7 @@ impl SettingsPage {
             Self::Calendars => "Calendars",
             Self::Spam => "Suspicious mail",
             Self::Storage => "Stored mail",
-            Self::Encryption => "Encryption",
+            Self::Encryption => "Secure mail",
             Self::Troubleshooting => "Troubleshooting",
             Self::Account(_) => "Account",
         }
@@ -920,8 +920,8 @@ impl SettingsPage {
             Self::Writing => "How messages you write are composed and sent.",
             Self::Calendars => "The calendars synced from a server, and the one on this computer.",
             Self::Spam => "Mail from people you know is never held. Nothing moves on the server.",
-            Self::Storage => "How downloaded messages are kept on this computer.",
-            Self::Encryption => "Your keys, to read encrypted mail and to send it encrypted.",
+            Self::Storage => "How downloaded messages are kept on this computer, and whether they are encrypted there.",
+            Self::Encryption => "Your OpenPGP and S/MIME keys, to read encrypted mail and to send mail encrypted or signed.",
             Self::Troubleshooting => "What to send when something is slow or does not work.",
             Self::Account(_) => "",
         }
@@ -1301,7 +1301,7 @@ struct BeaverApp {
     signing_in: Option<SignIn>,
     /// What the window shows, as picked in the rail at its left edge.
     section: Section,
-    /// Settings > Encryption's dialogs.
+    /// Settings > Secure mail's dialogs.
     key_dialogs: encryption::Dialogs,
     /// The user's own keys and certificates, by their place in the vault, read when first asked for.
     key_files: std::collections::HashMap<std::path::PathBuf, Option<Vec<u8>>>,
@@ -4412,7 +4412,7 @@ impl BeaverApp {
         let others: Vec<(String, bool)> = recipients.into_iter().filter(|(r, _)| *r != address).collect();
         // OpenPGP first, the way most people who encrypt write; S/MIME when everyone has a certificate.
         let openpgp = (|| {
-            let secret = self.own_key(&address).ok_or_else(|| format!("Turn on encryption for {address} in Settings > Encryption first"))?;
+            let secret = self.own_key(&address).ok_or_else(|| format!("Turn on encryption for {address} in Settings > Secure mail first"))?;
             let own = beavermail_crypto::public_key(&secret).ok_or("Your key could not be read")?;
             let (mut to, mut bcc) = (vec![own], Vec::new());
             for (recipient, blind) in &others {

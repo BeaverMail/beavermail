@@ -21,6 +21,7 @@ What changed in each version of BeaverMail, newest first.
 ### Changed
 
 - Fewer false alarms in the spam checks.
+- Settings › Encryption is now Secure mail, set apart from Stored mail, where mail on this computer is encrypted.
 - All inboxes, Suspicious and Spam get the menus of an account's own folders.
 - Folders start folded in the sidebar, and those opened are remembered; a folder opened from anywhere shows in the sidebar.
 - Settings chosen from drop-downs, each saying what its choice does.
