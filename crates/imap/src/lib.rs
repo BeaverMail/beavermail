@@ -82,6 +82,9 @@ pub struct ImapSource {
     /// Folders where the server describes a message's structure in a way that cannot be read: their
     /// headers are fetched without it, so that one message does not stop the whole folder.
     plain: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Where Archive moves messages: the account's choice of folder (empty for the server's archive)
+    /// and whether into a folder for each year. Changed with the account's settings, see [`Self::set_archive`].
+    archive: std::sync::Mutex<(String, bool)>,
     /// What [`Self::auth_server`] found, and whether it was learned (then it is final) and when not.
     auth_server: std::sync::Mutex<Option<(String, Option<std::time::Instant>)>>,
     /// Messages as (folder, uid) whose flags were changed here and are on their way to the server: a
@@ -158,7 +161,7 @@ impl ImapSource {
     /// Creates the source over the shared archive; the connection is opened on first use.
     pub fn new(account: &Account, password: String, store: Arc<Store>, files: Arc<Vault>) -> Self {
         let config = Config { server: account.imap.clone(), user: account.user.clone(), password, offline: Default::default(), token: None };
-        Self { config, poll_interval: std::time::Duration::from_secs(180), account: account.key(), address: account.address().to_lowercase(), store, files, state: Mutex::new(State::default()), reader: Mutex::new(State::default()), plain: Default::default(), auth_server: std::sync::Mutex::new(None), writing: Default::default() }
+        Self { config, poll_interval: std::time::Duration::from_secs(180), account: account.key(), address: account.address().to_lowercase(), store, files, state: Mutex::new(State::default()), reader: Mutex::new(State::default()), plain: Default::default(), archive: std::sync::Mutex::new((account.archive.clone(), account.archive_by_year)), auth_server: std::sync::Mutex::new(None), writing: Default::default() }
     }
 
     /// Changes how often a server without IDLE is polled (3 minutes by default).
@@ -684,12 +687,53 @@ impl ImapSource {
         self.store.folder_with_role(&self.account, role)
     }
 
+    /// Archives into `folder` (empty for the server's archive folder), into a folder for each year
+    /// inside it when `by_year`; for the account's settings changed while connected.
+    pub fn set_archive(&self, folder: &str, by_year: bool) {
+        *self.archive.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = (folder.to_owned(), by_year);
+    }
+
+    /// Where Archive moves message `id`: the folder chosen for the account, or the server's archive;
+    /// by year, the folder of its year inside that one, made the first time it is needed.
+    async fn archive_folder(&self, id: MessageId) -> Result<String, MailError> {
+        let (chosen, by_year) = self.archive.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        if self.store.folders(&self.account)?.is_empty() {
+            self.mailboxes().await?;
+        }
+        let folders = self.store.folders(&self.account)?;
+        let base = if chosen.is_empty() {
+            folders.iter().find(|f| f.role == Role::Archive).ok_or_else(|| backend("this account has no archive folder: choose one in its settings"))?
+        } else {
+            folders.iter().find(|f| f.name == chosen).ok_or_else(|| backend(format!("there is no folder {chosen} any more: choose another in the account's settings")))?
+        };
+        if !by_year {
+            return Ok(base.name.clone());
+        }
+        let year = self.store.year_of(id)?.to_string();
+        let delimiter = match base.delimiter {
+            Some(d) => d,
+            None => self.delimiter(&mut *self.state.lock().await).await?.ok_or_else(|| backend("this server keeps no folders inside others, so it cannot archive by year"))?,
+        };
+        let full = format!("{}{delimiter}{year}", base.name);
+        if !folders.iter().any(|f| f.name == full) {
+            let created = self.create_folder(Some(&base.name), &year).await;
+            self.mailboxes().await?; // listed here at once, so the sidebar shows it
+            // Made meanwhile by another client is as good as made here.
+            if let Err(e) = created
+                && !self.store.folders(&self.account)?.iter().any(|f| f.name == full)
+            {
+                return Err(e);
+            }
+        }
+        Ok(full)
+    }
+
     /// Applies `op` to one message on the server, then mirrors it in the archive.
     async fn write(&self, id: MessageId, op: Op) -> Result<(), MailError> {
         let at = self.store.locate(id)?.ok_or(MailError::NotFound)?;
         let target = match &op {
             Op::Seen(_) | Op::Pinned(_) | Op::Starred(_) | Op::Label(..) | Op::Erase => None,
-            Op::Archive => Some(self.folder_with_role(Role::Archive).await?.ok_or_else(|| backend("this account has no archive folder"))?),
+            Op::Archive => Some(self.archive_folder(id).await?),
             Op::Trash => Some(self.folder_with_role(Role::Trash).await?.ok_or_else(|| backend("this account has no trash folder"))?),
             Op::Move(role) => Some(self.folder_with_role(*role).await?.ok_or_else(|| backend(format!("this account has no {role:?} folder")))?),
             // One removed or renamed meanwhile (on the server, or from another client) is not created again.

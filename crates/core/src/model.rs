@@ -234,6 +234,13 @@ pub struct Account {
     /// The outgoing server's own login, when it is not the incoming one's; its password is kept apart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub smtp_user: Option<String>,
+    /// Where Archive moves messages: a folder by its name on the server, or empty for the one the
+    /// server marks as the archive.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub archive: String,
+    /// Archive into a folder for each year inside it ("Archive/2026"), by the message's date.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub archive_by_year: bool,
 }
 
 /// An address book synced over CardDAV: a source of its own, apart from the mail accounts (contacts
@@ -689,7 +696,7 @@ mod tests {
     #[test]
     fn mail_goes_out_under_the_users_name_unless_it_is_only_the_login() {
         let server = Server { host: "imap.x.org".into(), port: 993, tls: Tls::Tls };
-        let account = |name: &str| Account { name: name.into(), user: "ada".into(), email: "ada@x.org".into(), imap: server.clone(), smtp: server.clone(), save_sent: true, keep: Keep::default(), signature: String::new(), oauth: None, smtp_user: None };
+        let account = |name: &str| Account { name: name.into(), user: "ada".into(), email: "ada@x.org".into(), imap: server.clone(), smtp: server.clone(), save_sent: true, keep: Keep::default(), signature: String::new(), oauth: None, smtp_user: None, archive: String::new(), archive_by_year: false };
         assert_eq!(account("Ada Lovelace").sender(), "\"Ada Lovelace\" <ada@x.org>");
         assert_eq!(account("Lovelace, Ada").sender(), "\"Lovelace, Ada\" <ada@x.org>", "quoted: the comma is part of the name");
         assert_eq!(account("Ada \"the\" Countess").sender(), "\"Ada the Countess\" <ada@x.org>");

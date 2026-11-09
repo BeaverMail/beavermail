@@ -665,6 +665,9 @@ struct NewAccount {
     save_sent: bool,
     keep: Keep,
     signature: String,
+    /// See [`Account::archive`].
+    archive: String,
+    archive_by_year: bool,
     /// Signed in with a provider: kept through an edit, so the account stays an OAuth one.
     oauth: Option<OAuthProvider>,
     /// The last "Test connection", shown while the form still says what was tested.
@@ -694,6 +697,8 @@ impl Default for NewAccount {
             save_sent: true,
             keep: Keep::default(),
             signature: String::new(),
+            archive: String::new(),
+            archive_by_year: false,
             oauth: None,
             check: None,
             error: None,
@@ -734,6 +739,8 @@ impl NewAccount {
             save_sent: account.save_sent,
             keep: account.keep,
             signature: account.signature.clone(),
+            archive: account.archive.clone(),
+            archive_by_year: account.archive_by_year,
             oauth: account.oauth,
             focus_first: true,
             ..Self::default()
@@ -801,6 +808,8 @@ impl NewAccount {
             signature: self.signature.trim_end().to_owned(),
             oauth: self.oauth,
             smtp_user,
+            archive: self.archive.clone(),
+            archive_by_year: self.archive_by_year,
         })
     }
 }
@@ -1032,7 +1041,8 @@ fn section_title(ui: &mut egui::Ui, text: &str) {
 }
 
 /// One account's page in Settings. `waiting`: a sign-in for it is open in the browser.
-fn account_page(ui: &mut egui::Ui, t: &theme::Tokens, form: &mut NewAccount, waiting: bool) -> Option<PageAction> {
+/// `folders`: the account's folders as (name on the server, as shown), for where Archive moves mail.
+fn account_page(ui: &mut egui::Ui, t: &theme::Tokens, form: &mut NewAccount, waiting: bool, folders: &[(String, String)]) -> Option<PageAction> {
     let mut action = None;
     let hint = |ui: &mut egui::Ui, text: &str| ui.label(RichText::new(text).size(13.0).color(t.text_dim));
     form_grid(ui, "account_identity", |ui| {
@@ -1065,6 +1075,24 @@ fn account_page(ui: &mut egui::Ui, t: &theme::Tokens, form: &mut NewAccount, wai
         ui.end_row();
     });
     views::switch_row(ui, t, &mut form.save_sent, "Keep a copy of sent messages in Sent", "Turn off for providers that already do it, such as Gmail and Microsoft 365.");
+
+    // A new account has no folders listed yet: its archive is chosen once it is connected.
+    if !folders.is_empty() {
+        section_title(ui, "Archive");
+        form_grid(ui, "account_archive", |ui| {
+            ui.label("Move to");
+            let server = "The server's archive folder";
+            let shown = folders.iter().find(|(name, _)| *name == form.archive).map_or(server, |(_, title)| title.as_str());
+            egui::ComboBox::from_id_salt("archive").width(FIELD_WIDTH).selected_text(shown).show_ui(ui, |ui| {
+                ui.selectable_value(&mut form.archive, String::new(), server);
+                for (name, title) in folders {
+                    ui.selectable_value(&mut form.archive, name.clone(), title);
+                }
+            });
+            ui.end_row();
+        });
+        views::switch_row(ui, t, &mut form.archive_by_year, "A folder for each year", "Inside it, by each message's date: 2026, 2025… Made the first time one is needed.");
+    }
 
     section_title(ui, "Connection");
     match form.oauth {
@@ -3737,7 +3765,10 @@ impl BeaverApp {
                             SettingsPage::Account(_) => {
                                 if let Some(form) = &mut self.account_edit {
                                     let waiting = self.signing_in.as_ref().is_some_and(|s| s.editing.is_some() && s.editing == form.editing);
-                                    page_action = account_page(ui, t, form, waiting);
+                                    let folders: Vec<(String, String)> = form.editing.and_then(|serial| self.accounts.iter().find(|v| v.serial == serial)).map(|v| {
+                                        v.mailboxes.iter().filter(|m| matches!(m.role, Role::Archive | Role::Other)).map(|m| (m.name.clone(), views::folder_title(&m.name, m.role, m.delimiter))).collect()
+                                    }).unwrap_or_default();
+                                    page_action = account_page(ui, t, form, waiting, &folders);
                                 }
                             }
                             SettingsPage::Reading => {
@@ -6623,6 +6654,9 @@ impl BeaverApp {
             // Name, address, signature or sync choices only: the password, the connection and the open folder stay as they are.
             all[at] = account.clone();
             store::save(&all)?;
+            if let Some(source) = &self.accounts[at].source {
+                source.set_archive(&account.archive, account.archive_by_year);
+            }
             self.accounts[at].account = account;
             return Ok(self.accounts[at].serial);
         }
@@ -9635,7 +9669,7 @@ mod tests {
     fn what_an_account_knows_is_loaded_again_only_when_its_marks_change() {
         let archive = Arc::new(Store::in_memory().unwrap());
         let server = Server { host: "mail.example.org".into(), port: 993, tls: Tls::Tls };
-        let account = Account { name: "Ada".into(), user: "ada@example.org".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true, keep: Keep::default(), signature: String::new(), oauth: None, smtp_user: None };
+        let account = Account { name: "Ada".into(), user: "ada@example.org".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true, keep: Keep::default(), signature: String::new(), oauth: None, smtp_user: None, archive: String::new(), archive_by_year: false };
         let (cache, mut settings) = (KnownCache::default(), Settings::default());
         let first = cache.get(&archive, &account, &[], &settings).unwrap();
         assert!(Arc::ptr_eq(&first, &cache.get(&archive, &account, &[], &settings).unwrap()), "kept");

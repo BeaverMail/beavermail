@@ -36,7 +36,7 @@ async fn listen(good_password: &'static str) -> (u16, Arc<Mutex<Transcript>>) {
 
 fn account(port: u16) -> Account {
     let server = Server { host: "127.0.0.1".into(), port, tls: Tls::None };
-    Account { name: "mock".into(), user: "me@example.com".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true, keep: beavermail_core::Keep::default(), signature: String::new(), oauth: None, smtp_user: None }
+    Account { name: "mock".into(), user: "me@example.com".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true, keep: beavermail_core::Keep::default(), signature: String::new(), oauth: None, smtp_user: None, archive: String::new(), archive_by_year: false }
 }
 
 async fn serve(socket: TcpStream, transcript: Arc<Mutex<Transcript>>, good_password: &'static str) {

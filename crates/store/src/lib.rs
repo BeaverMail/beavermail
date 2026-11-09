@@ -1882,6 +1882,15 @@ impl Store {
         rows.collect::<Result<_, _>>().map_err(db)
     }
 
+    /// The year of the message's date on this computer's clock, for archiving by year; this year for
+    /// one without a valid date.
+    pub fn year_of(&self, id: MessageId) -> Result<i32, MailError> {
+        use chrono::Datelike;
+        let timestamp: Option<i64> = self.read().query_row("SELECT timestamp FROM messages WHERE id = ?1", [id.0 as i64], |r| r.get(0)).optional().map_err(db)?;
+        let date = timestamp.filter(|t| *t > 0).and_then(|t| chrono::DateTime::from_timestamp(t, 0));
+        Ok(date.map_or_else(chrono::Local::now, |d| d.with_timezone(&chrono::Local)).year())
+    }
+
     /// The id of the message with this UID, if it is cached.
     pub fn id_of(&self, account: &str, folder: &str, uid: u32) -> Result<Option<MessageId>, MailError> {
         let conn = self.read();

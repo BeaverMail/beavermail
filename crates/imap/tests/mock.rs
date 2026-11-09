@@ -84,7 +84,7 @@ async fn start_opts(move_works: bool, attachment: bool, idle: bool) -> Mock {
         }
     });
     let server = Server { host: "127.0.0.1".into(), port, tls: Tls::None };
-    let account = Account { name: "mock".into(), user: "u".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true, keep: beavermail_core::Keep::default(), signature: String::new(), oauth: None, smtp_user: None };
+    let account = Account { name: "mock".into(), user: "u".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true, keep: beavermail_core::Keep::default(), signature: String::new(), oauth: None, smtp_user: None, archive: String::new(), archive_by_year: false };
     let store = Arc::new(Store::in_memory().unwrap());
     let files = Arc::new(Vault::in_memory());
     Mock { source: ImapSource::new(&account, "p".into(), store.clone(), files.clone()), account, store, files, log, message, list, bye, broken, tls_only }
@@ -828,4 +828,20 @@ async fn no_password_goes_unencrypted_to_a_server_that_refuses_it() {
     let error = mock.source.check().await.expect_err("not signed in").to_string();
     assert!(error.contains("encrypted connection"), "{error}");
     assert!(!mock.commands().iter().any(|c| c.starts_with("LOGIN")), "{:?}", mock.commands());
+}
+
+#[tokio::test]
+async fn archive_by_year_makes_the_year_folder_once() {
+    let mock = start(true).await;
+    mock.source.set_archive("", true);
+    let id = message_in(&mock, "INBOX").await; // dated 1 January 2024
+    mock.source.archive(id).await.unwrap();
+    let commands = mock.commands();
+    assert!(commands.iter().any(|c| c.starts_with("CREATE") && c.contains("Archive/2024")), "{commands:?}");
+    assert_eq!(mock.writes(), ["UID MOVE 5 \"Archive/2024\""]);
+    // Into another folder chosen for the account, not the server's.
+    mock.source.set_archive("Missing", false);
+    let id = message_in(&mock, "INBOX").await;
+    let error = mock.source.archive(id).await.expect_err("not there").to_string();
+    assert!(error.contains("no folder Missing"), "{error}");
 }
