@@ -169,7 +169,7 @@ pub fn section(ui: &mut Ui, t: &Tokens, form: &mut Form, current: Mode, locked: 
 pub fn recovery_dialog(ctx: &egui::Context, t: &Tokens, form: &mut Form) -> Option<String> {
     let code = form.new_code.clone()?;
     let mut save = None;
-    egui::Modal::new(egui::Id::new("recovery_key")).show(ctx, |ui| {
+    crate::views::modal(ctx, egui::Id::new("recovery_key")).show(ctx, |ui| {
         ui.set_width(crate::FORM_WIDTH);
         ui.heading("Your recovery key");
         ui.add(egui::Label::new(RichText::new("It opens the mail stored on this computer, and your encryption keys, if this computer's key or your passphrase is lost. Keep it away from this computer: on paper, or in a password manager. It is shown only now; BeaverMail does not keep it.").color(t.text_dim)).wrap());
@@ -205,7 +205,7 @@ pub fn recovery_dialog(ctx: &egui::Context, t: &Tokens, form: &mut Form) -> Opti
 /// computer's key for it is missing. A recovery key opens either.
 pub fn unlock_prompt(ctx: &egui::Context, t: &Tokens, form: &mut Form, busy: bool, mode: Mode, recovery: bool) -> Option<Request> {
     let mut request = None;
-    let modal = egui::Modal::new(egui::Id::new("unlock_vault")).show(ctx, |ui| {
+    let modal = crate::views::modal(ctx, egui::Id::new("unlock_vault")).show(ctx, |ui| {
         ui.set_width(380.0);
         if form.confirm_reset {
             ui.heading("Delete stored mail?");

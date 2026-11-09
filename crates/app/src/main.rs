@@ -3327,7 +3327,7 @@ impl BeaverApp {
         if self.confirm_discard {
             let (mut discard, mut keep, mut save) = (false, false, false);
             let quitting = self.quitting;
-            let modal = egui::Modal::new(egui::Id::new("confirm_discard")).show(ctx, |ui| {
+            let modal = crate::views::modal(ctx, egui::Id::new("confirm_discard")).show(ctx, |ui| {
                 ui.set_width(FORM_WIDTH * 0.8);
                 ui.heading(if quitting { "Quit with this message open?" } else { "Discard this message?" });
                 ui.label(RichText::new("What you wrote will be lost, unless you keep it as a draft.").color(t.text_dim));
@@ -3386,7 +3386,7 @@ impl BeaverApp {
         let n = self.in_flight.len();
         let mut quit = n == 0;
         if n > 0 {
-            egui::Modal::new(egui::Id::new("closing")).show(ctx, |ui| {
+            crate::views::modal(ctx, egui::Id::new("closing")).show(ctx, |ui| {
                 ui.set_width(FORM_WIDTH * 0.8);
                 ui.horizontal(|ui| {
                     ui.add(egui::Spinner::new().size(16.0));
@@ -3485,7 +3485,7 @@ impl BeaverApp {
     fn open_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
         let Some((id, index, name)) = self.confirm_open.clone() else { return };
         let (mut open, mut cancel) = (false, false);
-        let modal = egui::Modal::new(egui::Id::new("confirm_open")).show(ctx, |ui| {
+        let modal = crate::views::modal(ctx, egui::Id::new("confirm_open")).show(ctx, |ui| {
             ui.set_width(FORM_WIDTH * 0.85);
             ui.heading("Open this file?");
             ui.label(RichText::new(format!("{} can run programs or change your computer when opened. Only open it if you were expecting it from someone you trust.", attachments::safe_name(&name))).color(t.text_dim));
@@ -4224,7 +4224,7 @@ impl BeaverApp {
         let Some(target) = self.settings_leave else { return };
         let name = self.account_edit.as_ref().and_then(|f| self.view(f.editing?)).map(|v| v.account.address().to_owned()).unwrap_or_default();
         let (mut confirm, mut cancel) = (false, false);
-        let modal = egui::Modal::new(egui::Id::new("settings_leave")).show(ctx, |ui| {
+        let modal = crate::views::modal(ctx, egui::Id::new("settings_leave")).show(ctx, |ui| {
             ui.set_width(FORM_WIDTH * 0.8);
             ui.heading(format!("Discard changes to {name}?"));
             ui.label(RichText::new("What you changed on this page has not been saved.").color(t.text_dim));
@@ -4295,7 +4295,7 @@ impl BeaverApp {
         let mut chosen = ctx.input(|i| i.key_pressed(egui::Key::Enter)).then_some(palette.at).filter(|at| entries.get(*at).is_some_and(|(e, ..)| why(e).is_none()));
         let id = egui::Id::new("palette");
         let area = egui::Modal::default_area(id).anchor(egui::Align2::CENTER_TOP, vec2(0.0, 90.0));
-        let modal = egui::Modal::new(id).area(area).show(ctx, |ui| {
+        let modal = crate::views::modal(ctx, id).area(area).show(ctx, |ui| {
             ui.set_width(PALETTE_WIDTH);
             let before = palette.query.clone();
             // A row of fixed height: the box centres itself in whatever height it is given.
@@ -4352,7 +4352,7 @@ impl BeaverApp {
             _ => (format!("BeaverMail asks {host} to stop sending you this mail. Nothing opens in your browser."), "Unsubscribe"),
         };
         let (mut confirm, mut cancel) = (false, false);
-        let modal = egui::Modal::new(egui::Id::new("confirm_unsubscribe")).show(ctx, |ui| {
+        let modal = crate::views::modal(ctx, egui::Id::new("confirm_unsubscribe")).show(ctx, |ui| {
             ui.set_width(FORM_WIDTH * 0.8);
             ui.heading(format!("Unsubscribe from {who}?"));
             ui.label(RichText::new(text).color(t.text_dim));
@@ -4578,7 +4578,7 @@ impl BeaverApp {
             "New mail from them still reaches the Inbox while holding suspicious mail is off in Settings."
         };
         let (mut confirm, mut cancel) = (false, false);
-        let modal = egui::Modal::new(egui::Id::new("confirm_block")).show(ctx, |ui| {
+        let modal = crate::views::modal(ctx, egui::Id::new("confirm_block")).show(ctx, |ui| {
             ui.set_width(FORM_WIDTH * 0.8);
             ui.heading(format!("Block {who}?"));
             ui.label(RichText::new(format!("This message and their mail in this folder move to Spam. {later} Choose Not spam on any of their messages to undo it.")).color(t.text_dim));
@@ -4853,7 +4853,7 @@ impl BeaverApp {
     fn data_move_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
         let Some(Ok(plan)) = self.data_move.clone() else { return };
         let (mut confirm, mut cancel) = (false, false);
-        let modal = egui::Modal::new(egui::Id::new("confirm_data_move")).show(ctx, |ui| {
+        let modal = crate::views::modal(ctx, egui::Id::new("confirm_data_move")).show(ctx, |ui| {
             ui.set_width(FORM_WIDTH * 0.85);
             ui.heading("Move the data folder?");
             let how = if plan.same_disk { "moves it".to_owned() } else { format!("copies {} there, removes the old folder", relocate::amount(plan.bytes)) };
@@ -4889,7 +4889,7 @@ impl BeaverApp {
             [] => String::new(),
         };
         let (mut confirm, mut cancel) = (false, false);
-        let modal = egui::Modal::new(egui::Id::new("confirm_calendar_remove")).show(ctx, |ui| {
+        let modal = crate::views::modal(ctx, egui::Id::new("confirm_calendar_remove")).show(ctx, |ui| {
             ui.set_width(FORM_WIDTH * 0.85);
             ui.heading(format!("Stop syncing {name}?"));
             let what = if urls.len() == 1 { "Its events leave" } else { "Their events and the saved password leave" };
@@ -4969,7 +4969,7 @@ impl BeaverApp {
         let repeats = event.as_ref().is_some_and(|e| !e.rules.is_empty() || !e.rdates.is_empty());
         let local = kept.as_ref().is_some_and(|k| k.calendar == beavermail_core::CalendarSource::LOCAL);
         let (mut confirm, mut cancel) = (false, false);
-        let modal = egui::Modal::new(egui::Id::new("confirm_event_delete")).show(ctx, |ui| {
+        let modal = crate::views::modal(ctx, egui::Id::new("confirm_event_delete")).show(ctx, |ui| {
             ui.set_width(FORM_WIDTH * 0.85);
             ui.heading(format!("Delete {title}?"));
             let what = match (repeats, local) {
@@ -5433,7 +5433,7 @@ impl BeaverApp {
         let Some(url) = self.confirm_book_remove.clone() else { return };
         let name = self.settings.address_books.iter().find(|b| b.url == url).map(|b| if b.name.is_empty() { books::host(&b.url).to_owned() } else { b.name.clone() }).unwrap_or_default();
         let (mut confirm, mut cancel) = (false, false);
-        let modal = egui::Modal::new(egui::Id::new("confirm_book_remove")).show(ctx, |ui| {
+        let modal = crate::views::modal(ctx, egui::Id::new("confirm_book_remove")).show(ctx, |ui| {
             ui.set_width(FORM_WIDTH * 0.85);
             ui.heading(format!("Stop syncing {name}?"));
             ui.label(RichText::new("Its contacts leave BeaverMail. Nothing changes on the server.").color(t.text_dim));
@@ -5702,7 +5702,7 @@ impl BeaverApp {
         let Some((address, name)) = self.new_contact.as_mut() else { return };
         let valid = beavermail_smtp::valid_address(address);
         let (mut add, mut cancel) = (false, false);
-        let modal = egui::Modal::new(egui::Id::new("new_contact")).show(ctx, |ui| {
+        let modal = crate::views::modal(ctx, egui::Id::new("new_contact")).show(ctx, |ui| {
             ui.set_width(FORM_WIDTH);
             ui.heading("New contact");
             let about = match &book {
@@ -5752,7 +5752,7 @@ impl BeaverApp {
         let delimiter = self.view(form.serial).and_then(AccountView::delimiter);
         let shown = |name: &str, role: Role| views::folder_path(name, role, delimiter);
         let (mut create, mut cancel) = (false, false);
-        let modal = egui::Modal::new(egui::Id::new("new_folder")).show(ctx, |ui| {
+        let modal = crate::views::modal(ctx, egui::Id::new("new_folder")).show(ctx, |ui| {
             ui.set_width(FORM_WIDTH);
             ui.heading(if form.renaming.is_some() { "Rename folder" } else { "New folder" });
             let about = if form.renaming.is_some() { "Renamed on the server, with the folders inside it, so every device sees the new name." } else { "Made on the server, so every device that reads this account sees it." };
@@ -5897,7 +5897,7 @@ impl BeaverApp {
         let in_trash = view.mailboxes.iter().any(|m| m.role == Role::Trash && views::is_inside(&name, &m.name, delimiter));
         let for_good = in_trash || refused.is_some();
         let (mut confirm, mut cancel) = (false, false);
-        let modal = egui::Modal::new(egui::Id::new("confirm_folder_delete")).show(ctx, |ui| {
+        let modal = crate::views::modal(ctx, egui::Id::new("confirm_folder_delete")).show(ctx, |ui| {
             ui.set_width(FORM_WIDTH * 0.8);
             ui.heading(if for_good { format!("Delete {title} for good?") } else { format!("Move {title} to Trash?") });
             let folders = match inside.len() {
@@ -5946,7 +5946,7 @@ impl BeaverApp {
         };
         let who = if stored.name.is_empty() { stored.emails.first().or(stored.phones.first()).cloned().unwrap_or_default() } else { stored.name.clone() };
         let (mut confirm, mut cancel) = (false, false);
-        let modal = egui::Modal::new(egui::Id::new("confirm_card_delete")).show(ctx, |ui| {
+        let modal = crate::views::modal(ctx, egui::Id::new("confirm_card_delete")).show(ctx, |ui| {
             ui.set_width(FORM_WIDTH * 0.85);
             ui.heading(format!("Delete {who} everywhere?"));
             ui.label(RichText::new("They are deleted from your address book on the server, and from every device that syncs it.").color(t.text_dim));
@@ -5988,7 +5988,7 @@ impl BeaverApp {
             return;
         };
         let (mut confirm, mut cancel) = (false, false);
-        let modal = egui::Modal::new(egui::Id::new("confirm_remove")).show(ctx, |ui| {
+        let modal = crate::views::modal(ctx, egui::Id::new("confirm_remove")).show(ctx, |ui| {
             ui.set_width(FORM_WIDTH * 0.8);
             ui.heading(format!("Remove {name}?"));
             ui.label(RichText::new("The mail downloaded to this computer and the saved password are deleted. Nothing changes on the server, so the account can be added again.").color(t.text_dim));
@@ -7298,7 +7298,7 @@ impl BeaverApp {
         }
         let count = self.confirm_erase.len();
         let (mut confirm, mut cancel) = (false, false);
-        let modal = egui::Modal::new(egui::Id::new("confirm_erase")).show(ctx, |ui| {
+        let modal = crate::views::modal(ctx, egui::Id::new("confirm_erase")).show(ctx, |ui| {
             ui.set_width(FORM_WIDTH * 0.8);
             ui.heading(if count == 1 { "Delete permanently?".to_owned() } else { format!("Delete {count} messages permanently?") });
             let what = if count == 1 { "This message" } else { "These messages" };
@@ -7378,7 +7378,7 @@ impl BeaverApp {
         }
         let accounts: Vec<String> = targets.iter().filter_map(|&(serial, _)| Some(self.view(serial)?.account.address().to_owned())).collect();
         let (mut confirm, mut cancel) = (false, false);
-        let modal = egui::Modal::new(egui::Id::new("confirm_empty")).show(ctx, |ui| {
+        let modal = crate::views::modal(ctx, egui::Id::new("confirm_empty")).show(ctx, |ui| {
             ui.set_width(FORM_WIDTH * 0.8);
             let messages = format!("{} message{}", views::thousands(count as u32), if count == 1 { "" } else { "s" });
             ui.heading(match folders.len() {
@@ -7425,7 +7425,7 @@ impl BeaverApp {
         }
         let ids: Vec<MessageId> = self.visible().iter().map(|m| m.id).collect();
         let (mut confirm, mut cancel) = (false, false);
-        let modal = egui::Modal::new(egui::Id::new("confirm_spam")).show(ctx, |ui| {
+        let modal = crate::views::modal(ctx, egui::Id::new("confirm_spam")).show(ctx, |ui| {
             ui.set_width(FORM_WIDTH * 0.8);
             ui.heading(format!("Move {} message{} to Spam?", ids.len(), if ids.len() == 1 { "" } else { "s" }));
             ui.label(RichText::new("Their senders are marked as spam, so their mail goes there from now on. Any message can be brought back from the Spam folder with Not spam.").color(t.text_dim));
@@ -7563,7 +7563,7 @@ impl BeaverApp {
         let (mut start, mut stop, mut test) = (None, false, false);
         let waiting = self.signing_in.as_ref().filter(|s| s.editing.is_none()).map(|s| s.provider);
         let ready = form.ready();
-        let modal = egui::Modal::new(egui::Id::new("add_account")).show(ctx, |ui| {
+        let modal = crate::views::modal(ctx, egui::Id::new("add_account")).show(ctx, |ui| {
             ui.set_width(FORM_WIDTH);
             ui.heading("Add account");
             if let Some(provider) = waiting {

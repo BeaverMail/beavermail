@@ -1024,6 +1024,13 @@ pub fn server_searching(ui: &mut Ui, t: &Tokens, folder: &str, done: u32, total:
     clicked
 }
 
+/// A dialog over the window. egui frames one like a menu (8 points inside, the menu's corners); a
+/// dialog is a window, with a window's room and corners.
+pub fn modal(ctx: &egui::Context, id: egui::Id) -> egui::Modal {
+    let style = ctx.global_style();
+    egui::Modal::new(id).frame(egui::Frame::popup(&style).inner_margin(style.spacing.window_margin).corner_radius(style.visuals.window_corner_radius))
+}
+
 /// The one filled button of a group.
 pub fn primary_button(ui: &mut Ui, t: &Tokens, label: &str, enabled: bool) -> Response {
     let button = egui::Button::new(egui::RichText::new(label).color(t.on_accent)).fill(t.accent);

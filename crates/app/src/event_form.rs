@@ -85,7 +85,7 @@ pub fn dialog(ctx: &egui::Context, t: &Tokens, state: &mut Option<EventForm>, ta
     let form = state.as_mut()?;
     let today = Local::now().date_naive();
     let (mut saved, mut close) = (None, false);
-    let modal = egui::Modal::new(egui::Id::new("event_form")).show(ctx, |ui| {
+    let modal = crate::views::modal(ctx, egui::Id::new("event_form")).show(ctx, |ui| {
         ui.set_width(crate::FORM_WIDTH);
         ui.heading(if form.uid.is_some() { "Change event" } else { "New event" });
         ui.add_space(12.0);

@@ -155,7 +155,7 @@ pub fn add_dialog(ctx: &egui::Context, t: &Tokens, state: &mut Option<AddBook>, 
     let form = state.as_mut()?;
     let mut action = None;
     let mut close = false;
-    let modal = egui::Modal::new(egui::Id::new(words.id)).show(ctx, |ui| {
+    let modal = crate::views::modal(ctx, egui::Id::new(words.id)).show(ctx, |ui| {
         ui.set_width(crate::FORM_WIDTH);
         ui.heading(format!("Add {}", words.one));
         ui.label(RichText::new(words.about).color(t.text_dim));

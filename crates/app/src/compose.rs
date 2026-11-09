@@ -1323,7 +1323,7 @@ fn review_spelling(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, spell
     }
     let mut act = None;
     let language = beavermail_spell::name(&compose.spell.language).to_owned();
-    let modal = egui::Modal::new(egui::Id::new("review_spelling")).show(ctx, |ui| {
+    let modal = crate::views::modal(ctx, egui::Id::new("review_spelling")).show(ctx, |ui| {
         ui.set_width(crate::FORM_WIDTH);
         ui.heading("Check spelling");
         ui.label(RichText::new(format!("Word {} of {} · {language}", current + 1, wrong.len())).color(t.text_dim));
@@ -1571,7 +1571,7 @@ const PICK_WIDTH: f32 = 460.0;
 fn pick_when(ctx: &egui::Context, t: &Tokens, compose: &mut Compose) -> Option<i64> {
     let now = chrono::Local::now();
     let (mut chosen, mut cancel) = (None, false);
-    let modal = egui::Modal::new(egui::Id::new("pick_when")).show(ctx, |ui| {
+    let modal = crate::views::modal(ctx, egui::Id::new("pick_when")).show(ctx, |ui| {
         ui.set_width(PICK_WIDTH);
         ui.heading("Pick date & time");
         ui.label(RichText::new("BeaverMail sends it then, if it is open.").color(t.text_dim));

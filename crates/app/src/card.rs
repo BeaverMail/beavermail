@@ -91,7 +91,7 @@ impl Card {
 /// Shows the card over everything else; returns what the user asked for.
 pub fn show(ctx: &egui::Context, t: &Tokens, card: &mut Card) -> Option<CardAction> {
     let mut action = None;
-    let modal = egui::Modal::new(egui::Id::new("contact_card")).show(ctx, |ui| {
+    let modal = crate::views::modal(ctx, egui::Id::new("contact_card")).show(ctx, |ui| {
         ui.set_width(crate::FORM_WIDTH);
         // The whole form of an address book's card is taller than a small window: it scrolls, and the
         // buttons stay below it, always in reach.

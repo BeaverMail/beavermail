@@ -159,7 +159,7 @@ pub fn dialogs(ctx: &egui::Context, t: &Tokens, dialogs: &mut Dialogs) -> Option
     };
     if let Some(backup) = dialogs.backup.as_mut() {
         let mut close = false;
-        let modal = egui::Modal::new(egui::Id::new("key_backup")).show(ctx, |ui| {
+        let modal = crate::views::modal(ctx, egui::Id::new("key_backup")).show(ctx, |ui| {
             ui.set_width(crate::FORM_WIDTH);
             ui.heading("Back up your key");
             let what = if backup.own { "the password you choose" } else { "this code" };
@@ -216,7 +216,7 @@ pub fn dialogs(ctx: &egui::Context, t: &Tokens, dialogs: &mut Dialogs) -> Option
     }
     if let Some(unlock) = dialogs.unlock.as_mut() {
         let mut close = false;
-        let modal = egui::Modal::new(egui::Id::new("key_unlock")).show(ctx, |ui| {
+        let modal = crate::views::modal(ctx, egui::Id::new("key_unlock")).show(ctx, |ui| {
             ui.set_width(crate::FORM_WIDTH);
             ui.heading("Unlock the key");
             dim(ui, &format!("The file is protected. Type the password or code it was saved with, to use it for {}.", unlock.address));
@@ -245,7 +245,7 @@ pub fn dialogs(ctx: &egui::Context, t: &Tokens, dialogs: &mut Dialogs) -> Option
     if let Some((address, certificate)) = dialogs.remove.clone() {
         let mut close = false;
         let what = if certificate { "certificate" } else { "key" };
-        let modal = egui::Modal::new(egui::Id::new("key_remove")).show(ctx, |ui| {
+        let modal = crate::views::modal(ctx, egui::Id::new("key_remove")).show(ctx, |ui| {
             ui.set_width(crate::FORM_WIDTH * 0.85);
             ui.heading(format!("Remove the {what} of {address}?"));
             dim(ui, &format!("Mail encrypted to it can no longer be read on this computer, until you import the {what} again from a backup. People who have it keep sending encrypted mail to it."));
