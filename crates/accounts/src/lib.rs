@@ -65,8 +65,17 @@ pub fn archive_path() -> Result<PathBuf, String> {
     Ok(data_dir()?.join("mail.sqlite3"))
 }
 
-/// The directory holding the archive, the message files and the key file.
+/// The directory holding the archive, the message files and the key file: the one chosen in
+/// Settings, or the system's data folder.
 pub fn data_dir() -> Result<PathBuf, String> {
+    match load_settings().map(|s| s.data_folder) {
+        Ok(chosen) if !chosen.is_empty() => Ok(PathBuf::from(chosen)),
+        _ => default_data_dir(),
+    }
+}
+
+/// The system's data folder for the app, used unless another is chosen.
+pub fn default_data_dir() -> Result<PathBuf, String> {
     let dirs = ProjectDirs::from("", "", "beavermail").ok_or("no home directory")?;
     Ok(dirs.data_dir().to_path_buf())
 }

@@ -23,6 +23,7 @@ mod drafts;
 mod event_form;
 mod encryption;
 mod original;
+mod relocate;
 mod remote;
 mod screen;
 mod sender;
@@ -100,6 +101,8 @@ enum Event {
     Attachment(Result<(String, Vec<u8>), MailError>),
     /// Saving attachments through a file dialog ended: `None` when the user cancelled, else what to tell them.
     Saved(Result<Option<String>, String>),
+    /// A new place for the data folder was chosen and checked; `None` when the user cancelled.
+    DataFolder(Option<Result<relocate::Plan, String>>),
     /// Files chosen in the "attach" dialog.
     Picked(Vec<std::path::PathBuf>),
     /// The copy of a draft on the server was stored (or not): (account serial, draft id, what the text was, result).
@@ -1434,6 +1437,10 @@ struct BeaverApp {
     list_view: (f32, f32),
     /// Asking whether to forget the senders and messages marked as spam or not spam.
     confirm_forget_marks: bool,
+    /// The new place chosen for the data folder: a move to confirm, or why it cannot go there.
+    data_move: Option<Result<relocate::Plan, String>>,
+    /// A place for the data folder is being chosen or checked.
+    data_checking: bool,
     /// What is typed in "Add a trusted sender".
     trust_input: String,
     /// What is typed to find a sender marked as spam, in Settings.
@@ -1600,6 +1607,8 @@ impl BeaverApp {
             folded_anchor: false,
             list_view: (0.0, 0.0),
             confirm_forget_marks: false,
+            data_move: None,
+            data_checking: false,
             trust_input: String::new(),
             spam_query: String::new(),
             compose_focus: None,
@@ -3879,6 +3888,28 @@ impl BeaverApp {
                                 if locked && ui.button("Unlock…").clicked() {
                                     unlock_again = true;
                                 }
+                                section_title(ui, "Data folder");
+                                if let Ok(dir) = store::data_dir() {
+                                    hint(ui, &format!("Messages, the search index and keys are kept in {}", dir.display()));
+                                    ui.add_space(4.0);
+                                    ui.horizontal(|ui| {
+                                        if ui.add_enabled(!self.data_checking && job.is_none(), egui::Button::new("Change…")).on_disabled_hover_text("Wait for the current change to end").clicked() {
+                                            self.data_checking = true;
+                                            self.data_move = None;
+                                            self.spawn(async move {
+                                                let Some(to) = rfd::AsyncFileDialog::new().set_title("Move the data folder to").set_directory(&dir).pick_folder().await else { return Event::DataFolder(None) };
+                                                let to = to.path().to_owned();
+                                                Event::DataFolder(tokio::task::spawn_blocking(move || relocate::check(&dir, &to)).await.ok())
+                                            });
+                                        }
+                                        if self.data_checking {
+                                            ui.spinner();
+                                        }
+                                    });
+                                    if let Some(Err(e)) = &self.data_move {
+                                        ui.label(RichText::new(e).size(13.0).color(t.danger));
+                                    }
+                                }
                             }
                             SettingsPage::Troubleshooting => {
                                 let about = "How long messages take to open, and what fails. Never the text, subject or addresses of a message.";
@@ -4628,6 +4659,37 @@ impl BeaverApp {
         self.save_settings();
         self.calendar_version += 1;
         self.calendar_open = None;
+    }
+
+    /// Asks to close, move the data folder and start again; the move itself runs at the next start.
+    fn data_move_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
+        let Some(Ok(plan)) = self.data_move.clone() else { return };
+        let (mut confirm, mut cancel) = (false, false);
+        let modal = egui::Modal::new(egui::Id::new("confirm_data_move")).show(ctx, |ui| {
+            ui.set_width(FORM_WIDTH * 0.85);
+            ui.heading("Move the data folder?");
+            let how = if plan.same_disk { "moves it".to_owned() } else { format!("copies {} there, removes the old folder", relocate::amount(plan.bytes)) };
+            ui.label(RichText::new(format!("BeaverMail closes, {how} and starts again from {}.", plan.to.display())).color(t.text_dim));
+            ui.add_space(12.0);
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
+                confirm = ui.add(egui::Button::new(RichText::new("Move and restart").color(t.on_accent)).fill(t.accent)).clicked();
+                cancel = ui.button("Cancel").clicked();
+            });
+        });
+        if confirm {
+            self.settings.moving_to = plan.to.display().to_string();
+            match store::save_settings(&self.settings) {
+                Ok(()) => {
+                    self.data_move = None;
+                    RESTART.store(true, std::sync::atomic::Ordering::Relaxed);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                Err(e) => self.data_move = Some(Err(e)),
+            }
+        }
+        if cancel || modal.should_close() {
+            self.data_move = None;
+        }
     }
 
     fn calendar_remove_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
@@ -6982,6 +7044,10 @@ impl BeaverApp {
                 Ok(()) => self.notice = Some((format!("Unsubscribed from {who}. Mail already on its way may still arrive."), std::time::Instant::now())),
                 Err(e) => self.error = Some(format!("Could not unsubscribe from {who}: {e}. Try the unsubscribe link in the message.")),
             },
+            Event::DataFolder(plan) => {
+                self.data_checking = false;
+                self.data_move = plan;
+            }
             Event::Saved(result) => match result {
                 Ok(Some(text)) => {
                     self.notice = Some((text, std::time::Instant::now()));
@@ -8995,6 +9061,7 @@ impl eframe::App for BeaverApp {
         self.folder_delete_dialog(ui.ctx(), &t);
         self.book_remove_dialog(ui.ctx(), &t);
         self.calendar_remove_dialog(ui.ctx(), &t);
+        self.data_move_dialog(ui.ctx(), &t);
         self.event_dialogs(ui.ctx(), &t);
         let logins: Vec<(u64, String)> = self.accounts.iter().map(|v| (v.serial, v.account.address().to_owned())).collect();
         let added: Vec<String> = self.settings.calendars.iter().map(|c| c.url.clone()).collect();
@@ -9112,6 +9179,87 @@ fn accelerated(label: &str, at: usize, color: egui::Color32) -> egui::text::Layo
     job
 }
 
+/// Set when the app closes to start again, as after choosing a new data folder.
+static RESTART: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The app, after a move of the data folder asked for in Settings, made before anything in it is open.
+enum Start {
+    Moving(Arc<relocate::Progress>, Receiver<Result<(), String>>),
+    Ready(Box<BeaverApp>),
+}
+
+impl Start {
+    fn new(ctx: egui::Context) -> Self {
+        let settings = store::load_settings().unwrap_or_default();
+        let (Ok(from), false) = (store::data_dir(), settings.moving_to.is_empty()) else { return Self::Ready(Box::new(BeaverApp::new(ctx))) };
+        let (progress, (tx, rx)) = (Arc::new(relocate::Progress::default()), channel());
+        let shared = progress.clone();
+        std::thread::spawn(move || {
+            let to = std::path::PathBuf::from(&settings.moving_to);
+            // Saved as the folder in use once it is complete; the default place is left unnamed.
+            let taken = || {
+                let mut saved = store::load_settings()?;
+                saved.data_folder = if store::default_data_dir().is_ok_and(|d| d == to) { String::new() } else { settings.moving_to.clone() };
+                saved.moving_to.clear();
+                store::save_settings(&saved)
+            };
+            let result = relocate::run(&from, &to, &shared, taken);
+            if result.is_err() {
+                // Not tried again at every start: the data stays where it was, the reason is shown.
+                let _ = store::load_settings().and_then(|mut s| {
+                    s.moving_to.clear();
+                    store::save_settings(&s)
+                });
+            }
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+        Self::Moving(progress, rx)
+    }
+}
+
+impl eframe::App for Start {
+    fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
+        if let Self::Ready(app) = self {
+            app.on_exit(gl);
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        if let Self::Moving(progress, rx) = self {
+            if let Ok(result) = rx.try_recv() {
+                let mut app = BeaverApp::new(ui.ctx().clone());
+                if let Err(e) = result {
+                    app.error = Some(format!("The data folder was not moved: {e}"));
+                }
+                *self = Self::Ready(Box::new(app));
+            } else {
+                // Closing now would stop the copy half way; it is started again at the next start anyway.
+                if ui.ctx().input(|i| i.viewport().close_requested()) {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                }
+                let t = theme::Tokens::get(ui.ctx());
+                let (done, total) = (progress.done.load(std::sync::atomic::Ordering::Relaxed), progress.total.load(std::sync::atomic::Ordering::Relaxed));
+                egui::CentralPanel::default().show(ui, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(ui.available_height() / 2.0 - 60.0);
+                        ui.heading("Moving your mail");
+                        ui.label(RichText::new("BeaverMail opens once everything is in the new folder.").color(t.text_dim));
+                        ui.add_space(16.0);
+                        let shown = if total == 0 { "Getting ready…".to_owned() } else { format!("{} of {}", relocate::amount(done), relocate::amount(total)) };
+                        ui.add(egui::ProgressBar::new(done as f32 / total.max(1) as f32).desired_width(FORM_WIDTH).text(shown));
+                    });
+                });
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+                return;
+            }
+        }
+        if let Self::Ready(app) = self {
+            app.ui(ui, frame);
+        }
+    }
+}
+
 fn main() -> eframe::Result {
     if std::env::args().any(|a| a == "--screen-dry-run") {
         if let Err(e) = screen::dry_run() {
@@ -9142,7 +9290,7 @@ fn main() -> eframe::Result {
                 // egui's 0.3 s is quicker than the systems' (0.4 to 0.5 s), and it is timed by frame, so a slow
                 // frame after the first click could split a double click in two.
                 cc.egui_ctx.options_mut(|o| o.input_options.max_double_click_delay = 0.5);
-                Ok(Box::new(BeaverApp::new(cc.egui_ctx.clone())))
+                Ok(Box::new(Start::new(cc.egui_ctx.clone())))
             }),
         )
     };
@@ -9151,6 +9299,11 @@ fn main() -> eframe::Result {
     let result = start(eframe::NativeOptions { renderer: eframe::Renderer::Wgpu, ..options() }).or_else(|_| start(options()));
     #[cfg(not(windows))]
     let result = start(options());
+    if result.is_ok() && RESTART.load(std::sync::atomic::Ordering::Relaxed)
+        && let Err(e) = std::env::current_exe().and_then(|exe| std::process::Command::new(exe).args(std::env::args_os().skip(1)).spawn())
+    {
+        report(&format!("BeaverMail could not start again: {e}\n\nStart it again to move the data folder."));
+    }
     if let Err(e) = &result {
         report(&format!("BeaverMail could not open its window:\n\n{e}\n\nThe graphics driver may lack OpenGL 2 (a virtual machine or a remote desktop often does)."));
     }

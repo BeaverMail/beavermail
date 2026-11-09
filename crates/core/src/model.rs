@@ -595,6 +595,12 @@ pub struct Settings {
     /// Send asks first when words are marked wrong.
     #[serde(default)]
     pub spelling_before_send: bool,
+    /// Where the archive, message files and keys are kept; empty for the system's data folder.
+    #[serde(default)]
+    pub data_folder: String,
+    /// A folder the data is to be moved to at the next start; empty when none.
+    #[serde(default)]
+    pub moving_to: String,
 }
 
 fn yes() -> bool {
@@ -607,7 +613,7 @@ fn undo_secs() -> u32 {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { display: DisplayMode::default(), sender_display: Default::default(), rich_outgoing: true, undo_send_secs: undo_secs(), remote_senders: Default::default(), hold_suspicious: true, marked: Default::default(), threads: true, reading_pane: true, reader_below: false, list_layout: ListLayout::default(), columns: Columns::default(), sorts: Default::default(), folded: Default::default(), density: Density::default(), diagnostics: false, link_params: String::new(), address_books: Vec::new(), calendars: Vec::new(), spelling: true, spelling_language: String::new(), spelling_words: Default::default(), spelling_before_send: false }
+        Self { display: DisplayMode::default(), sender_display: Default::default(), rich_outgoing: true, undo_send_secs: undo_secs(), remote_senders: Default::default(), hold_suspicious: true, marked: Default::default(), threads: true, reading_pane: true, reader_below: false, list_layout: ListLayout::default(), columns: Columns::default(), sorts: Default::default(), folded: Default::default(), density: Density::default(), diagnostics: false, link_params: String::new(), address_books: Vec::new(), calendars: Vec::new(), spelling: true, spelling_language: String::new(), spelling_words: Default::default(), spelling_before_send: false, data_folder: String::new(), moving_to: String::new() }
     }
 }
 

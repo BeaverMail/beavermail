@@ -47,6 +47,8 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 # url) and look-alike characters folded by Unicode's confusables (UTS #39).
 idna = "1"
 unicode-security = "0.1"
+# The free room on a disk before the data folder is moved there (on rustix and windows-sys, already in the tree).
+fs4 = "1"
 
 # Windows draws through Direct3D (wgpu), which a machine without a graphics driver still has in
 # software; its OpenGL is 1.1, too old for the OpenGL renderer the other systems use.
