@@ -991,8 +991,11 @@ pub fn server_bar(ui: &mut Ui, t: &Tokens, state: &ServerSearch) -> bool {
                 fraction
             });
             if let Some(fraction) = fraction.inner {
-                ui.add_space(8.0);
-                ui.add(egui::ProgressBar::new(fraction).desired_height(4.0).fill(t.accent));
+                // Only once a folder is done: an empty bar shows as a stray dot of its rounded end.
+                if fraction > 0.0 {
+                    ui.add_space(8.0);
+                    ui.add(egui::ProgressBar::new(fraction).desired_height(4.0).fill(t.accent));
+                }
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
             }
         });
@@ -1011,8 +1014,10 @@ pub fn server_searching(ui: &mut Ui, t: &Tokens, folder: &str, done: u32, total:
         ui.heading("Searching the server");
         ui.label(egui::RichText::new(line).color(t.text_dim));
         ui.add_space(12.0);
-        ui.add(egui::ProgressBar::new(fraction).desired_width(260.0).desired_height(4.0).fill(t.accent));
-        ui.add_space(12.0);
+        if fraction > 0.0 {
+            ui.add(egui::ProgressBar::new(fraction).desired_width(260.0).desired_height(4.0).fill(t.accent));
+            ui.add_space(12.0);
+        }
         clicked = ui.button("Stop").on_hover_text("Keep what was found so far").clicked();
     });
     ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
