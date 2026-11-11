@@ -897,6 +897,8 @@ enum Section {
 enum SettingsPage {
     #[default]
     Appearance,
+    /// The list of accounts, each opening its own page.
+    Accounts,
     Reading,
     Writing,
     Calendars,
@@ -911,12 +913,13 @@ enum SettingsPage {
 }
 
 impl SettingsPage {
-    const ALL: [Self; 10] = [Self::Appearance, Self::Reading, Self::Writing, Self::Calendars, Self::Spam, Self::Filters, Self::Labels, Self::Encryption, Self::Storage, Self::Troubleshooting];
+    const ALL: [Self; 11] = [Self::Accounts, Self::Appearance, Self::Reading, Self::Writing, Self::Calendars, Self::Spam, Self::Filters, Self::Labels, Self::Encryption, Self::Storage, Self::Troubleshooting];
 
     fn title(self) -> &'static str {
         match self {
             Self::Reading => "Reading",
             Self::Appearance => "Appearance",
+            Self::Accounts => "Accounts",
             Self::Writing => "Writing",
             Self::Calendars => "Calendars",
             Self::Spam => "Suspicious mail",
@@ -933,6 +936,7 @@ impl SettingsPage {
         match self {
             Self::Reading => Some(Icon::MailOpen),
             Self::Appearance => Some(Icon::Palette),
+            Self::Accounts => Some(Icon::Users),
             Self::Writing => Some(Icon::Pencil),
             Self::Calendars => Some(Icon::Calendar),
             Self::Spam => Some(Icon::Spam),
@@ -949,6 +953,7 @@ impl SettingsPage {
         match self {
             Self::Reading => "Most unwanted mail and tracking arrives as HTML, so messages start as text.",
             Self::Appearance => "How the app looks.",
+            Self::Accounts => "The mail accounts in BeaverMail. Pick one to change its servers, name and folders.",
             Self::Writing => "How messages you write are composed and sent.",
             Self::Calendars => "The calendars synced from a server, and the one on this computer.",
             Self::Spam => "Mail from people you know is never held. Nothing moves on the server.",
@@ -3810,7 +3815,7 @@ impl BeaverApp {
                     self.account_edit = Some(NewAccount::editing(serial, &view.account));
                 }
                 Some(_) => {}
-                None => self.leave_settings_page(Some(SettingsPage::default())),
+                None => self.leave_settings_page(Some(SettingsPage::Accounts)),
             }
         }
         let account = match self.settings_page {
@@ -3869,23 +3874,12 @@ impl BeaverApp {
                     label(ui, RichText::new("Settings").heading());
                     ui.add_space(14.0);
                     for page in SettingsPage::ALL {
-                        if views::settings_row(ui, t, page.title(), page.icon(), self.settings_page == page).clicked() && self.settings_page != page {
+                        // An account's page sits under Accounts.
+                        let selected = self.settings_page == page || (page == SettingsPage::Accounts && matches!(self.settings_page, SettingsPage::Account(_)));
+                        if views::settings_row(ui, t, page.title(), page.icon(), selected).clicked() && self.settings_page != page {
                             goto = Some(Some(page));
                         }
                     }
-                    ui.add_space(18.0);
-                    label(ui, RichText::new("Accounts").size(13.0).family(theme::bold()).color(t.text_dim));
-                    ui.add_space(4.0);
-                    egui::ScrollArea::vertical().id_salt("settings_accounts").show(ui, |ui| {
-                        for view in &self.accounts {
-                            let page = SettingsPage::Account(view.serial);
-                            let row = views::settings_row(ui, t, view.account.address(), None, self.settings_page == page);
-                            if row.clicked() && self.settings_page != page {
-                                goto = Some(Some(page));
-                            }
-                        }
-                        add = views::settings_row(ui, t, "Add account", Some(Icon::Plus), false).clicked();
-                    });
                 }));
                 let side = egui::Rect::from_min_size(nav.response.rect.min, vec2(nav.response.rect.width(), height));
                 ui.painter().set(nav_fill, egui::epaint::RectShape::filled(side, egui::CornerRadius { nw: 14, sw: 14, ne: 0, se: 0 }, t.bg));
@@ -3897,6 +3891,10 @@ impl BeaverApp {
                     // The title wraps short of the close button in the corner.
                     ui.scope(|ui| { ui.set_max_width(ui.available_width() - theme::CONTROL_H); match &account {
                         Some(account) => {
+                            if ui.add(egui::Button::image_and_text(Icon::ChevronLeft.image(icons::SIZE, t.text_dim), RichText::new("Accounts").color(t.text_dim)).frame(false)).on_hover_text("Back to the list of accounts").clicked() {
+                                goto = Some(Some(SettingsPage::Accounts));
+                            }
+                            ui.add_space(6.0);
                             ui.horizontal(|ui| {
                                 let (rect, _) = ui.allocate_exact_size(vec2(views::AVATAR, views::AVATAR), egui::Sense::hover());
                                 views::avatar(ui, t, account.address(), rect.center(), views::AVATAR);
@@ -3921,6 +3919,19 @@ impl BeaverApp {
                         ui.set_max_width(ui.available_width() - 16.0);
                         let hint = |ui: &mut egui::Ui, text: &str| ui.label(RichText::new(text).size(13.0).color(t.text_dim));
                         match self.settings_page {
+                            SettingsPage::Accounts => {
+                                if self.accounts.is_empty() {
+                                    add = views::empty_state(ui, t, "No accounts yet", "Add one to start reading your mail.", Some("Add account"));
+                                } else {
+                                    for view in &self.accounts {
+                                        if views::settings_row(ui, t, view.account.address(), None, false).clicked() {
+                                            goto = Some(Some(SettingsPage::Account(view.serial)));
+                                        }
+                                    }
+                                    ui.add_space(12.0);
+                                    add = ui.add(egui::Button::image_and_text(Icon::Plus.image(icons::SIZE, t.text_dim), "Add account")).clicked();
+                                }
+                            }
                             SettingsPage::Account(_) => {
                                 if let Some(form) = &mut self.account_edit {
                                     let waiting = self.signing_in.as_ref().is_some_and(|s| s.editing.is_some() && s.editing == form.editing);
