@@ -1549,6 +1549,9 @@ struct BeaverApp {
     held_counts: std::collections::HashMap<u64, (u32, u32)>,
     /// The spam checks are running over the Inbox being shown.
     checking: bool,
+    /// The first frame, and the first list, were timed in the diagnostic log.
+    first_frame_logged: bool,
+    first_list_logged: bool,
     /// The account whose filters Settings › Filters shows, by key.
     filter_account: String,
     /// The filter being made or changed: (its place in the settings, `None` for a new one; the filter).
@@ -1562,6 +1565,7 @@ struct BeaverApp {
 impl BeaverApp {
     fn new(ctx: egui::Context) -> Self {
         let (tx, rx) = channel();
+        let began = std::time::Instant::now();
         let (vault, vault_error) = match store::data_dir().and_then(|dir| Vault::open(&dir, Box::new(SystemStore)).map_err(|e| e.to_string())) {
             Ok(vault) => (vault, None),
             // Never a plain-text fallback: without the key, messages are kept in memory only.
@@ -1572,6 +1576,7 @@ impl BeaverApp {
             let store = if vault.is_locked() { Store::locked(&path) } else { Store::open(&path, vault.derived_key("index").as_deref()) };
             store.map_err(|e| e.to_string())
         });
+        let vault_opened = began.elapsed();
         let (archive, archive_error) = match opened {
             Ok(archive) => (archive, None),
             // Without a usable file the app still works, but nothing is kept between runs.
@@ -1715,6 +1720,8 @@ impl BeaverApp {
             show_suspicious: false,
             held_counts: Default::default(),
             checking: false,
+            first_frame_logged: false,
+            first_list_logged: false,
         };
         app.error = archive_error.or(vault_error);
         let _ = std::fs::remove_dir_all(&app.open_dir); // copies of attachments from an earlier run
@@ -1725,15 +1732,20 @@ impl BeaverApp {
         if app.settings.diagnostics {
             diag::set(store::data_dir().ok().as_deref());
         }
+        // Where the start went, up to the window: the vault and archive opened before the log could be.
+        log::debug!("start: vault opened in {vault_opened:.0?}, archive in {:.0?}", began.elapsed() - vault_opened);
+        let accounts_began = std::time::Instant::now();
         match store::load() {
             Ok(accounts) => accounts.into_iter().for_each(|a| {
                 app.add_view(a);
             }),
             Err(e) => app.error = Some(e),
         }
+        log::debug!("start: {} accounts set up in {:.0?}", app.accounts.len(), accounts_began.elapsed());
         app.count_outbox(); // what waited from the last session shows at once
         app.load_offline();
         app.warm_known();
+        log::debug!("start: app ready {:.0?} after start", diag::since_start());
         app
     }
 
@@ -2068,9 +2080,12 @@ impl BeaverApp {
         let loaded = self.screening.keys().any(|id| self.origin.get(id) == Some(&serial));
         let verdicts = (inbox && self.settings.hold_suspicious && !loaded).then(|| (self.archive.clone(), self.view(serial).map(|v| v.account.key()).unwrap_or_default()));
         self.spawn(async move {
+            let began = std::time::Instant::now();
             let messages = source.messages(&folder).await;
+            let read = began.elapsed();
             let kept = verdicts.and_then(|(archive, key)| archive.verdicts(&key, &folder).ok()).unwrap_or_default();
-            let kept = kept.into_iter().filter_map(|(id, json)| Some((id, serde_json::from_str(&json).ok()?))).collect();
+            let kept: Vec<_> = kept.into_iter().filter_map(|(id, json)| Some((id, serde_json::from_str(&json).ok()?))).collect();
+            log::debug!("folder {index}: {} messages read in {read:.0?}, {} verdicts in {:.0?}", messages.as_ref().map_or(0, Vec::len), kept.len(), began.elapsed() - read);
             Event::Messages(serial, index, messages, kept)
         });
     }
@@ -2869,14 +2884,7 @@ impl BeaverApp {
         }
         let Some(view) = self.view(serial) else { return };
         let (Some(source), account) = (view.source.clone(), view.account.clone()) else { return };
-        let mine = |id: &MessageId| self.origin.get(id) == Some(&serial);
-        // The verdicts kept from before, read at once so held mail never shows in the Inbox.
-        if !self.screening.keys().any(mine)
-            && let Some(folder) = view.mailboxes.get(index).map(|f| f.name.clone())
-            && let Ok(kept) = self.archive.verdicts(&account.key(), &folder)
-        {
-            self.screening.extend(kept.into_iter().filter_map(|(id, json)| Some((id, serde_json::from_str(&json).ok()?))));
-        }
+        // The verdicts kept from before came with the list (see `list`), read off the window's thread.
         self.move_marked_spam();
         let mine = |id: &MessageId| self.origin.get(id) == Some(&serial);
         let fresh: Vec<MessageSummary> = self.messages.iter().filter(|m| mine(&m.id) && !self.screening.contains_key(&m.id)).cloned().collect();
@@ -7174,6 +7182,7 @@ impl BeaverApp {
             }
             Event::Messages(serial, index, result, kept) if self.shows(serial, index) => match result {
                 Ok(messages) => {
+                    let (began, count) = (std::time::Instant::now(), messages.len());
                     self.screening.extend(kept);
                     // This account's part of the list is replaced; the others' stay (All inboxes).
                     let origin = &self.origin;
@@ -7185,11 +7194,19 @@ impl BeaverApp {
                         self.messages.sort_by_key(|m| std::cmp::Reverse(m.timestamp));
                     }
                     self.error = None;
+                    let merged = began.elapsed();
                     self.screen_inbox(serial, index);
+                    let screened = began.elapsed();
                     if let Some(id) = self.open_when_listed.filter(|id| self.messages.iter().any(|m| m.id == *id)) {
                         self.open_when_listed = None;
                         self.select_message(id);
                         self.list_reveal = self.listed().iter().position(|i| self.conversations.same(*i, id) || *i == id);
+                    }
+                    if began.elapsed() > std::time::Duration::from_millis(30) {
+                        log::debug!("list of {count}: merged in {merged:.0?}, spam checks started in {:.0?}, opened in {:.0?}", screened - merged, began.elapsed() - screened);
+                    }
+                    if !std::mem::replace(&mut self.first_list_logged, true) {
+                        log::debug!("start: first list ({count} messages) in {:.0?} after start", diag::since_start());
                     }
                 }
                 Err(e) => self.error = Some(e.to_string()),
@@ -9350,6 +9367,9 @@ impl eframe::App for BeaverApp {
             }
         }
         let mut slow = SlowFrame(std::time::Instant::now(), Vec::new(), String::new());
+        if !std::mem::replace(&mut self.first_frame_logged, true) {
+            log::debug!("start: first frame {:.0?} after start", diag::since_start());
+        }
         while let Ok(event) = self.rx.try_recv() {
             // A slow one is named in the log by its place in `Event` (Discriminant(n)).
             let (kind, started) = (std::mem::discriminant(&event), std::time::Instant::now());
@@ -9387,6 +9407,7 @@ impl eframe::App for BeaverApp {
         }
         slow.mark("conversations");
         self.send_scheduled(ui.ctx());
+        slow.mark("scheduled");
         // The last scheduled message went (or was taken back): the view goes with its row.
         if self.show_scheduled && self.scheduled.is_empty() {
             match self.accounts.iter().find_map(|v| Some((v.serial, v.mailboxes.iter().position(|m| m.role == Role::Inbox)?))) {
@@ -9397,9 +9418,11 @@ impl eframe::App for BeaverApp {
         }
         let t = theme::Tokens::get(ui.ctx());
         self.error_banner(ui, &t);
+        slow.mark("banner");
         self.status_bar(ui, &t);
+        slow.mark("status bar");
         self.rail(ui, &t);
-        slow.mark("bars");
+        slow.mark("rail");
         // Out of Mail, its tabs, folders, list and reader give the window to the section.
         let contacts = self.section != Section::Mail;
         match self.section {
@@ -9892,6 +9915,7 @@ impl eframe::App for Start {
 }
 
 fn main() -> eframe::Result {
+    diag::mark_start();
     if std::env::args().any(|a| a == "--screen-dry-run") {
         if let Err(e) = screen::dry_run() {
             eprintln!("beavermail: {e}");

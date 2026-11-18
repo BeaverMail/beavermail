@@ -16,6 +16,19 @@ struct Logger {
 
 static LOGGER: Logger = Logger { file: Mutex::new(None) };
 
+/// When the run started, for the start-up timings.
+static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Marks the start of the run; the first call counts.
+pub fn mark_start() {
+    STARTED.get_or_init(std::time::Instant::now);
+}
+
+/// The time since the run started.
+pub fn since_start() -> std::time::Duration {
+    STARTED.get().map_or(std::time::Duration::ZERO, std::time::Instant::elapsed)
+}
+
 /// The log's path in the data folder `dir`.
 pub fn path(dir: &Path) -> PathBuf {
     dir.join("beavermail-diagnostics.log")
