@@ -29,6 +29,8 @@ pub(crate) enum Action {
     /// To another folder of the same account, by name.
     Move(String),
     Erase,
+    /// Deleted for good wherever it is: the mailbox is full and Trash refused it.
+    Purge,
     Reply,
     ReplyAll,
     Forward,
@@ -46,7 +48,7 @@ impl Action {
 
     /// Whether the message leaves the folder being shown.
     pub(crate) fn removes(&self) -> bool {
-        matches!(self, Self::Archive | Self::Trash | Self::Spam | Self::NotSpam | Self::Move(_) | Self::Erase)
+        matches!(self, Self::Archive | Self::Trash | Self::Spam | Self::NotSpam | Self::Move(_) | Self::Erase | Self::Purge)
     }
 }
 
@@ -89,6 +91,7 @@ pub(crate) async fn perform(source: Arc<ImapSource>, id: MessageId, action: Acti
         Action::NotSpam => source.move_to(id, Role::Inbox).await,
         Action::Move(folder) => source.move_to_folder(id, &folder).await,
         Action::Erase => source.erase(id).await,
+        Action::Purge => source.purge(id).await,
         Action::Reply | Action::ReplyAll | Action::Forward => Ok(()),
     }
 }

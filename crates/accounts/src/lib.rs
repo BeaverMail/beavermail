@@ -195,7 +195,7 @@ mod tests {
     fn account(user: &str) -> Account {
         let imap = Server { host: "mail.example.org".into(), port: 143, tls: Tls::StartTls };
         let smtp = Server { host: "mail.example.org".into(), port: 465, tls: Tls::Tls };
-        Account { name: "Work".into(), user: user.into(), email: user.into(), imap, smtp, save_sent: true, keep: beavermail_core::Keep::default(), signature: String::new(), oauth: None, smtp_user: None, archive: String::new(), archive_by_year: false }
+        Account { name: "Work".into(), user: user.into(), email: user.into(), imap, smtp, save_sent: true, keep: beavermail_core::Keep::default(), signature: String::new(), oauth: None, smtp_user: None, archive: String::new(), archive_by_year: false, quota_warning: 90 }
     }
 
     #[test]
@@ -210,6 +210,13 @@ mod tests {
         let accounts = parse(text).unwrap();
         assert_eq!(accounts[0].email, "");
         assert_eq!(accounts[0].address(), "a@example.org");
+        assert_eq!(accounts[0].quota_warning, 90, "the default warning level");
+    }
+
+    #[test]
+    fn a_quota_warning_of_never_is_kept() {
+        let accounts = vec![Account { quota_warning: 0, ..account("a@example.org") }];
+        assert_eq!(parse(&render(&accounts).unwrap()).unwrap(), accounts);
     }
 
     #[test]

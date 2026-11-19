@@ -2,6 +2,12 @@
 
 What changed in each version of BeaverMail, newest first.
 
+## Unreleased
+
+### Added
+
+- Server storage on each account's page, where the server sets limits (IMAP QUOTA): space used of the limit, and a warning mark on the account in the sidebar once it is 80, 90 (by default) or 95% full, or never. When Trash refuses mail because the mailbox is full, the messages can be deleted for good instead, after a confirmation.
+
 ## 0.2.0 – 2026-11-11
 
 ### Added

@@ -72,6 +72,25 @@ pub struct MessageSummary {
 pub struct SyncReport {
     /// Older messages on the server that are not in the archive yet (an estimate).
     pub remaining: u32,
+    /// The account's space on the server, asked with each sync of the Inbox: `None` for other folders,
+    /// and for a server that sets no limit (or does not tell).
+    pub quota: Option<Quota>,
+}
+
+/// How much of its limits on the server an account uses (IMAP QUOTA, RFC 9208).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Quota {
+    /// Space as (used, limit), in KiB.
+    pub storage: Option<(u64, u64)>,
+    /// Number of messages as (used, limit).
+    pub messages: Option<(u64, u64)>,
+}
+
+impl Quota {
+    /// The share of the fuller of the two limits that is used, in percent.
+    pub fn percent(&self) -> u64 {
+        [self.storage, self.messages].into_iter().flatten().filter(|(_, limit)| *limit > 0).map(|(used, limit)| used.saturating_mul(100) / limit).max().unwrap_or(0)
+    }
 }
 
 /// A file attached to a message. The bytes stay in the message file until asked for.
@@ -241,6 +260,9 @@ pub struct Account {
     /// Archive into a folder for each year inside it ("Archive/2026"), by the message's date.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub archive_by_year: bool,
+    /// Warn when the server's space for the account is this full, in percent; 0 never warns.
+    #[serde(default = "quota_warning")]
+    pub quota_warning: u8,
 }
 
 /// An address book synced over CardDAV: a source of its own, apart from the mail accounts (contacts
@@ -676,6 +698,10 @@ fn yes() -> bool {
     true
 }
 
+fn quota_warning() -> u8 {
+    90
+}
+
 fn undo_secs() -> u32 {
     10
 }
@@ -758,7 +784,7 @@ mod tests {
     #[test]
     fn mail_goes_out_under_the_users_name_unless_it_is_only_the_login() {
         let server = Server { host: "imap.x.org".into(), port: 993, tls: Tls::Tls };
-        let account = |name: &str| Account { name: name.into(), user: "ada".into(), email: "ada@x.org".into(), imap: server.clone(), smtp: server.clone(), save_sent: true, keep: Keep::default(), signature: String::new(), oauth: None, smtp_user: None, archive: String::new(), archive_by_year: false };
+        let account = |name: &str| Account { name: name.into(), user: "ada".into(), email: "ada@x.org".into(), imap: server.clone(), smtp: server.clone(), save_sent: true, keep: Keep::default(), signature: String::new(), oauth: None, smtp_user: None, archive: String::new(), archive_by_year: false, quota_warning: 90 };
         assert_eq!(account("Ada Lovelace").sender(), "\"Ada Lovelace\" <ada@x.org>");
         assert_eq!(account("Lovelace, Ada").sender(), "\"Lovelace, Ada\" <ada@x.org>", "quoted: the comma is part of the name");
         assert_eq!(account("Ada \"the\" Countess").sender(), "\"Ada the Countess\" <ada@x.org>");

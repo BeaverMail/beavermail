@@ -8,7 +8,7 @@
 pub mod model;
 pub mod sample;
 
-pub use model::{address_text, OAuthProvider, Account, AddressBook, Attachment, CalendarSource, Columns, Condition, Filter, FilterAction, ListLayout, AuthCheck, AuthResult, Density, DisplayMode, Hit, Keep, Label, Mailbox, MessageBody, MessageId, MessageSummary, Outgoing, OutgoingFile, Progress, Role, Encryption, Seal, Server, Settings, Signature, Sort, SortBy, SignatureCheck, SignedWith, SyncReport, Tls};
+pub use model::{address_text, OAuthProvider, Account, AddressBook, Attachment, CalendarSource, Columns, Condition, Filter, FilterAction, ListLayout, AuthCheck, AuthResult, Density, DisplayMode, Hit, Keep, Label, Mailbox, MessageBody, MessageId, MessageSummary, Outgoing, OutgoingFile, Progress, Role, Encryption, Seal, Server, Settings, Signature, Sort, SortBy, SignatureCheck, SignedWith, SyncReport, Tls, Quota};
 
 use std::fmt;
 use std::future::Future;
@@ -24,6 +24,8 @@ pub enum MailError {
     Backend(String),
     /// The server could not be reached (no network, or it is down): the archive still answers.
     Offline(String),
+    /// The server refused because the account is over its quota (`NO [OVERQUOTA]`, RFC 9208).
+    Full(String),
 }
 
 impl fmt::Display for MailError {
@@ -33,6 +35,8 @@ impl fmt::Display for MailError {
             Self::Auth(why) => write!(f, "authentication failed: {why}"),
             Self::Backend(why) => write!(f, "mail backend error: {why}"),
             Self::Offline(why) => write!(f, "cannot reach the server: {why}"),
+            Self::Full(why) if why.is_empty() => f.write_str("the mailbox on the server is full"),
+            Self::Full(why) => write!(f, "the mailbox on the server is full: {why}"),
         }
     }
 }

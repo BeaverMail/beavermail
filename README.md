@@ -8,7 +8,7 @@ computer, remote content stays blocked, and it works offline. Written in Rust wi
 
 ## Status
 
-- Accounts: any IMAP/SMTP server, or Google and Microsoft sign-in (OAuth2); several at once, with All inboxes.
+- Accounts: any IMAP/SMTP server, or Google and Microsoft sign-in (OAuth2); several at once, with All inboxes; server storage shown, with a warning when nearly full.
 - Offline: encrypted local archive with full-text search; changes and mail wait in an Outbox for the server.
 - Reading: plain text, simplified or original HTML; conversations, tabs, nothing remote loaded unless allowed; the list as cards or a table, ordered per folder, the message beside it, below it or in a tab.
 - Safety: sender checks, look-alike domains and links, risky attachments; held "Suspicious" mail and a spam classifier.

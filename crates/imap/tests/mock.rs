@@ -44,6 +44,8 @@ struct Mock {
     modseq: Arc<Mutex<Option<u64>>>,
     /// It offers QRESYNC too, and its folders' next UID is this one.
     qresync: Arc<Mutex<Option<u32>>>,
+    /// The server offers QUOTA and UIDPLUS, and the account is over its quota: copies are refused.
+    full: Arc<Mutex<bool>>,
 }
 
 impl Mock {
@@ -80,18 +82,18 @@ async fn start_opts(move_works: bool, attachment: bool, idle: bool) -> Mock {
     let log = Arc::new(Mutex::new(Vec::new()));
     let message = Arc::new(Mutex::new(MESSAGE.to_owned()));
     let list = Arc::new(Mutex::new(LIST.to_owned()));
-    let (bye, broken, tls_only, modseq, qresync) = (Arc::new(Mutex::new(None)), Arc::new(Mutex::new(false)), Arc::new(Mutex::new(false)), Arc::new(Mutex::new(None)), Arc::new(Mutex::new(None)));
-    let (served, replies) = (log.clone(), Replies { message: message.clone(), list: list.clone(), bye: bye.clone(), broken: broken.clone(), tls_only: tls_only.clone(), modseq: modseq.clone(), qresync: qresync.clone() });
+    let (bye, broken, tls_only, modseq, qresync, full) = (Arc::new(Mutex::new(None)), Arc::new(Mutex::new(false)), Arc::new(Mutex::new(false)), Arc::new(Mutex::new(None)), Arc::new(Mutex::new(None)), Arc::new(Mutex::new(false)));
+    let (served, replies) = (log.clone(), Replies { message: message.clone(), list: list.clone(), bye: bye.clone(), broken: broken.clone(), tls_only: tls_only.clone(), modseq: modseq.clone(), qresync: qresync.clone(), full: full.clone() });
     tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
             tokio::spawn(serve(socket, served.clone(), move_works, attachment, idle, replies.clone()));
         }
     });
     let server = Server { host: "127.0.0.1".into(), port, tls: Tls::None };
-    let account = Account { name: "mock".into(), user: "u".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true, keep: beavermail_core::Keep::default(), signature: String::new(), oauth: None, smtp_user: None, archive: String::new(), archive_by_year: false };
+    let account = Account { name: "mock".into(), user: "u".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true, keep: beavermail_core::Keep::default(), signature: String::new(), oauth: None, smtp_user: None, archive: String::new(), archive_by_year: false, quota_warning: 90 };
     let store = Arc::new(Store::in_memory().unwrap());
     let files = Arc::new(Vault::in_memory());
-    Mock { source: ImapSource::new(&account, "p".into(), store.clone(), files.clone()), account, store, files, log, message, list, bye, broken, tls_only, modseq, qresync }
+    Mock { source: ImapSource::new(&account, "p".into(), store.clone(), files.clone()), account, store, files, log, message, list, bye, broken, tls_only, modseq, qresync, full }
 }
 
 /// What a test can change in the server's answers while it runs; see [`Mock`].
@@ -104,10 +106,11 @@ struct Replies {
     tls_only: Arc<Mutex<bool>>,
     modseq: Arc<Mutex<Option<u64>>>,
     qresync: Arc<Mutex<Option<u32>>>,
+    full: Arc<Mutex<bool>>,
 }
 
 async fn serve(socket: TcpStream, log: Arc<Mutex<Vec<String>>>, move_works: bool, attachment: bool, idle: bool, replies: Replies) {
-    let Replies { message, list, bye, broken, tls_only, modseq, qresync } = replies;
+    let Replies { message, list, bye, broken, tls_only, modseq, qresync, full } = replies;
     let (read, mut write) = socket.into_split();
     let mut read = BufReader::new(read);
     let _ = write.write_all(b"* OK ready\r\n").await;
@@ -126,7 +129,7 @@ async fn serve(socket: TcpStream, log: Arc<Mutex<Vec<String>>>, move_works: bool
         }
         let verb = command.to_ascii_uppercase();
         let reply = if verb.starts_with("CAPABILITY") {
-            let extra = format!("{}{}{}", if idle { " IDLE" } else { "" }, if *tls_only.lock().unwrap() { " STARTTLS LOGINDISABLED" } else { "" }, if modseq.lock().unwrap().is_some() { if qresync.lock().unwrap().is_some() { " ENABLE CONDSTORE QRESYNC" } else { " ENABLE CONDSTORE" } } else { "" });
+            let extra = format!("{}{}{}{}", if *full.lock().unwrap() { " QUOTA UIDPLUS" } else { "" }, if idle { " IDLE" } else { "" }, if *tls_only.lock().unwrap() { " STARTTLS LOGINDISABLED" } else { "" }, if modseq.lock().unwrap().is_some() { if qresync.lock().unwrap().is_some() { " ENABLE CONDSTORE QRESYNC" } else { " ENABLE CONDSTORE" } } else { "" });
             format!("* CAPABILITY IMAP4rev1{extra}\r\n{tag} OK done\r\n")
         } else if verb.starts_with("AUTHENTICATE XOAUTH2") {
             // The client's answer to the challenge is a line of its own, kept in the log to check.
@@ -157,6 +160,10 @@ async fn serve(socket: TcpStream, log: Arc<Mutex<Vec<String>>>, move_works: bool
                 }
             }
             format!("{tag} OK IDLE terminated\r\n")
+        } else if verb.starts_with("GETQUOTAROOT") {
+            format!("* QUOTAROOT INBOX \"\"\r\n* QUOTA \"\" (STORAGE 1000 1000 MESSAGE 10 500)\r\n{tag} OK done\r\n")
+        } else if *full.lock().unwrap() && (verb.starts_with("UID MOVE") || verb.starts_with("UID COPY")) {
+            format!("{tag} NO [OVERQUOTA] Quota exceeded\r\n")
         } else if verb.starts_with("NOOP") {
             format!("{tag} OK done\r\n")
         } else if verb.starts_with("LIST") {
@@ -418,6 +425,28 @@ async fn erase_is_refused_outside_the_trash() {
     let error = mock.source.erase(id).await.unwrap_err();
     assert!(matches!(error, MailError::Backend(_)), "{error:?}");
     assert!(mock.writes().is_empty(), "nothing may reach the server: {:?}", mock.writes());
+}
+
+#[tokio::test]
+async fn a_full_mailbox_refuses_the_trash_says_so_and_deletes_for_good_instead() {
+    let mock = start(true).await;
+    *mock.full.lock().unwrap() = true;
+    let id = message_in(&mock, "INBOX").await;
+    let error = mock.source.trash(id).await.unwrap_err();
+    assert!(matches!(&error, MailError::Full(why) if why == "Quota exceeded"), "{error:?}");
+    assert!(mock.source.purges(), "the server has UIDPLUS");
+    mock.source.purge(id).await.unwrap();
+    assert_eq!(mock.writes(), ["UID MOVE 5 \"Trash\"", "UID COPY 5 \"Trash\"", "UID STORE 5 +FLAGS.SILENT (\\Deleted)", "UID EXPUNGE 5"]);
+}
+
+#[tokio::test]
+async fn a_sync_of_the_inbox_tells_the_quota_and_others_do_not() {
+    let mock = start(true).await;
+    *mock.full.lock().unwrap() = true;
+    mock.source.mailboxes().await.unwrap();
+    let quota = mock.source.sync("INBOX").await.unwrap().quota.expect("the server has limits");
+    assert_eq!((quota.storage, quota.messages, quota.percent()), (Some((1000, 1000)), Some((10, 500)), 100));
+    assert_eq!(mock.source.sync("Archive").await.unwrap().quota, None);
 }
 
 #[tokio::test]

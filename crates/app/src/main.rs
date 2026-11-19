@@ -42,7 +42,7 @@ mod unsubscribe;
 mod views;
 
 use beavermail_accounts as store;
-use beavermail_core::{OAuthProvider, Account, Filter, Density, DisplayMode, Hit, Keep, MailError, MailSender, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Progress, Role, Server, Settings, Sort, SortBy, SyncReport, Tls, ListLayout};
+use beavermail_core::{OAuthProvider, Account, Filter, Density, DisplayMode, Hit, Keep, MailError, MailSender, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Progress, Role, Server, Settings, Sort, SortBy, SyncReport, Tls, ListLayout, Quota};
 use beavermail_imap::ImapSource;
 use beavermail_smtp::{SmtpSender, render_draft};
 use beavermail_store::Store;
@@ -646,6 +646,15 @@ struct AccountView {
     /// Whether the server is to be asked again on its own, and after how long the next time.
     retrying: bool,
     retry_wait: std::time::Duration,
+    /// The account's space on the server, as the last sync of the Inbox said; `None` without limits.
+    quota: Option<Quota>,
+}
+
+impl AccountView {
+    /// The quota when it is past the account's warning level, to be shown in the sidebar.
+    fn quota_warning(&self) -> Option<Quota> {
+        self.quota.filter(|q| self.account.quota_warning > 0 && q.percent() >= u64::from(self.account.quota_warning))
+    }
 }
 
 /// The "Add account" form. Ports are text until submitted.
@@ -676,6 +685,8 @@ struct NewAccount {
     /// See [`Account::archive`].
     archive: String,
     archive_by_year: bool,
+    /// See [`Account::quota_warning`].
+    quota_warning: u8,
     /// Signed in with a provider: kept through an edit, so the account stays an OAuth one.
     oauth: Option<OAuthProvider>,
     /// The last "Test connection", shown while the form still says what was tested.
@@ -707,6 +718,7 @@ impl Default for NewAccount {
             signature: String::new(),
             archive: String::new(),
             archive_by_year: false,
+            quota_warning: 90,
             oauth: None,
             check: None,
             error: None,
@@ -749,6 +761,7 @@ impl NewAccount {
             signature: account.signature.clone(),
             archive: account.archive.clone(),
             archive_by_year: account.archive_by_year,
+            quota_warning: account.quota_warning,
             oauth: account.oauth,
             focus_first: true,
             ..Self::default()
@@ -818,6 +831,7 @@ impl NewAccount {
             smtp_user,
             archive: self.archive.clone(),
             archive_by_year: self.archive_by_year,
+            quota_warning: self.quota_warning,
         })
     }
 }
@@ -1063,7 +1077,7 @@ fn section_title(ui: &mut egui::Ui, text: &str) {
 
 /// One account's page in Settings. `waiting`: a sign-in for it is open in the browser.
 /// `folders`: the account's folders as (name on the server, as shown), for where Archive moves mail.
-fn account_page(ui: &mut egui::Ui, t: &theme::Tokens, form: &mut NewAccount, waiting: bool, folders: &[(String, String)]) -> Option<PageAction> {
+fn account_page(ui: &mut egui::Ui, t: &theme::Tokens, form: &mut NewAccount, waiting: bool, folders: &[(String, String)], quota: Option<Quota>) -> Option<PageAction> {
     let mut action = None;
     let hint = |ui: &mut egui::Ui, text: &str| ui.label(RichText::new(text).size(13.0).color(t.text_dim));
     form_grid(ui, "account_identity", |ui| {
@@ -1113,6 +1127,32 @@ fn account_page(ui: &mut egui::Ui, t: &theme::Tokens, form: &mut NewAccount, wai
             ui.end_row();
         });
         views::switch_row(ui, t, &mut form.archive_by_year, "A folder for each year", "Inside it, by each message's date: 2026, 2025… Made the first time one is needed.");
+    }
+
+    // Only where the server sets limits and says so.
+    if let Some(quota) = quota {
+        section_title(ui, "Server storage");
+        if let Some((used, limit)) = quota.storage {
+            let fraction = used as f32 / limit.max(1) as f32;
+            let fill = if form.quota_warning > 0 && quota.percent() >= u64::from(form.quota_warning) { t.danger } else { t.accent };
+            ui.add(egui::ProgressBar::new(fraction.min(1.0)).desired_width(FORM_WIDTH).desired_height(8.0).corner_radius(4.0).fill(fill));
+            hint(ui, &format!("{} of {} used ({}%)", attachments::human_size(used * 1024), attachments::human_size(limit * 1024), used.saturating_mul(100) / limit.max(1)));
+        }
+        if let Some((used, limit)) = quota.messages {
+            hint(ui, &format!("{used} of {limit} messages"));
+        }
+        ui.add_space(4.0);
+        form_grid(ui, "account_quota", |ui| {
+            ui.label("Warn when");
+            let label = |p: u8| if p == 0 { "Never".to_owned() } else { format!("{p}% full") };
+            egui::ComboBox::from_id_salt("quota_warning").width(FIELD_WIDTH).selected_text(label(form.quota_warning)).show_ui(ui, |ui| {
+                for p in [80, 90, 95, 0] {
+                    ui.selectable_value(&mut form.quota_warning, p, label(p));
+                }
+            });
+            ui.end_row();
+        });
+        hint(ui, "A full mailbox refuses new mail and copies to Sent, Drafts and Trash.");
     }
 
     section_title(ui, "Connection");
@@ -1317,6 +1357,10 @@ struct BeaverApp {
     /// A message waiting for the user to confirm erasing it for good.
     /// Messages to erase for good from the Trash, until the user confirms; empty when not asking.
     confirm_erase: Vec<MessageId>,
+    /// The messages in `confirm_erase` are not in Trash: the mailbox is full and Trash refused them.
+    erase_full: bool,
+    /// Messages Trash refused because the mailbox is full, offered for good deletion beside `error`.
+    full_trash: Vec<MessageId>,
     /// Messages picked in the list with Ctrl+click, Shift+click or Ctrl+A, the first being where a
     /// Shift+click range starts; commands apply to all of them once there are two or more.
     picked: Vec<MessageId>,
@@ -1596,6 +1640,8 @@ impl BeaverApp {
             error: None,
             form: None,
             confirm_erase: Vec::new(),
+            erase_full: false,
+            full_trash: Vec::new(),
             picked: Vec::new(),
             confirm_spam: false,
             confirm_empty: Vec::new(),
@@ -1827,7 +1873,7 @@ impl BeaverApp {
         }
         let progress = Arc::new(Progress::default());
         progress.paused.store(self.downloads_paused, std::sync::atomic::Ordering::Relaxed);
-        let view = AccountView { serial, account, source, sender, mailboxes: Vec::new(), error, offline: None, progress, watch_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)), watching: false, retrying: false, retry_wait: RETRY_FIRST };
+        let view = AccountView { serial, account, source, sender, mailboxes: Vec::new(), error, offline: None, progress, watch_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)), watching: false, retrying: false, retry_wait: RETRY_FIRST, quota: None };
         match position {
             Some(at) => self.accounts.insert(at.min(self.accounts.len()), view),
             None => self.accounts.push(view),
@@ -3946,7 +3992,8 @@ impl BeaverApp {
                                     let folders: Vec<(String, String)> = form.editing.and_then(|serial| self.accounts.iter().find(|v| v.serial == serial)).map(|v| {
                                         v.mailboxes.iter().filter(|m| matches!(m.role, Role::Archive | Role::Other)).map(|m| (m.name.clone(), views::folder_path(&m.name, m.role, m.delimiter))).collect()
                                     }).unwrap_or_default();
-                                    page_action = account_page(ui, t, form, waiting, &folders);
+                                    let quota = form.editing.and_then(|serial| self.accounts.iter().find(|v| v.serial == serial)?.quota);
+                                    page_action = account_page(ui, t, form, waiting, &folders, quota);
                                 }
                             }
                             SettingsPage::Reading => {
@@ -7156,7 +7203,11 @@ impl BeaverApp {
             }
             Event::Synced(serial, index, result) => {
                 self.syncing = self.syncing.saturating_sub(1);
-                if result.is_ok() && self.view(serial).and_then(|v| v.mailboxes.get(index)).is_some_and(|m| m.role == Role::Inbox) {
+                if let Ok(report) = &result
+                    && let Some(view) = self.accounts.iter_mut().find(|v| v.serial == serial)
+                    && view.mailboxes.get(index).is_some_and(|m| m.role == Role::Inbox)
+                {
+                    view.quota = report.quota;
                     self.run_filters(serial, None);
                 }
                 if !self.shows(serial, index) {
@@ -7322,8 +7373,19 @@ impl BeaverApp {
                 self.offline_changes.push((serial, index, change.0, change.1));
                 self.save_offline();
             }
-            Event::Done(serial, index, _, Err(e)) => {
-                self.error = Some(e.to_string());
+            Event::Done(serial, index, change, Err(e)) => {
+                // Trash refused for a full mailbox: deleting for good is what frees space, offered beside the error.
+                match change {
+                    Some((id, Action::Trash)) if matches!(e, MailError::Full(_)) && self.view(serial).and_then(|v| v.source.as_ref()).is_some_and(|s| s.purges()) => {
+                        self.full_trash.push(id);
+                        let count = self.full_trash.len();
+                        self.error = Some(format!("{} not moved to Trash: the mailbox on the server is full.", if count == 1 { "The message was".to_owned() } else { format!("{count} messages were") }));
+                    }
+                    _ => {
+                        self.full_trash.clear();
+                        self.error = Some(e.to_string());
+                    }
+                }
                 // Show what the server really has.
                 if self.unified && self.shows(serial, index) {
                     self.show_all(self.unified_role);
@@ -7584,11 +7646,13 @@ impl BeaverApp {
                 self.body = None;
                 self.in_tab = false;
             }
-            ids.iter().for_each(|id| self.act(*id, Action::Erase));
+            let action = if self.erase_full { Action::Purge } else { Action::Erase };
+            ids.iter().for_each(|id| self.act(*id, action.clone()));
             self.picked.clear();
         }
         if confirm || cancel || modal.should_close() {
             self.confirm_erase.clear();
+            self.erase_full = false;
         }
     }
 
@@ -8078,6 +8142,12 @@ impl BeaverApp {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.button("Dismiss").clicked() {
                         self.error = None;
+                        self.full_trash.clear();
+                    }
+                    if !self.full_trash.is_empty() && ui.button(RichText::new("Delete permanently…").color(t.danger)).clicked() {
+                        self.confirm_erase = std::mem::take(&mut self.full_trash);
+                        self.erase_full = true;
+                        self.error = None;
                     }
                 });
             });
@@ -8441,6 +8511,21 @@ impl BeaverApp {
                                     ui.add_space(4.0);
                                     ui.add(egui::Label::new(RichText::new("The mail stored on this computer is shown meanwhile, and the server is asked again on its own.").size(13.0).color(t.text_dim)).wrap());
                                 });
+                            } else if let Some(quota) = view.quota_warning() {
+                                // Nearly full: a mark on the account, how full on hover, its settings on a click.
+                                let row = header.header_response.rect;
+                                let spot = egui::Rect::from_center_size(egui::pos2(row.right() - 8.0 - icons::SIZE / 2.0, row.center().y), egui::Vec2::splat(icons::SIZE + 6.0));
+                                let mark = ui.interact(spot, ui.id().with(("quota", view.serial)), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+                                if mark.hovered() {
+                                    ui.painter().rect_filled(spot, egui::CornerRadius::same(6), t.hover);
+                                }
+                                Icon::CircleAlert.image(icons::SIZE, t.danger).paint_at(ui, spot.shrink(3.0));
+                                let used = quota.storage.map_or_else(String::new, |(used, limit)| format!(" ({} of {})", attachments::human_size(used * 1024), attachments::human_size(limit * 1024)));
+                                let mark = mark.on_hover_text(format!("The mailbox on the server is {}% full{used}. Click for the account's settings.", quota.percent()));
+                                mark.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Mailbox nearly full"));
+                                if mark.clicked() {
+                                    edit = Some(view.serial);
+                                }
                             }
                             if header.header_response.clicked() {
                                 fold = Some(view.account.key());
@@ -10017,7 +10102,7 @@ mod tests {
     fn what_an_account_knows_is_loaded_again_only_when_its_marks_change() {
         let archive = Arc::new(Store::in_memory().unwrap());
         let server = Server { host: "mail.example.org".into(), port: 993, tls: Tls::Tls };
-        let account = Account { name: "Ada".into(), user: "ada@example.org".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true, keep: Keep::default(), signature: String::new(), oauth: None, smtp_user: None, archive: String::new(), archive_by_year: false };
+        let account = Account { name: "Ada".into(), user: "ada@example.org".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true, keep: Keep::default(), signature: String::new(), oauth: None, smtp_user: None, archive: String::new(), archive_by_year: false, quota_warning: 90 };
         let (cache, mut settings) = (KnownCache::default(), Settings::default());
         let first = cache.get(&archive, &account, &[], &settings).unwrap();
         assert!(Arc::ptr_eq(&first, &cache.get(&archive, &account, &[], &settings).unwrap()), "kept");

@@ -44,6 +44,8 @@ struct State {
     folder: Option<String>,
     /// QRESYNC is on for the session: a fetch of what changed also names the messages expunged.
     qresync: bool,
+    /// The server answers GETQUOTAROOT (RFC 9208).
+    quota: bool,
 }
 
 /// What a write does to one message.
@@ -64,6 +66,8 @@ enum Op {
     Folder(String),
     /// Permanent delete; allowed only inside the trash folder.
     Erase,
+    /// Permanent delete from any folder: when the mailbox is full and Trash takes nothing more.
+    Purge,
 }
 
 pub struct ImapSource {
@@ -103,6 +107,8 @@ struct Config {
     offline: std::sync::atomic::AtomicBool,
     /// Signed in with a provider: an access token instead of the password.
     token: Option<beavermail_core::TokenSource>,
+    /// The server has UIDPLUS, as the last connection said: one message alone can be expunged.
+    uidplus: std::sync::atomic::AtomicBool,
 }
 
 impl ImapSource {
@@ -110,6 +116,17 @@ impl ImapSource {
     /// the archive keeps answering the rest.
     pub fn set_offline(&self, offline: bool) {
         self.config.offline.store(offline, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether a message can be deleted for good outside Trash ([`Self::purge`]): the server has UIDPLUS.
+    pub fn purges(&self) -> bool {
+        self.config.uidplus.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Deletes a message for good wherever it is, without a copy in Trash: what is left when the
+    /// mailbox is full and Trash refuses it.
+    pub async fn purge(&self, id: MessageId) -> Result<(), MailError> {
+        self.write(id, Op::Purge).await
     }
 
     /// The message as stored on this computer, without going to the server; `None` when it is not stored.
@@ -162,7 +179,7 @@ impl ImapSource {
 
     /// Creates the source over the shared archive; the connection is opened on first use.
     pub fn new(account: &Account, password: String, store: Arc<Store>, files: Arc<Vault>) -> Self {
-        let config = Config { server: account.imap.clone(), user: account.user.clone(), password, offline: Default::default(), token: None };
+        let config = Config { server: account.imap.clone(), user: account.user.clone(), password, offline: Default::default(), token: None, uidplus: Default::default() };
         Self { config, poll_interval: std::time::Duration::from_secs(180), account: account.key(), address: account.address().to_lowercase(), store, files, state: Mutex::new(State::default()), reader: Mutex::new(State::default()), plain: Default::default(), archive: std::sync::Mutex::new((account.archive.clone(), account.archive_by_year)), auth_server: std::sync::Mutex::new(None), writing: Default::default() }
     }
 
@@ -359,8 +376,36 @@ fn unreadable(e: &async_imap::error::Error) -> Option<String> {
 fn imap_error(e: async_imap::error::Error) -> MailError {
     match e {
         async_imap::error::Error::ConnectionLost | async_imap::error::Error::Io(_) => MailError::Offline(e.to_string()),
+        // The library does not know the code, so it stays in the text.
+        async_imap::error::Error::No(why) if why.to_ascii_uppercase().contains("[OVERQUOTA]") => MailError::Full(server_text(&why)),
         e => backend(e),
     }
+}
+
+/// What the server said after the response code, out of the library's description of the answer.
+fn server_text(why: &str) -> String {
+    let after = why.split_once(']').map_or(why, |(_, rest)| rest);
+    after.trim().trim_end_matches(['"', ')', '}', ' ']).trim().to_owned()
+}
+
+/// The account's quota as GETQUOTAROOT tells it for `folder`; `None` without limits.
+async fn quota_of(session: &mut Session<Stream>, folder: &str) -> Result<Option<beavermail_core::Quota>, async_imap::error::Error> {
+    use async_imap::types::QuotaResourceName;
+    let (_, quotas) = session.get_quota_root(folder).await?;
+    let mut quota = beavermail_core::Quota::default();
+    for resource in quotas.iter().flat_map(|q| &q.resources) {
+        let slot = match resource.name {
+            QuotaResourceName::Storage => &mut quota.storage,
+            QuotaResourceName::Message => &mut quota.messages,
+            QuotaResourceName::Atom(_) => continue,
+        };
+        // Several roots over the Inbox: the tightest limit is the one that refuses first.
+        let fuller = |(u, l): (u64, u64)| u.saturating_mul(1000).checked_div(l).unwrap_or(0);
+        if resource.limit > 0 && slot.is_none_or(|old| fuller((resource.usage, resource.limit)) > fuller(old)) {
+            *slot = Some((resource.usage, resource.limit));
+        }
+    }
+    Ok((quota != beavermail_core::Quota::default()).then_some(quota))
 }
 
 /// Runs `command` and keeps what `take` finds in its answer, only once the command's tagged OK came.
@@ -541,6 +586,8 @@ impl State {
             if !self.qresync && has("CONDSTORE") {
                 let _ = session.run_command_and_check_ok("ENABLE CONDSTORE").await;
             }
+            self.quota = has("QUOTA");
+            config.uidplus.store(has("UIDPLUS"), std::sync::atomic::Ordering::Relaxed);
             self.session = Some(session);
         }
         self.used = Some(std::time::Instant::now());
@@ -788,7 +835,7 @@ impl ImapSource {
     async fn write(&self, id: MessageId, op: Op) -> Result<(), MailError> {
         let at = self.store.locate(id)?.ok_or(MailError::NotFound)?;
         let target = match &op {
-            Op::Seen(_) | Op::Pinned(_) | Op::Starred(_) | Op::Label(..) | Op::Erase => None,
+            Op::Seen(_) | Op::Pinned(_) | Op::Starred(_) | Op::Label(..) | Op::Erase | Op::Purge => None,
             Op::Archive => Some(self.archive_folder(id).await?),
             Op::Trash => Some(self.own_folder(Role::Trash).await?),
             Op::Move(role) => Some(self.folder_with_role(*role).await?.ok_or_else(|| backend(format!("this account has no {role:?} folder")))?),
@@ -808,7 +855,7 @@ impl ImapSource {
         }
         // A flag is set here at once, so a list read meanwhile shows it; undone if the server refuses,
         // kept when it cannot be reached (the change waits to be sent).
-        let flag = target.is_none() && !matches!(op, Op::Erase);
+        let flag = target.is_none() && !matches!(op, Op::Erase | Op::Purge);
         let key = (at.folder.clone(), at.uid);
         if flag {
             self.set_flag(id, &op, true)?;
@@ -834,7 +881,7 @@ impl ImapSource {
             Op::Pinned(on) => self.store.set_pinned(id, *on == forward),
             Op::Starred(on) => self.store.set_starred(id, *on == forward),
             Op::Label(keyword, on) => self.store.set_label(id, keyword, *on == forward),
-            Op::Archive | Op::Trash | Op::Move(_) | Op::Folder(_) | Op::Erase => Ok(()),
+            Op::Archive | Op::Trash | Op::Move(_) | Op::Folder(_) | Op::Erase | Op::Purge => Ok(()),
         }
     }
 
@@ -883,7 +930,7 @@ impl ImapSource {
                         session.uid_expunge(&uid).await?.try_collect::<Vec<_>>().await?;
                     }
                 }
-                (Op::Erase, _) => {
+                (Op::Erase | Op::Purge, _) => {
                     session.uid_store(&uid, "+FLAGS.SILENT (\\Deleted)").await?.try_collect::<Vec<_>>().await?;
                     // shortcut: needs UIDPLUS; without it the message stays flagged \\Deleted rather than risk expunging others.
                     session.uid_expunge(&uid).await?.try_collect::<Vec<_>>().await?;
@@ -951,6 +998,14 @@ impl ImapSource {
             let session = state.session.as_mut().expect("just connected");
             let result = self.sync_with(session, folder, qresync).await;
             return match result {
+                Ok(mut report) if state.quota && folder.eq_ignore_ascii_case("INBOX") => {
+                    // Never what fails the sync: a server that refuses tells nothing, one gone fails the next call.
+                    match quota_of(state.session.as_mut().expect("just synced"), "INBOX").await {
+                        Ok(quota) => report.quota = quota,
+                        Err(e) => log::debug!("quota: {e}"),
+                    }
+                    Ok(report)
+                }
                 Ok(report) => Ok(report),
                 Err(SyncError::Archive(e)) => Err(e),
                 // A message the server describes in a way that cannot be read: the folder is read again,
@@ -1146,7 +1201,7 @@ impl ImapSource {
         // Kept only now that everything above went through: an interrupted sync compares in full next time.
         store.set_seen(account, folder, now)?;
         let have = store.uid_range(account, folder)?.map_or(0, |(_, _, count)| count);
-        Ok(SyncReport { remaining: if floor <= 1 { 0 } else { selected.exists.saturating_sub(have) } })
+        Ok(SyncReport { remaining: if floor <= 1 { 0 } else { selected.exists.saturating_sub(have) }, quota: None })
     }
 }
 
