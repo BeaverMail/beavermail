@@ -640,6 +640,55 @@ pub struct Settings {
     /// own, in the order shown. The server keeps only their keywords.
     #[serde(default)]
     pub labels: Vec<Label>,
+    /// The language model that drafts replies and summarises conversations; off when it has no provider.
+    #[serde(default)]
+    pub assistant: Assistant,
+}
+
+/// Where the assistant's requests go; the key is in the credential store, never here.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Assistant {
+    #[serde(default)]
+    pub provider: Option<LlmProvider>,
+    /// The model's id, as the provider's list gave it.
+    #[serde(default)]
+    pub model: String,
+    /// The server's address, up to `/v1` ("http://localhost:11434/v1"); empty for the provider's own.
+    #[serde(default)]
+    pub url: String,
+    /// Send without asking each time; asked again when the provider changes.
+    #[serde(default)]
+    pub trusted: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LlmProvider {
+    Anthropic,
+    OpenAi,
+    /// A server on this computer or network speaking OpenAI's API (Ollama, LM Studio, llama.cpp).
+    Local,
+}
+
+impl LlmProvider {
+    pub const ALL: [Self; 3] = [Self::Anthropic, Self::OpenAi, Self::Local];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Anthropic => "Anthropic (Claude)",
+            Self::OpenAi => "OpenAI",
+            Self::Local => "Local server",
+        }
+    }
+
+    /// The credential store's name for its key.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::OpenAi => "openai",
+            Self::Local => "local",
+        }
+    }
 }
 
 /// A label as this computer shows it.
@@ -708,7 +757,7 @@ fn undo_secs() -> u32 {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { display: DisplayMode::default(), sender_display: Default::default(), rich_outgoing: true, undo_send_secs: undo_secs(), remote_senders: Default::default(), hold_suspicious: true, marked: Default::default(), threads: true, reading_pane: true, reader_below: false, list_layout: ListLayout::default(), columns: Columns::default(), sorts: Default::default(), folded: Default::default(), density: Density::default(), diagnostics: false, link_params: String::new(), address_books: Vec::new(), calendars: Vec::new(), spelling: true, spelling_language: String::new(), spelling_words: Default::default(), spelling_before_send: false, data_folder: String::new(), moving_to: String::new(), filters: Vec::new(), filtered_upto: Default::default(), labels: Vec::new() }
+        Self { display: DisplayMode::default(), sender_display: Default::default(), rich_outgoing: true, undo_send_secs: undo_secs(), remote_senders: Default::default(), hold_suspicious: true, marked: Default::default(), threads: true, reading_pane: true, reader_below: false, list_layout: ListLayout::default(), columns: Columns::default(), sorts: Default::default(), folded: Default::default(), density: Density::default(), diagnostics: false, link_params: String::new(), address_books: Vec::new(), calendars: Vec::new(), spelling: true, spelling_language: String::new(), spelling_words: Default::default(), spelling_before_send: false, data_folder: String::new(), moving_to: String::new(), filters: Vec::new(), filtered_upto: Default::default(), labels: Vec::new(), assistant: Assistant::default() }
     }
 }
 

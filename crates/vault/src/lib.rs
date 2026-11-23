@@ -492,8 +492,9 @@ impl Vault {
             Backing::Disk(dir) => {
                 let mut found = Vec::new();
                 // Everything the vault holds: downloaded mail, drafts with their attachments, the
-                // user's own encryption keys, and the changes waiting for the server.
-                let mut pending = vec![dir.join("mail"), dir.join("drafts"), dir.join("keyring"), dir.join("offline")];
+                // user's own encryption keys, the changes waiting for the server, and what was sent to
+                // the assistant.
+                let mut pending = vec![dir.join("mail"), dir.join("drafts"), dir.join("keyring"), dir.join("offline"), dir.join("assistant")];
                 while let Some(folder) = pending.pop() {
                     let Ok(entries) = std::fs::read_dir(&folder) else { continue };
                     for entry in entries.flatten() {
@@ -628,9 +629,10 @@ impl Vault {
     pub fn reset(&self) -> Result<(), MailError> {
         self.remove_dir(Path::new("mail"))?;
         // Encrypted with the forgotten key, the user's own keys and the changes waiting for the server
-        // cannot be read either.
+        // cannot be read either, nor the record of what went to the assistant.
         self.remove_dir(Path::new("keyring"))?;
         self.remove_dir(Path::new("offline"))?;
+        self.remove_dir(Path::new("assistant"))?;
         if let Ok(file) = self.read_keys() {
             for slot in file.slots.iter().filter(|s| s.kind == "credential-store") {
                 self.credentials.remove(&slot.id)?;

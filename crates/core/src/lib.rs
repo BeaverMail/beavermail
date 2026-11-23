@@ -8,7 +8,7 @@
 pub mod model;
 pub mod sample;
 
-pub use model::{address_text, OAuthProvider, Account, AddressBook, Attachment, CalendarSource, Columns, Condition, Filter, FilterAction, ListLayout, AuthCheck, AuthResult, Density, DisplayMode, Hit, Keep, Label, Mailbox, MessageBody, MessageId, MessageSummary, Outgoing, OutgoingFile, Progress, Role, Encryption, Seal, Server, Settings, Signature, Sort, SortBy, SignatureCheck, SignedWith, SyncReport, Tls, Quota};
+pub use model::{address_text, OAuthProvider, Account, Assistant, LlmProvider, AddressBook, Attachment, CalendarSource, Columns, Condition, Filter, FilterAction, ListLayout, AuthCheck, AuthResult, Density, DisplayMode, Hit, Keep, Label, Mailbox, MessageBody, MessageId, MessageSummary, Outgoing, OutgoingFile, Progress, Role, Encryption, Seal, Server, Settings, Signature, Sort, SortBy, SignatureCheck, SignedWith, SyncReport, Tls, Quota};
 
 use std::fmt;
 use std::future::Future;

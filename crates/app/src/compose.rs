@@ -71,6 +71,14 @@ pub struct Compose {
     pub sig_from: u64,
     /// Put the caret at the top of the body when it is first drawn (above a signature).
     caret_top: bool,
+    /// The message this replies to, so the assistant can read its conversation.
+    pub answers: Option<beavermail_core::MessageId>,
+    /// The assistant's instruction being typed; `None` when its row is closed.
+    pub assist: Option<String>,
+    /// The assistant is writing.
+    pub assisting: bool,
+    /// The text above the signature and quote was written by the assistant and not yet sent.
+    pub generated: bool,
     /// People to suggest in the address fields, as (name, address), best first.
     pub contacts: std::sync::Arc<Vec<Contact>>,
     /// An address field shows suggestions: Esc closes them, not the window.
@@ -150,6 +158,8 @@ pub enum Outcome {
     Learn(String),
     /// Download the dictionary of the message's language.
     Download,
+    /// Have the assistant write the message, with this instruction (may be empty).
+    Assist(String),
 }
 
 /// What "send later" offers from `now`, as (label, moment): tomorrow morning and afternoon, and
@@ -272,6 +282,10 @@ impl Compose {
             sig: String::new(),
             sig_from: from,
             caret_top: false,
+            answers: None,
+            assist: None,
+            assisting: false,
+            generated: false,
             contacts: Default::default(),
             suggesting: false,
             encrypt: false,
@@ -537,6 +551,26 @@ impl Compose {
     }
 
 
+    /// Where the user's own text ends: at the signature, else at the quoted message, else the end.
+    fn own_end(&self) -> usize {
+        let at = |needle: &str| (!needle.is_empty()).then(|| self.body.find(needle)).flatten();
+        // The line [`Self::reply`] puts above the quoted message, not any "On" the user wrote.
+        let quote = self.body.match_indices("\n\nOn ").map(|(i, _)| i).find(|&i| self.body[i + 2..].lines().next().is_some_and(|l| l.ends_with(" wrote:")));
+        at(&self.sig).or(quote).unwrap_or(self.body.len())
+    }
+
+    /// What the user wrote, without signature and quote: the assistant's draft to work on.
+    pub fn own_text(&self) -> &str {
+        &self.body[..self.own_end()]
+    }
+
+    /// Puts the assistant's text in place of the user's own, before the signature and quote.
+    pub fn put_generated(&mut self, text: &str) {
+        let end = self.own_end();
+        self.body.replace_range(..end, text.trim_end());
+        self.generated = true;
+    }
+
     pub fn attached_size(&self) -> u64 {
         self.files.iter().map(|f| f.size).sum()
     }
@@ -608,7 +642,7 @@ pub fn usable(paths: impl IntoIterator<Item = std::path::PathBuf>) -> Vec<(std::
 }
 
 /// "Name <address>" for a message's sender.
-fn sender(message: &MessageSummary) -> String {
+pub fn sender(message: &MessageSummary) -> String {
     match message.address.trim() {
         "" => message.from.trim().to_owned(),
         address => beavermail_core::address_text(&message.from, address),
@@ -968,8 +1002,73 @@ fn toolbar(ui: &mut Ui, ctx: &egui::Context, t: &Tokens, compose: &mut Compose, 
     ui.label(RichText::new("Markdown: sent as plain text with a simple HTML version. No images or tracking.").size(12.5).color(t.text_dim));
 }
 
+/// The assistant's instruction field, focused when it opens.
+const ASSIST_FIELD: &str = "compose_assist";
+
+/// The assistant: a quiet button, then a card with the instruction and Draft, and its progress while
+/// it writes. The instruction when Draft is pressed.
+fn assist_row(ui: &mut Ui, t: &Tokens, compose: &mut Compose) -> Option<String> {
+    let mut asked = None;
+    let (answers, own) = (compose.answers.is_some(), !compose.own_text().trim().is_empty());
+    if compose.assist.is_none() && !compose.assisting {
+        let tip = if answers { "Draft the reply from the conversation" } else { "Write the message from an instruction" };
+        if ui.add(egui::Button::image_and_text(Icon::Sparkles.image(crate::icons::SIZE, t.text_dim), "Assistant").frame(false).sense(NO_TAB)).on_hover_text(tip).clicked() {
+            compose.assist = Some(String::new());
+            ui.memory_mut(|m| m.request_focus(egui::Id::new(ASSIST_FIELD)));
+        }
+        return None;
+    }
+    Frame::new().fill(t.surface).stroke(egui::Stroke::new(1.0, t.border_strong)).corner_radius(theme::CONTROL_RADIUS).inner_margin(12).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.add(Icon::Sparkles.image(crate::icons::SIZE, t.accent));
+            ui.label(RichText::new("Assistant").family(theme::bold()));
+            let about = match (compose.assisting, answers) {
+                (true, true) => "Drafting the reply…",
+                (true, false) => "Writing the message…",
+                (false, true) => "Drafts the reply from the conversation",
+                (false, false) => "Writes the message from your instruction",
+            };
+            ui.label(RichText::new(about).size(13.0).color(t.text_dim));
+            if !compose.assisting {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if crate::icons::button_small(ui, t, Icon::X, "Close the assistant").clicked() {
+                        compose.assist = None;
+                    }
+                });
+            }
+        });
+        if compose.assisting {
+            ui.add_space(8.0);
+            ui.add(egui::Spinner::new().size(16.0));
+            return;
+        }
+        let Some(instruction) = compose.assist.as_mut() else { return };
+        ui.add_space(8.0);
+        let hint = if answers { "What to answer, if anything: \"accept, but next week\"" } else { "What to write: \"thank the team for the launch\"" };
+        // As wide as the window already is, like the body: a width asked from the space left would grow it.
+        let field = ui.add(TextEdit::multiline(instruction).id(egui::Id::new(ASSIST_FIELD)).hint_text(hint).desired_width(f32::INFINITY).desired_rows(2).margin(egui::Margin::symmetric(10, 8)));
+        let submit = field.has_focus() && ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Enter));
+        let can = answers || own || !instruction.trim().is_empty();
+        ui.add_space(8.0);
+        ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
+            let why = "Write what the message should say";
+            let draft = views::primary_button(ui, t, "Draft", can).on_hover_text("Ctrl+Enter").on_disabled_hover_text(why).clicked();
+            if (draft || (submit && can)) && let Some(text) = compose.assist.take() {
+                asked = Some(text);
+            }
+            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                ui.label(RichText::new("Nothing is sent until you press Send.").size(13.0).color(t.text_dim));
+            });
+        });
+    });
+    ui.add_space(8.0);
+    asked
+}
+
 /// Shows the window. `senders` lists the accounts that can send, as (serial, address).
-pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &[(u64, String)], rich: bool, spelling: &Spelling) -> Outcome {
+/// `assistant`: a language model is set up, so the message can be written with it.
+pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &[(u64, String)], rich: bool, spelling: &Spelling, assistant: bool) -> Outcome {
     let mut outcome = Outcome::Keep;
     find_misspelled(compose, spelling);
     let waiting_for_files = compose.pending() > 0;
@@ -1079,6 +1178,14 @@ pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &
                 // Leave room for the header rows and buttons so the window never outgrows a small screen.
                 let body_h = (ctx.content_rect().height() - 360.0).clamp(120.0, 420.0);
                 let id = egui::Id::new("compose_body");
+                if assistant && !compose.preview
+                    && let Some(instruction) = assist_row(ui, t, compose)
+                {
+                    outcome = Outcome::Assist(instruction);
+                }
+                if compose.generated {
+                    views::note(ui, Icon::Sparkles, t.text_dim, "Written by the assistant: read it before sending", "Nothing is sent until you press Send");
+                }
                 if rich {
                     toolbar(ui, ctx, t, compose, id);
                 }
@@ -1653,7 +1760,7 @@ mod tests {
         let frame = |events: Vec<egui::Event>, compose: &mut Compose| {
             let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(1600.0, 1000.0))), events, ..Default::default() };
             let mut output = ctx.run_ui(input, |ui| {
-                sent.set(matches!(window(ui.ctx(), &Tokens::dark(), compose, &[(1, "me@x.org".into())], false, &spelling), Outcome::Send));
+                sent.set(matches!(window(ui.ctx(), &Tokens::dark(), compose, &[(1, "me@x.org".into())], false, &spelling, false), Outcome::Send));
             });
             output.textures_delta.clear(); // nothing is drawn here
         };
@@ -1736,7 +1843,7 @@ mod tests {
         let size = |compose: &mut Compose| {
             for _ in 0..2 {
                 let mut output = ctx.run_ui(input(), |ui| {
-                    window(ui.ctx(), &Tokens::dark(), compose, &[(1, "me@x.org".into())], false, &OFF);
+                    window(ui.ctx(), &Tokens::dark(), compose, &[(1, "me@x.org".into())], false, &OFF, false);
                 });
                 output.textures_delta.clear(); // nothing is drawn here
             }
@@ -1770,7 +1877,7 @@ mod tests {
         let frame = |events: Vec<egui::Event>, compose: &mut Compose| {
             let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(1600.0, 1000.0))), events, ..Default::default() };
             let mut output = ctx.run_ui(input, |ui| {
-                window(ui.ctx(), &Tokens::dark(), compose, &[(1, "me@x.org".into())], false, &OFF);
+                window(ui.ctx(), &Tokens::dark(), compose, &[(1, "me@x.org".into())], false, &OFF, false);
             });
             output.textures_delta.clear(); // nothing is drawn here
         };
@@ -1817,7 +1924,7 @@ mod tests {
         let frame = |events: Vec<egui::Event>, compose: &mut Compose| {
             let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(1600.0, 1000.0))), events, ..Default::default() };
             let mut output = ctx.run_ui(input, |ui| {
-                window(ui.ctx(), &Tokens::dark(), compose, &[(1, "me@x.org".into())], false, &OFF);
+                window(ui.ctx(), &Tokens::dark(), compose, &[(1, "me@x.org".into())], false, &OFF, false);
             });
             output.textures_delta.clear(); // nothing is drawn here
         };
@@ -2018,6 +2125,21 @@ mod tests {
         let out = c.outgoing("me@example.org", false);
         assert_eq!(out.in_reply_to.as_deref(), Some("m2@host"));
         assert_eq!(out.references, ["m1@host", "m2@host"]);
+    }
+
+    #[test]
+    fn the_assistant_writes_above_signature_and_quote() {
+        let (summary, body) = message();
+        let mut c = Compose::reply(0, "me@example.org", &summary, &body, false).with_signature("Bob");
+        c.body.insert_str(0, "On Monday, yes.");
+        assert_eq!(c.own_text(), "On Monday, yes.");
+        c.put_generated("Hello Ada,\nsee you there.\n");
+        assert!(c.body.starts_with("Hello Ada,\nsee you there.\n\n-- \nBob\n\nOn 2026-10-13"), "{}", c.body);
+        assert!(c.generated);
+        let mut fresh = Compose::new(0);
+        fresh.body = "draft".into();
+        fresh.put_generated("text");
+        assert_eq!(fresh.body, "text");
     }
 
     #[test]

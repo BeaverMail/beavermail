@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 mod actions;
+mod assistant;
 mod attachments;
 mod body;
 mod books;
@@ -34,6 +35,7 @@ mod tabs;
 mod html;
 mod icons;
 mod learn;
+mod llm;
 mod security;
 mod spelling;
 mod theme;
@@ -123,6 +125,14 @@ enum Event {
     FileStored(String, std::path::PathBuf, Result<(), String>),
     /// A one-click unsubscribe ended: (who, result).
     Unsubscribed(String, Result<(), String>),
+    /// The models the assistant's provider offers.
+    AssistantModels(Result<Vec<(String, String)>, String>),
+    /// What was sent to the assistant before.
+    AssistantLog(Result<Vec<assistant::Entry>, String>),
+    /// A request for the assistant is ready, waiting to be sent.
+    AssistantReady(assistant::Prepared),
+    /// The assistant answered, or could not (an empty error: the user cancelled).
+    Assistant(assistant::Purpose, Result<String, String>),
     /// A dictionary for the spell check was read or downloaded: (its code, result).
     Dictionary(String, Result<Arc<beavermail_spell::Speller>, String>),
     /// A sign-in with a provider ended: (its cancel flag, which tells it from an earlier one, result).
@@ -563,6 +573,8 @@ struct ReaderOutcome {
     collapse: Option<MessageId>,
     /// "Show earlier" was pressed in the conversation.
     expand: bool,
+    /// "Summarise" was pressed, or the summary closed.
+    summarize: Option<bool>,
     /// Trust was pressed for this message's sender.
     trust: Option<MessageId>,
     /// The sender's name was clicked: open their card, as (address, name).
@@ -915,6 +927,7 @@ enum SettingsPage {
     Accounts,
     Reading,
     Writing,
+    Assistant,
     Calendars,
     Spam,
     Filters,
@@ -927,7 +940,7 @@ enum SettingsPage {
 }
 
 impl SettingsPage {
-    const ALL: [Self; 11] = [Self::Accounts, Self::Appearance, Self::Reading, Self::Writing, Self::Calendars, Self::Spam, Self::Filters, Self::Labels, Self::Encryption, Self::Storage, Self::Troubleshooting];
+    const ALL: [Self; 12] = [Self::Accounts, Self::Appearance, Self::Reading, Self::Writing, Self::Assistant, Self::Calendars, Self::Spam, Self::Filters, Self::Labels, Self::Encryption, Self::Storage, Self::Troubleshooting];
 
     fn title(self) -> &'static str {
         match self {
@@ -935,6 +948,7 @@ impl SettingsPage {
             Self::Appearance => "Appearance",
             Self::Accounts => "Accounts",
             Self::Writing => "Writing",
+            Self::Assistant => "Assistant",
             Self::Calendars => "Calendars",
             Self::Spam => "Suspicious mail",
             Self::Filters => "Filters",
@@ -952,6 +966,7 @@ impl SettingsPage {
             Self::Appearance => Some(Icon::Palette),
             Self::Accounts => Some(Icon::Users),
             Self::Writing => Some(Icon::Pencil),
+            Self::Assistant => Some(Icon::Sparkles),
             Self::Calendars => Some(Icon::Calendar),
             Self::Spam => Some(Icon::Spam),
             Self::Filters => Some(Icon::Sliders),
@@ -969,6 +984,7 @@ impl SettingsPage {
             Self::Appearance => "How the app looks.",
             Self::Accounts => "The mail accounts in BeaverMail. Pick one to change its servers, name and folders.",
             Self::Writing => "How messages you write are composed and sent.",
+            Self::Assistant => "Drafts replies and summarises long conversations with a language model and your own key. Mail leaves only when you ask, and nothing is sent on its own.",
             Self::Calendars => "The calendars synced from a server, and the one on this computer.",
             Self::Spam => "Mail from people you know is never held. Nothing moves on the server.",
             Self::Filters => "Rules that sort new mail as it arrives: move it, star it, label it or mark it as read.",
@@ -997,6 +1013,12 @@ fn event_targets(calendars: &[beavermail_core::CalendarSource]) -> Vec<(String, 
 }
 
 pub(crate) const FORM_WIDTH: f32 = 460.0;
+
+/// Conversations this long offer the assistant's summary.
+const SUMMARY_FROM: usize = 4;
+
+/// Messages this long offer it too.
+const SUMMARY_CHARS: usize = 1500;
 const SETTINGS_WIDTH: f32 = 780.0;
 const PALETTE_WIDTH: f32 = 560.0;
 /// How far the toast sits above the window's bottom edge: clear of the status bar.
@@ -1454,6 +1476,10 @@ struct BeaverApp {
     confirm_remove: Option<u64>,
     /// Unsubscribe was pressed (who, how), until the user confirms.
     confirm_unsubscribe: Option<(String, unsubscribe::Method)>,
+    /// The assistant's settings page, and the request waiting for the user's yes.
+    assistant: assistant::State,
+    /// The summary of a conversation, by one of its messages; `None` inside while it is being written.
+    summary: Option<(MessageId, Option<Result<String, String>>)>,
     /// Block sender was pressed on this message, until the user confirms.
     confirm_block: Option<MessageId>,
     /// The source tab shown, or the last one.
@@ -1693,6 +1719,8 @@ impl BeaverApp {
             settings_leave: None,
             confirm_remove: None,
             confirm_unsubscribe: None,
+            assistant: assistant::State::default(),
+            summary: None,
             confirm_block: None,
             source_view: None,
             palette: None,
@@ -3474,7 +3502,7 @@ impl BeaverApp {
             failed: dictionaries.failed.as_ref().filter(|(c, _)| on && c == language).map(|(_, e)| e.as_str()),
             before_send: self.settings.spelling_before_send,
         };
-        let outcome = if esc { compose::Outcome::Discard } else { compose::window(ctx, t, &mut compose, &senders, self.settings.rich_outgoing, &spelling) };
+        let outcome = if esc { compose::Outcome::Discard } else { compose::window(ctx, t, &mut compose, &senders, self.settings.rich_outgoing, &spelling, assistant::ready(&self.settings.assistant)) };
         if compose.from != compose.sig_from {
             let signature = self.view(compose.from).map(|v| v.account.signature.clone()).unwrap_or_default();
             compose.change_signature(compose.from, &signature);
@@ -3518,6 +3546,13 @@ impl BeaverApp {
                 self.save_settings();
             }
             compose::Outcome::Download => self.want_dictionary(&compose.spell.language.clone(), true, true),
+            compose::Outcome::Assist(instruction) => {
+                compose.assisting = true;
+                compose.error = None;
+                let draft = compose.own_text().to_owned();
+                let make = move |me: &str, mails: &[llm::Mail]| llm::reply_input(&instruction, &draft, me, mails);
+                self.assistant_prepare(assistant::Purpose::Reply(compose.id.clone()), Some(compose.from), compose.answers, llm::REPLY, make);
+            }
         }
         if compose.send_at.is_some_and(|at| at <= std::time::Instant::now()) {
             compose.send_at = None;
@@ -3879,6 +3914,7 @@ impl BeaverApp {
         let dirty = account.as_ref().zip(self.account_edit.as_ref()).is_some_and(|(a, form)| form.changed(a));
         let mut changed = false;
         let mut filter_action = None;
+        let mut assistant_page = None;
         let mut rescreen = false;
         let mut vault_request = None;
         let mut unlock_again = false;
@@ -4333,6 +4369,11 @@ impl BeaverApp {
                                     }
                                 }
                             }
+                            SettingsPage::Assistant => {
+                                let (edited, action) = assistant::page(ui, t, &mut self.settings.assistant, &mut self.assistant);
+                                changed |= edited;
+                                assistant_page = action;
+                            }
                             SettingsPage::Troubleshooting => {
                                 let about = "How long messages take to open, and what fails. Never the text, subject or addresses of a message.";
                                 if views::switch_row(ui, t, &mut self.settings.diagnostics, "Write a diagnostic log", about).changed() {
@@ -4429,6 +4470,9 @@ impl BeaverApp {
         self.leave_dialog(ctx, t);
         if let Some(action) = filter_action {
             self.filter_page_action(action);
+        }
+        if let Some(action) = assistant_page {
+            self.assistant_page_action(action);
         }
         if changed {
             self.save_settings();
@@ -4581,6 +4625,116 @@ impl BeaverApp {
     }
 
     /// Confirms leaving a mailing list, naming where the request goes.
+    fn assistant_page_action(&mut self, action: assistant::PageAction) {
+        match action {
+            assistant::PageAction::LoadModels => {
+                self.assistant.loading = true;
+                let settings = self.settings.assistant.clone();
+                self.spawn(async move {
+                    let models = move || -> Result<Vec<(String, String)>, String> {
+                        let provider = settings.provider.ok_or("the assistant is off")?;
+                        let key = beavermail_accounts::assistant_key(provider)?;
+                        llm::models(&llm::Target { provider, url: settings.url, key, model: String::new() })
+                    };
+                    Event::AssistantModels(tokio::task::spawn_blocking(models).await.unwrap_or_else(|e| Err(e.to_string())))
+                });
+            }
+            assistant::PageAction::ShowLog => {
+                let vault = self.vault.clone();
+                self.spawn(async move { Event::AssistantLog(tokio::task::spawn_blocking(move || assistant::read_log(&vault)).await.unwrap_or_else(|e| Err(e.to_string()))) });
+            }
+            assistant::PageAction::ClearLog => {
+                if let Err(e) = assistant::clear_log(&self.vault) {
+                    self.error = Some(format!("Could not delete the record: {e}"));
+                }
+                self.assistant.log = None;
+            }
+        }
+    }
+
+    /// Reads the conversation of `id` (nothing when `None`), then makes the request with `make` in the
+    /// background, told who the user is: account `me`, and which messages came from their accounts. It
+    /// comes back as [`Event::AssistantReady`].
+    fn assistant_prepare(&mut self, purpose: assistant::Purpose, me: Option<u64>, id: Option<MessageId>, system: &'static str, make: impl FnOnce(&str, &[llm::Mail]) -> String + Send + 'static) {
+        let me = me.and_then(|serial| self.view(serial)).map(|v| v.account.sender()).unwrap_or_default();
+        let own: Vec<String> = self.accounts.iter().map(|v| v.account.address().trim().to_lowercase()).collect();
+        let mut wanted = Vec::new();
+        let mut source = None;
+        if let Some(id) = id {
+            let members = if self.threaded() { self.conversations.members(id).to_vec() } else { Vec::new() };
+            let members = if members.is_empty() { vec![id] } else { members };
+            wanted = members.into_iter().filter_map(|m| self.summary_of(m).map(|s| (m, compose::sender(s), s.received.clone(), own.contains(&s.address.trim().to_lowercase())))).collect();
+            source = self.serial_of(id).and_then(|serial| self.view(serial)).and_then(|v| v.source.clone());
+            if source.is_none() {
+                return self.assistant_answer(purpose, Err("its account is not connected".into()));
+            }
+        }
+        self.spawn(async move {
+            let mut read = Vec::new();
+            for (m, from, date, mine) in wanted {
+                let Some(source) = &source else { break };
+                match source.body(m).await {
+                    Ok(body) => read.push((from, date, body.text, mine)),
+                    Err(e) => return Event::Assistant(purpose, Err(format!("could not read a message of the conversation: {e}"))),
+                }
+            }
+            let mails: Vec<llm::Mail> = read.iter().map(|(from, date, text, mine)| llm::Mail { from, date, text, mine: *mine }).collect();
+            let input = make(&me, &mails);
+            Event::AssistantReady(assistant::Prepared { purpose, system, input, messages: mails.len() })
+        });
+    }
+
+    fn assistant_send(&mut self, prepared: assistant::Prepared) {
+        let (vault, settings) = (self.vault.clone(), self.settings.assistant.clone());
+        self.spawn(async move {
+            let purpose = prepared.purpose.clone();
+            let result = tokio::task::spawn_blocking(move || assistant::send(&vault, &settings, &prepared)).await.unwrap_or_else(|e| Err(e.to_string()));
+            Event::Assistant(purpose, result)
+        });
+    }
+
+    /// Puts the assistant's answer where it was asked for; an empty error means the user cancelled.
+    fn assistant_answer(&mut self, purpose: assistant::Purpose, result: Result<String, String>) {
+        match purpose {
+            assistant::Purpose::Reply(draft) => {
+                let Some(compose) = self.compose.as_mut().filter(|c| c.id == draft) else { return };
+                compose.assisting = false;
+                match result {
+                    Ok(text) => compose.put_generated(&text),
+                    Err(e) if !e.is_empty() => compose.error = Some(format!("The assistant could not write: {e}")),
+                    Err(_) => {}
+                }
+            }
+            assistant::Purpose::Summary(id) => match result {
+                Err(e) if e.is_empty() => self.summary = None,
+                result if self.summary.as_ref().is_some_and(|(of, _)| *of == id) => self.summary = Some((id, Some(result))),
+                _ => {}
+            },
+        }
+    }
+
+    /// Asks the assistant to summarise the conversation of `id`.
+    fn summarize(&mut self, id: MessageId) {
+        self.summary = Some((id, None));
+        let me = self.serial_of(id);
+        self.assistant_prepare(assistant::Purpose::Summary(id), me, Some(id), llm::SUMMARY, llm::summary_input);
+    }
+
+    /// Asks before mail leaves for the assistant.
+    fn assistant_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
+        let Some(send) = assistant::confirm(ctx, t, &self.settings.assistant, &mut self.assistant) else { return };
+        let Some(prepared) = self.assistant.confirm.take() else { return };
+        if send && std::mem::take(&mut self.assistant.trust) {
+            self.settings.assistant.trusted = true;
+            self.save_settings();
+        }
+        if send {
+            self.assistant_send(prepared);
+        } else {
+            self.assistant_answer(prepared.purpose, Err(String::new()));
+        }
+    }
+
     fn unsubscribe_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
         let Some((who, way)) = self.confirm_unsubscribe.clone() else { return };
         let host = way.host();
@@ -6481,6 +6635,9 @@ impl BeaverApp {
             _ => compose::Compose::reply(serial, own, summary, body, matches!(action, Action::ReplyAll)),
         };
         let mut compose = compose.with_signature(&view.account.signature);
+        if !matches!(action, Action::Forward) {
+            compose.answers = Some(id);
+        }
         let carry = std::mem::take(&mut compose.carry);
         let source = view.source.clone();
         let draft = compose.id.clone();
@@ -7571,6 +7728,14 @@ impl BeaverApp {
             Event::Contacts(Ok(contacts)) => self.contacts = Arc::new(contacts),
             Event::Contacts(Err(_)) => {} // the fields only miss their suggestions
             Event::Dictionary(code, result) => self.dictionaries.arrived(code, result),
+            Event::AssistantModels(result) => {
+                self.assistant.loading = false;
+                self.assistant.models = Some(result);
+            }
+            Event::AssistantLog(result) => self.assistant.log = Some(result),
+            Event::AssistantReady(prepared) if self.settings.assistant.trusted => self.assistant_send(prepared),
+            Event::AssistantReady(prepared) => self.assistant.confirm = Some(prepared),
+            Event::Assistant(purpose, result) => self.assistant_answer(purpose, result),
             Event::Unsubscribed(who, result) => match result {
                 Ok(()) => self.notice = Some((format!("Unsubscribed from {who}. Mail already on its way may still arrive."), std::time::Instant::now())),
                 Err(e) => self.error = Some(format!("Could not unsubscribe from {who}: {e}. Try the unsubscribe link in the message.")),
@@ -9015,6 +9180,11 @@ impl BeaverApp {
             None => Vec::new(),
         };
         let whole = self.whole_conversation;
+        // A long conversation, or a long message on its own or in a short one.
+        let long = self.body.as_ref().is_some_and(|b| b.data.text.chars().count() >= SUMMARY_CHARS);
+        let offer_summary = assistant::ready(&self.settings.assistant) && (conversation.len() >= SUMMARY_FROM || long);
+        // The summary of this conversation, not of one opened before.
+        let summary = self.summary.as_ref().filter(|(of, _)| self.message.is_some_and(|m| self.conversations.same(*of, m))).map(|(_, s)| s.clone());
         let work_offline = self.work_offline;
         // The correction that makes sense for the tab's message; the reasons are the warnings shown above it.
         let correction = self.message.and_then(|id| self.correction(id)).map(|(choice, _)| choice);
@@ -9340,7 +9510,15 @@ impl BeaverApp {
                             if hidden > 0 && ui.button(format!("Show {hidden} earlier")).clicked() {
                                 out.expand = true;
                             }
+                            if offer_summary && summary.is_none() && assistant::summary_button(ui, t, "A few lines on the whole conversation, by the assistant") {
+                                out.summarize = Some(true);
+                            }
                         });
+                        if let Some(state) = &summary
+                            && assistant::summary_box(ui, t, state)
+                        {
+                            out.summarize = Some(false);
+                        }
                         ui.add_space(8.0);
                         for (i, m) in conversation.iter().enumerate() {
                             if m.id == message.id && !folded_anchor {
@@ -9373,6 +9551,14 @@ impl BeaverApp {
                             }
                         }
                     } else {
+                        if offer_summary && summary.is_none() && assistant::summary_button(ui, t, "A few lines on this message, by the assistant") {
+                            out.summarize = Some(true);
+                        }
+                        if let Some(state) = &summary
+                            && assistant::summary_box(ui, t, state)
+                        {
+                            out.summarize = Some(false);
+                        }
                         heard.push((message.clone(), section(ui, &message, body, true, false)));
                     }
                     // As at the end of a conversation in every threaded client: answer its latest message.
@@ -9632,7 +9818,7 @@ impl eframe::App for BeaverApp {
         slow.mark("keys");
         // Without the reading pane only a message tab has a reader.
         let shows_reader = !contacts && (self.in_tab || self.settings.reading_pane);
-        let ReaderOutcome { action, url, mode, remember, attachment, save_many, allow_sender, mark, bulk, move_to, unsubscribe, block, unfold, collapse, expand, trust, card, retry, source, invite } =
+        let ReaderOutcome { action, url, mode, remember, attachment, save_many, allow_sender, mark, bulk, move_to, unsubscribe, block, unfold, collapse, expand, summarize, trust, card, retry, source, invite } =
             if shows_reader { self.reader(ui, &t) } else { ReaderOutcome::default() };
         slow.mark("reader");
         if retry && let Some(at) = self.active() {
@@ -9645,6 +9831,11 @@ impl eframe::App for BeaverApp {
             self.trust(id);
         }
         self.whole_conversation |= expand;
+        match (summarize, self.message) {
+            (Some(true), Some(id)) => self.summarize(id),
+            (Some(false), _) => self.summary = None,
+            _ => {}
+        }
         if let Some(id) = unfold {
             self.unfold(id);
         }
@@ -9751,6 +9942,7 @@ impl eframe::App for BeaverApp {
             self.key_action(action);
         }
         self.unsubscribe_dialog(ui.ctx(), &t);
+        self.assistant_dialog(ui.ctx(), &t);
         self.palette_window(ui.ctx(), &t);
         self.toast(ui.ctx(), &t);
         self.block_dialog(ui.ctx(), &t);

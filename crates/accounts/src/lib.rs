@@ -148,6 +148,29 @@ pub fn forget_calendar_password(calendar: &beavermail_core::CalendarSource) -> R
     }
 }
 
+/// The key for the assistant's provider (an API key, or the local server's own token).
+fn assistant_entry(provider: beavermail_core::LlmProvider) -> Result<keyring::Entry, String> {
+    keyring::Entry::new(SERVICE, &format!("llm:{}", provider.key())).map_err(|e| format!("credential store: {e}"))
+}
+
+/// The provider's key; empty when none is kept (a local server may need none).
+pub fn assistant_key(provider: beavermail_core::LlmProvider) -> Result<String, String> {
+    match assistant_entry(provider)?.get_password() {
+        Ok(key) => Ok(key),
+        Err(keyring::Error::NoEntry) => Ok(String::new()),
+        Err(e) => Err(format!("credential store, assistant: {e}")),
+    }
+}
+
+/// Keeps the provider's key; an empty one removes it.
+pub fn set_assistant_key(provider: beavermail_core::LlmProvider, key: &str) -> Result<(), String> {
+    let entry = assistant_entry(provider)?;
+    match if key.is_empty() { entry.delete_credential() } else { entry.set_password(key) } {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(format!("credential store: {e}")),
+    }
+}
+
 pub fn password(account: &Account) -> Result<String, String> {
     entry(account)?.get_password().map_err(|e| format!("credential store: {e}"))
 }
