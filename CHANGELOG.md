@@ -9,6 +9,10 @@ What changed in each version of BeaverMail, newest first.
 - An assistant in Settings › Assistant, with your own key for Anthropic, OpenAI or a local server speaking OpenAI's API (Ollama, LM Studio, llama.cpp), the models listed by the provider itself: Assistant in the message being written drafts the reply from the conversation or the message from an instruction, marked as written by it and never sent on its own; Summarise on a conversation of 4 messages or more, or on a long message. Before mail leaves it shows how much and where, unless told not to ask again, and what was sent is kept, encrypted like the mail, to read or delete in Settings.
 - Server storage on each account's page, where the server sets limits (IMAP QUOTA): space used of the limit, and a warning mark on the account in the sidebar once it is 80, 90 (by default) or 95% full, or never. When Trash refuses mail because the mailbox is full, the messages can be deleted for good instead, after a confirmation.
 
+### Fixed
+
+- The text of a message sent only as HTML keeps its lines: web mail writes each in a block of its own, which ran together into one line in replies, forwards, the text view and search. The earlier message below a reply stays apart too: after a line, as Outlook and web mail set off its From / Sent header, or quoted with > when it was quoted in the message.
+
 ## 0.2.0 – 2026-11-11
 
 ### Added

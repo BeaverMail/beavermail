@@ -1280,6 +1280,92 @@ fn attachment_data(raw: &[u8], index: u32) -> Result<(String, Vec<u8>), MailErro
     Ok((part.attachment_name().map_or_else(|| format!("attachment-{}", index + 1), str::to_owned), part.contents().to_vec()))
 }
 
+/// The line the original message's header block gets below a reply, as Outlook writes it in plain text.
+const RULE: &str = "________________________________";
+/// Where a `<blockquote>` starts and ends, kept through the conversion to text (private-use characters).
+const QUOTE_IN: char = '\u{E000}';
+const QUOTE_OUT: char = '\u{E001}';
+
+/// The text of a message that has only HTML. mail-parser's conversion ends a line only at `<br>` and
+/// `</p>`, but web mail puts each line in a `<div>`: so a line break goes before every block's end too.
+/// What sets an earlier message apart is kept as plain-text mail does: a quote as `> ` lines, a rule
+/// (`<hr>`, or a block with a top border like Outlook's "From: / Sent:" header) as a line of its own.
+fn html_text(html: &str) -> String {
+    const BLOCKS: [&str; 12] = ["div", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "table", "pre"];
+    // Lower-casing ASCII keeps every byte where it was, so the offsets found apply to `html` too.
+    let lower = html.to_ascii_lowercase();
+    let mut marked = String::with_capacity(html.len() + 256);
+    let (mut copied, mut after_block) = (0, None);
+    for (at, _) in lower.match_indices('<') {
+        let tag = &lower[at + 1..];
+        let end = tag.find('>').map_or(lower.len(), |e| at + e + 2);
+        let add = if let Some(closing) = tag.strip_prefix('/') {
+            let name = closing.split(|c: char| c == '>' || c.is_ascii_whitespace()).next().unwrap_or_default();
+            if !BLOCKS.contains(&name) {
+                continue;
+            }
+            // Blocks inside blocks end together: one line break for them all.
+            let nested = after_block.is_some_and(|e: usize| e <= at && lower[e..at].trim().is_empty());
+            after_block = Some(end);
+            let mut add = if nested { String::new() } else { "<br>".to_owned() };
+            if name == "blockquote" {
+                add.push(QUOTE_OUT);
+            }
+            add
+        } else {
+            match tag.split(|c: char| c == '>' || c == '/' || c.is_ascii_whitespace()).next().unwrap_or_default() {
+                // Right after a block's end the line is already broken.
+                "blockquote" if after_block.is_some_and(|e: usize| e <= at && lower[e..at].trim().is_empty()) => QUOTE_IN.to_string(),
+                "blockquote" => format!("<br>{QUOTE_IN}"),
+                "hr" => format!("<br><br>{RULE}<br>"),
+                _ if top_border(&lower[at..end]) => format!("<br><br>{RULE}<br>"),
+                _ => continue,
+            }
+        };
+        if !add.is_empty() {
+            marked.push_str(&html[copied..at]);
+            marked.push_str(&add);
+            copied = at;
+        }
+    }
+    marked.push_str(&html[copied..]);
+    let text = mail_parser::decoders::html::html_to_text(&marked);
+    let mut out = String::with_capacity(text.len());
+    let mut depth = 0usize;
+    for line in text.split('\n') {
+        // Marks at the start of a line count for it, the rest from the next line on.
+        let mut rest = line.trim_start();
+        while let Some(mark) = rest.chars().next().filter(|c| matches!(*c, QUOTE_IN | QUOTE_OUT)) {
+            depth = if mark == QUOTE_IN { depth + 1 } else { depth.saturating_sub(1) };
+            rest = rest[mark.len_utf8()..].trim_start();
+        }
+        let quoted = depth;
+        let words: String = rest.chars().filter(|c| !matches!(*c, QUOTE_IN | QUOTE_OUT)).collect();
+        for mark in rest.chars().filter(|c| matches!(*c, QUOTE_IN | QUOTE_OUT)) {
+            depth = if mark == QUOTE_IN { depth + 1 } else { depth.saturating_sub(1) };
+        }
+        if words.trim().is_empty() && line.chars().any(|c| matches!(c, QUOTE_IN | QUOTE_OUT)) {
+            continue; // a line that only held marks
+        }
+        let line = if line.starts_with(|c| matches!(c, QUOTE_IN | QUOTE_OUT)) || quoted > 0 { words.as_str() } else { line };
+        out.push_str(format!("{}{}", "> ".repeat(quoted), line.trim_end()).trim_end_matches(' '));
+        out.push('\n');
+    }
+    // Never more than one empty line in a row.
+    while out.contains("\n\n\n") {
+        out = out.replace("\n\n\n", "\n\n");
+    }
+    out.trim().to_owned()
+}
+
+/// A tag whose style draws a line above it, as the header of the message below a reply.
+fn top_border(tag: &str) -> bool {
+    let Some(at) = tag.find("border-top:") else { return false };
+    let value = tag[at + "border-top:".len()..].trim_start();
+    let value = &value[..value.find([';', '"', '\'']).unwrap_or(value.len())];
+    !value.is_empty() && !value.starts_with("none") && !value.starts_with("hidden") && !value.starts_with('0')
+}
+
 /// The text, recipients and threading headers of a complete message.
 fn parse_body(raw: &[u8]) -> Result<MessageBody, MailError> {
     let message = MessageParser::default().parse(raw).ok_or(MailError::NotFound)?;
@@ -1287,7 +1373,11 @@ fn parse_body(raw: &[u8]) -> Result<MessageBody, MailError> {
     let sealed = message.root_part().content_type().is_some_and(|c| c.ctype().eq_ignore_ascii_case("multipart") && c.subtype().is_some_and(|s| s.eq_ignore_ascii_case("encrypted")));
     Ok(MessageBody {
         attachments: attachments(&message),
-        text: if sealed { String::new() } else { message.body_text(0).map(|t| t.into_owned()).unwrap_or_default() },
+        text: match message.text_part(0) {
+            _ if sealed => String::new(),
+            Some(part) if part.is_text_html() => html_text(part.text_contents().unwrap_or_default()),
+            _ => message.body_text(0).map(|t| t.into_owned()).unwrap_or_default(),
+        },
         to: addresses(message.to()),
         cc: addresses(message.cc()),
         reply_to: addresses(message.reply_to()),
@@ -2000,6 +2090,25 @@ impl MailSource for ImapSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_earlier_message_below_a_reply_stays_apart() {
+        let head = "From: alice@example.com\r\nTo: bob@example.org\r\nSubject: x\r\nMIME-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\n\r\n";
+        // A web mail's reply: the answer, then the original's header in a block with a top border.
+        let html = r#"<html><body><div id="reply"> <div>Good morning Bob</div><div>I confirm</div><div>Alice</div></div><div id="header"><table width="100%"><tbody><tr><td><div style="border-right: none; border-top: 1pt solid rgb(181, 196, 223); padding: 3pt 0in 0in;"><div><b>From:</b> bob@example.org</div><div><b>Subject:</b> Invoice</div></div></td></tr></tbody></table> <br> </div><div><p>Hello,</p><p>the invoice is due.</p></div></body></html>"#;
+        let text = parse_body(format!("{head}{html}\r\n").as_bytes()).unwrap().text;
+        assert_eq!(text, format!("Good morning Bob\nI confirm\nAlice\n\n{RULE}\nFrom: bob@example.org\nSubject: Invoice\n\nHello,\nthe invoice is due."), "{text:?}");
+        let html = "<div>Yes</div><div>On Monday Bob wrote:</div><blockquote><div>Can you?</div><blockquote><div>First</div></blockquote></blockquote><div style=\"border-top:none\">After</div>";
+        let text = parse_body(format!("{head}{html}\r\n").as_bytes()).unwrap().text;
+        assert_eq!(text, "Yes\nOn Monday Bob wrote:\n> Can you?\n> > First\nAfter", "{text:?}");
+    }
+
+    #[test]
+    fn html_only_mail_keeps_its_lines() {
+        let raw = b"From: alice@example.com\r\nTo: bob@example.org\r\nSubject: x\r\nMIME-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<html><body><div>Good morning Bob</div><DIV>I confirm the details</DIV><div><br></div><div><div>Regards</div></div><div>Alice</div><ul><li>one</li><li>two</li></ul><p>Done &amp; dusted</p></body></html>\r\n";
+        let text = parse_body(raw).unwrap().text;
+        assert_eq!(text, "Good morning Bob\nI confirm the details\n\nRegards\nAlice\none\ntwo\nDone & dusted", "{text:?}");
+    }
 
     #[test]
     fn an_invitation_part_is_read_from_the_message() {
