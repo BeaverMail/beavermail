@@ -392,6 +392,7 @@ impl Compose {
             send_at: None,
             encrypt: (!self.encrypt_auto).then_some(self.encrypt),
             calendar: self.calendar.clone(),
+            on_server: self.server_saved == self.fingerprint(),
         }
     }
 
@@ -403,7 +404,8 @@ impl Compose {
             "Forward" => "Forward",
             _ => "New message",
         };
-        Self {
+        let on_server = draft.on_server;
+        let mut compose = Self {
             to: draft.to,
             cc: draft.cc,
             bcc: draft.bcc,
@@ -423,7 +425,11 @@ impl Compose {
             touched: true,
             ..Self::new(from)
         }
-        .settled()
+        .settled();
+        if on_server {
+            compose.server_saved = compose.saved;
+        }
+        compose
     }
 
     /// Makes room for a file and says where its copy goes in the vault.
@@ -1107,11 +1113,12 @@ pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &
                     if !status.is_empty() {
                         ui.label(RichText::new(status).size(12.5).color(t.text_dim));
                     }
+                    // Placed before the subject, so the subject is truncated in the room left, not over it.
+                    if !compose.subject.trim().is_empty() {
+                        ui.label(RichText::new(compose.title).size(12.5).color(t.text_dim));
+                    }
                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                         ui.add(egui::Label::new(RichText::new(compose.heading()).size(theme::SUBTITLE).family(theme::bold()).color(t.text)).truncate());
-                        if !compose.subject.trim().is_empty() {
-                            ui.label(RichText::new(compose.title).size(12.5).color(t.text_dim));
-                        }
                     });
                 });
             });

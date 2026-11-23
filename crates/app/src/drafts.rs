@@ -37,6 +37,10 @@ pub struct DraftData {
     /// An answer to an invitation: the iTIP part it carries.
     #[serde(default)]
     pub calendar: Option<String>,
+    /// The server's Drafts folder holds this text: from then on the draft is the server's, and kept
+    /// here only to go on writing it.
+    #[serde(default)]
+    pub on_server: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,9 +77,50 @@ pub fn save(vault: &Vault, account: &str, draft: &DraftData) -> Result<(), MailE
     vault.write(&json_path(account, &draft.id), &json)
 }
 
-/// Whether the draft is still kept here.
-pub fn exists(vault: &Vault, account: &str, id: &str) -> bool {
-    vault.read(&json_path(account, id)).ok().flatten().is_some()
+/// Draft `id`, when it is kept here.
+pub fn load(vault: &Vault, account: &str, id: &str) -> Option<DraftData> {
+    vault.read(&json_path(account, id)).ok().flatten().and_then(|bytes| serde_json::from_slice(&bytes).ok())
+}
+
+/// Where the ids of drafts deleted here, whose copy is still to be removed from the server, are kept.
+fn deleted_path(account: &str) -> PathBuf {
+    Path::new("drafts").join(format!("{}.deleted", component(account)))
+}
+
+/// The drafts deleted here whose copy on the server is still to be removed.
+pub fn deleted(vault: &Vault, account: &str) -> Vec<String> {
+    vault.read(&deleted_path(account)).ok().flatten().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default()
+}
+
+/// Notes (`gone`) or forgets that draft `id`'s copy on the server is still to be removed.
+pub fn set_deleted(vault: &Vault, account: &str, id: &str, gone: bool) -> Result<(), MailError> {
+    let mut ids = deleted(vault, account);
+    ids.retain(|i| i != id);
+    if gone {
+        ids.push(id.to_owned());
+    }
+    let json = serde_json::to_vec(&ids).map_err(|e| MailError::Backend(format!("draft: {e}")))?;
+    vault.write(&deleted_path(account), &json)
+}
+
+/// What to do with a draft kept here, not queued to send, once the server says whether its Drafts
+/// folder has a copy (`there`).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Reconcile {
+    /// Its text is not on the server yet (written offline, or a copy that failed): store it there. It
+    /// goes even when a copy is there, which it replaces: changes made here are never lost.
+    Upload,
+    /// It was on the server and is gone: sent or deleted elsewhere, so it goes here too.
+    Forget,
+    Keep,
+}
+
+pub fn reconcile(draft: &DraftData, there: bool) -> Reconcile {
+    match (draft.on_server, there) {
+        (false, _) => Reconcile::Upload,
+        (true, false) => Reconcile::Forget,
+        (true, true) => Reconcile::Keep,
+    }
 }
 
 /// The account's drafts, the most recently changed first. One that cannot be read is skipped.
@@ -122,6 +167,30 @@ mod tests {
     }
 
     #[test]
+    fn a_draft_follows_the_server_once_it_is_there() {
+        let written_here = draft("a", "x", 1);
+        let uploaded = DraftData { on_server: true, ..draft("a", "x", 1) };
+        assert_eq!(reconcile(&written_here, false), Reconcile::Upload);
+        // Changed here after its copy went up: the change goes up too, even if the copy was sent elsewhere.
+        assert_eq!(reconcile(&written_here, true), Reconcile::Upload);
+        assert_eq!(reconcile(&uploaded, true), Reconcile::Keep);
+        assert_eq!(reconcile(&uploaded, false), Reconcile::Forget);
+    }
+
+    #[test]
+    fn deleted_drafts_wait_until_the_server_lets_them_go() {
+        let vault = Vault::in_memory();
+        set_deleted(&vault, "me", "a", true).unwrap();
+        set_deleted(&vault, "me", "b", true).unwrap();
+        set_deleted(&vault, "me", "a", true).unwrap();
+        assert_eq!(deleted(&vault, "me"), ["b", "a"]);
+        set_deleted(&vault, "me", "b", false).unwrap();
+        assert_eq!(deleted(&vault, "me"), ["a"]);
+        // Not read as a draft of the account.
+        assert!(load_all(&vault, "me").is_empty());
+    }
+
+    #[test]
     fn deleting_a_draft_removes_its_attachments_too() {
         let vault = Vault::in_memory();
         save(&vault, "me", &draft("a", "x", 1)).unwrap();
@@ -133,13 +202,13 @@ mod tests {
     }
 
     #[test]
-    fn a_draft_is_known_to_exist_until_it_is_deleted() {
+    fn a_draft_is_found_until_it_is_deleted() {
         let vault = Vault::in_memory();
-        assert!(!exists(&vault, "me", "a"));
+        assert_eq!(load(&vault, "me", "a"), None);
         save(&vault, "me", &draft("a", "x", 1)).unwrap();
-        assert!(exists(&vault, "me", "a"));
+        assert_eq!(load(&vault, "me", "a").map(|d| d.subject), Some("x".to_owned()));
         delete(&vault, "me", "a").unwrap();
-        assert!(!exists(&vault, "me", "a"));
+        assert_eq!(load(&vault, "me", "a"), None);
     }
 
     #[test]

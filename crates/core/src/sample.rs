@@ -146,6 +146,10 @@ impl MailSource for SampleSource {
         Err(read_only())
     }
 
+    async fn saved_drafts(&self) -> Result<Vec<String>, MailError> {
+        Ok(Vec::new())
+    }
+
     async fn delete_draft(&self, _: &str) -> Result<(), MailError> {
         Err(read_only())
     }

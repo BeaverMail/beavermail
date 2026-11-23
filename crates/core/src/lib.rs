@@ -98,6 +98,9 @@ pub trait MailSource {
     /// replacing any earlier copy of the draft `id`.
     fn save_draft(&self, id: &str, raw: Vec<u8>) -> impl Future<Output = Result<(), MailError>> + Send;
 
+    /// The ids of the drafts the Drafts folder holds a copy of (those with an `X-BeaverMail-Draft` header).
+    fn saved_drafts(&self) -> impl Future<Output = Result<Vec<String>, MailError>> + Send;
+
     /// Removes every copy of the draft `id` from the Drafts folder.
     fn delete_draft(&self, id: &str) -> impl Future<Output = Result<(), MailError>> + Send;
 

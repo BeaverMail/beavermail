@@ -326,6 +326,13 @@ const KEEPS_NAME: &str = "the Inbox and the folders for sent mail, drafts, the a
 
 /// A folder name the user typed, against what RFC 9051 (5.1) forbids or advises against, and the
 /// server's separator, which cannot be inside one level's name.
+/// The draft id in a header block fetched for `X-BeaverMail-Draft`.
+fn draft_id(raw: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(raw);
+    let line = text.lines().find(|l| l.get(..19).is_some_and(|h| h.eq_ignore_ascii_case("x-beavermail-draft:")))?;
+    Some(line[19..].trim().to_owned()).filter(|id| !id.is_empty())
+}
+
 fn check_name(name: &str, delimiter: Option<char>) -> Result<(), MailError> {
     let refused = match name {
         "" => "the folder needs a name".to_owned(),
@@ -1887,6 +1894,25 @@ impl MailSource for ImapSource {
         self.store.remove_uids(&self.account, &folder, &older)
     }
 
+    async fn saved_drafts(&self) -> Result<Vec<String>, MailError> {
+        let Some(folder) = self.folder_with_role(Role::Drafts).await? else { return Ok(Vec::new()) };
+        let mut state = self.state.lock().await;
+        let session = state.session(&self.config).await?;
+        let result = async {
+            session.select(&folder).await?;
+            // An empty string matches every message carrying the header (RFC 3501, SEARCH HEADER).
+            let found = session.uid_search("HEADER X-BeaverMail-Draft \"\"").await?;
+            if found.is_empty() {
+                return Ok(Vec::new());
+            }
+            let set = found.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+            let fetches: Vec<Fetch> = session.uid_fetch(&set, "(UID BODY.PEEK[HEADER.FIELDS (X-BEAVERMAIL-DRAFT)])").await?.try_collect().await?;
+            Ok::<Vec<String>, async_imap::error::Error>(fetches.iter().filter_map(|f| draft_id(f.header()?)).collect())
+        }
+        .await;
+        result.map_err(|e| state.failed(e))
+    }
+
     async fn delete_draft(&self, id: &str) -> Result<(), MailError> {
         let Some(folder) = self.folder_with_role(Role::Drafts).await? else { return Ok(()) };
         let mut state = self.state.lock().await;
@@ -2090,6 +2116,13 @@ impl MailSource for ImapSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_draft_id_is_read_from_its_header() {
+        assert_eq!(draft_id(b"X-BeaverMail-Draft: d-42\r\n\r\n").as_deref(), Some("d-42"));
+        assert_eq!(draft_id(b"x-beavermail-draft:  d-7 \r\n").as_deref(), Some("d-7"));
+        assert_eq!(draft_id(b"\r\n"), None);
+    }
 
     #[test]
     fn an_earlier_message_below_a_reply_stays_apart() {
