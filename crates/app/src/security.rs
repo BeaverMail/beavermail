@@ -85,7 +85,7 @@ pub fn section(ui: &mut Ui, t: &Tokens, form: &mut Form, current: Mode, locked: 
     let chosen = form.mode.get_or_insert(current);
     let options = [
         (Mode::System, "Encrypted, unlocked by this computer", "The key is kept in the system's credential store, so the app opens without asking. Protects a lost or copied disk."),
-        (Mode::Passphrase, "Encrypted with my passphrase", "You type the passphrase at every start. If you forget it the stored mail cannot be opened; it can be downloaded again from the server."),
+        (Mode::Passphrase, "Encrypted with my passphrase", "You type the passphrase at every start. If you forget it the stored mail cannot be opened; it can be downloaded again from the server, but what is in the folders on this computer is lost."),
         (Mode::Off, "Not encrypted", "Messages are plain files that any program on this computer can read. Easy to back up and search with other tools."),
     ];
     for (mode, title, hint) in options {
@@ -209,7 +209,7 @@ pub fn unlock_prompt(ctx: &egui::Context, t: &Tokens, form: &mut Form, busy: boo
         ui.set_width(380.0);
         if form.confirm_reset {
             ui.heading("Delete stored mail?");
-            ui.label(RichText::new("This removes every message stored on this device and starts again with a key kept by the system. Your mail is still on the server and is downloaded again. Your encryption keys and certificates go too: without a backup, encrypted mail can no longer be read.").color(t.text_dim));
+            ui.label(RichText::new("This removes every message stored on this device and starts again with a key kept by the system. Your mail is still on the server and is downloaded again; what is in the folders on this computer is only here, and is lost. Your encryption keys and certificates go too: without a backup, encrypted mail can no longer be read.").color(t.text_dim));
             ui.add_space(12.0);
             ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
                 if ui.add(egui::Button::new(RichText::new("Delete stored mail").color(t.on_accent)).fill(t.danger)).clicked() {
@@ -226,7 +226,7 @@ pub fn unlock_prompt(ctx: &egui::Context, t: &Tokens, form: &mut Form, busy: boo
             ui.heading(if lost { "Stored mail cannot be opened" } else { "Use your recovery key" });
             let about = match (lost, recovery) {
                 (true, true) => "This computer no longer has the key for the mail stored here, as after a reinstall. Enter your recovery key to open it.",
-                (true, false) => "This computer no longer has the key for the mail stored here, as after a reinstall, and no recovery key was made. Start again: your mail is downloaded again from the server.",
+                (true, false) => "This computer no longer has the key for the mail stored here, as after a reinstall, and no recovery key was made. Start again: your mail is downloaded again from the server, but what was in the folders on this computer is lost.",
                 _ => "Enter the recovery key you kept. The stored mail opens and is unlocked by this computer from then on; you can set a new passphrase in Settings.",
             };
             ui.add(egui::Label::new(RichText::new(about).color(t.text_dim)).wrap());

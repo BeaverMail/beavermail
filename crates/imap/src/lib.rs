@@ -109,6 +109,8 @@ struct Config {
     token: Option<beavermail_core::TokenSource>,
     /// The server has UIDPLUS, as the last connection said: one message alone can be expunged.
     uidplus: std::sync::atomic::AtomicBool,
+    /// The folders on this computer: there is no server, the archive is all there is.
+    local: bool,
 }
 
 impl ImapSource {
@@ -127,6 +129,20 @@ impl ImapSource {
     /// mailbox is full and Trash refuses it.
     pub async fn purge(&self, id: MessageId) -> Result<(), MailError> {
         self.write(id, Op::Purge).await
+    }
+
+    /// Puts a whole message into `folder` with its flags: one moved here from another account or from
+    /// this computer. On a server it is listed at the folder's next sync.
+    pub async fn add(&self, folder: &str, raw: &[u8], flags: &Flags) -> Result<(), MailError> {
+        if self.config.local {
+            return self.keep(folder, raw, flags).map(drop);
+        }
+        let mut marks: Vec<&str> = flags.labels.split_whitespace().collect();
+        marks.extend([(!flags.unread, "\\Seen"), (flags.starred, "\\Flagged"), (flags.pinned, PINNED)].into_iter().filter_map(|(on, f)| on.then_some(f)));
+        let mut state = self.state.lock().await;
+        let session = state.session(&self.config).await?;
+        let added = session.append(folder, Some(&format!("({})", marks.join(" "))), None, raw).await;
+        added.map_err(|e| state.failed(e))
     }
 
     /// The message as stored on this computer, without going to the server; `None` when it is not stored.
@@ -179,8 +195,76 @@ impl ImapSource {
 
     /// Creates the source over the shared archive; the connection is opened on first use.
     pub fn new(account: &Account, password: String, store: Arc<Store>, files: Arc<Vault>) -> Self {
-        let config = Config { server: account.imap.clone(), user: account.user.clone(), password, offline: Default::default(), token: None, uidplus: Default::default() };
+        let config = Config { server: account.imap.clone(), user: account.user.clone(), password, offline: Default::default(), token: None, uidplus: Default::default(), local: false };
         Self { config, poll_interval: std::time::Duration::from_secs(180), account: account.key(), address: account.address().to_lowercase(), store, files, state: Mutex::new(State::default()), reader: Mutex::new(State::default()), plain: Default::default(), archive: std::sync::Mutex::new((account.archive.clone(), account.archive_by_year)), auth_server: std::sync::Mutex::new(None), writing: Default::default() }
+    }
+
+    /// The folders on this computer ([`Account::local`]): a source without a server, over the same archive, whose messages
+    /// are only those [`Self::keep`] put there. Reading, searching and flags work as for an account;
+    /// what needs a server (sync, watch, drafts, Sent) does nothing or says there is none.
+    pub fn local(store: Arc<Store>, files: Arc<Vault>) -> Self {
+        let mut source = Self::new(&Account::local(), String::new(), store, files);
+        source.config.local = true;
+        source
+    }
+
+    /// Whether this is the folders on this computer ([`Self::local`]).
+    pub fn is_local(&self) -> bool {
+        self.config.local
+    }
+
+    /// Puts message `raw` (RFC 5322 bytes) in `folder` of the folders on this computer, with `flags`:
+    /// the file is written and the message listed and made searchable. Only for [`Self::local`].
+    pub fn keep(&self, folder: &str, raw: &[u8], flags: &Flags) -> Result<MessageId, MailError> {
+        if !self.config.local {
+            return Err(backend("only the folders on this computer take messages this way"));
+        }
+        if !self.store.folders(&self.account)?.iter().any(|f| f.name == folder) {
+            return Err(backend(format!("there is no folder {folder} any more")));
+        }
+        let uid = self.store.uid_range(&self.account, folder)?.map_or(1, |(_, highest, _)| highest + 1);
+        let mut header = local_header(uid, raw).ok_or_else(|| backend("this is not a message"))?;
+        (header.unread, header.pinned, header.starred, header.labels) = (flags.unread, flags.pinned, flags.starred, flags.labels.clone());
+        self.files.write(&self.file_of(&self.account, folder, uid)?, raw)?;
+        self.store.add_headers(&self.account, folder, &[header])?;
+        self.store.mark_stored(&self.account, folder, uid)?;
+        let id = self.store.id_of(&self.account, folder, uid)?.ok_or(MailError::NotFound)?;
+        // As when a message is read: what is encrypted is indexed by its subject and sender only.
+        if let Some(body) = self.read(raw).ok().filter(|b| b.encryption.is_none()) {
+            self.store.set_preview(id, &body.text)?;
+            self.store.set_attachments(&self.account, folder, uid, !body.attachments.is_empty())?;
+            self.store.index_body(id, &body.text)?;
+        }
+        Ok(id)
+    }
+
+    /// Removes message `id` from the folders on this computer, its file too.
+    /// Makes the Inbox, Archive and Trash on this computer where they are missing: always there, never renamed or deleted.
+    fn local_folders(&self) -> Result<(), MailError> {
+        let mut all: Vec<(String, Role)> = self.store.folders(&self.account)?.into_iter().map(|f| (f.name, f.role)).collect();
+        let before = all.clone();
+        for (name, role) in [("Inbox", Role::Inbox), ("Archive", Role::Archive), ("Trash", Role::Trash)] {
+            if all.iter().any(|(_, r)| *r == role) {
+                continue;
+            }
+            match all.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
+                Some(taken) => taken.1 = role,
+                None => all.push((name.to_string(), role)),
+            }
+        }
+        if all != before {
+            self.store.set_folders(&self.account, &all)?;
+            for (name, _) in all.iter().filter(|f| !before.contains(f)) {
+                self.store.set_delimiter(&self.account, name, Some('/'))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn forget_local(&self, id: MessageId) -> Result<(), MailError> {
+        let at = self.store.locate(id)?.ok_or(MailError::NotFound)?;
+        self.drop_files(&at.folder, &[at.uid]);
+        self.store.remove(id)
     }
 
     /// Changes how often a server without IDLE is polled (3 minutes by default).
@@ -272,6 +356,9 @@ impl ImapSource {
     /// Deletes the files of messages that no longer exist on the server.
     /// The server's separator between a folder and those inside it, from an empty LIST (RFC 9051 6.3.9).
     async fn delimiter(&self, state: &mut State) -> Result<Option<char>, MailError> {
+        if self.config.local {
+            return Ok(Some('/'));
+        }
         let listed = answered(state.session(&self.config).await?, "LIST \"\" \"\"", |r| match r {
             Response::MailboxData(MailboxDatum::List(list)) => list.delimiter.as_deref().and_then(|d| d.chars().next()),
             _ => None,
@@ -286,11 +373,13 @@ impl ImapSource {
     /// Renames folder `from` to `to` on the server, then here: the folders inside it and their messages
     /// follow, keeping their ids, flags and files. `to` is checked already.
     async fn move_folder(&self, mut state: tokio::sync::MutexGuard<'_, State>, from: &str, to: &str, delimiter: Option<char>) -> Result<String, MailError> {
-        let renamed = state.session(&self.config).await?.rename(from, to).await;
-        if let Err(e) = renamed {
-            return Err(state.failed(e));
+        if !self.config.local {
+            let renamed = state.session(&self.config).await?.rename(from, to).await;
+            if let Err(e) = renamed {
+                return Err(state.failed(e));
+            }
+            let _ = state.session(&self.config).await?.subscribe(to).await;
         }
-        let _ = state.session(&self.config).await?.subscribe(to).await;
         drop(state);
         // Without a separator the server keeps no folders inside others, so any will do.
         for (old, new) in self.store.rename_folder(&self.account, from, to, delimiter.unwrap_or('/'))? {
@@ -570,6 +659,9 @@ impl async_imap::Authenticator for XOAuth2 {
 impl State {
     /// The open session, connecting first if needed.
     async fn session(&mut self, config: &Config) -> Result<&mut Session<Stream>, MailError> {
+        if config.local {
+            return Err(backend("the folders on this computer have no server"));
+        }
         if config.offline.load(std::sync::atomic::Ordering::Relaxed) {
             self.session = None; // closed, so nothing more goes over it
             return Err(MailError::Offline("working offline".into()));
@@ -685,35 +777,55 @@ fn header(fetch: &Fetch) -> Option<Header> {
     let uid = fetch.uid?;
     let raw = fetch.header().or_else(|| fetch.section(&async_imap::imap_proto::SectionPath::Full(async_imap::imap_proto::MessageSection::Header)))?;
     let message = MessageParser::default().parse_headers(raw)?;
-    let sender = message.from().and_then(|a| a.first());
-    let date = message.date();
-    let received = date.map_or_else(String::new, |d| format!("{:04}-{:02}-{:02} {:02}:{:02}", d.year, d.month, d.day, d.hour, d.minute));
-    let timestamp = date.map(|d| d.to_timestamp()).or_else(|| fetch.internal_date().map(|d| d.timestamp())).unwrap_or(0);
+    let fields = header_fields(uid, raw, &message);
     Some(Header {
-        uid,
-        from_name: sender.and_then(|a| a.name()).unwrap_or_default().to_owned(),
-        from_addr: sender.and_then(|a| a.address()).unwrap_or_default().to_owned(),
-        subject: message.subject().unwrap_or_default().to_owned(),
-        received,
-        timestamp,
+        timestamp: message.date().map(|d| d.to_timestamp()).or_else(|| fetch.internal_date().map(|d| d.timestamp())).unwrap_or(0),
         unread: !fetch.flags().any(|f| f == Flag::Seen),
         pinned: fetch.flags().any(|f| matches!(f, Flag::Custom(k) if k == PINNED)),
         starred: fetch.flags().any(|f| f == Flag::Flagged),
-        priority: priority(&message),
         labels: labels(fetch.flags()),
-        message_id: message.message_id().unwrap_or_default().to_owned(),
-        in_reply_to: ids(message.in_reply_to()).join(" "),
-        references: ids(message.references()).join(" "),
         size: fetch.size.unwrap_or(0),
-        recipients: recipients(&message),
-        raw: raw.to_vec(),
         // The server's description of the message is exact; the Content-Type is a guess for servers
         // that do not send it.
         has_attachments: fetch.bodystructure().map_or_else(
             || message.root_part().content_type().is_some_and(|c| c.ctype().eq_ignore_ascii_case("multipart") && c.subtype().is_some_and(|s| s.eq_ignore_ascii_case("mixed"))),
             carries_file,
         ),
+        ..fields
     })
+}
+
+/// What a message's header fields say, `raw` being the header block `message` was parsed from; the
+/// flags, size and attachments are the caller's to fill in.
+fn header_fields(uid: u32, raw: &[u8], message: &mail_parser::Message<'_>) -> Header {
+    let sender = message.from().and_then(|a| a.first());
+    let date = message.date();
+    Header {
+        uid,
+        from_name: sender.and_then(|a| a.name()).unwrap_or_default().to_owned(),
+        from_addr: sender.and_then(|a| a.address()).unwrap_or_default().to_owned(),
+        subject: message.subject().unwrap_or_default().to_owned(),
+        received: date.map_or_else(String::new, |d| format!("{:04}-{:02}-{:02} {:02}:{:02}", d.year, d.month, d.day, d.hour, d.minute)),
+        timestamp: date.map_or(0, |d| d.to_timestamp()),
+        priority: priority(message),
+        message_id: message.message_id().unwrap_or_default().to_owned(),
+        in_reply_to: ids(message.in_reply_to()).join(" "),
+        references: ids(message.references()).join(" "),
+        recipients: recipients(message),
+        raw: raw.to_vec(),
+        ..Header::default()
+    }
+}
+
+/// The header of a whole message `raw` put in the folders on this computer, as UID `uid`; read, with no
+/// flags. `None` when it is not a message.
+fn local_header(uid: u32, raw: &[u8]) -> Option<Header> {
+    let message = MessageParser::default().parse(raw)?;
+    let end = raw.windows(4).position(|w| w == b"\r\n\r\n").map(|at| at + 4).or_else(|| raw.windows(2).position(|w| w == b"\n\n").map(|at| at + 2)).unwrap_or(raw.len());
+    let fields = header_fields(uid, &raw[..end], &message);
+    // Without a date it is as new as the moment it was put here.
+    let timestamp = if message.date().is_some() { fields.timestamp } else { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64) };
+    Some(Header { timestamp, size: u32::try_from(raw.len()).unwrap_or(u32::MAX), has_attachments: message.attachment_count() > 0, ..fields })
 }
 
 /// What the sender marked a message as: 1 high, -1 low, 0 neither. `X-Priority` gives 1 (highest) to 5
@@ -840,6 +952,9 @@ impl ImapSource {
 
     /// Applies `op` to one message on the server, then mirrors it in the archive.
     async fn write(&self, id: MessageId, op: Op) -> Result<(), MailError> {
+        if self.config.local {
+            return self.write_local(id, op);
+        }
         let at = self.store.locate(id)?.ok_or(MailError::NotFound)?;
         let target = match &op {
             Op::Seen(_) | Op::Pinned(_) | Op::Starred(_) | Op::Label(..) | Op::Erase | Op::Purge => None,
@@ -879,6 +994,36 @@ impl ImapSource {
         result?;
         self.drop_files(&at.folder, &[at.uid]);
         self.store.remove(id)
+    }
+
+    /// [`Self::write`] in the folders on this computer: the archive is all there is to change.
+    fn write_local(&self, id: MessageId, op: Op) -> Result<(), MailError> {
+        match op {
+            Op::Erase | Op::Purge => self.forget_local(id),
+            Op::Archive | Op::Trash | Op::Move(_) => {
+                let role = match op {
+                    Op::Archive => Role::Archive,
+                    Op::Trash => Role::Trash,
+                    Op::Move(role) => role,
+                    _ => unreachable!(),
+                };
+                self.local_folders()?;
+                let name = self.store.folder_with_role(&self.account, role)?.ok_or_else(|| backend("the folders on this computer have no spam folder"))?;
+                self.write_local(id, Op::Folder(name))
+            }
+            Op::Folder(name) => {
+                let at = self.store.locate(id)?.ok_or(MailError::NotFound)?;
+                if name == at.folder {
+                    return Err(backend(format!("the message is already in {}", at.folder)));
+                }
+                let raw = self.files.read(&self.file_of(&self.account, &at.folder, at.uid)?)?.ok_or(MailError::NotFound)?;
+                let flags = self.store.flags_since(&self.account, &at.folder, at.uid)?.into_iter().find(|(uid, _)| *uid == at.uid).map(|(_, f)| f).unwrap_or_default();
+                // Put there first: a failure leaves it where it was, never nowhere.
+                self.keep(&name, &raw, &flags)?;
+                self.forget_local(id)
+            }
+            flag => self.set_flag(id, &flag, true),
+        }
     }
 
     /// Mirrors a flag change in the archive (`forward`), or undoes it.
@@ -1572,6 +1717,9 @@ impl MailSource for ImapSource {
 
     async fn search_server(&self, query: &str, limit: usize, progress: &Progress, found: &(dyn Fn(Vec<Hit>) + Send + Sync)) -> Result<(), MailError> {
         use std::sync::atomic::Ordering::Relaxed;
+        if self.config.local {
+            return Ok(());
+        }
         let Some((folders, criteria)) = self.store.server_search(&self.account, query)? else { return Ok(()) };
         progress.total.store(folders.len() as u32, Relaxed);
         for folder in folders {
@@ -1619,6 +1767,10 @@ impl MailSource for ImapSource {
     }
 
     async fn mailboxes(&self) -> Result<Vec<Mailbox>, MailError> {
+        if self.config.local {
+            self.local_folders()?;
+            return self.cached_mailboxes().await;
+        }
         let mut state = self.state.lock().await;
         let result = async {
             let session = state.session(&self.config).await?;
@@ -1676,12 +1828,18 @@ impl MailSource for ImapSource {
     }
 
     async fn sync(&self, mailbox: &str) -> Result<SyncReport, MailError> {
+        if self.config.local {
+            return Ok(SyncReport::default()); // nothing changes anywhere else
+        }
         self.sync_folder(mailbox).await
     }
 
     async fn watch(&self, mailbox: &str, changed: &(dyn Fn() + Send + Sync), stop: &std::sync::atomic::AtomicBool) -> Result<(), MailError> {
         use std::sync::atomic::Ordering::Relaxed;
         use std::time::Duration;
+        if self.config.local {
+            return Ok(());
+        }
         // Its own connection: IDLE keeps one busy for as long as it runs.
         let mut session = connect_in_time(&self.config).await?;
         let idle_supported = session.capabilities().await.map_err(backend)?.has_str("IDLE");
@@ -1734,6 +1892,9 @@ impl MailSource for ImapSource {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
         // Searching the text needs it indexed, whatever is kept offline.
         self.index_stored().await?;
+        if self.config.local {
+            return Ok(());
+        }
         let Some(since) = keep.since(now) else { return Ok(()) };
         // The Spam folder's headers, not its bodies: what the server set aside teaches the spam checks.
         if let Some(junk) = self.store.folder_with_role(&self.account, Role::Junk)? {
@@ -1990,8 +2151,19 @@ impl MailSource for ImapSource {
             (Some(parent), Some(d)) => format!("{parent}{d}{}", folder_name::encode(name)),
             (Some(_), None) => return Err(backend("this server keeps no folders inside others")),
         };
-        if self.store.folders(&self.account)?.iter().any(|f| f.name.eq_ignore_ascii_case(&full)) {
+        let folders = self.store.folders(&self.account)?;
+        if folders.iter().any(|f| f.name.eq_ignore_ascii_case(&full)) {
             return Err(backend(format!("there is a folder {name} already")));
+        }
+        if self.config.local {
+            if parent.is_some_and(|p| !folders.iter().any(|f| f.name == p)) {
+                return Err(backend("the folder it goes in is gone"));
+            }
+            let mut all: Vec<(String, Role)> = folders.into_iter().map(|f| (f.name, f.role)).collect();
+            all.push((full.clone(), Role::Other));
+            self.store.set_folders(&self.account, &all)?;
+            self.store.set_delimiter(&self.account, &full, Some('/'))?;
+            return Ok(full);
         }
         let created = state.session(&self.config).await?.create(&full).await;
         if let Err(e) = created {
@@ -2069,11 +2241,13 @@ impl MailSource for ImapSource {
         doomed.push(name);
         let mut state = self.state.lock().await;
         for folder in doomed {
-            let deleted = state.session(&self.config).await?.delete(folder).await;
-            if let Err(e) = deleted {
-                return Err(state.failed(e));
+            if !self.config.local {
+                let deleted = state.session(&self.config).await?.delete(folder).await;
+                if let Err(e) = deleted {
+                    return Err(state.failed(e));
+                }
+                let _ = state.session(&self.config).await?.unsubscribe(folder).await;
             }
-            let _ = state.session(&self.config).await?.unsubscribe(folder).await;
             self.store.forget_folder(&self.account, folder)?;
             let _ = self.files.remove_dir(&folder_path(&self.account, folder));
         }
@@ -2091,6 +2265,11 @@ impl MailSource for ImapSource {
         let folder = self.folder_with_role(role).await?.ok_or_else(|| backend(format!("this account has no {role:?} folder")))?;
         // Only what the user has seen listed: what arrived meanwhile is not erased unseen.
         let listed: Vec<u32> = self.store.flags_since(&self.account, &folder, 0)?.into_iter().map(|(uid, ..)| uid).collect();
+        if self.config.local {
+            self.drop_files(&folder, &listed);
+            self.store.remove_uids(&self.account, &folder, &listed)?;
+            return Ok(listed.len());
+        }
         let mut state = self.state.lock().await;
         let session = state.session(&self.config).await?;
         let result = async {
@@ -2116,6 +2295,81 @@ impl MailSource for ImapSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn local() -> ImapSource {
+        ImapSource::local(Arc::new(Store::in_memory().unwrap()), Arc::new(Vault::in_memory()))
+    }
+
+    fn mail(subject: &str, text: &str) -> Vec<u8> {
+        format!("From: Alice <alice@example.com>\r\nTo: bob@example.org\r\nSubject: {subject}\r\nDate: Mon, 2 Nov 2026 10:00:00 +0000\r\nMessage-ID: <{subject}@example.com>\r\n\r\n{text}\r\n").into_bytes()
+    }
+
+    #[tokio::test]
+    async fn the_folders_on_this_computer_keep_read_and_find_their_mail() {
+        let here = local();
+        assert!(here.is_local());
+        let kept = here.create_folder(None, "Kept").await.unwrap();
+        let old = here.create_folder(Some(&kept), "2025").await.unwrap();
+        assert_eq!(old, "Kept/2025");
+        assert!(here.create_folder(None, "kept").await.is_err(), "a second folder of the same name");
+        let id = here.keep(&old, &mail("invoice", "the total is due"), &Flags { unread: true, starred: true, ..Flags::default() }).unwrap();
+        here.keep(&old, &mail("lunch", "see you"), &Flags::default()).unwrap();
+        let listed = here.messages(&old).await.unwrap();
+        assert_eq!(listed.len(), 2);
+        let invoice = listed.iter().find(|m| m.id == id).unwrap();
+        assert!(invoice.unread && invoice.starred);
+        assert_eq!((invoice.address.as_str(), invoice.message_id.as_str()), ("alice@example.com", "invoice@example.com"));
+        assert!(here.body(id).await.unwrap().text.contains("the total is due"));
+        let found = here.search("total", 10).await.unwrap();
+        assert_eq!(found.iter().map(|h| (h.message.id, h.folder.as_str())).collect::<Vec<_>>(), [(id, old.as_str())]);
+        // Flags change here alone: there is no server to wait for.
+        here.set_unread(id, false).await.unwrap();
+        assert!(!here.messages(&old).await.unwrap().iter().find(|m| m.id == id).unwrap().unread);
+        // Nothing to sync or watch, and no server behind it.
+        assert_eq!(here.sync(&old).await.unwrap(), SyncReport::default());
+        assert!(here.save_draft("d1", mail("draft", "x")).await.is_err());
+        // Inbox, Archive and Trash are always there and stay: Delete goes to Trash, a folder too.
+        let mut names: Vec<String> = here.mailboxes().await.unwrap().into_iter().map(|m| m.name).collect();
+        names.sort();
+        assert_eq!(names, ["Archive", "Inbox", "Kept", "Kept/2025", "Trash"]);
+        assert!(here.delete_folder("Inbox").await.is_err() && here.rename_folder("Trash", "Bin").await.is_err());
+        here.trash(id).await.unwrap();
+        assert_eq!(here.messages("Trash").await.unwrap().len(), 1);
+        assert_eq!(here.trash_folder(&old).await.unwrap(), "Trash/2025");
+        assert_eq!(here.messages("Trash/2025").await.unwrap().len(), 1);
+        let archived = here.messages("Trash").await.unwrap()[0].id;
+        here.archive(archived).await.unwrap();
+        assert_eq!(here.messages("Archive").await.unwrap().len(), 1);
+        here.keep("Trash", &mail("old", "x"), &Flags::default()).unwrap();
+        assert_eq!(here.empty(Role::Trash).await.unwrap(), 1);
+        assert!(here.messages("Trash").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn mail_on_this_computer_moves_with_its_folders_and_is_deleted_for_good() {
+        let here = local();
+        let (a, b) = (here.create_folder(None, "A").await.unwrap(), here.create_folder(None, "B").await.unwrap());
+        let id = here.keep(&a, &mail("plan", "first draft of the plan"), &Flags { starred: true, ..Flags::default() }).unwrap();
+        here.move_to_folder(id, &b).await.unwrap();
+        assert!(here.messages(&a).await.unwrap().is_empty());
+        let moved = here.messages(&b).await.unwrap();
+        assert_eq!(moved.len(), 1);
+        assert!(moved[0].starred, "its flags go with it");
+        assert!(here.body(moved[0].id).await.unwrap().text.contains("first draft"));
+        // Renamed, its messages and their files follow.
+        let inner = here.create_folder(Some(&b), "Inner").await.unwrap();
+        let deep = here.keep(&inner, &mail("deep", "inside"), &Flags::default()).unwrap();
+        let renamed = here.rename_folder(&b, "C").await.unwrap();
+        assert_eq!(renamed, "C");
+        assert!(here.body(deep).await.unwrap().text.contains("inside"));
+        assert_eq!(here.messages("C/Inner").await.unwrap().len(), 1);
+        // Deleted for good, alone or with its folder.
+        here.erase(moved[0].id).await.unwrap();
+        assert_eq!(here.messages("C").await.unwrap().len(), 0);
+        here.delete_folder("C").await.unwrap();
+        assert!(here.mailboxes().await.unwrap().iter().all(|m| m.name != "C"));
+        assert!(here.keep("C", &mail("late", "x"), &Flags::default()).is_err(), "not into a folder that is gone");
+    }
 
     #[test]
     fn a_draft_id_is_read_from_its_header() {

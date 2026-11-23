@@ -407,6 +407,13 @@ impl Progress {
 }
 
 impl Account {
+    /// The folders on this computer, shown as an account without a server; its key, `@local`, is one
+    /// no real account has (their user is never empty).
+    pub fn local() -> Self {
+        let none = Server { host: "local".to_owned(), port: 0, tls: Tls::Tls };
+        Self { name: String::new(), user: String::new(), email: String::new(), imap: none.clone(), smtp: none, save_sent: false, keep: Keep::default(), signature: String::new(), oauth: None, smtp_user: None, archive: String::new(), archive_by_year: false, quota_warning: 0 }
+    }
+
     /// The address to send from: the configured one, else the login name.
     pub fn address(&self) -> &str {
         if self.email.trim().is_empty() { &self.user } else { self.email.trim() }
