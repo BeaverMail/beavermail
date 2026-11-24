@@ -90,7 +90,7 @@ async fn start_opts(move_works: bool, attachment: bool, idle: bool) -> Mock {
         }
     });
     let server = Server { host: "127.0.0.1".into(), port, tls: Tls::None };
-    let account = Account { name: "mock".into(), user: "u".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true, keep: beavermail_core::Keep::default(), signature: String::new(), oauth: None, smtp_user: None, archive: String::new(), archive_by_year: false, quota_warning: 90 };
+    let account = Account { name: "mock".into(), user: "u".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true, keep: beavermail_core::Keep::default(), signature: String::new(), smtp_user: None, archive: String::new(), archive_by_year: false, quota_warning: 90 };
     let store = Arc::new(Store::in_memory().unwrap());
     let files = Arc::new(Vault::in_memory());
     Mock { source: ImapSource::new(&account, "p".into(), store.clone(), files.clone()), account, store, files, log, message, list, bye, broken, tls_only, modseq, qresync, full }
@@ -131,14 +131,6 @@ async fn serve(socket: TcpStream, log: Arc<Mutex<Vec<String>>>, move_works: bool
         let reply = if verb.starts_with("CAPABILITY") {
             let extra = format!("{}{}{}{}", if *full.lock().unwrap() { " QUOTA UIDPLUS" } else { "" }, if idle { " IDLE" } else { "" }, if *tls_only.lock().unwrap() { " STARTTLS LOGINDISABLED" } else { "" }, if modseq.lock().unwrap().is_some() { if qresync.lock().unwrap().is_some() { " ENABLE CONDSTORE QRESYNC" } else { " ENABLE CONDSTORE" } } else { "" });
             format!("* CAPABILITY IMAP4rev1{extra}\r\n{tag} OK done\r\n")
-        } else if verb.starts_with("AUTHENTICATE XOAUTH2") {
-            // The client's answer to the challenge is a line of its own, kept in the log to check.
-            let mut answer = String::new();
-            if write.write_all(b"+ \r\n").await.is_err() || read.read_line(&mut answer).await.is_err() {
-                return;
-            }
-            log.lock().unwrap().push(answer.trim_end().to_owned());
-            format!("{tag} OK signed in\r\n")
         } else if verb.starts_with("IDLE") {
             // Say something changed after a moment, then wait for the client to end IDLE.
             if write.write_all(b"+ idling\r\n").await.is_err() {
@@ -520,17 +512,6 @@ async fn working_offline_keeps_off_the_server_until_online_again() {
     assert!(mock.source.messages("INBOX").await.is_ok(), "the archive still answers");
     mock.source.set_offline(false);
     mock.source.sync("INBOX").await.unwrap();
-}
-
-#[tokio::test]
-async fn a_provider_account_signs_in_with_an_access_token() {
-    let mock = start(true).await;
-    let source = ImapSource::new(&mock.account, String::new(), mock.store.clone(), mock.files.clone()).with_token(Arc::new(|| Ok("access-1".to_owned())));
-    source.sync("INBOX").await.unwrap();
-    let commands = mock.commands();
-    assert!(!commands.iter().any(|c| c.starts_with("LOGIN")), "{commands:?}");
-    // "user=u^Aauth=Bearer access-1^A^A" in base64.
-    assert!(commands.iter().any(|c| c == "dXNlcj11AWF1dGg9QmVhcmVyIGFjY2Vzcy0xAQE="), "{commands:?}");
 }
 
 #[tokio::test]

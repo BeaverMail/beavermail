@@ -4,7 +4,6 @@
 //! passwords live only in the system credential store (Keychain, Credential Manager,
 //! Secret Service), keyed by [`Account::key`]. A password is never written to the file.
 
-pub mod oauth;
 
 use std::path::PathBuf;
 
@@ -218,7 +217,7 @@ mod tests {
     fn account(user: &str) -> Account {
         let imap = Server { host: "mail.example.org".into(), port: 143, tls: Tls::StartTls };
         let smtp = Server { host: "mail.example.org".into(), port: 465, tls: Tls::Tls };
-        Account { name: "Work".into(), user: user.into(), email: user.into(), imap, smtp, save_sent: true, keep: beavermail_core::Keep::default(), signature: String::new(), oauth: None, smtp_user: None, archive: String::new(), archive_by_year: false, quota_warning: 90 }
+        Account { name: "Work".into(), user: user.into(), email: user.into(), imap, smtp, save_sent: true, keep: beavermail_core::Keep::default(), signature: String::new(), smtp_user: None, archive: String::new(), archive_by_year: false, quota_warning: 90 }
     }
 
     #[test]
@@ -249,6 +248,13 @@ mod tests {
         let text = toml::to_string_pretty(&settings).unwrap();
         assert_eq!(toml::from_str::<Settings>(&text).unwrap(), settings);
         assert_eq!(toml::from_str::<Settings>("").unwrap(), Settings::default());
+    }
+
+    #[test]
+    fn an_account_saved_with_a_sign_in_no_longer_offered_still_loads() {
+        let accounts = vec![account("a@example.org")];
+        let text = render(&accounts).unwrap().replacen("[[account]]", "[[account]]\noauth = \"google\"", 1);
+        assert_eq!(parse(&text).unwrap(), accounts);
     }
 
     #[test]

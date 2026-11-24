@@ -566,10 +566,7 @@ pub fn dry_run() -> Result<(), String> {
     println!("BeaverMail spam checks, dry run: nothing is moved on the server and no mark is saved.");
 
     for account in &list {
-        let mut source = ImapSource::new(account, accounts::password(account).unwrap_or_default(), archive.clone(), vault.clone());
-        if let Some(provider) = account.oauth {
-            source = source.with_token(accounts::oauth::token_source(provider, account.clone()));
-        }
+        let source = ImapSource::new(account, accounts::password(account).unwrap_or_default(), archive.clone(), vault.clone());
         let key = account.key();
         eprintln!("{}: syncing the folder list, Sent and Inbox (read-only)…", account.address());
         let synced = runtime.block_on(async {

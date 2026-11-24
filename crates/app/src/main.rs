@@ -44,7 +44,7 @@ mod unsubscribe;
 mod views;
 
 use beavermail_accounts as store;
-use beavermail_core::{OAuthProvider, Account, Filter, Density, DisplayMode, Hit, Keep, MailError, MailSender, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Progress, Role, Server, Settings, Sort, SortBy, SyncReport, Tls, ListLayout, Quota};
+use beavermail_core::{Account, Filter, Density, DisplayMode, Hit, Keep, MailError, MailSender, MailSource, Mailbox, MessageBody, MessageId, MessageSummary, Progress, Role, Server, Settings, Sort, SortBy, SyncReport, Tls, ListLayout, Quota};
 use beavermail_imap::ImapSource;
 use beavermail_smtp::{SmtpSender, render_draft};
 use beavermail_store::Store;
@@ -141,8 +141,6 @@ enum Event {
     Assistant(assistant::Purpose, Result<String, String>),
     /// A dictionary for the spell check was read or downloaded: (its code, result).
     Dictionary(String, Result<Arc<beavermail_spell::Speller>, String>),
-    /// A sign-in with a provider ended: (its cancel flag, which tells it from an earlier one, result).
-    SignedIn(Arc<std::sync::atomic::AtomicBool>, Result<store::oauth::Grant, String>),
     /// A "Test connection" ended: (the form it is for, what was tested, IMAP's answer, SMTP's answer).
     Checked(Option<u64>, Box<(Account, String, String)>, Result<(), String>, Result<(), String>),
     /// A key file was picked to import for this address (`None`: the dialog was cancelled).
@@ -165,26 +163,10 @@ enum Event {
     Contacts(Result<Vec<beavermail_store::Contact>, MailError>),
 }
 
-/// A sign-in with a provider waiting for the user in the browser.
-struct SignIn {
-    provider: OAuthProvider,
-    /// The account page it is for; `None` for the Add account dialog.
-    editing: Option<u64>,
-    cancel: Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl SignIn {
-    fn stop(&self) {
-        self.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
 /// What the user pressed on an account's page in Settings.
 enum PageAction {
     Remove,
     Test,
-    SignIn(OAuthProvider),
-    CancelSignIn,
 }
 
 enum VaultOutcome {
@@ -708,8 +690,6 @@ struct NewAccount {
     archive_by_year: bool,
     /// See [`Account::quota_warning`].
     quota_warning: u8,
-    /// Signed in with a provider: kept through an edit, so the account stays an OAuth one.
-    oauth: Option<OAuthProvider>,
     /// The last "Test connection", shown while the form still says what was tested.
     check: Option<Check>,
     error: Option<String>,
@@ -740,7 +720,6 @@ impl Default for NewAccount {
             archive: String::new(),
             archive_by_year: false,
             quota_warning: 90,
-            oauth: None,
             check: None,
             error: None,
             focus_first: true,
@@ -783,7 +762,6 @@ impl NewAccount {
             archive: account.archive.clone(),
             archive_by_year: account.archive_by_year,
             quota_warning: account.quota_warning,
-            oauth: account.oauth,
             focus_first: true,
             ..Self::default()
         }
@@ -800,26 +778,6 @@ impl NewAccount {
         !self.user.trim().is_empty() && !self.imap_host.trim().is_empty() && password
     }
 
-    /// The form for the account `grant` signed in to, with the provider's servers.
-    fn signed_in(provider: OAuthProvider, grant: store::oauth::Grant) -> Self {
-        let (imap, smtp) = store::oauth::servers(provider);
-        Self {
-            user: grant.email.clone(),
-            email: grant.email,
-            password: grant.refresh_token,
-            imap_host: imap.host,
-            imap_port: imap.port.to_string(),
-            imap_tls: imap.tls,
-            smtp_host: smtp.host,
-            smtp_port: smtp.port.to_string(),
-            smtp_tls: smtp.tls,
-            name: grant.name.unwrap_or_default(),
-            save_sent: false, // both providers file sent mail themselves
-            oauth: Some(provider),
-            ..Self::default()
-        }
-    }
-
     fn build(&self) -> Result<Account, String> {
         let port = |text: &str, what: &str| text.trim().parse().map_err(|_| format!("{what} port is not a number"));
         let (user, imap_host) = (self.user.trim(), self.imap_host.trim());
@@ -834,7 +792,7 @@ impl NewAccount {
         };
         let smtp_host = if self.smtp_host.trim().is_empty() { imap_host } else { self.smtp_host.trim() };
         let smtp_user = match self.smtp_user.trim() {
-            _ if !self.smtp_own || self.oauth.is_some() => None,
+            _ if !self.smtp_own => None,
             "" => return Err("enter the user for the outgoing server".into()),
             user => Some(user.to_owned()),
         };
@@ -848,7 +806,6 @@ impl NewAccount {
             save_sent: self.save_sent,
             keep: self.keep,
             signature: self.signature.trim_end().to_owned(),
-            oauth: self.oauth,
             smtp_user,
             archive: self.archive.clone(),
             archive_by_year: self.archive_by_year,
@@ -1116,7 +1073,7 @@ fn section_title(ui: &mut egui::Ui, text: &str) {
 
 /// One account's page in Settings. `waiting`: a sign-in for it is open in the browser.
 /// `folders`: the account's folders as (name on the server, as shown), for where Archive moves mail.
-fn account_page(ui: &mut egui::Ui, t: &theme::Tokens, form: &mut NewAccount, waiting: bool, folders: &[(String, String)], quota: Option<Quota>) -> Option<PageAction> {
+fn account_page(ui: &mut egui::Ui, t: &theme::Tokens, form: &mut NewAccount, folders: &[(String, String)], quota: Option<Quota>) -> Option<PageAction> {
     let mut action = None;
     let hint = |ui: &mut egui::Ui, text: &str| ui.label(RichText::new(text).size(13.0).color(t.text_dim));
     form_grid(ui, "account_identity", |ui| {
@@ -1195,33 +1152,13 @@ fn account_page(ui: &mut egui::Ui, t: &theme::Tokens, form: &mut NewAccount, wai
     }
 
     section_title(ui, "Connection");
-    match form.oauth {
-        Some(provider) if waiting => {
-            hint(ui, &format!("Finish signing in to {} in your browser.", provider.name()));
-            ui.add_space(4.0);
-            if ui.button("Cancel sign-in").clicked() {
-                action = Some(PageAction::CancelSignIn);
-            }
-        }
-        Some(provider) => {
-            hint(ui, &format!("Signed in with {} as {}. Sign in again if the account stops connecting.", provider.name(), form.user));
-            ui.add_space(4.0);
-            if ui.button("Sign in again…").clicked() {
-                action = Some(PageAction::SignIn(provider));
-            }
-        }
-        None => {
-            hint(ui, "Saving a change here reconnects the account. A different user or server downloads its mail again.");
-            ui.add_space(4.0);
-            form_grid(ui, "account_login", |ui| login_rows(ui, form));
-            server_sections(ui, t, form);
-        }
-    }
-    if !waiting {
-        ui.add_space(8.0);
-        if check_rows(ui, t, form) {
-            action = Some(PageAction::Test);
-        }
+    hint(ui, "Saving a change here reconnects the account. A different user or server downloads its mail again.");
+    ui.add_space(4.0);
+    form_grid(ui, "account_login", |ui| login_rows(ui, form));
+    server_sections(ui, t, form);
+    ui.add_space(8.0);
+    if check_rows(ui, t, form) {
+        action = Some(PageAction::Test);
     }
 
     section_title(ui, "Remove account");
@@ -1347,9 +1284,6 @@ fn server_sections(ui: &mut egui::Ui, t: &theme::Tokens, form: &mut NewAccount) 
 
 /// The outgoing server's own login, under its section, when it is not the incoming one's.
 fn smtp_login(ui: &mut egui::Ui, t: &theme::Tokens, form: &mut NewAccount) {
-    if form.oauth.is_some() {
-        return;
-    }
     ui.add_space(4.0);
     views::switch_row(ui, t, &mut form.smtp_own, "Different user and password for sending", "For servers that send with a login of their own.");
     if form.smtp_own {
@@ -1451,8 +1385,6 @@ struct BeaverApp {
     settings_page: SettingsPage,
     /// The account page being edited in Settings; nothing is saved until Save changes.
     account_edit: Option<NewAccount>,
-    /// A sign-in with a provider, from Add account or an account's page, until it ends.
-    signing_in: Option<SignIn>,
     /// What the window shows, as picked in the rail at its left edge.
     section: Section,
     /// Settings > Secure mail's dialogs.
@@ -1720,7 +1652,6 @@ impl BeaverApp {
             show_settings: false,
             settings_page: SettingsPage::default(),
             account_edit: None,
-            signing_in: None,
             contacts: Default::default(),
             section: Section::Mail,
             key_dialogs: Default::default(),
@@ -1906,12 +1837,7 @@ impl BeaverApp {
             Ok(password) => {
                 // A missing password of its own makes the outgoing server refuse, which sending then says.
                 let smtp_password = if account.smtp_user.is_some() { store::smtp_password(&account).unwrap_or_default() } else { password.clone() };
-                let (mut sender, mut source) = (SmtpSender::new(&account, smtp_password), ImapSource::new(&account, password, self.archive.clone(), self.vault.clone()));
-                if let Some(provider) = account.oauth {
-                    // The stored secret is the provider's refresh token; the servers get access tokens.
-                    let token = store::oauth::token_source(provider, account.clone());
-                    (sender, source) = (sender.with_token(token.clone()), source.with_token(token));
-                }
+                let (sender, source) = (SmtpSender::new(&account, smtp_password), ImapSource::new(&account, password, self.archive.clone(), self.vault.clone()));
                 (Some(Arc::new(source)), Some(Arc::new(sender)), None)
             }
             Err(e) => (None, None, Some(e)),
@@ -4068,12 +3994,11 @@ impl BeaverApp {
                             }
                             SettingsPage::Account(_) => {
                                 if let Some(form) = &mut self.account_edit {
-                                    let waiting = self.signing_in.as_ref().is_some_and(|s| s.editing.is_some() && s.editing == form.editing);
                                     let folders: Vec<(String, String)> = form.editing.and_then(|serial| self.accounts.iter().find(|v| v.serial == serial)).map(|v| {
                                         v.mailboxes.iter().filter(|m| matches!(m.role, Role::Archive | Role::Other)).map(|m| (m.name.clone(), views::folder_path(&m.name, m.role, m.delimiter))).collect()
                                     }).unwrap_or_default();
                                     let quota = form.editing.and_then(|serial| self.accounts.iter().find(|v| v.serial == serial)?.quota);
-                                    page_action = account_page(ui, t, form, waiting, &folders, quota);
+                                    page_action = account_page(ui, t, form, &folders, quota);
                                 }
                             }
                             SettingsPage::Reading => {
@@ -4503,8 +4428,6 @@ impl BeaverApp {
         }
         match (page_action, self.settings_page) {
             (Some(PageAction::Remove), SettingsPage::Account(serial)) => self.confirm_remove = Some(serial),
-            (Some(PageAction::SignIn(provider)), SettingsPage::Account(serial)) => self.sign_in(provider, Some(serial)),
-            (Some(PageAction::CancelSignIn), _) => self.cancel_sign_in(),
             (Some(PageAction::Test), SettingsPage::Account(serial)) => self.test_connection(Some(serial)),
             _ => {}
         }
@@ -4535,9 +4458,6 @@ impl BeaverApp {
     /// Goes to another settings page, or closes Settings with `None`, dropping any unsaved account changes.
     fn leave_settings_page(&mut self, target: Option<SettingsPage>) {
         self.account_edit = None;
-        if self.signing_in.as_ref().is_some_and(|s| s.editing.is_some()) {
-            self.cancel_sign_in();
-        }
         match target {
             Some(page) => self.settings_page = page,
             None => self.show_settings = false,
@@ -7840,7 +7760,6 @@ impl BeaverApp {
                     }
                 }
             }
-            Event::SignedIn(cancel, result) => self.signed_in(cancel, result),
             Event::Checked(editing, tested, imap, smtp) => {
                 let form = if editing.is_none() { self.form.as_mut() } else { self.account_edit.as_mut().filter(|f| f.editing == editing) };
                 if let Some(check) = form.and_then(|f| f.check.as_mut()).filter(|c| c.tested == *tested) {
@@ -8188,11 +8107,7 @@ impl BeaverApp {
         form.error = None;
         let tested = (account.clone(), form.password.clone(), form.smtp_password.clone());
         form.check = Some(Check { tested: tested.clone(), answers: None });
-        let (mut imap, mut smtp) = (ImapSource::new(&account, password, archive, vault), SmtpSender::new(&account, smtp_password));
-        if let Some(provider) = account.oauth {
-            let token = store::oauth::token_source(provider, account.clone());
-            (imap, smtp) = (imap.with_token(token.clone()), smtp.with_token(token));
-        }
+        let (imap, smtp) = (ImapSource::new(&account, password, archive, vault), SmtpSender::new(&account, smtp_password));
         self.spawn(async move {
             let said = |result: Result<(), MailError>| {
                 result.map_err(|e| match e {
@@ -8206,101 +8121,17 @@ impl BeaverApp {
         });
     }
 
-    /// Opens the provider's sign-in in the browser and waits for it in the background; `editing`: for
-    /// that account's page, else for Add account.
-    fn sign_in(&mut self, provider: OAuthProvider, editing: Option<u64>) {
-        self.cancel_sign_in();
-        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        self.signing_in = Some(SignIn { provider, editing, cancel: cancel.clone() });
-        self.spawn(async move {
-            let flag = cancel.clone();
-            let open = |url: &str| opener::open_browser(url).map_err(|e| format!("could not open the browser: {e}"));
-            let result = tokio::task::spawn_blocking(move || store::oauth::authorize(provider, open, &flag)).await.unwrap_or_else(|e| Err(e.to_string()));
-            Event::SignedIn(cancel, result)
-        });
-    }
-
-    fn cancel_sign_in(&mut self) {
-        if let Some(sign_in) = self.signing_in.take() {
-            sign_in.stop();
-        }
-    }
-
-    /// A sign-in ended: Add account adds the account; an account's page keeps the new token until Save changes.
-    fn signed_in(&mut self, cancel: Arc<std::sync::atomic::AtomicBool>, result: Result<store::oauth::Grant, String>) {
-        let Some(sign_in) = self.signing_in.take_if(|s| Arc::ptr_eq(&s.cancel, &cancel)) else { return }; // cancelled, or replaced by a newer one
-        let form = match sign_in.editing {
-            None => self.form.as_mut(),
-            Some(serial) => self.account_edit.as_mut().filter(|f| f.editing == Some(serial)),
-        };
-        let Some(form) = form else { return }; // its dialog or page was closed
-        let grant = match result {
-            Ok(grant) => grant,
-            Err(e) => return form.error = Some(e),
-        };
-        if form.editing.is_some() {
-            if !grant.email.eq_ignore_ascii_case(&form.user) {
-                return form.error = Some(format!("You signed in as {}, but this account is {}.", grant.email, form.user));
-            }
-            form.password = grant.refresh_token;
-            form.error = None;
-            return;
-        }
-        // A name typed in the dialog wins over the one the provider has.
-        let mut filled = NewAccount::signed_in(sign_in.provider, grant);
-        if !form.name.trim().is_empty() {
-            filled.name = std::mem::take(&mut form.name);
-        }
-        let result = self.save_account(&filled);
-        let Some(form) = self.form.as_mut() else { return };
-        form.name = filled.name;
-        match result {
-            Ok(serial) => {
-                self.form = None;
-                if self.show_settings {
-                    self.settings_page = SettingsPage::Account(serial);
-                }
-            }
-            Err(e) => form.error = Some(e),
-        }
-    }
-
     /// The Add account dialog; an existing account is changed on its page in Settings.
     fn account_form(&mut self, ctx: &egui::Context) {
         let Some(mut form) = self.form.take() else { return };
         let t = theme::Tokens::get(ctx);
         let (mut submit, mut cancel) = (false, false);
-        let (mut start, mut stop, mut test) = (None, false, false);
-        let waiting = self.signing_in.as_ref().filter(|s| s.editing.is_none()).map(|s| s.provider);
+        let mut test = false;
         let ready = form.ready();
         let modal = crate::views::modal(ctx, egui::Id::new("add_account")).show(ctx, |ui| {
             ui.set_width(FORM_WIDTH);
             ui.heading("Add account");
-            if let Some(provider) = waiting {
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(format!("Finish signing in to {} in your browser.", provider.name()));
-                });
-                ui.add_space(12.0);
-                ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
-                    stop = ui.button("Cancel").clicked();
-                });
-                return;
-            }
-            let providers: Vec<OAuthProvider> = [OAuthProvider::Google, OAuthProvider::Microsoft].into_iter().filter(|p| store::oauth::available(*p)).collect();
-            if !providers.is_empty() {
-                ui.add_space(8.0);
-                for provider in providers {
-                    if ui.add_sized([ui.available_width(), theme::CONTROL_H], egui::Button::new(format!("Sign in with {}", provider.name()))).clicked() {
-                        start = Some(provider);
-                    }
-                }
-                ui.add_space(12.0);
-                ui.label(RichText::new("Or connect any other mailbox over IMAP and SMTP.").color(t.text_dim));
-            } else {
-                ui.label(RichText::new("Connect an existing mailbox over IMAP and SMTP.").color(t.text_dim));
-            }
+            ui.label(RichText::new("Connect an existing mailbox over IMAP and SMTP.").color(t.text_dim));
             ui.add_space(8.0);
             // Scrolls on a short window, so the buttons below stay in reach.
             egui::ScrollArea::vertical().max_height((ctx.content_rect().height() - 240.0).max(160.0)).show(ui, |ui| {
@@ -8334,13 +8165,6 @@ impl BeaverApp {
             });
         });
         let mut open = !(cancel || modal.should_close());
-        if stop || (!open && waiting.is_some()) {
-            self.cancel_sign_in();
-        }
-        if let Some(provider) = start {
-            form.error = None;
-            self.sign_in(provider, None);
-        }
         if test && open {
             self.form = Some(form);
             self.test_connection(None);
@@ -10543,7 +10367,7 @@ mod tests {
     fn what_an_account_knows_is_loaded_again_only_when_its_marks_change() {
         let archive = Arc::new(Store::in_memory().unwrap());
         let server = Server { host: "mail.example.org".into(), port: 993, tls: Tls::Tls };
-        let account = Account { name: "Ada".into(), user: "ada@example.org".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true, keep: Keep::default(), signature: String::new(), oauth: None, smtp_user: None, archive: String::new(), archive_by_year: false, quota_warning: 90 };
+        let account = Account { name: "Ada".into(), user: "ada@example.org".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true, keep: Keep::default(), signature: String::new(), smtp_user: None, archive: String::new(), archive_by_year: false, quota_warning: 90 };
         let (cache, mut settings) = (KnownCache::default(), Settings::default());
         let first = cache.get(&archive, &account, &[], &settings).unwrap();
         assert!(Arc::ptr_eq(&first, &cache.get(&archive, &account, &[], &settings).unwrap()), "kept");
@@ -10591,15 +10415,6 @@ mod tests {
     }
 
     #[test]
-    fn a_sign_in_fills_the_providers_servers() {
-        let grant = store::oauth::Grant { email: "ada@gmail.com".into(), name: None, refresh_token: "r".into() };
-        let account = NewAccount::signed_in(OAuthProvider::Google, grant).build().unwrap();
-        assert_eq!((account.user.as_str(), account.address(), account.imap.host.as_str(), account.smtp.port), ("ada@gmail.com", "ada@gmail.com", "imap.gmail.com", 587));
-        assert_eq!(account.oauth, Some(OAuthProvider::Google));
-        assert!(!account.save_sent, "the provider files sent mail itself");
-    }
-
-    #[test]
     fn a_test_result_stands_only_for_the_form_it_tested() {
         let mut form = filled();
         let tested = (form.build().unwrap(), form.password.clone(), String::new());
@@ -10622,8 +10437,6 @@ mod tests {
         let account = form.build().unwrap();
         assert_eq!((account.smtp_user.as_deref(), account.smtp_login(), account.user.as_str()), (Some("relay-ada"), "relay-ada", "ada@example.org"));
         assert_eq!(NewAccount::editing(7, &account).build().unwrap(), account, "kept through an edit");
-        form.oauth = Some(OAuthProvider::Google);
-        assert_eq!(form.build().unwrap().smtp_user, None, "a provider's sign-in covers both servers");
     }
 
     fn filled() -> NewAccount {

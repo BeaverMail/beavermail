@@ -8,7 +8,7 @@
 pub mod model;
 pub mod sample;
 
-pub use model::{address_text, OAuthProvider, Account, Assistant, LlmProvider, AddressBook, Attachment, CalendarSource, Columns, Condition, Filter, FilterAction, ListLayout, AuthCheck, AuthResult, Density, DisplayMode, Hit, Keep, Label, Mailbox, MessageBody, MessageId, MessageSummary, Outgoing, OutgoingFile, Progress, Role, Encryption, Seal, Server, Settings, Signature, Sort, SortBy, SignatureCheck, SignedWith, SyncReport, Tls, Quota};
+pub use model::{address_text, Account, Assistant, LlmProvider, AddressBook, Attachment, CalendarSource, Columns, Condition, Filter, FilterAction, ListLayout, AuthCheck, AuthResult, Density, DisplayMode, Hit, Keep, Label, Mailbox, MessageBody, MessageId, MessageSummary, Outgoing, OutgoingFile, Progress, Role, Encryption, Seal, Server, Settings, Signature, Sort, SortBy, SignatureCheck, SignedWith, SyncReport, Tls, Quota};
 
 use std::fmt;
 use std::future::Future;
@@ -42,11 +42,6 @@ impl fmt::Display for MailError {
 }
 
 impl std::error::Error for MailError {}
-
-/// A fresh OAuth 2.0 access token for an account that signs in with a provider: the backends ask it
-/// before each connection. It may ask the provider for a new token, so it blocks; call it off the
-/// async threads.
-pub type TokenSource = std::sync::Arc<dyn Fn() -> Result<String, MailError> + Send + Sync>;
 
 /// Access to one account's mail. The UI talks only to this trait.
 ///

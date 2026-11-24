@@ -33,12 +33,6 @@ jobs:
       - name: System libraries
         run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev
       - name: Build
-        # The sign-in buttons appear only with the app's client IDs, kept as repository secrets; without
-        # them the build works and has no Google or Microsoft sign-in.
-        env:
-          BEAVERMAIL_GOOGLE_CLIENT_ID: ${{ secrets.BEAVERMAIL_GOOGLE_CLIENT_ID }}
-          BEAVERMAIL_GOOGLE_CLIENT_SECRET: ${{ secrets.BEAVERMAIL_GOOGLE_CLIENT_SECRET }}
-          BEAVERMAIL_MICROSOFT_CLIENT_ID: ${{ secrets.BEAVERMAIL_MICROSOFT_CLIENT_ID }}
         run: cargo build --release -p beavermail
       - name: Package
         run: |

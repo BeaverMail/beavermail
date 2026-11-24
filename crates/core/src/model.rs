@@ -246,10 +246,6 @@ pub struct Account {
     /// Text added under new messages, replies and forwards; empty for none.
     #[serde(default)]
     pub signature: String,
-    /// Signed in with this provider (OAuth 2.0) instead of a password: the secret kept for the
-    /// account is then its refresh token.
-    #[serde(default)]
-    pub oauth: Option<OAuthProvider>,
     /// The outgoing server's own login, when it is not the incoming one's; its password is kept apart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub smtp_user: Option<String>,
@@ -335,23 +331,6 @@ pub fn address_text(name: &str, address: &str) -> String {
     }
 }
 
-/// Who an account signs in with, when it is not a password.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum OAuthProvider {
-    Google,
-    Microsoft,
-}
-
-impl OAuthProvider {
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Google => "Google",
-            Self::Microsoft => "Microsoft",
-        }
-    }
-}
-
 /// How much mail is kept on this computer. Headers and flags are always synchronised.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -411,7 +390,7 @@ impl Account {
     /// no real account has (their user is never empty).
     pub fn local() -> Self {
         let none = Server { host: "local".to_owned(), port: 0, tls: Tls::Tls };
-        Self { name: String::new(), user: String::new(), email: String::new(), imap: none.clone(), smtp: none, save_sent: false, keep: Keep::default(), signature: String::new(), oauth: None, smtp_user: None, archive: String::new(), archive_by_year: false, quota_warning: 0 }
+        Self { name: String::new(), user: String::new(), email: String::new(), imap: none.clone(), smtp: none, save_sent: false, keep: Keep::default(), signature: String::new(), smtp_user: None, archive: String::new(), archive_by_year: false, quota_warning: 0 }
     }
 
     /// The address to send from: the configured one, else the login name.
@@ -840,7 +819,7 @@ mod tests {
     #[test]
     fn mail_goes_out_under_the_users_name_unless_it_is_only_the_login() {
         let server = Server { host: "imap.x.org".into(), port: 993, tls: Tls::Tls };
-        let account = |name: &str| Account { name: name.into(), user: "ada".into(), email: "ada@x.org".into(), imap: server.clone(), smtp: server.clone(), save_sent: true, keep: Keep::default(), signature: String::new(), oauth: None, smtp_user: None, archive: String::new(), archive_by_year: false, quota_warning: 90 };
+        let account = |name: &str| Account { name: name.into(), user: "ada".into(), email: "ada@x.org".into(), imap: server.clone(), smtp: server.clone(), save_sent: true, keep: Keep::default(), signature: String::new(), smtp_user: None, archive: String::new(), archive_by_year: false, quota_warning: 90 };
         assert_eq!(account("Ada Lovelace").sender(), "\"Ada Lovelace\" <ada@x.org>");
         assert_eq!(account("Lovelace, Ada").sender(), "\"Lovelace, Ada\" <ada@x.org>", "quoted: the comma is part of the name");
         assert_eq!(account("Ada \"the\" Countess").sender(), "\"Ada the Countess\" <ada@x.org>");

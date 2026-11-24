@@ -30,12 +30,6 @@ jobs:
           targets: aarch64-apple-darwin, x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
       - name: Build
-        # The sign-in buttons appear only with the app's client IDs, kept as repository secrets; without
-        # them the build works and has no Google or Microsoft sign-in.
-        env:
-          BEAVERMAIL_GOOGLE_CLIENT_ID: ${{ secrets.BEAVERMAIL_GOOGLE_CLIENT_ID }}
-          BEAVERMAIL_GOOGLE_CLIENT_SECRET: ${{ secrets.BEAVERMAIL_GOOGLE_CLIENT_SECRET }}
-          BEAVERMAIL_MICROSOFT_CLIENT_ID: ${{ secrets.BEAVERMAIL_MICROSOFT_CLIENT_ID }}
         run: |
           cargo build --release -p beavermail --target aarch64-apple-darwin
           cargo build --release -p beavermail --target x86_64-apple-darwin

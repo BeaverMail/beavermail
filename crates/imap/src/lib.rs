@@ -105,8 +105,6 @@ struct Config {
     password: String,
     /// The user chose to work offline: no connection is opened, and an open one is dropped.
     offline: std::sync::atomic::AtomicBool,
-    /// Signed in with a provider: an access token instead of the password.
-    token: Option<beavermail_core::TokenSource>,
     /// The server has UIDPLUS, as the last connection said: one message alone can be expunged.
     uidplus: std::sync::atomic::AtomicBool,
     /// The folders on this computer: there is no server, the archive is all there is.
@@ -195,7 +193,7 @@ impl ImapSource {
 
     /// Creates the source over the shared archive; the connection is opened on first use.
     pub fn new(account: &Account, password: String, store: Arc<Store>, files: Arc<Vault>) -> Self {
-        let config = Config { server: account.imap.clone(), user: account.user.clone(), password, offline: Default::default(), token: None, uidplus: Default::default(), local: false };
+        let config = Config { server: account.imap.clone(), user: account.user.clone(), password, offline: Default::default(), uidplus: Default::default(), local: false };
         Self { config, poll_interval: std::time::Duration::from_secs(180), account: account.key(), address: account.address().to_lowercase(), store, files, state: Mutex::new(State::default()), reader: Mutex::new(State::default()), plain: Default::default(), archive: std::sync::Mutex::new((account.archive.clone(), account.archive_by_year)), auth_server: std::sync::Mutex::new(None), writing: Default::default() }
     }
 
@@ -265,14 +263,6 @@ impl ImapSource {
         let at = self.store.locate(id)?.ok_or(MailError::NotFound)?;
         self.drop_files(&at.folder, &[at.uid]);
         self.store.remove(id)
-    }
-
-    /// Changes how often a server without IDLE is polled (3 minutes by default).
-    #[must_use]
-    /// Signs in with `token`'s access tokens (XOAUTH2) instead of the password.
-    pub fn with_token(mut self, token: beavermail_core::TokenSource) -> Self {
-        self.config.token = Some(token);
-        self
     }
 
     /// The body of a message as the reader shows it: decrypted with the account's own key when it is
@@ -592,19 +582,11 @@ async fn connect(c: &Config) -> Result<Session<Stream>, MailError> {
             return Err(encryption_required(host));
         }
     }
-    match &c.token {
-        // Asked off the async threads: getting a token may ask the provider for a new one.
-        Some(token) => {
-            let token = token.clone();
-            let access = tokio::task::spawn_blocking(move || token()).await.map_err(backend)??;
-            client.authenticate("XOAUTH2", XOAuth2 { user: c.user.clone(), token: access, answered: false }).await.map_err(|(e, _)| MailError::Auth(e.to_string()))
-        }
-        None => client.login(&c.user, &c.password).await.map_err(|(e, _)| match e.to_string() {
-            // The server's code for "sign in over an encrypted connection", not a wrong password.
-            why if why.contains("PRIVACYREQUIRED") || why.contains("PrivacyRequired") => encryption_required(host),
-            why => MailError::Auth(why),
-        }),
-    }
+    client.login(&c.user, &c.password).await.map_err(|(e, _)| match e.to_string() {
+        // The server's code for "sign in over an encrypted connection", not a wrong password.
+        why if why.contains("PRIVACYREQUIRED") || why.contains("PrivacyRequired") => encryption_required(host),
+        why => MailError::Auth(why),
+    })
 }
 
 fn encryption_required(host: &str) -> MailError {
@@ -635,25 +617,6 @@ async fn login_disabled(client: &mut Client<Stream>, said: Option<bool>) -> Resu
     let (tx, rx) = async_channel::unbounded();
     client.run_command_and_check_ok("CAPABILITY", Some(tx)).await.map_err(backend)?;
     Ok(std::iter::from_fn(|| rx.try_recv().ok()).any(|r| matches!(r, async_imap::types::UnsolicitedResponse::Other(d) if matches!(d.parsed(), Response::Capabilities(caps) if refuses_plain_login(caps)))))
-}
-
-/// The XOAUTH2 answer to the server's challenge. If the server refuses the token it sends a second
-/// challenge with the reason, which an empty answer closes, so the refusal comes back as an error.
-struct XOAuth2 {
-    user: String,
-    token: String,
-    answered: bool,
-}
-
-impl async_imap::Authenticator for XOAuth2 {
-    type Response = String;
-
-    fn process(&mut self, _challenge: &[u8]) -> String {
-        if std::mem::replace(&mut self.answered, true) {
-            return String::new();
-        }
-        format!("user={}\x01auth=Bearer {}\x01\x01", self.user, self.token)
-    }
 }
 
 impl State {
