@@ -32,7 +32,7 @@ pub fn truncated(ui: &Ui, text: &str, font: FontId, color: Color32, width: f32) 
     ui.painter().layout_job(job)
 }
 
-fn row_background(ui: &Ui, rect: Rect, response: &Response, selected: bool, t: &Tokens) {
+pub(crate) fn row_background(ui: &Ui, rect: Rect, response: &Response, selected: bool, t: &Tokens) {
     let fill = if selected {
         tint(t)
     } else if response.is_pointer_button_down_on() {

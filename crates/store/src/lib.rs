@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use beavermail_core::{Hit, MailError, MessageId, MessageSummary, Role};
+use beavermail_core::{Attachment, Hit, MailError, MessageId, MessageSummary, Role};
 use rusqlite::{Connection, OptionalExtension, params};
 
 const SCHEMA: &str = "
@@ -424,6 +424,19 @@ pub struct FolderRow {
     pub stored: u32,
     /// The server's separator between this folder and those inside it; `None` until it lists it again.
     pub delimiter: Option<char>,
+}
+
+/// A file of a downloaded message, as the attachment library lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LibraryFile {
+    pub message: MessageId,
+    pub file: Attachment,
+    pub account: String,
+    pub folder: String,
+    /// The sender's name, or address when there is no name.
+    pub from: String,
+    pub subject: String,
+    pub timestamp: i64,
 }
 
 /// Where a message lives on the server.
@@ -910,6 +923,23 @@ fn migrate(conn: &Connection) -> Result<(), MailError> {
                  );
                  CREATE INDEX IF NOT EXISTS tasks_message ON tasks (message);
                  PRAGMA user_version = 25;",
+            )
+            .map_err(db)?;
+        }
+        // Version 26: the files of downloaded messages, for the attachment library; every stored
+        // message is read again to list them (and encrypted ones, now indexed once decrypted).
+        if version < 26 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS attachments (
+                     message INTEGER NOT NULL REFERENCES messages (id) ON DELETE CASCADE,
+                     idx INTEGER NOT NULL,
+                     name TEXT NOT NULL,
+                     mime TEXT NOT NULL,
+                     size INTEGER NOT NULL,
+                     PRIMARY KEY (message, idx)
+                 );
+                 UPDATE messages SET indexed = 0 WHERE stored = 1;
+                 PRAGMA user_version = 26;",
             )
             .map_err(db)?;
         }
@@ -1845,6 +1875,13 @@ impl Store {
             .map_err(db)
     }
 
+    /// The message `id` with its folder, and the account it is in.
+    pub fn hit(&self, id: MessageId) -> Result<Option<(String, Hit)>, MailError> {
+        let conn = self.read();
+        let sql = format!("SELECT {SUMMARY_COLUMNS}, folder, account FROM messages WHERE id = ?1");
+        conn.query_row(&sql, [id.0 as i64], |r| Ok((r.get(17)?, Hit { message: summary(r)?, folder: r.get(16)? }))).optional().map_err(db)
+    }
+
     /// Messages of `folder` that answer one the user sent: their In-Reply-To or References name a
     /// message of the Sent folder.
     pub fn replies_to_sent(&self, account: &str, folder: &str) -> Result<std::collections::HashSet<MessageId>, MailError> {
@@ -1975,12 +2012,68 @@ impl Store {
         tx.commit().map_err(db)
     }
 
+    /// Lists the files of a message the attachment library shows, in place of those listed before.
+    pub fn set_files(&self, id: MessageId, files: &[Attachment]) -> Result<(), MailError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(db)?;
+        tx.execute("DELETE FROM attachments WHERE message = ?1", [id.0 as i64]).map_err(db)?;
+        for file in files {
+            tx.execute("INSERT INTO attachments (message, idx, name, mime, size) VALUES (?1, ?2, ?3, ?4, ?5)", params![id.0 as i64, file.index, file.name, file.mime, file.size as i64]).map_err(db)?;
+        }
+        tx.commit().map_err(db)
+    }
+
+    /// Marks a stored message as encrypted to a key not here: left out of the index until
+    /// [`Store::retry_sealed`].
+    pub fn mark_sealed(&self, id: MessageId) -> Result<(), MailError> {
+        self.conn().execute("UPDATE messages SET indexed = 2 WHERE id = ?1", [id.0 as i64]).map(|_| ()).map_err(db)
+    }
+
+    /// The user's keys changed: the encrypted messages no key opened are read again.
+    pub fn retry_sealed(&self) -> Result<(), MailError> {
+        self.conn().execute("UPDATE messages SET indexed = 0 WHERE indexed = 2", []).map(|_| ()).map_err(db)
+    }
+
+    /// Every file of the downloaded messages of every account, newest first, outside Trash and Spam.
+    pub fn library(&self) -> Result<Vec<LibraryFile>, MailError> {
+        let conn = self.read();
+        let mut stmt = conn
+            .prepare(
+                "SELECT a.message, a.idx, a.name, a.mime, a.size, m.account, m.folder,
+                        CASE WHEN m.from_name = '' THEN m.from_addr ELSE m.from_name END, m.subject, m.timestamp
+                 FROM attachments a JOIN messages m ON m.id = a.message
+                 LEFT JOIN folders f ON f.account = m.account AND f.name = m.folder
+                 WHERE f.role IS NULL OR f.role NOT IN (?1, ?2)
+                 ORDER BY m.timestamp DESC, a.message DESC, a.idx",
+            )
+            .map_err(db)?;
+        let rows = stmt
+            .query_map(params![role_to_int(Role::Trash), role_to_int(Role::Junk)], |r| {
+                Ok(LibraryFile {
+                    message: MessageId(r.get::<_, i64>(0)? as u64),
+                    file: Attachment { index: r.get::<_, i64>(1)? as u32, name: r.get(2)?, mime: r.get(3)?, size: r.get::<_, i64>(4)? as u64 },
+                    account: r.get(5)?,
+                    folder: r.get(6)?,
+                    from: r.get(7)?,
+                    subject: r.get(8)?,
+                    timestamp: r.get(9)?,
+                })
+            })
+            .map_err(db)?;
+        rows.collect::<Result<_, _>>().map_err(db)
+    }
+
     /// Messages whose file is stored but whose text is not searchable yet: (id, folder, uid).
     pub fn unindexed(&self, account: &str, limit: usize) -> Result<Vec<(MessageId, String, u32)>, MailError> {
         let conn = self.read();
         let mut stmt = conn.prepare("SELECT id, folder, uid FROM messages WHERE account = ?1 AND stored = 1 AND indexed = 0 LIMIT ?2").map_err(db)?;
         let rows = stmt.query_map(params![account, limit as i64], |r| Ok((MessageId(r.get::<_, i64>(0)? as u64), r.get(1)?, r.get::<_, i64>(2)? as u32))).map_err(db)?;
         rows.collect::<Result<_, _>>().map_err(db)
+    }
+
+    /// How many messages [`Store::unindexed`] would list in all.
+    pub fn count_unindexed(&self, account: &str) -> Result<u32, MailError> {
+        self.read().query_row("SELECT COUNT(*) FROM messages WHERE account = ?1 AND stored = 1 AND indexed = 0", [account], |r| r.get::<_, i64>(0).map(|n| n as u32)).map_err(db)
     }
 
     /// Empties the text index, as if the messages had been stored before searching existed. For tests.
@@ -2519,6 +2612,38 @@ mod tests {
         assert_eq!(found(&store, "paella"), ["Plan"]);
         store.remove_uids("me", "INBOX", &[1]).unwrap();
         assert!(found(&store, "paella").is_empty(), "gone from the index with the message");
+    }
+
+    #[test]
+    fn the_library_lists_files_outside_trash_and_they_leave_with_their_message() {
+        let store = store();
+        store.set_folders("me", &[("INBOX".into(), Role::Inbox), ("Trash".into(), Role::Trash)]).unwrap();
+        store.add_headers("me", "INBOX", &[header(1, "a", 1, false)]).unwrap();
+        store.add_headers("me", "Trash", &[header(2, "b", 2, false)]).unwrap();
+        let (kept, binned) = (store.id_of("me", "INBOX", 1).unwrap().unwrap(), store.id_of("me", "Trash", 2).unwrap().unwrap());
+        let file = |index: u32, name: &str| Attachment { index, name: name.into(), mime: "application/pdf".into(), size: 10 };
+        store.set_files(kept, &[file(0, "old.pdf")]).unwrap();
+        store.set_files(kept, &[file(0, "report.pdf"), file(2, "plan.pdf")]).unwrap();
+        store.set_files(binned, &[file(0, "binned.pdf")]).unwrap();
+        let listed = store.library().unwrap();
+        assert_eq!(listed.iter().map(|f| f.file.name.as_str()).collect::<Vec<_>>(), ["report.pdf", "plan.pdf"]);
+        assert_eq!((listed[1].message, listed[1].file.index, listed[1].folder.as_str()), (kept, 2, "INBOX"));
+        let (account, hit) = store.hit(kept).unwrap().unwrap();
+        assert_eq!((account.as_str(), hit.folder.as_str(), hit.message.id), ("me", "INBOX", kept));
+        store.remove(kept).unwrap();
+        assert!(store.library().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_message_no_key_opens_waits_until_the_keys_change() {
+        let store = store();
+        store.add_headers("me", "INBOX", &[header(1, "a", 1, false)]).unwrap();
+        store.mark_stored("me", "INBOX", 1).unwrap();
+        let id = store.unindexed("me", 10).unwrap()[0].0;
+        store.mark_sealed(id).unwrap();
+        assert!(store.unindexed("me", 10).unwrap().is_empty());
+        store.retry_sealed().unwrap();
+        assert_eq!(store.unindexed("me", 10).unwrap()[0].0, id);
     }
 
     #[test]

@@ -227,11 +227,8 @@ impl ImapSource {
         self.store.add_headers(&self.account, folder, &[header])?;
         self.store.mark_stored(&self.account, folder, uid)?;
         let id = self.store.id_of(&self.account, folder, uid)?.ok_or(MailError::NotFound)?;
-        // As when a message is read: what is encrypted is indexed by its subject and sender only.
-        if let Some(body) = self.read(raw).ok().filter(|b| b.encryption.is_none()) {
-            self.store.set_preview(id, &body.text)?;
-            self.store.set_attachments(&self.account, folder, uid, !body.attachments.is_empty())?;
-            self.store.index_body(id, &body.text)?;
+        if let Ok(body) = self.readable(raw) {
+            index(&self.store, id, &Location { account: self.account.clone(), folder: folder.to_owned(), uid }, body.as_ref())?;
         }
         Ok(id)
     }
@@ -328,6 +325,20 @@ impl ImapSource {
     /// none when encryption is not set up (or the vault is locked).
     fn own_keys(&self) -> Vec<Vec<u8>> {
         self.own_files(&beavermail_crypto::key_path(&self.address))
+    }
+
+    /// The text and files of a stored message as search and the attachment library see them: decrypted
+    /// with the account's own keys (no sender's key is checked or learned, as reading it does), its
+    /// content unwrapped when signed in one piece, as [`MailSource::attachment`] finds its files.
+    /// `Ok(None)`: encrypted, and no key here opens it.
+    fn readable(&self, raw: &[u8]) -> Result<Option<MessageBody>, MailError> {
+        let plain = match beavermail_crypto::decrypt(raw, &self.own_keys(), &[]).or_else(|| beavermail_crypto::decrypt_smime(raw, &self.own_certificates())) {
+            Some(beavermail_crypto::Opened::Message(plain, _)) => plain,
+            Some(_) => return Ok(None),
+            None => raw.to_vec(),
+        };
+        let content = beavermail_crypto::unwrap_signed(&plain, &[]).map_or(plain, |(content, _)| content);
+        parse_body(&content).map(Some)
     }
 
     /// The file at `current` and the ones it replaced.
@@ -1089,30 +1100,43 @@ impl ImapSource {
 
     /// Makes the text of messages that were stored before searching existed (or whose download did not
     /// get to it) searchable. A message whose file turns out to be missing is marked as not stored, so
-    /// the next download fetches it again.
-    async fn index_stored(&self) -> Result<(), MailError> {
+    /// the next download fetches it again. Counted in `progress`, paused and stopped with it after any
+    /// message: reading one may decrypt it, and the app closing waits for none.
+    async fn index_stored(&self, progress: &Progress) -> Result<(), MailError> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let total = self.store.count_unindexed(&self.account)?;
+        if total == 0 {
+            return Ok(());
+        }
+        progress.total.store(total, Relaxed);
+        progress.done.store(0, Relaxed);
+        progress.set_activity(READING);
         loop {
             let batch = self.store.unindexed(&self.account, 200)?;
             if batch.is_empty() {
+                progress.set_activity("");
                 return Ok(());
             }
             for (id, folder, uid) in batch {
+                while progress.paused.load(Relaxed) && !progress.cancel.load(Relaxed) {
+                    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                }
+                if progress.cancel.load(Relaxed) {
+                    return Ok(());
+                }
                 let path = self.file_of(&self.account, &folder, uid)?;
                 match self.files.read(&path) {
-                    Ok(Some(raw)) => match parse_body(&raw) {
-                        Ok(body) => {
-                            self.store.set_preview(id, &body.text)?;
-                            self.store.set_attachments(&self.account, &folder, uid, !body.attachments.is_empty())?;
-                            self.store.index_body(id, &body.text)?;
-                        }
+                    Ok(Some(raw)) => match self.readable(&raw) {
+                        Ok(body) => index(&self.store, id, &Location { account: self.account.clone(), folder, uid }, body.as_ref())?,
                         Err(_) => self.store.mark_indexed(id)?, // not a message: do not look again
                     },
                     Ok(None) => self.store.clear_stored(id)?,
                     Err(MailError::Auth(why)) => return Err(MailError::Auth(why)), // locked: try again after unlocking
                     Err(_) => self.store.mark_indexed(id)?,
                 }
+                progress.done.fetch_add(1, Relaxed);
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
         }
     }
 
@@ -1351,11 +1375,9 @@ impl ImapSource {
             let path = self.file_of(&self.account, folder, uid)?;
             self.files.write(&path, raw)?;
             if let Some(id) = self.store.id_of(&self.account, folder, uid)?
-                && let Ok(body) = parse_body(raw)
+                && let Ok(body) = self.readable(raw)
             {
-                self.store.set_preview(id, &body.text)?;
-                self.store.set_attachments(&self.account, folder, uid, !body.attachments.is_empty())?;
-                self.store.index_body(id, &body.text)?;
+                index(&self.store, id, &Location { account: self.account.clone(), folder: folder.to_owned(), uid }, body.as_ref())?;
             }
             self.store.mark_stored(&self.account, folder, uid)?;
         }
@@ -1379,6 +1401,29 @@ impl From<MailError> for SyncError {
     fn from(e: MailError) -> Self {
         Self::Archive(e)
     }
+}
+
+/// What the download says it is doing while it reads the messages already stored.
+pub const READING: &str = "Reading downloaded mail";
+
+/// Makes a stored message searchable and lists the files the attachment library shows, from its
+/// [`ImapSource::readable`] body; `None` (encrypted to a key not here) is read again when the user's
+/// keys change. What is decrypted is indexed too: the archive is as protected as the vault keeps it.
+fn index(store: &Store, id: MessageId, at: &Location, body: Option<&MessageBody>) -> Result<(), MailError> {
+    let Some(body) = body else { return store.mark_sealed(id) };
+    store.set_preview(id, &body.text)?;
+    store.set_attachments(&at.account, &at.folder, at.uid, !body.attachments.is_empty())?;
+    store.set_files(id, &body.attachments.iter().filter(|file| in_library(file)).cloned().collect::<Vec<_>>())?;
+    store.index_body(id, &body.text)
+}
+
+/// Whether a file belongs in the attachment library: not an invitation, a signature or a key, which
+/// mail programs attach by themselves.
+fn in_library(file: &Attachment) -> bool {
+    let mime = file.mime.to_ascii_lowercase();
+    let extension = file.name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+    let technical = ["text/calendar", "application/ics", "application/pgp-signature", "application/pgp-keys", "application/pkcs7-signature", "application/x-pkcs7-signature"];
+    !technical.contains(&mime.as_str()) && !["ics", "asc", "sig", "p7s"].contains(&extension.as_str())
 }
 
 /// The files attached to a message: parts that are not the text, named or marked as attachments.
@@ -1866,7 +1911,10 @@ impl MailSource for ImapSource {
         use std::sync::atomic::Ordering::Relaxed;
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
         // Searching the text needs it indexed, whatever is kept offline.
-        self.index_stored().await?;
+        self.index_stored(progress).await?;
+        if progress.cancel.load(Relaxed) {
+            return Ok(());
+        }
         if self.config.local {
             return Ok(());
         }
@@ -1974,16 +2022,11 @@ impl MailSource for ImapSource {
         }
         // Recorded and indexed after the message is shown: the database may be busy with the
         // background download, and the reader need not wait for it.
-        let (store, plain) = (self.store.clone(), body.encryption.is_none().then(|| (body.text.clone(), !body.attachments.is_empty())));
+        let readable = (!matches!(body.encryption, Some(Encryption::NoKey(_) | Encryption::Failed(..)))).then(|| body.clone());
+        let store = self.store.clone();
         tokio::task::spawn_blocking(move || {
             store.mark_stored(&at.account, &at.folder, at.uid)?;
-            // What was decrypted is never kept: an encrypted message is indexed by its subject and sender only.
-            if let Some((text, attachments)) = plain {
-                store.set_preview(id, &text)?;
-                store.set_attachments(&at.account, &at.folder, at.uid, attachments)?;
-                store.index_body(id, &text)?;
-            }
-            Ok::<_, MailError>(())
+            index(&store, id, &at, readable.as_ref())
         });
         Ok(body)
     }
@@ -2296,6 +2339,37 @@ mod tests {
         assert!(body.text.contains("still readable"));
         // Signed with the old key: still the user's own.
         assert!(matches!(body.signature, Some(beavermail_core::Signature { check: beavermail_core::SignatureCheck::Valid { .. }, .. })));
+    }
+
+    #[tokio::test]
+    async fn an_encrypted_message_is_indexed_once_a_key_opens_it_and_its_files_reach_the_library() {
+        let account = Account { email: "alice@example.org".into(), ..Account::local() };
+        let source = ImapSource::new(&account, String::new(), Arc::new(Store::in_memory().unwrap()), Arc::new(Vault::in_memory()));
+        let key = beavermail_crypto::generate("Alice", "alice@example.org").unwrap();
+        let raw = "From: bob@example.org\r\nTo: alice@example.org\r\nSubject: Plans\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nthe secret harbour\r\n--b\r\nContent-Type: application/pdf; name=plan.pdf\r\nContent-Disposition: attachment; filename=plan.pdf\r\n\r\n%PDF\r\n--b\r\nContent-Type: text/calendar; name=invite.ics\r\nContent-Disposition: attachment; filename=invite.ics\r\n\r\nBEGIN:VCALENDAR\r\n--b--\r\n";
+        let sealed = beavermail_crypto::encrypt(raw.as_bytes(), &key, &[beavermail_crypto::public_key(&key).unwrap()], &[]).unwrap();
+        source.store.add_headers(&source.account, "INBOX", &[local_header(1, &sealed).unwrap()]).unwrap();
+        source.files.write(&source.file_of(&source.account, "INBOX", 1).unwrap(), &sealed).unwrap();
+        source.store.mark_stored(&source.account, "INBOX", 1).unwrap();
+
+        let progress = Progress::default();
+        progress.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        source.index_stored(&progress).await.unwrap();
+        assert_eq!(source.store.unindexed(&source.account, 10).unwrap().len(), 1, "stopped before reading anything");
+        let progress = Progress::default();
+        source.index_stored(&progress).await.unwrap();
+        assert_eq!((progress.done.load(std::sync::atomic::Ordering::Relaxed), progress.total.load(std::sync::atomic::Ordering::Relaxed)), (1, 1));
+        assert!(source.store.search(&source.account, "harbour", 10).unwrap().is_empty(), "no key yet");
+        assert!(source.store.library().unwrap().is_empty());
+
+        source.files.write(&beavermail_crypto::key_path("alice@example.org"), &key).unwrap();
+        source.store.retry_sealed().unwrap();
+        source.index_stored(&progress).await.unwrap();
+        assert_eq!(source.store.search(&source.account, "harbour", 10).unwrap().len(), 1);
+        let files = source.store.library().unwrap();
+        assert_eq!(files.iter().map(|f| f.file.name.as_str()).collect::<Vec<_>>(), ["plan.pdf"], "the invitation is not a file of the library");
+        let (name, bytes) = source.attachment(files[0].message, files[0].file.index).await.unwrap();
+        assert_eq!((name.as_str(), bytes.as_slice()), ("plan.pdf", b"%PDF".as_slice()));
     }
 
     #[tokio::test]

@@ -24,6 +24,7 @@ mod drafts;
 mod event_form;
 mod filters;
 mod labels;
+mod library;
 mod encryption;
 mod original;
 mod relocate;
@@ -114,6 +115,8 @@ enum Event {
     Vault(VaultOutcome),
     /// The bytes of an attachment, to open with another program.
     Attachment(Result<(String, Vec<u8>), MailError>),
+    /// The picture of a file of the Attachments section, decoded; `None` when it could not be had.
+    Thumb(library::Key, Option<egui::ColorImage>),
     /// Saving attachments through a file dialog ended: `None` when the user cancelled, else what to tell them.
     Saved(Result<Option<String>, String>),
     /// What one folder on a server holds for search `seq`, added to what the archive found.
@@ -898,6 +901,7 @@ enum Section {
     Contacts,
     Calendar,
     Tasks,
+    Attachments,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -1419,6 +1423,8 @@ struct BeaverApp {
     /// The photos of the cards shown in the Contacts list (by card id), read as their rows come into
     /// view; read again with the list.
     contact_photos: std::collections::HashMap<i64, Option<egui::TextureHandle>>,
+    /// The Attachments section: the files listed, what is picked and searched, the pictures read.
+    library: library::Library,
     /// The address-book card waiting for the user to confirm deleting it everywhere.
     confirm_card_delete: Option<i64>,
     /// After an address book's first sync: (its URL, the contacts kept only here, each ticked or not).
@@ -1703,6 +1709,7 @@ impl BeaverApp {
             address_book: None,
             contacts_shown: None,
             contact_photos: std::collections::HashMap::new(),
+            library: library::Library::default(),
             confirm_card_delete: None,
             contact_query: String::new(),
             new_contact: None,
@@ -2521,7 +2528,9 @@ impl BeaverApp {
     fn serial_of(&self, id: MessageId) -> Option<u64> {
         let tab = self.tabs.iter().find(|t| t.message.id == id).map(|t| t.serial);
         let hit = || self.hits.iter().find(|(_, h)| h.message.id == id).map(|(s, _)| *s);
-        tab.or_else(hit).or_else(|| self.origin.get(&id).copied()).or(self.selected.map(|(s, _)| s))
+        // A message of none of those (a file of the Attachments section): its account, as the archive knows it.
+        let archived = || self.archive.locate(id).ok().flatten().and_then(|at| self.accounts.iter().chain(self.here.as_ref()).find(|v| v.account.key() == at.account).map(|v| v.serial));
+        tab.or_else(hit).or_else(|| self.origin.get(&id).copied()).or_else(archived).or(self.selected.map(|(s, _)| s))
     }
 
     /// What the folder of message `id` is for: its tab's, its search result's, or the folder shown.
@@ -3743,7 +3752,8 @@ impl BeaverApp {
     /// a folder (names that exist get a number, nothing is overwritten).
     fn save_attachments(&mut self, id: MessageId, indexes: Vec<u32>) {
         let Some(source) = self.serial_of(id).and_then(|s| self.view(s)?.source.clone()) else { return };
-        let names: Vec<(u32, String)> = indexes.iter().filter_map(|i| self.body_of(id)?.data.attachments.iter().find(|a| a.index == *i)).map(|a| (a.index, attachments::safe_name(&a.name))).collect();
+        let listed = |i: u32| self.body_of(id).and_then(|b| b.data.attachments.iter().find(|a| a.index == i)).or_else(|| self.library.file((id, i)).map(|f| &f.file));
+        let names: Vec<(u32, String)> = indexes.iter().filter_map(|i| listed(*i)).map(|a| (a.index, attachments::safe_name(&a.name))).collect();
         let Some(first) = names.first().map(|(_, n)| n.clone()) else { return };
         self.spawn(async move {
             let one = names.len() == 1;
@@ -6492,6 +6502,7 @@ impl BeaverApp {
         let earlier = current.as_ref().is_some_and(|old| matches!((beavermail_crypto::made_at(&data), beavermail_crypto::made_at(old)), (Some(new), Some(now)) if new < now));
         if earlier {
             self.key_dialogs.unlock = None;
+            let _ = self.archive.retry_sealed(); // read again at the next sync: losing it only waits for another key change
             return match self.vault.write(&retired, &data) {
                 Ok(()) => self.notice = Some((format!("Added as an earlier {}: mail encrypted to it opens again", if certificate { "certificate" } else { "key" }), std::time::Instant::now())),
                 Err(e) => self.error = Some(format!("Could not keep the key: {e}")),
@@ -6512,6 +6523,7 @@ impl BeaverApp {
             let now = chrono::Local::now().timestamp();
             let _ = self.archive.learn_peer_key(&address, &public, now);
         }
+        let _ = self.archive.retry_sealed(); // as above
         self.key_files.insert(path, Some(data));
         self.encryption_checked = None;
         self.key_dialogs.unlock = None;
@@ -7598,11 +7610,11 @@ impl BeaverApp {
             return Err("Not in the source of a message");
         }
         // Out of Mail the list and the reader are not on screen: what acts on them waits.
-        if self.section != Section::Mail && !matches!(command, Command::Palette | Command::NewMessage | Command::Settings | Command::Mail | Command::Contacts | Command::Calendar | Command::Tasks | Command::WorkOffline | Command::WorkOnline) {
+        if self.section != Section::Mail && !matches!(command, Command::Palette | Command::NewMessage | Command::Settings | Command::Mail | Command::Contacts | Command::Calendar | Command::Tasks | Command::Attachments | Command::WorkOffline | Command::WorkOnline) {
             return Err("Go to Mail first");
         }
         match command {
-            Command::Palette | Command::Search | Command::Settings | Command::Mail | Command::Contacts | Command::Calendar | Command::Tasks => Ok(()),
+            Command::Palette | Command::Search | Command::Settings | Command::Mail | Command::Contacts | Command::Calendar | Command::Tasks | Command::Attachments => Ok(()),
             Command::NewMessage if self.senders().is_empty() => Err("Add an account to send mail"),
             Command::NewMessage => Ok(()),
             // A message only selected, or still loading, is answered once its text is there.
@@ -7829,6 +7841,11 @@ impl BeaverApp {
             Command::Tasks => {
                 self.return_to = None;
                 self.section = Section::Tasks;
+            }
+            Command::Attachments => {
+                self.return_to = None;
+                self.section = Section::Attachments;
+                self.library.files = None;
             }
             Command::Calendar => {
                 self.return_to = None;
@@ -8370,6 +8387,13 @@ impl BeaverApp {
                 self.spawn(async move { Event::Mailboxes(serial, source.mailboxes().await, true) });
             }
             Event::Vault(outcome) => self.apply_vault(outcome),
+            Event::Thumb(key, picture) => {
+                let thumb = match picture {
+                    Some(picture) => library::Thumb::Ready(self.ctx.load_texture("library_thumb", picture, egui::TextureOptions::LINEAR)),
+                    None => library::Thumb::Missing,
+                };
+                self.library.thumbs.insert(key, thumb);
+            }
             Event::Attachment(result) => match result {
                 Ok((name, bytes)) => match attachments::open(&self.open_dir, &name, &bytes) {
                     Ok(()) => self.notice = Some((format!("Opening {}", attachments::safe_name(&name)), std::time::Instant::now())),
@@ -8963,7 +8987,7 @@ impl BeaverApp {
                 } else if locked {
                     ui.label(RichText::new("Stored mail is locked. Downloads wait for the passphrase.").size(13.0).color(t.danger));
                 } else if running && total > 0 && done < total {
-                    ui.label(dim("Downloading mail".to_owned()));
+                    ui.label(dim(if activity == beavermail_imap::READING { activity.clone() } else { "Downloading mail".to_owned() }));
                     let fraction = done as f32 / total as f32;
                     ui.add(egui::ProgressBar::new(fraction).desired_width(220.0).desired_height(8.0).corner_radius(4.0).fill(t.accent));
                     ui.label(dim(format!("{done} of {total}")));
@@ -9128,7 +9152,7 @@ impl BeaverApp {
                 }
                 ui.with_layout(Layout::top_down(Align::Min), |ui| {
                     let due = self.tasks_due_today();
-                    for (section, icon, command, name) in [(Section::Mail, Icon::Mail, Command::Mail, "Mail"), (Section::Calendar, Icon::Calendar, Command::Calendar, "Calendar"), (Section::Tasks, Icon::ListChecks, Command::Tasks, "Tasks"), (Section::Contacts, Icon::Users, Command::Contacts, "Contacts")] {
+                    for (section, icon, command, name) in [(Section::Mail, Icon::Mail, Command::Mail, "Mail"), (Section::Calendar, Icon::Calendar, Command::Calendar, "Calendar"), (Section::Tasks, Icon::ListChecks, Command::Tasks, "Tasks"), (Section::Attachments, Icon::Paperclip, Command::Attachments, "Attachments"), (Section::Contacts, Icon::Users, Command::Contacts, "Contacts")] {
                         let on = self.section == section;
                         let name = if section == Section::Tasks && due > 0 { format!("Tasks: {due} due today or overdue") } else { name.to_owned() };
                         let name = name.as_str();
@@ -9250,6 +9274,64 @@ impl BeaverApp {
         }
         if let Some(action) = action {
             self.card_action(action, true);
+        }
+    }
+
+    /// The Attachments section: every file of the downloaded mail.
+    fn attachments_section(&mut self, ui: &mut egui::Ui, t: &theme::Tokens) {
+        use std::sync::atomic::Ordering::Relaxed;
+        // While mail is downloaded or read, its files arrive: the list is read again every 2 s, and once at the end.
+        let working: Vec<_> = self.accounts.iter().chain(self.here.as_ref()).filter(|v| v.progress.running.load(Relaxed)).map(|v| (v.progress.done.load(Relaxed), v.progress.total.load(Relaxed))).collect();
+        let progress = (!working.is_empty()).then(|| working.iter().fold((0, 0), |(d, t), (done, total)| (d + done, t + total)));
+        let stale = self.library.read_at.is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(2));
+        if self.library.files.is_none() || (stale && (progress.is_some() || self.library.working)) {
+            let files = self.archive.library().unwrap_or_else(|e| {
+                self.error = Some(format!("Could not list the attachments: {e}"));
+                Vec::new()
+            });
+            self.library.files = Some(files);
+            self.library.read_at = Some(std::time::Instant::now());
+            self.library.working = progress.is_some();
+        }
+        if progress.is_some() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs(2));
+        }
+        let mut accounts: Vec<(String, String)> = self.accounts.iter().map(|v| (v.account.key(), v.account.address().to_owned())).collect();
+        if let Some(here) = &self.here {
+            accounts.push((here.account.key(), "On this computer".to_owned()));
+        }
+        for action in library::section(ui, t, &mut self.library, &accounts, progress, self.settings.density) {
+            self.library_action(action);
+        }
+    }
+
+    fn library_action(&mut self, action: library::Action) {
+        use library::Action as A;
+        match action {
+            A::Open((id, index)) => match self.library.file((id, index)).map(|f| f.file.name.clone()) {
+                Some(name) if attachments::is_risky(&name) => self.confirm_open = Some((id, index, name)),
+                Some(_) => self.fetch_attachment(id, index),
+                None => {}
+            },
+            A::Save((id, index)) => self.save_attachments(id, vec![index]),
+            A::GoTo((id, _)) => match self.archive.hit(id).ok().flatten() {
+                Some((key, hit)) => {
+                    let Some(serial) = self.accounts.iter().chain(self.here.as_ref()).find(|v| v.account.key() == key).map(|v| v.serial) else { return };
+                    self.open_from(Section::Attachments, serial, &hit);
+                }
+                None => self.error = Some("The message of this file is no longer on this computer.".into()),
+            },
+            A::Load(key) => {
+                let Some(source) = self.serial_of(key.0).and_then(|s| self.view(s)?.source.clone()) else { return };
+                self.library.thumbs.insert(key, library::Thumb::Loading);
+                self.spawn(async move {
+                    let picture = source.attachment(key.0, key.1).await.ok().and_then(|(_, bytes)| {
+                        let picture = image::load_from_memory(&bytes).ok()?.thumbnail(library::THUMB_SIDE, library::THUMB_SIDE).to_rgba8();
+                        Some(egui::ColorImage::from_rgba_unmultiplied([picture.width() as usize, picture.height() as usize], picture.as_raw()))
+                    });
+                    Event::Thumb(key, picture)
+                });
+            }
         }
     }
 
@@ -10431,6 +10513,10 @@ impl BeaverApp {
 
 impl eframe::App for BeaverApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Downloads and reading stop at their next message, so the window closes without waiting for them.
+        for view in self.accounts.iter().chain(self.here.as_ref()) {
+            view.progress.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         // What waited for Undo is done now, or the mail would come back at the next start.
         // One that cannot reach the server waits for the next run instead.
         if let Some(pending) = self.pending.take() {
@@ -10538,6 +10624,7 @@ impl eframe::App for BeaverApp {
             Section::Contacts => self.contacts_view(ui, &t),
             Section::Calendar => self.calendar_section(ui, &t),
             Section::Tasks => self.tasks_section(ui, &t),
+            Section::Attachments => self.attachments_section(ui, &t),
             Section::Mail => {}
         }
         slow.mark("section");
