@@ -279,7 +279,7 @@ mod tests {
         let ctx = egui::Context::default();
         crate::theme::apply(&ctx);
         let added = [AddressBook { name: "Personal".into(), url: "https://dav.example.org/ada/personal/".into(), user: "ada".into(), default: true, read_only: false }];
-        let book = |url: &str, name: &str, writable| (Found { url: url.into(), name: name.into(), writable, color: String::new() }, writable);
+        let book = |url: &str, name: &str, writable| (Found { url: url.into(), name: name.into(), writable, color: String::new(), events: false, tasks: false }, writable);
         let found = vec![book(&added[0].url, "Personal", true), book("https://dav.example.org/ada/recent/", "Recently contacted", false)];
         let mut state = Some(AddBook { from: None, server: "example.org".into(), user: "ada".into(), password: "pw".into(), finding: false, focus_first: true, found: Some(Ok(found)) });
         for _ in 0..2 {

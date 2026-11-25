@@ -301,6 +301,15 @@ pub struct CalendarSource {
     /// Nothing can be written there (shared read-only, a subscription).
     #[serde(default)]
     pub read_only: bool,
+    /// It takes events: false for a list of tasks only.
+    #[serde(default = "shown")]
+    pub events: bool,
+    /// It takes tasks; `None` for one added before tasks were read here, until its server is asked.
+    #[serde(default)]
+    pub tasks: Option<bool>,
+    /// Tasks made here go to this list.
+    #[serde(default)]
+    pub tasks_default: bool,
 }
 
 impl CalendarSource {

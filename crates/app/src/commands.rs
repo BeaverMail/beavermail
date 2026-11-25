@@ -20,6 +20,7 @@ pub enum Command {
     Undo,
     ToggleRead,
     Pin,
+    MakeTask,
     Star,
     /// One of the five standard labels, `$label1` to `$label5`, on or off, by its number.
     Label(u8),
@@ -47,6 +48,7 @@ pub enum Command {
     AllInboxes,
     Mail,
     Calendar,
+    Tasks,
     Contacts,
     WorkOffline,
     WorkOnline,
@@ -68,7 +70,7 @@ const CTRL_SHIFT: Modifiers = Modifiers::COMMAND.plus(Modifiers::SHIFT);
 
 impl Command {
     /// In the order the keys are tried (Ctrl+Shift+Tab before Ctrl+Tab) and the palette lists them.
-    pub const ALL: [Self; 42] = [
+    pub const ALL: [Self; 44] = [
         Self::Palette,
         Self::NewMessage,
         Self::Reply,
@@ -81,6 +83,7 @@ impl Command {
         Self::Undo,
         Self::ToggleRead,
         Self::Pin,
+        Self::MakeTask,
         Self::Star,
         Self::Label(1),
         Self::Label(2),
@@ -107,6 +110,7 @@ impl Command {
         Self::AllInboxes,
         Self::Mail,
         Self::Calendar,
+        Self::Tasks,
         Self::Contacts,
         Self::WorkOffline,
         Self::WorkOnline,
@@ -127,6 +131,7 @@ impl Command {
             Self::Undo => "Undo archive or move",
             Self::ToggleRead => "Mark as read or unread",
             Self::Pin => "Pin or unpin",
+            Self::MakeTask => "Make a task",
             Self::Star => "Star or unstar",
             Self::Label(1) => "Label Important",
             Self::Label(2) => "Label Work",
@@ -154,6 +159,7 @@ impl Command {
             Self::AllInboxes => "Go to All inboxes",
             Self::Mail => "Go to Mail",
             Self::Calendar => "Go to Calendar",
+            Self::Tasks => "Go to Tasks",
             Self::Contacts => "Go to Contacts",
             Self::WorkOffline => "Work offline",
             Self::WorkOnline => "Work online",
@@ -175,6 +181,7 @@ impl Command {
             Self::Undo => &[Trigger::Shortcut(CTRL, Key::Z, false)],
             Self::ToggleRead => &[Trigger::Key(Key::U)],
             Self::Pin => &[Trigger::Key(Key::P)],
+            Self::MakeTask => &[Trigger::Key(Key::T)],
             Self::Star => &[Trigger::Key(Key::S)],
             Self::Label(1) => &[Trigger::Text("1")],
             Self::Label(2) => &[Trigger::Text("2")],
@@ -194,7 +201,7 @@ impl Command {
             Self::SelectAll => &[Trigger::Shortcut(CTRL, Key::A, false)],
             Self::Search => &[Trigger::Text("/")],
             Self::SwitchPane => &[Trigger::Key(Key::F6)],
-            Self::NewFolder | Self::NotSpam | Self::OpenInFolder | Self::TrustSender | Self::BlockSender | Self::CreateFilter | Self::Refresh | Self::AllInboxes | Self::Mail | Self::Calendar | Self::Contacts | Self::WorkOffline | Self::WorkOnline | Self::Settings => &[],
+            Self::NewFolder | Self::NotSpam | Self::OpenInFolder | Self::TrustSender | Self::BlockSender | Self::CreateFilter | Self::Refresh | Self::AllInboxes | Self::Mail | Self::Calendar | Self::Tasks | Self::Contacts | Self::WorkOffline | Self::WorkOnline | Self::Settings => &[],
         }
     }
 

@@ -25,6 +25,8 @@ struct Cards {
     /// href → (version, vCard)
     cards: BTreeMap<String, (u32, String)>,
     version: u32,
+    /// Collections made with MKCALENDAR.
+    made: Vec<String>,
 }
 
 fn start() -> (String, Arc<Mutex<Cards>>) {
@@ -83,14 +85,18 @@ fn answer(cards: &Arc<Mutex<Cards>>, method: &str, path: &str, headers: &BTreeMa
                 + &ok(CALENDAR, r##"<d:resourcetype><d:collection/><cal:calendar/></d:resourcetype><d:displayname>Work</d:displayname><ical:calendar-color>#3366FFFF</ical:calendar-color><cal:supported-calendar-component-set><cal:comp name="VEVENT"/></cal:supported-calendar-component-set>"##)
                 + &ok(TASKS, r#"<d:resourcetype><d:collection/><cal:calendar/></d:resourcetype><d:displayname>Tasks</d:displayname><cal:supported-calendar-component-set><cal:comp name="VTODO"/></cal:supported-calendar-component-set>"#),
         ),
-        ("PROPFIND", CALENDAR) => {
-            let mut inner = ok(CALENDAR, "<d:resourcetype><d:collection/><cal:calendar/></d:resourcetype>");
-            for (href, (version, _)) in state.cards.iter().filter(|(h, _)| h.starts_with(CALENDAR)) {
+        ("PROPFIND", CALENDAR | TASKS) => {
+            let mut inner = ok(path, "<d:resourcetype><d:collection/><cal:calendar/></d:resourcetype>");
+            for (href, (version, _)) in state.cards.iter().filter(|(h, _)| h.starts_with(path)) {
                 inner += &ok(href, &format!("<d:getetag>\"{version}\"</d:getetag><d:resourcetype/>"));
             }
             multistatus(inner)
         }
-        ("REPORT", CALENDAR) => {
+        ("MKCALENDAR", made) if made.starts_with("/dav/calendars/ada/") && body.contains(r#"<c:comp name="VTODO"/>"#) => {
+            state.made.push(made.to_owned());
+            reply("201 Created", "", "")
+        }
+        ("REPORT", CALENDAR | TASKS) => {
             let wanted: Vec<&str> = body.split("<d:href>").skip(1).filter_map(|h| h.split("</d:href>").next()).collect();
             multistatus(wanted.iter().filter_map(|h| state.cards.get(*h).map(|(v, event)| ok(h, &format!("<d:getetag>\"{v}\"</d:getetag><cal:calendar-data>{event}</cal:calendar-data>")))).collect())
         }
@@ -150,7 +156,7 @@ fn the_address_book_is_found_from_the_server_address_through_the_well_known_one(
     let book = Book::discover(&url, "ada", "secret").unwrap();
     assert_eq!(book.url, format!("{url}{BOOK}"));
     let found = Book::discover_all(&url, "ada", "secret").unwrap();
-    let book = |path: &str, name: &str, writable| Found { url: format!("{url}{path}"), name: name.to_owned(), writable, color: String::new() };
+    let book = |path: &str, name: &str, writable| Found { url: format!("{url}{path}"), name: name.to_owned(), writable, color: String::new(), events: true, tasks: true };
     assert_eq!(found, [book(BOOK, "Contacts", true), book(RECENT, "Recently contacted", false)], "with the names the server gives, and what can be written");
     assert!(matches!(Book::discover(&url, "ada", "wrong"), Err(MailError::Auth(_))));
 }
@@ -236,7 +242,9 @@ fn a_sync_brings_every_card_sends_what_changed_here_and_lets_the_server_win() {
 fn calendars_of_events_are_found_and_their_events_kept_as_the_server_has_them() {
     let (url, state) = start();
     let found = Calendar::discover_all(&url, "ada", "secret").unwrap();
-    assert_eq!(found, [Found { url: format!("{url}{CALENDAR}"), name: "Work".into(), writable: true, color: "#3366FF".into() }], "the tasks one is left out");
+    let work = Found { url: format!("{url}{CALENDAR}"), name: "Work".into(), writable: true, color: "#3366FF".into(), events: true, tasks: false };
+    let tasks = Found { url: format!("{url}{TASKS}"), name: "Tasks".into(), writable: true, color: String::new(), events: false, tasks: true };
+    assert_eq!(found, [work, tasks], "a list of tasks is found as one, not as a calendar of events");
     let event = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:review-1\r\nSUMMARY:Review\r\nDTSTART:20261012T090000Z\r\nDTEND:20261012T100000Z\r\nRRULE:FREQ=DAILY;COUNT=3\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
     {
         let mut s = state.lock().unwrap();
@@ -246,8 +254,8 @@ fn calendars_of_events_are_found_and_their_events_kept_as_the_server_has_them() 
     }
     let calendar = Calendar::open(&found[0].url, "ada", "secret");
     let store = beavermail_store::Store::in_memory().unwrap();
-    assert_eq!(sync_calendar(&calendar, &store).unwrap(), 1);
-    assert_eq!(sync_calendar(&calendar, &store).unwrap(), 0, "nothing new the second time");
+    assert_eq!(sync_calendar(&calendar, &store).unwrap().received, 1);
+    assert_eq!(sync_calendar(&calendar, &store).unwrap().received, 0, "nothing new the second time");
     let day = |d: u32| chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2026, 10, d, 0, 0, 0).unwrap();
     let stored = store.events_between(std::slice::from_ref(&calendar.url), day(13).timestamp(), day(14).timestamp()).unwrap();
     assert_eq!(stored.len(), 1, "a repeating event is asked for in any range");
@@ -258,4 +266,61 @@ fn calendars_of_events_are_found_and_their_events_kept_as_the_server_has_them() 
     state.lock().unwrap().cards.clear();
     sync_calendar(&calendar, &store).unwrap();
     assert!(store.events(&calendar.url).unwrap().is_empty());
+}
+
+fn put_on_server(state: &Arc<Mutex<Cards>>, href: &str, text: &str) {
+    let mut s = state.lock().unwrap();
+    s.version += 1;
+    let v = s.version;
+    s.cards.insert(href.to_owned(), (v, text.to_owned()));
+}
+
+#[test]
+fn tasks_are_kept_apart_from_events_sent_when_changed_here_and_merged_when_changed_on_both_sides() {
+    use beavermail_carddav::todo::{self, Edit};
+    let (url, state) = start();
+    let now = chrono::Utc::now();
+    let list = Calendar::open(&format!("{url}{TASKS}"), "ada", "secret");
+    let store = beavermail_store::Store::in_memory().unwrap();
+    let text = todo::new("pay-1", &[Edit::summary("Pay rent")], now);
+    put_on_server(&state, &format!("{TASKS}pay-1.ics"), &text);
+    put_on_server(&state, &format!("{TASKS}e.ics"), "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:e\r\nDTSTART:20261012T090000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n");
+    assert_eq!(sync_calendar(&list, &store).unwrap().received, 2);
+    assert_eq!((store.tasks(&list.url).unwrap().len(), store.events(&list.url).unwrap().len()), (1, 1), "each where it belongs");
+
+    // Made here: sent at the next sync.
+    let made = todo::new("call-1", &[Edit::summary("Call Bob")], now);
+    let href = list.new_href("call-1");
+    store.add_task(&list.url, &href, &made, &todo::fields(&made)).unwrap();
+    assert_eq!(sync_calendar(&list, &store).unwrap().sent, 1);
+    assert!(state.lock().unwrap().cards.contains_key(&href));
+
+    // Changed here (priority) and on the server (title): both kept.
+    let kept = store.tasks(&list.url).unwrap().into_iter().find(|t| t.href.ends_with("pay-1.ics")).unwrap();
+    let edits = [Edit::priority(1)];
+    let mine = todo::apply(&kept.ics, &edits, now);
+    store.change_task(kept.id, &mine, &todo::fields(&mine), &Edit::touched(&edits)).unwrap();
+    put_on_server(&state, &kept.href, &todo::apply(&text, &[Edit::summary("Pay the rent")], now));
+    let done = sync_calendar(&list, &store).unwrap();
+    assert_eq!((done.sent, done.lost), (1, 0));
+    let on_server = todo::parse(&state.lock().unwrap().cards[&kept.href].1).unwrap();
+    assert_eq!((on_server.summary.as_str(), on_server.priority), ("Pay the rent", 1));
+    assert_eq!(store.tasks(&list.url).unwrap().iter().filter(|t| t.state != beavermail_store::CardState::Synced).count(), 0);
+
+    // Changed here, deleted on the server: deleted, counted as lost.
+    let kept = store.task(store.tasks(&list.url).unwrap().into_iter().find(|t| t.href == href).unwrap().id).unwrap().unwrap();
+    let edits = [Edit::summary("Call Bob today")];
+    let mine = todo::apply(&kept.ics, &edits, now);
+    store.change_task(kept.id, &mine, &todo::fields(&mine), &Edit::touched(&edits)).unwrap();
+    state.lock().unwrap().cards.remove(&href);
+    assert_eq!(sync_calendar(&list, &store).unwrap().lost, 1);
+    assert!(store.task(kept.id).unwrap().is_none());
+}
+
+#[test]
+fn a_task_list_is_made_in_the_calendar_home() {
+    let (url, state) = start();
+    let made = Calendar::make_task_list(&url, "ada", "secret", "Tasks").unwrap();
+    assert!(made.tasks && !made.events && made.url.starts_with(&format!("{url}/dav/calendars/ada/")));
+    assert_eq!(state.lock().unwrap().made.len(), 1);
 }

@@ -108,12 +108,18 @@ pub fn page(ui: &mut egui::Ui, t: &Tokens, calendars: &mut [CalendarSource], log
                     if !calendar.is_local() && ui.button("Remove").on_hover_text("Stop syncing it: its events leave BeaverMail, nothing changes on the server").clicked() {
                         action = Some(PageAction::AskRemove(vec![calendar.url.clone()]));
                     }
-                    if calendar.default {
-                        ui.label(RichText::new("Default").color(t.text_dim)).on_hover_text("Accepted invitations and new events go here");
+                    // A list of tasks only is the default for tasks; any other calendar, for events.
+                    let tasks_only = !calendar.events;
+                    let (is_default, tip) = if tasks_only { (calendar.tasks_default, "New tasks go here") } else { (calendar.default, "Accepted invitations and new events go here") };
+                    if is_default {
+                        ui.label(RichText::new("Default").color(t.text_dim)).on_hover_text(tip);
                     } else if calendar.read_only {
                         ui.label(RichText::new("Read-only").color(t.text_dim)).on_hover_text("Shared with you or a subscription: nothing can be written there");
-                    } else if ui.button("Make default").on_hover_text("Accepted invitations and new events go here").clicked() {
-                        make_default = Some(calendar.url.clone());
+                    } else if ui.button("Make default").on_hover_text(tip).clicked() {
+                        make_default = Some((calendar.url.clone(), tasks_only));
+                    }
+                    if tasks_only {
+                        ui.label(RichText::new("Tasks").color(t.text_dim)).on_hover_text("A task list: its tasks are in Tasks");
                     }
                 });
             });
@@ -148,9 +154,13 @@ pub fn page(ui: &mut egui::Ui, t: &Tokens, calendars: &mut [CalendarSource], log
             action = Some(PageAction::AskRemove(urls));
         }
     }
-    if let Some(url) = make_default {
+    if let Some((url, tasks_only)) = make_default {
         for c in calendars.iter_mut() {
-            c.default = c.url == url;
+            if tasks_only {
+                c.tasks_default = c.url == url;
+            } else {
+                c.default = c.url == url;
+            }
         }
         changed = true;
     }
@@ -304,7 +314,7 @@ mod tests {
     fn the_settings_page_lists_each_server_with_its_calendars_within_the_page() {
         let ctx = egui::Context::default();
         crate::theme::apply(&ctx);
-        let calendar = |name: &str, url: &str, user: &str| CalendarSource { name: name.into(), url: url.into(), user: user.into(), color: String::new(), shown: true, default: false, read_only: false };
+        let calendar = |name: &str, url: &str, user: &str| CalendarSource { name: name.into(), url: url.into(), user: user.into(), color: String::new(), shown: true, default: false, read_only: false, events: true, tasks: Some(false), tasks_default: false };
         let mut calendars = vec![
             calendar("On this computer", CalendarSource::LOCAL, ""),
             calendar("Work", "https://dav.example.org/ada/work/", "ada"),
@@ -336,7 +346,7 @@ mod tests {
         assert_eq!(week_start(day(21)), day(19));
         assert_eq!(week_start(day(19)), day(19));
         assert_eq!(week_start(day(25)), day(19), "Sunday ends the week");
-        let mut work = CalendarSource { name: "Work".into(), url: "https://dav.example.org/work/".into(), user: "ada".into(), color: "#3366FF".into(), shown: true, default: false, read_only: false };
+        let mut work = CalendarSource { name: "Work".into(), url: "https://dav.example.org/work/".into(), user: "ada".into(), color: "#3366FF".into(), shown: true, default: false, read_only: false, events: true, tasks: Some(false), tasks_default: false };
         assert_eq!(color(&work, 0), Color32::from_rgb(0x33, 0x66, 0xFF));
         work.color.clear();
         assert_eq!(color(&work, 2), theme::account_color(2));

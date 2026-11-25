@@ -19,10 +19,11 @@ computer, remote content stays blocked, and it works offline. Written in Rust wi
 - Assistant: replies drafted and conversations summarised by a language model with your own key (Anthropic, OpenAI or local), asked first and recorded.
 - Contacts: cards, address books synced over CardDAV.
 - Calendar: week, month and agenda over CalDAV or on this computer; events made and changed here; invitations answered from mail; calendars renamed, recoloured and their servers' passwords changed in Settings.
+- Tasks: lists over CalDAV (made here when a server has none), grouped by due date and put in order by dragging, with subtasks, labels and priority; changes kept offline and merged with those made elsewhere.
 
 Keys (Ctrl+K lists every command): Up/Down, Page Up/Down, Home/End (with Shift, pick a range), F6, Enter,
-E, Delete, V (move to folder), U, P, S, 1–5, 0, `!`, C or Ctrl+N, R, A, F, `/`, Ctrl+Z, Ctrl+U, Ctrl+W, Ctrl+Tab; in the calendar
-T, Left/Right, W, M, A, N.
+E, Delete, V (move to folder), U, P, S, T (make a task), 1–5, 0, `!`, C or Ctrl+N, R, A, F, `/`, Ctrl+Z, Ctrl+U, Ctrl+W, Ctrl+Tab; in the calendar
+T, Left/Right, W, M, A, N; in Tasks Up/Down, Space, Delete, N or `/`, Esc.
 
 Drag and drop of attachments does not work on Wayland yet: start with `WAYLAND_DISPLAY=` to use X11.
 
@@ -34,7 +35,7 @@ Drag and drop of attachments does not work on Wayland yet: start with `WAYLAND_D
 - `crates/imap`: IMAP backend (`ImapSource`), keeping the archive in sync.
 - `crates/smtp`: sending (`SmtpSender`).
 - `crates/crypto`: S/MIME and OpenPGP.
-- `crates/carddav`: address books (CardDAV) and calendars (CalDAV).
+- `crates/carddav`: address books (CardDAV), calendars and tasks (CalDAV).
 - `crates/accounts`: `accounts.toml` and the system credential store.
 - `crates/app`: the egui desktop app (binary `beavermail`).
 

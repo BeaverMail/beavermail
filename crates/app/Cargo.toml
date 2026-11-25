@@ -38,7 +38,7 @@ beavermail-crypto.workspace = true
 beavermail-carddav.workspace = true
 beavermail-vault.workspace = true
 beavermail-spell.workspace = true
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 # Times on this computer's clock for "send later"; already in the tree through the store.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Contact photos: read, and made small for the card; already in the tree through the HTML renderer.

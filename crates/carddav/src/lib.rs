@@ -7,6 +7,7 @@
 pub mod calendar;
 pub mod ical;
 pub mod sync;
+pub mod todo;
 pub mod vcard;
 
 pub use sync::{Synced, fields, sync};
@@ -40,6 +41,9 @@ pub struct Found {
     pub writable: bool,
     /// The colour the server keeps for a calendar (`#RRGGBB`), empty when none.
     pub color: String,
+    /// A calendar that takes events (`VEVENT`), tasks (`VTODO`), or both; both when it does not say.
+    pub events: bool,
+    pub tasks: bool,
 }
 
 /// What is looked for on a server.
@@ -140,26 +144,62 @@ impl Client {
     /// principal's home.
     fn find_from(&self, url: &str, kind: Kind) -> Result<Vec<Found>, MailError> {
         let what = if kind == Kind::Calendar { "calendar" } else { "address book" };
-        let is = |r: &Response| if kind == Kind::Calendar { r.calendar && r.events } else { r.addressbook };
-        let home_of = |r: &Response| if kind == Kind::Calendar { r.calendar_home.clone() } else { r.home.clone() };
-        let found = |at: &str, r: Response| Found { url: absolute(at, &r.href), name: r.name.unwrap_or_default(), writable: r.writable, color: r.color.unwrap_or_default() };
+        let is = |r: &Response| if kind == Kind::Calendar { r.calendar && (r.events || r.tasks) } else { r.addressbook };
+        let found = |at: &str, r: Response| Found { url: absolute(at, &r.href), name: r.name.unwrap_or_default(), writable: r.writable, color: r.color.unwrap_or_default(), events: r.events, tasks: r.tasks };
         let (at, answer) = self.dav("PROPFIND", url, "0", PROPFIND_HOME)?;
-        let mut first = responses(&answer)?.into_iter().next().ok_or_else(|| MailError::Backend("the server said nothing".into()))?;
+        let first = responses(&answer)?.into_iter().next().ok_or_else(|| MailError::Backend("the server said nothing".into()))?;
         if is(&first) {
             return Ok(vec![found(&at, first)]);
         }
-        let home = match home_of(&first) {
-            Some(home) => absolute(&at, &home),
-            None => {
-                let principal = first.principal.take().ok_or_else(|| MailError::Backend(format!("not a server with a {what}")))?;
-                let (at, answer) = self.dav("PROPFIND", &absolute(&at, &principal), "0", PROPFIND_HOME)?;
-                let home = responses(&answer)?.iter().find_map(home_of).ok_or_else(|| MailError::Backend(format!("the account has no {what} home")))?;
-                absolute(&at, &home)
-            }
-        };
+        let home = self.home_from(&at, first, kind)?;
         let (at, answer) = self.dav("PROPFIND", &home, "1", PROPFIND_HOME)?;
         let all: Vec<Found> = responses(&answer)?.into_iter().filter(|r| is(r)).map(|r| found(&at, r)).collect();
         if all.is_empty() { Err(MailError::Backend(format!("the account has no {what}"))) } else { Ok(all) }
+    }
+
+    /// A new task list named `name` in the user's calendar home, found from `start` as [`Client::discover`]
+    /// finds it: a collection that takes tasks only (RFC 4791 5.3.1).
+    fn make_task_list(&self, start: &str, name: &str) -> Result<Found, MailError> {
+        let start = if start.contains("://") { start.trim().to_owned() } else { format!("https://{}", start.trim()) };
+        let mut tried = Vec::new();
+        for candidate in [start.clone(), format!("{}/.well-known/caldav", origin(&start))] {
+            let home = self.dav("PROPFIND", &candidate, "0", PROPFIND_HOME).and_then(|(at, answer)| {
+                let first = responses(&answer)?.into_iter().next().ok_or_else(|| MailError::Backend("the server said nothing".into()))?;
+                self.home_from(&at, first, Kind::Calendar)
+            });
+            let home = match home {
+                Ok(home) => home,
+                Err(MailError::Auth(e)) => return Err(MailError::Auth(e)),
+                Err(e) => {
+                    tried.push(e.to_string());
+                    continue;
+                }
+            };
+            let url = format!("{}/{}/", home.trim_end_matches('/'), new_uid());
+            let body = format!(
+                r#"<?xml version="1.0" encoding="utf-8"?><c:mkcalendar xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:set><d:prop><d:displayname>{}</d:displayname><c:supported-calendar-component-set><c:comp name="VTODO"/></c:supported-calendar-component-set></d:prop></d:set></c:mkcalendar>"#,
+                xml_escape(name)
+            );
+            let (status, _, _) = self.send("MKCALENDAR", &url, &[("Content-Type", "application/xml; charset=utf-8")], &body)?;
+            if !(200..=299).contains(&status) {
+                return Err(refused(status, "make the task list"));
+            }
+            return Ok(Found { url, name: name.to_owned(), writable: true, color: String::new(), events: false, tasks: true });
+        }
+        Err(MailError::Backend(format!("no calendar home found at {start}: {}", tried.join("; "))))
+    }
+
+    /// The home of the user's collections of `kind`, from the answer about `at`: said there, or at its principal.
+    fn home_from(&self, at: &str, mut first: Response, kind: Kind) -> Result<String, MailError> {
+        let what = if kind == Kind::Calendar { "calendar" } else { "address book" };
+        let home_of = |r: &Response| if kind == Kind::Calendar { r.calendar_home.clone() } else { r.home.clone() };
+        if let Some(home) = home_of(&first) {
+            return Ok(absolute(at, &home));
+        }
+        let principal = first.principal.take().ok_or_else(|| MailError::Backend(format!("not a server with a {what}")))?;
+        let (at, answer) = self.dav("PROPFIND", &absolute(at, &principal), "0", PROPFIND_HOME)?;
+        let home = responses(&answer)?.iter().find_map(home_of).ok_or_else(|| MailError::Backend(format!("the account has no {what} home")))?;
+        Ok(absolute(&at, &home))
     }
 
     /// Writes a card or an event: a new one when `etag` is `None` (refused if one is there already),
@@ -288,8 +328,10 @@ struct Response {
     data: Option<String>,
     addressbook: bool,
     calendar: bool,
-    /// A calendar that holds events (its supported components include `VEVENT`, or it does not say).
+    /// A calendar that holds events, or tasks (its supported components include `VEVENT`, `VTODO`, or it
+    /// does not say).
     events: bool,
+    tasks: bool,
     collection: bool,
     principal: Option<String>,
     home: Option<String>,
@@ -308,7 +350,7 @@ fn responses(xml: &str) -> Result<Vec<Response>, MailError> {
         .descendants()
         .filter(|n| is(n, "response"))
         .map(|r| {
-            let mut out = Response { href: r.children().find(|c| is(c, "href")).and_then(|h| h.text()).unwrap_or_default().trim().to_owned(), writable: true, events: true, ..Default::default() };
+            let mut out = Response { href: r.children().find(|c| is(c, "href")).and_then(|h| h.text()).unwrap_or_default().trim().to_owned(), writable: true, events: true, tasks: true, ..Default::default() };
             // A property counts only from a propstat whose status is 200 (a 404 lists what the server lacks).
             let props = r.children().filter(|c| is(c, "propstat")).filter(|p| text_of(*p, "status").is_none_or(|s| s.contains(" 200"))).filter_map(|p| p.children().find(|c| is(c, "prop")));
             for prop in props {
@@ -326,7 +368,10 @@ fn responses(xml: &str) -> Result<Vec<Response>, MailError> {
                         "calendar-home-set" => out.calendar_home = text_of(p, "href"),
                         // "#RRGGBB" or "#RRGGBBAA": the colour without its opacity.
                         "calendar-color" => out.color = p.text().map(|t| t.trim().chars().take(7).collect()).filter(|t: &String| t.len() == 7 && t.starts_with('#')),
-                        "supported-calendar-component-set" => out.events = p.children().filter(|c| is(c, "comp")).any(|c| c.attribute("name") == Some("VEVENT")),
+                        "supported-calendar-component-set" => {
+                            let holds = |name: &str| p.children().filter(|c| is(c, "comp")).any(|c| c.attribute("name").is_some_and(|n| n.eq_ignore_ascii_case(name)));
+                            (out.events, out.tasks) = (holds("VEVENT"), holds("VTODO"));
+                        }
                         "current-user-privilege-set" => out.writable = p.descendants().any(|d| ["all", "write", "write-content", "bind"].iter().any(|w| is(&d, w))),
                         "displayname" => out.name = p.text().map(|t| t.trim().to_owned()).filter(|t| !t.is_empty()),
                         _ => {}

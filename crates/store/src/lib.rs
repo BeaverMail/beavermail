@@ -256,6 +256,35 @@ pub struct EventSpan {
     pub last: Option<i64>,
 }
 
+/// A task of a list (a calendar object holding one `VTODO`) as stored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredTask {
+    pub id: i64,
+    /// The list's URL.
+    pub list: String,
+    pub href: String,
+    /// The server's version of it; empty for one not sent yet.
+    pub etag: String,
+    /// The iCalendar text.
+    pub ics: String,
+    pub state: CardState,
+    /// The properties changed here and not sent yet, to be applied again on a newer version of the server's.
+    pub touched: Vec<String>,
+}
+
+/// What the archive needs of a task to find it, worked out by whoever stores it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TaskFields {
+    pub uid: String,
+    /// The `UID` of the task it is a part of; empty for none.
+    pub parent: String,
+    /// When it is due, in seconds since the epoch.
+    pub due: Option<i64>,
+    pub done: bool,
+    /// The Message-ID of the message it was made from; empty for none.
+    pub message: String,
+}
+
 /// What a card shows, read from its vCard by whoever stores it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CardFields {
@@ -860,6 +889,29 @@ fn migrate(conn: &Connection) -> Result<(), MailError> {
                 }
             }
             conn.execute_batch(&format!("{add} PRAGMA user_version = 24;")).map_err(db)?;
+        }
+        // Version 25: tasks of CalDAV lists, with the properties changed here and not sent yet.
+        if version < 25 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS tasks (
+                     id INTEGER PRIMARY KEY,
+                     list TEXT NOT NULL,
+                     href TEXT NOT NULL,
+                     etag TEXT NOT NULL DEFAULT '',
+                     ics TEXT NOT NULL,
+                     uid TEXT NOT NULL DEFAULT '',
+                     parent TEXT NOT NULL DEFAULT '',
+                     due INTEGER,
+                     done INTEGER NOT NULL DEFAULT 0,
+                     message TEXT NOT NULL DEFAULT '',
+                     touched TEXT NOT NULL DEFAULT '',
+                     state INTEGER NOT NULL DEFAULT 0,
+                     UNIQUE (list, href)
+                 );
+                 CREATE INDEX IF NOT EXISTS tasks_message ON tasks (message);
+                 PRAGMA user_version = 25;",
+            )
+            .map_err(db)?;
         }
     Ok(())
 }
@@ -1604,9 +1656,115 @@ impl Store {
         self.conn().execute("DELETE FROM events WHERE calendar = ?1 AND href = ?2", params![calendar, href]).map(|_| ()).map_err(db)
     }
 
-    /// Forgets a calendar's events: it was removed here.
+    /// Forgets a calendar's events and tasks: it was removed here.
     pub fn forget_calendar(&self, calendar: &str) -> Result<(), MailError> {
-        self.conn().execute("DELETE FROM events WHERE calendar = ?1", [calendar]).map(|_| ()).map_err(db)
+        let conn = self.conn();
+        conn.execute("DELETE FROM tasks WHERE list = ?1", [calendar]).map_err(db)?;
+        conn.execute("DELETE FROM events WHERE calendar = ?1", [calendar]).map(|_| ()).map_err(db)
+    }
+
+    /// The tasks of a list, as stored, for its sync: deleted ones too, until the server has them deleted.
+    pub fn tasks(&self, list: &str) -> Result<Vec<StoredTask>, MailError> {
+        self.query_tasks("WHERE list = ?1", params![list])
+    }
+
+    /// The tasks of `lists` there are to show: all but those deleted here.
+    pub fn shown_tasks(&self, lists: &[String]) -> Result<Vec<StoredTask>, MailError> {
+        let list = lists.iter().map(|c| format!("'{}'", c.replace('\'', "''"))).collect::<Vec<_>>().join(", ");
+        self.query_tasks(&format!("WHERE list IN ({list}) AND state != 3"), params![])
+    }
+
+    pub fn task(&self, id: i64) -> Result<Option<StoredTask>, MailError> {
+        Ok(self.query_tasks("WHERE id = ?1", params![id])?.into_iter().next())
+    }
+
+    fn query_tasks(&self, filter: &str, args: impl rusqlite::Params) -> Result<Vec<StoredTask>, MailError> {
+        let conn = self.read();
+        let mut stmt = conn.prepare(&format!("SELECT id, list, href, etag, ics, state, touched FROM tasks {filter}")).map_err(db)?;
+        let rows = stmt
+            .query_map(args, |r| {
+                let touched: String = r.get(6)?;
+                Ok(StoredTask { id: r.get(0)?, list: r.get(1)?, href: r.get(2)?, etag: r.get(3)?, ics: r.get(4)?, state: CardState::from_int(r.get(5)?), touched: touched.split_whitespace().map(str::to_owned).collect() })
+            })
+            .map_err(db)?;
+        rows.collect::<Result<_, _>>().map_err(db)
+    }
+
+    /// How many open tasks of `lists` are due before `before` (seconds since the epoch).
+    pub fn tasks_due(&self, lists: &[String], before: i64) -> Result<u32, MailError> {
+        let list = lists.iter().map(|c| format!("'{}'", c.replace('\'', "''"))).collect::<Vec<_>>().join(", ");
+        self.read().query_row(&format!("SELECT COUNT(*) FROM tasks WHERE list IN ({list}) AND state != 3 AND done = 0 AND due < ?1"), [before], |r| r.get(0)).map_err(db)
+    }
+
+    /// The Message-IDs of the messages tasks were made from.
+    pub fn task_messages(&self) -> Result<std::collections::HashSet<String>, MailError> {
+        let conn = self.read();
+        let mut stmt = conn.prepare("SELECT DISTINCT message FROM tasks WHERE message != '' AND state != 3").map_err(db)?;
+        let rows = stmt.query_map([], |r| r.get(0)).map_err(db)?;
+        rows.collect::<Result<_, _>>().map_err(db)
+    }
+
+    /// Keeps a task as the server has it.
+    pub fn put_task(&self, list: &str, href: &str, etag: &str, ics: &str, fields: &TaskFields) -> Result<(), MailError> {
+        self.conn()
+            .execute(
+                "INSERT INTO tasks (list, href, etag, ics, uid, parent, due, done, message, touched, state) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, '', 0)
+                 ON CONFLICT (list, href) DO UPDATE SET etag = ?3, ics = ?4, uid = ?5, parent = ?6, due = ?7, done = ?8, message = ?9, touched = '', state = 0",
+                params![list, href, etag, ics, fields.uid, fields.parent, fields.due, fields.done, fields.message],
+            )
+            .map(|_| ())
+            .map_err(db)
+    }
+
+    /// A task made here, to be sent at the next sync; its id.
+    pub fn add_task(&self, list: &str, href: &str, ics: &str, fields: &TaskFields) -> Result<i64, MailError> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO tasks (list, href, ics, uid, parent, due, done, message, state) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 2)",
+            params![list, href, ics, fields.uid, fields.parent, fields.due, fields.done, fields.message],
+        )
+        .map_err(db)?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// A task changed here, `touched` naming the properties changed, to be sent at the next sync.
+    pub fn change_task(&self, id: i64, ics: &str, fields: &TaskFields, touched: &[&str]) -> Result<(), MailError> {
+        let conn = self.conn();
+        let before: String = conn.query_row("SELECT touched FROM tasks WHERE id = ?1", [id], |r| r.get(0)).optional().map_err(db)?.unwrap_or_default();
+        let mut all: Vec<&str> = before.split_whitespace().collect();
+        all.extend(touched.iter().filter(|t| !before.split_whitespace().any(|b| b == **t)));
+        conn.execute(
+            "UPDATE tasks SET ics = ?2, uid = ?3, parent = ?4, due = ?5, done = ?6, message = ?7, touched = ?8, state = CASE WHEN state = 2 THEN 2 ELSE 1 END WHERE id = ?1",
+            params![id, ics, fields.uid, fields.parent, fields.due, fields.done, fields.message, all.join(" ")],
+        )
+        .map(|_| ())
+        .map_err(db)
+    }
+
+    /// The server's newer version of a task changed here, with the changes made here applied on it again:
+    /// still to be sent, now over that version.
+    pub fn rebase_task(&self, id: i64, etag: &str, ics: &str, fields: &TaskFields) -> Result<(), MailError> {
+        self.conn()
+            .execute("UPDATE tasks SET etag = ?2, ics = ?3, uid = ?4, parent = ?5, due = ?6, done = ?7, message = ?8 WHERE id = ?1", params![id, etag, ics, fields.uid, fields.parent, fields.due, fields.done, fields.message])
+            .map(|_| ())
+            .map_err(db)
+    }
+
+    /// A task deleted here: one never sent goes at once, any other waits to be deleted on the server.
+    pub fn delete_task(&self, id: i64) -> Result<(), MailError> {
+        let conn = self.conn();
+        conn.execute("DELETE FROM tasks WHERE id = ?1 AND state = 2", [id]).map_err(db)?;
+        conn.execute("UPDATE tasks SET state = 3 WHERE id = ?1", [id]).map(|_| ()).map_err(db)
+    }
+
+    /// The task is as the server has it now, at this version.
+    pub fn task_synced(&self, id: i64, etag: &str) -> Result<(), MailError> {
+        self.conn().execute("UPDATE tasks SET etag = ?2, touched = '', state = 0 WHERE id = ?1", params![id, etag]).map(|_| ()).map_err(db)
+    }
+
+    /// Forgets a task: gone from the server, or its deletion done.
+    pub fn forget_task(&self, list: &str, href: &str) -> Result<(), MailError> {
+        self.conn().execute("DELETE FROM tasks WHERE list = ?1 AND href = ?2", params![list, href]).map(|_| ()).map_err(db)
     }
 
     /// Forgets an address book's cards: its sync was turned off.
@@ -1672,6 +1830,19 @@ impl Store {
             .query_map(params![address.trim().to_lowercase(), role_to_int(Role::Junk), role_to_int(Role::Trash), limit as i64], |r| Ok((r.get(17)?, Hit { message: summary(r)?, folder: r.get(16)? })))
             .map_err(db)?;
         rows.collect::<Result<_, _>>().map_err(db)
+    }
+
+    /// A message by its Message-ID (without `<>`), in any account, as (account, where it is); one in
+    /// Spam or Trash only when it is nowhere else.
+    pub fn message_by_id(&self, message_id: &str) -> Result<Option<(String, Hit)>, MailError> {
+        let conn = self.read();
+        let sql = format!(
+            "SELECT {SUMMARY_COLUMNS}, folder, account FROM messages m WHERE message_id = ?1
+             ORDER BY folder IN (SELECT name FROM folders f WHERE f.account = m.account AND f.role IN (?2, ?3)), timestamp DESC LIMIT 1"
+        );
+        conn.query_row(&sql, params![message_id.trim().trim_matches(['<', '>']), role_to_int(Role::Junk), role_to_int(Role::Trash)], |r| Ok((r.get(17)?, Hit { message: summary(r)?, folder: r.get(16)? })))
+            .optional()
+            .map_err(db)
     }
 
     /// Messages of `folder` that answer one the user sent: their In-Reply-To or References name a

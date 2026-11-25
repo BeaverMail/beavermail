@@ -142,10 +142,10 @@ const WINDOWS: [(&str, &str); 40] = [
 ];
 
 /// A property's parameters: names upper case, values without quotes.
-type Params = Vec<(String, String)>;
+pub(crate) type Params = Vec<(String, String)>;
 
 /// A property's name (upper case), its parameters and value.
-fn property(line: &str) -> Option<(String, Params, &str)> {
+pub(crate) fn property(line: &str) -> Option<(String, Params, &str)> {
     let (head, value) = split_unquoted(line)?;
     let mut parts = split_params(head).into_iter();
     let name = parts.next()?.to_ascii_uppercase();
@@ -154,7 +154,7 @@ fn property(line: &str) -> Option<(String, Params, &str)> {
 }
 
 /// `NAME;A=1;B="x;y"` at its `;`s that are not inside quotes.
-fn split_params(head: &str) -> Vec<&str> {
+pub(crate) fn split_params(head: &str) -> Vec<&str> {
     let (mut out, mut quoted, mut from) = (Vec::new(), false, 0);
     for (i, c) in head.char_indices() {
         match c {
@@ -170,11 +170,11 @@ fn split_params(head: &str) -> Vec<&str> {
     out
 }
 
-fn param<'a>(params: &'a [(String, String)], name: &str) -> Option<&'a str> {
+pub(crate) fn param<'a>(params: &'a [(String, String)], name: &str) -> Option<&'a str> {
     params.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
 }
 
-fn when(params: &[(String, String)], value: &str) -> When {
+pub(crate) fn when(params: &[(String, String)], value: &str) -> When {
     let value = value.trim().to_owned();
     When { date_only: param(params, "VALUE") == Some("DATE") || (value.len() == 8 && !value.contains('T')), tzid: param(params, "TZID").map(str::to_owned), value }
 }
@@ -397,7 +397,7 @@ pub fn written(old: Option<&str>, uid: &str, draft: &Draft, now: DateTime<Utc>) 
 }
 
 /// Lines folded at 75 octets (RFC 5545 3.1), never inside a character, ending in CRLF.
-fn fold(lines: &[String]) -> String {
+pub(crate) fn fold(lines: &[String]) -> String {
     let mut out = String::new();
     for line in lines {
         let mut rest = line.as_str();

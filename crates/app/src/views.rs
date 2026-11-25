@@ -185,6 +185,11 @@ enum Lead {
     Dot(Color32),
 }
 
+/// A list in the sidebar: its colour, name and how many it holds (a task list's open tasks).
+pub fn dot_row(ui: &mut Ui, t: &Tokens, name: &str, color: Color32, count: u32, selected: bool) -> Response {
+    nav_row(ui, t, name, Lead::Dot(color), (count, 0, false), selected)
+}
+
 /// A label in the sidebar: its colour and name; a click shows its mail.
 pub fn label_row(ui: &mut Ui, t: &Tokens, name: &str, color: Color32, selected: bool) -> Response {
     nav_row(ui, t, name, Lead::Dot(color), (0, 0, false), selected)
@@ -423,7 +428,7 @@ pub fn person_row(ui: &mut Ui, t: &Tokens, name: &str, line: &str, photo: Option
 /// text), so spam is judged without opening it. `count`: messages in its conversation, shown from two.
 /// `mark`: the colour of its account, in All inboxes.
 #[allow(clippy::too_many_arguments)]
-pub fn message_row(ui: &mut Ui, t: &Tokens, message: &MessageSummary, selected: bool, folder: Option<&str>, warning: Option<&str>, count: usize, mark: Option<Color32>) -> Response {
+pub fn message_row(ui: &mut Ui, t: &Tokens, message: &MessageSummary, selected: bool, folder: Option<&str>, warning: Option<&str>, count: usize, mark: Option<Color32>, task: bool) -> Response {
     // Clicked, never focused: the arrow keys move the list's own selection (`handle_keys`), and a focused
     // row would have egui move its focus with them too, scrolling the list elsewhere. Dragged onto a folder,
     // it moves there.
@@ -447,8 +452,8 @@ pub fn message_row(ui: &mut Ui, t: &Tokens, message: &MessageSummary, selected: 
         Icon::Paperclip.image(15.0, t.text_dim).paint_at(ui, Rect::from_center_size(pos2(card.right() - 14.0 - date_w - 17.0, card.top() + 21.0), vec2(15.0, 15.0)));
     }
     let mut clip = clip;
-    // Pinned here, and starred (a flag from any client): beside the paperclip.
-    for (on, icon, color) in [(message.pinned, Icon::Pin, t.accent), (message.starred, Icon::Star, theme::role_color(Role::Starred))] {
+    // Pinned here, starred (a flag from any client), made a task: beside the paperclip.
+    for (on, icon, color) in [(message.pinned, Icon::Pin, t.accent), (message.starred, Icon::Star, theme::role_color(Role::Starred)), (task, Icon::ListChecks, t.text_dim)] {
         if on {
             icon.image(15.0, color).paint_at(ui, Rect::from_center_size(pos2(card.right() - 14.0 - date_w - clip - 17.0, card.top() + 21.0), vec2(15.0, 15.0)));
             clip += 20.0;
@@ -637,7 +642,7 @@ pub fn table_header(ui: &mut Ui, t: &Tokens, sort: Sort, columns: Columns) -> He
 /// A message as a row of the table: sender, subject, date, in the columns of [`table_header`]. As
 /// [`message_row`], `folder` names where a search result is and `count` a conversation's messages.
 #[allow(clippy::too_many_arguments)]
-pub fn table_row(ui: &mut Ui, t: &Tokens, message: &MessageSummary, selected: bool, folder: Option<&str>, warning: Option<&str>, count: usize, mark: Option<Color32>, columns: Columns, height: f32) -> Response {
+pub fn table_row(ui: &mut Ui, t: &Tokens, message: &MessageSummary, selected: bool, folder: Option<&str>, warning: Option<&str>, count: usize, mark: Option<Color32>, columns: Columns, height: f32, task: bool) -> Response {
     // Clicked, never focused, as [`message_row`].
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click_and_drag());
     let inner = rect.shrink2(vec2(8.0, 1.0));
@@ -666,7 +671,7 @@ pub fn table_row(ui: &mut Ui, t: &Tokens, message: &MessageSummary, selected: bo
 
     // Subject, then at its end the conversation's count, the folder of a search result and the marks.
     let mut right = subject_cell.right() - 8.0;
-    for (on, icon, color) in [(message.has_attachments, Icon::Paperclip, t.text_dim), (message.starred, Icon::Star, theme::role_color(Role::Starred)), (message.pinned, Icon::Pin, t.accent)] {
+    for (on, icon, color) in [(message.has_attachments, Icon::Paperclip, t.text_dim), (message.starred, Icon::Star, theme::role_color(Role::Starred)), (message.pinned, Icon::Pin, t.accent), (task, Icon::ListChecks, t.text_dim)] {
         if on {
             icon.image(14.0, color).paint_at(ui, Rect::from_center_size(pos2(right - 7.0, y), vec2(14.0, 14.0)));
             right -= 20.0;

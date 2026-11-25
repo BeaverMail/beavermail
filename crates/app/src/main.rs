@@ -32,6 +32,7 @@ mod remote;
 mod screen;
 mod sender;
 mod tabs;
+mod tasks;
 mod html;
 mod icons;
 mod learn;
@@ -150,7 +151,10 @@ enum Event {
     /// An address book was synced: (its URL, what moved, or why not).
     ContactsSynced(String, Result<beavermail_carddav::Synced, MailError>),
     /// A calendar was synced: (its URL, how many events came, or why not).
-    CalendarsSynced(String, Result<usize, MailError>),
+    /// A task list made on a server, for this user.
+    TaskListMade(String, Result<beavermail_carddav::Found, String>),
+    /// A calendar synced, with what it takes when that was asked: (events, tasks).
+    CalendarsSynced(String, Result<(beavermail_carddav::Synced, Option<(bool, bool)>), MailError>),
     /// An event was written to (or deleted from) a calendar on its server, and kept here.
     CalendarWritten(Result<(), MailError>),
     /// "Find calendars" answered.
@@ -554,6 +558,8 @@ struct ReaderOutcome {
     bulk: Option<Action>,
     /// Move to folder… was pressed, for the open message or those picked.
     move_to: bool,
+    /// Make a task (or open its task) was pressed on this message.
+    task: Option<MessageId>,
     /// Unsubscribe was pressed: who sent the message, and how to leave the list.
     unsubscribe: Option<(String, unsubscribe::Method)>,
     /// Block sender was pressed on this message.
@@ -891,6 +897,7 @@ enum Section {
     Mail,
     Contacts,
     Calendar,
+    Tasks,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -974,7 +981,7 @@ impl SettingsPage {
 /// The calendars offered in the event dialog: by server (this computer first), each named with its
 /// server when there is more than one, so two calendars called "Calendar" can be told apart.
 fn event_targets(calendars: &[beavermail_core::CalendarSource]) -> Vec<(String, String, bool)> {
-    let mut sorted: Vec<&beavermail_core::CalendarSource> = calendars.iter().collect();
+    let mut sorted: Vec<&beavermail_core::CalendarSource> = calendars.iter().filter(|c| c.events).collect();
     sorted.sort_by_key(|c| (!c.is_local(), calendars::server(c)));
     let servers: std::collections::HashSet<String> = calendars.iter().map(calendars::server).collect();
     sorted
@@ -1501,6 +1508,35 @@ struct BeaverApp {
     calendar_logins: std::collections::HashMap<String, calendars::Login>,
     /// The dialog to add or change an event, while open.
     event_form: Option<event_form::EventForm>,
+    /// The Tasks section: what it shows, and what it keeps between frames.
+    task_filter: tasks::Filter,
+    task_open: Option<i64>,
+    task_edit: tasks::Editing,
+    task_list: tasks::ListState,
+    /// Tasks just ticked done, still shown struck through until then.
+    task_ticked: std::collections::HashMap<i64, std::time::Instant>,
+    /// Tasks whose subtasks are folded away, by `UID`.
+    task_folded: std::collections::HashSet<String>,
+    /// The tasks of every list, read once per calendar version.
+    task_cache: Option<(u64, Arc<Vec<tasks::Shown>>)>,
+    /// How many tasks are due today or overdue, for the rail: (calendar version, day, count).
+    task_due: Option<(u64, chrono::NaiveDate, u32)>,
+    /// Tasks deleted, gone for real when the Undo time is over: (their ids, then, what the toast says).
+    task_deleting: Option<(Vec<i64>, std::time::Instant, String)>,
+    /// Asking before deleting tasks: (their ids, what the question says).
+    confirm_task_delete: Option<(Vec<i64>, String)>,
+    /// The dialog to make a task list, while open.
+    new_task_list: Option<tasks::NewList>,
+    /// Tasks moved to another list: (the copy there, the task left here until the copy is on the server).
+    task_moves: Vec<(i64, i64)>,
+    /// Lists changed while they were syncing: synced again once that sync is over.
+    tasks_resync: std::collections::HashSet<String>,
+    /// The dialog to make a task of a message, while open.
+    task_from: Option<tasks::FromMessage>,
+    /// A message opened in a tab from another section (a task, a contact): closing that tab goes back there.
+    return_to: Option<(MessageId, Section)>,
+    /// The Message-IDs of the messages made tasks, read once per calendar version.
+    task_message_ids: Option<(u64, Arc<std::collections::HashSet<String>>)>,
     /// Asking whether to delete the event with this UID.
     confirm_event_delete: Option<String>,
     /// Other messages of the open conversation shown open in the reader, beside the tab's own
@@ -1716,6 +1752,22 @@ impl BeaverApp {
             confirm_calendar_remove: None,
             calendar_logins: Default::default(),
             event_form: None,
+            task_filter: tasks::Filter::default(),
+            task_open: None,
+            task_edit: tasks::Editing::default(),
+            task_list: tasks::ListState::default(),
+            task_ticked: Default::default(),
+            task_folded: Default::default(),
+            task_cache: None,
+            task_due: None,
+            task_deleting: None,
+            confirm_task_delete: None,
+            new_task_list: None,
+            task_moves: Vec::new(),
+            tasks_resync: Default::default(),
+            task_from: None,
+            return_to: None,
+            task_message_ids: None,
             confirm_event_delete: None,
             unfolded: Vec::new(),
             folded_anchor: false,
@@ -1877,6 +1929,8 @@ impl BeaverApp {
     }
 
     fn select_mailbox(&mut self, serial: u64, index: usize) {
+        // Another folder picked: closing the message no longer goes back where it came from.
+        self.return_to = None;
         let Some(view) = self.view(serial) else { return };
         if view.source.is_none() || view.mailboxes.get(index).is_none() {
             return;
@@ -2397,6 +2451,7 @@ impl BeaverApp {
             return;
         }
         let was_open = self.active() == Some(at);
+        let back = self.return_to.filter(|(id, _)| self.tabs[at].message.id == *id).map(|(_, from)| from);
         self.tabs.remove(at);
         if was_open {
             let pinned: Vec<usize> = (0..self.tabs.len()).filter(|i| self.tabs[*i].pinned).collect();
@@ -2404,6 +2459,10 @@ impl BeaverApp {
                 Some(&next) => self.activate(next),
                 None => self.show_mail(),
             }
+        }
+        if let Some(from) = back {
+            self.return_to = None;
+            self.section = from;
         }
     }
 
@@ -3221,6 +3280,15 @@ impl BeaverApp {
 
     /// A search result was clicked: show its folder with the message open.
     /// Shows a search result where it is, without leaving the search: its folder need not be the one shown.
+    /// Opens a message in a tab of its own from section `from`, to go back there when the tab is closed.
+    fn open_from(&mut self, from: Section, serial: u64, hit: &Hit) {
+        // From Mail itself it opens as any message does there, with nothing to go back to.
+        let elsewhere = from != Section::Mail;
+        self.section = Section::Mail;
+        self.open_hit(serial, hit, elsewhere);
+        self.return_to = elsewhere.then_some((hit.message.id, from));
+    }
+
     fn open_hit(&mut self, serial: u64, hit: &Hit, pin: bool) {
         let Some(role) = self.view(serial).and_then(|v| v.mailboxes.iter().find(|m| m.name == hit.folder)).map(|m| m.role) else { return };
         self.open(tabs::Tab { serial, message: hit.message.clone(), role, pinned: pin, source: false });
@@ -3599,7 +3667,7 @@ impl BeaverApp {
         if !self.closing {
             return;
         }
-        let n = self.in_flight.len();
+        let n = self.in_flight.len() + self.tasks_sending();
         let mut quit = n == 0;
         if n > 0 {
             crate::views::modal(ctx, egui::Id::new("closing")).show(ctx, |ui| {
@@ -3618,7 +3686,8 @@ impl BeaverApp {
             quit |= ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Q));
         }
         if quit {
-            if n > 0 {
+            // Tasks changed here stay in the archive as they are, and go at the next start.
+            if !self.in_flight.is_empty() {
                 self.offline_changes.append(&mut self.in_flight);
                 self.save_offline();
             }
@@ -5090,7 +5159,16 @@ impl BeaverApp {
             self.spawn(async move {
                 let url = calendar.url.clone();
                 let open = beavermail_carddav::calendar::Calendar::open(&calendar.url, &calendar.user, &password);
-                let result = tokio::task::spawn_blocking(move || beavermail_carddav::calendar::sync(&open, &archive)).await.unwrap_or_else(|e| Err(MailError::Backend(e.to_string())));
+                // One added before tasks were read here: its server is asked once whether it takes them.
+                let ask = calendar.tasks.is_none();
+                // On a thread of its own, which closing the app does not wait for: what changed here is
+                // kept in the archive and sent again at the next start.
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                std::thread::spawn(move || {
+                    let holds = if ask { open.holds().ok() } else { None };
+                    let _ = tx.send(beavermail_carddav::calendar::sync(&open, &archive).map(|done| (done, holds)));
+                });
+                let result = rx.await.unwrap_or_else(|e| Err(MailError::Backend(e.to_string())));
                 Event::CalendarsSynced(url, result)
             });
         }
@@ -5134,12 +5212,589 @@ impl BeaverApp {
     }
 
     /// The calendar on this computer is always there: invitations accepted without a server go to it.
+    /// The Message-IDs of the messages a task was made from.
+    fn task_messages(&mut self) -> Arc<std::collections::HashSet<String>> {
+        if let Some((version, ids)) = &self.task_message_ids
+            && *version == self.calendar_version
+        {
+            return ids.clone();
+        }
+        let ids = Arc::new(self.archive.task_messages().unwrap_or_default());
+        self.task_message_ids = Some((self.calendar_version, ids.clone()));
+        ids
+    }
+
+    /// Opens the dialog to make a task of message `id`, or, when it has one already, that task.
+    fn make_task_of(&mut self, id: MessageId) {
+        let Some(summary) = self.summary_of(id).cloned() else { return };
+        if !summary.message_id.is_empty()
+            && let Some(task) = self.shown_tasks().iter().find(|s| s.task.message_id() == Some(summary.message_id.as_str())).map(|s| s.id)
+        {
+            self.section = Section::Tasks;
+            self.task_filter = tasks::Filter::All;
+            self.task_action(tasks::TaskAction::Open(task));
+            return;
+        }
+        let list = match self.default_task_list() {
+            Ok(list) => list,
+            Err(e) => {
+                self.error = Some(format!("{e}: in Tasks, New list."));
+                return;
+            }
+        };
+        let text = self.body.as_ref().filter(|_| self.message == Some(id)).map(|b| b.data.text.clone()).unwrap_or_default();
+        let message_id = if summary.message_id.is_empty() { self.body.as_ref().filter(|_| self.message == Some(id)).map(|b| b.data.message_id.clone()).unwrap_or_default() } else { summary.message_id.clone() };
+        self.task_from = Some(tasks::FromMessage::new(&summary.subject, &text, &message_id, &list));
+    }
+
+    /// Changes to tasks made here in the lists being synced now: closing waits for the server to take them.
+    fn tasks_sending(&self) -> usize {
+        self.calendars_syncing.iter().map(|url| self.archive.tasks(url).map_or(0, |all| all.iter().filter(|t| t.state != beavermail_store::CardState::Synced).count())).sum()
+    }
+
+    /// The task lists: a server's calendars that take tasks.
+    fn task_lists(&self) -> Vec<tasks::List> {
+        let calendars = &self.settings.calendars;
+        calendars
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.tasks == Some(true) && !c.is_local())
+            .map(|(at, c)| tasks::List { url: c.url.clone(), name: c.name.clone(), server: calendars::server(c), color: calendars::color(c, at), writable: !c.read_only, default: c.tasks_default })
+            .collect()
+    }
+
+    /// The tasks of every list, but those moving to another list and those being deleted.
+    fn shown_tasks(&mut self) -> Arc<Vec<tasks::Shown>> {
+        if let Some((version, all)) = &self.task_cache
+            && *version == self.calendar_version
+        {
+            return all.clone();
+        }
+        let lists = self.task_lists();
+        let urls: Vec<String> = lists.iter().map(|l| l.url.clone()).collect();
+        let hidden: std::collections::HashSet<i64> = self.task_moves.iter().map(|(_, old)| *old).chain(self.task_deleting.iter().flat_map(|(ids, ..)| ids.iter().copied())).collect();
+        let all: Vec<tasks::Shown> = self
+            .archive
+            .shown_tasks(&urls)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| !hidden.contains(&s.id))
+            .filter_map(|s| Some(tasks::Shown { id: s.id, writable: lists.iter().any(|l| l.url == s.list && l.writable), task: beavermail_carddav::todo::parse(&s.ics)?, list: s.list }))
+            .collect();
+        let all = Arc::new(all);
+        self.task_cache = Some((self.calendar_version, all.clone()));
+        all
+    }
+
+    /// How many open tasks are due today or before, for the rail.
+    fn tasks_due_today(&mut self) -> u32 {
+        let today = chrono::Local::now().date_naive();
+        if let Some((version, day, count)) = self.task_due
+            && version == self.calendar_version
+            && day == today
+        {
+            return count;
+        }
+        let now = chrono::Local::now().naive_local();
+        let count = self.shown_tasks().iter().filter(|s| !s.task.done && matches!(tasks::group(&s.task, now), tasks::Group::Overdue | tasks::Group::Today)).count() as u32;
+        self.task_due = Some((self.calendar_version, today, count));
+        count
+    }
+
+    /// The list new tasks go to: the default one, else the first that can be written to.
+    fn default_task_list(&self) -> Result<String, &'static str> {
+        let lists = self.task_lists();
+        if lists.is_empty() {
+            return Err("No task list yet: make one first");
+        }
+        lists.iter().find(|l| l.default && l.writable).or_else(|| lists.iter().find(|l| l.writable)).map(|l| l.url.clone()).ok_or("Every task list is read-only")
+    }
+
+    /// Tasks of `list` changed here: shown at once, sent with a sync of the list (again after the one
+    /// running, if any).
+    fn tasks_changed(&mut self, list: &str) {
+        self.calendar_version += 1;
+        if self.calendars_syncing.contains(list) {
+            self.tasks_resync.insert(list.to_owned());
+        } else if !self.work_offline {
+            self.sync_calendars(Some(list));
+        }
+    }
+
+    /// A new task, kept here and sent at the next sync; its id.
+    fn add_task(&mut self, title: &str, list: Option<String>, parent: Option<String>) -> Option<i64> {
+        use beavermail_carddav::todo::{self, Edit};
+        let url = match list.map_or_else(|| self.default_task_list().map_err(str::to_owned), Ok) {
+            Ok(url) => url,
+            Err(e) => {
+                self.error = Some(e);
+                return None;
+            }
+        };
+        let uid = beavermail_carddav::new_uid();
+        let mut edits = vec![Edit::summary(title)];
+        if let Some(parent) = parent.as_deref() {
+            edits.push(Edit::parent(Some(parent)));
+        } else if self.task_filter == tasks::Filter::Today {
+            edits.push(Edit::due(&Default::default(), Some(&tasks::due_when(chrono::Local::now().date_naive(), None))));
+        }
+        let ics = todo::new(&uid, &edits, chrono::Utc::now());
+        self.keep_new_task(&url, &uid, &ics)
+    }
+
+    fn keep_new_task(&mut self, url: &str, uid: &str, ics: &str) -> Option<i64> {
+        let href = beavermail_carddav::calendar::Calendar::open(url, "", "").new_href(uid);
+        match self.archive.add_task(url, &href, ics, &beavermail_carddav::todo::fields(ics)) {
+            Ok(id) => {
+                self.tasks_changed(url);
+                Some(id)
+            }
+            Err(e) => {
+                self.error = Some(format!("Could not keep the task: {e}"));
+                None
+            }
+        }
+    }
+
+    /// Makes `edits` to a task here; they go to the server with the next sync.
+    fn change_task(&mut self, id: i64, edits: &[beavermail_carddav::todo::Edit]) {
+        use beavermail_carddav::todo::{self, Edit};
+        let Some(stored) = self.archive.task(id).ok().flatten() else { return };
+        let ics = todo::apply(&stored.ics, edits, chrono::Utc::now());
+        self.keep_changed_task(&stored.list, id, &ics, &Edit::touched(edits));
+    }
+
+    fn keep_changed_task(&mut self, list: &str, id: i64, ics: &str, touched: &[&str]) {
+        if let Err(e) = self.archive.change_task(id, ics, &beavermail_carddav::todo::fields(ics), touched) {
+            self.error = Some(format!("Could not change the task: {e}"));
+            return;
+        }
+        self.tasks_changed(list);
+    }
+
+    /// Ticks a task done, or opens it again. A repeating one leaves a done copy of its own and moves on
+    /// to its next date.
+    fn tick_task(&mut self, id: i64) {
+        use beavermail_carddav::todo::{self, Edit};
+        let Some(stored) = self.archive.task(id).ok().flatten() else { return };
+        let Some(task) = todo::parse(&stored.ics) else { return };
+        let now = chrono::Utc::now();
+        if task.done {
+            self.task_ticked.remove(&id);
+            return self.change_task(id, &[Edit::done(false, now)]);
+        }
+        if task.repeats() {
+            let (copy, series) = todo::complete_repeating(&stored.ics, &beavermail_carddav::new_uid(), now);
+            if let Some(copy_uid) = todo::parse(&copy).map(|t| t.uid) {
+                self.keep_new_task(&stored.list, &copy_uid, &copy);
+            }
+            match series {
+                Some(series) => self.keep_changed_task(&stored.list, id, &series, &["DUE", "DTSTART", "STATUS", "COMPLETED", "PERCENT-COMPLETE"]),
+                None => self.change_task(id, &[Edit::done(true, now)]),
+            }
+            self.notice = Some(("Done: the next one is on the list".into(), std::time::Instant::now()));
+            return;
+        }
+        self.task_ticked.insert(id, std::time::Instant::now());
+        self.change_task(id, &[Edit::done(true, now)]);
+    }
+
+    /// A task and every task under it, in its list.
+    fn task_and_subtasks(&mut self, id: i64) -> Vec<i64> {
+        let all = self.shown_tasks();
+        let mut out = vec![id];
+        let mut at = 0;
+        while at < out.len() {
+            let Some(s) = all.iter().find(|s| s.id == out[at]) else { break };
+            let (uid, list) = (s.task.uid.clone(), s.list.clone());
+            for child in all.iter().filter(|c| c.list == list && c.task.parent.as_deref() == Some(uid.as_str())) {
+                if !out.contains(&child.id) {
+                    out.push(child.id);
+                }
+            }
+            at += 1;
+        }
+        out
+    }
+
+    /// Moves a task and its subtasks to another list: copied there, and taken from here only once the
+    /// copy is on the server.
+    fn move_task(&mut self, id: i64, to: &str) {
+        // shortcut: the moves are kept in memory; a restart before the copy is sent leaves the task in both lists, never in none.
+        for one in self.task_and_subtasks(id) {
+            let Some(stored) = self.archive.task(one).ok().flatten() else { continue };
+            let uid = beavermail_carddav::todo::parse(&stored.ics).map(|t| t.uid).unwrap_or_else(beavermail_carddav::new_uid);
+            if let Some(copy) = self.keep_new_task(to, &uid, &stored.ics) {
+                self.task_moves.push((copy, one));
+                if self.task_open == Some(one) {
+                    self.task_open = Some(copy);
+                }
+            }
+        }
+        self.calendar_version += 1;
+    }
+
+    /// Takes the tasks moved away from their old list once their copy is on the server.
+    fn finish_task_moves(&mut self) {
+        let mut done = Vec::new();
+        self.task_moves.retain(|(copy, old)| match self.archive.task(*copy).ok().flatten() {
+            Some(c) if c.state == beavermail_store::CardState::Synced => {
+                done.push(*old);
+                false
+            }
+            Some(_) => true,
+            // The copy is gone: the task stays where it was.
+            None => false,
+        });
+        for old in done {
+            if let Some(stored) = self.archive.task(old).ok().flatten() {
+                let _ = self.archive.delete_task(old);
+                self.tasks_changed(&stored.list);
+            }
+        }
+    }
+
+    /// Deletes tasks after the Undo time; those of an earlier deletion go now.
+    fn start_task_delete(&mut self, ids: Vec<i64>, text: String) {
+        self.finish_task_delete();
+        if self.task_open.is_some_and(|open| ids.contains(&open)) {
+            self.task_open = None;
+        }
+        self.task_deleting = Some((ids, std::time::Instant::now(), text));
+        self.calendar_version += 1;
+    }
+
+    fn finish_task_delete(&mut self) {
+        let Some((ids, ..)) = self.task_deleting.take() else { return };
+        let mut lists = Vec::new();
+        for id in ids {
+            if let Some(stored) = self.archive.task(id).ok().flatten() {
+                let _ = self.archive.delete_task(id);
+                if !lists.contains(&stored.list) {
+                    lists.push(stored.list);
+                }
+            }
+        }
+        for list in lists {
+            self.tasks_changed(&list);
+        }
+        self.calendar_version += 1;
+    }
+
+    /// Makes a task list on the server of the dialog's choice, then syncs it as one of its calendars.
+    fn make_task_list(&mut self, server: usize, name: String) {
+        let sources: Vec<beavermail_core::CalendarSource> = self.task_servers();
+        let Some(source) = sources.get(server).cloned() else { return };
+        let password = match store::calendar_password(&source) {
+            Ok(p) => p,
+            Err(e) => {
+                if let Some(form) = self.new_task_list.as_mut() {
+                    form.error = Some(e);
+                }
+                return;
+            }
+        };
+        if let Some(form) = self.new_task_list.as_mut() {
+            (form.making, form.error) = (true, None);
+        }
+        let host = books::host(&source.url).to_owned();
+        let user = source.user.clone();
+        self.spawn(async move {
+            let made = tokio::task::spawn_blocking(move || beavermail_carddav::calendar::Calendar::make_task_list(&host, &source.user, &password, &name).map_err(|e| e.to_string()))
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()));
+            Event::TaskListMade(user, made)
+        });
+    }
+
+    /// One calendar of each server, for the servers a task list can be made on.
+    fn task_servers(&self) -> Vec<beavermail_core::CalendarSource> {
+        let mut out: Vec<beavermail_core::CalendarSource> = Vec::new();
+        for c in self.settings.calendars.iter().filter(|c| !c.is_local()) {
+            if !out.iter().any(|o| calendars::server(o) == calendars::server(c)) {
+                out.push(c.clone());
+            }
+        }
+        out
+    }
+
+    /// Keeps what was typed in the title and notes of the task open, before another one opens.
+    fn keep_task_typing(&mut self) {
+        let id = self.task_edit.id;
+        let Some(s) = self.shown_tasks().iter().find(|s| s.id == id && s.writable).cloned() else { return };
+        let edits = self.task_edit.changes(&s.task);
+        if !edits.is_empty() {
+            self.change_task(id, &edits);
+        }
+    }
+
+    fn task_action(&mut self, action: tasks::TaskAction) {
+        use tasks::TaskAction as A;
+        match action {
+            A::Pick(filter) => {
+                self.task_filter = filter;
+                self.task_list.show_completed = false;
+            }
+            A::Open(id) => {
+                self.keep_task_typing();
+                if let Some(s) = self.shown_tasks().iter().find(|s| s.id == id) {
+                    self.task_edit = tasks::Editing::of(s);
+                }
+                self.task_open = Some(id);
+            }
+            A::Close => {
+                self.keep_task_typing();
+                self.task_open = None;
+            }
+            A::Tick(id) => self.tick_task(id),
+            A::Add { title, list, parent } => {
+                self.add_task(&title, list, parent);
+            }
+            A::Change(id, edits) => self.change_task(id, &edits),
+            A::Move(id, to) => self.move_task(id, &to),
+            A::Delete(id) => {
+                let ids = self.task_and_subtasks(id);
+                let title = self.shown_tasks().iter().find(|s| s.id == id).map(|s| s.task.summary.trim().to_owned()).filter(|t| !t.is_empty()).unwrap_or_else(|| "this task".into());
+                match ids.len() {
+                    1 => self.start_task_delete(ids, "Task deleted".into()),
+                    2 => self.confirm_task_delete = Some((ids, format!("Delete “{title}” and its subtask?"))),
+                    n => self.confirm_task_delete = Some((ids, format!("Delete “{title}” and its {} subtasks?", n - 1))),
+                }
+            }
+            A::DeleteCompleted(url) => {
+                let ids: Vec<i64> = self.shown_tasks().iter().filter(|s| s.list == url && s.task.done && s.writable).map(|s| s.id).collect();
+                let name = self.task_lists().into_iter().find(|l| l.url == url).map(|l| l.name).unwrap_or_default();
+                if !ids.is_empty() {
+                    let n = ids.len();
+                    self.confirm_task_delete = Some((ids, if n == 1 { format!("Delete 1 completed task in {name}?") } else { format!("Delete {n} completed tasks in {name}?") }));
+                }
+            }
+            A::Fold(uid) => {
+                if !self.task_folded.remove(&uid) {
+                    self.task_folded.insert(uid);
+                }
+            }
+            A::ShowCompleted => self.task_list.show_completed = !self.task_list.show_completed,
+            // Made by the list from a drop; nothing else sends it.
+            A::Drop { .. } => {}
+            A::Reorder(ids) => {
+                // Numbered from the top, as other apps keep the order put by hand; only what changed is written.
+                let all = self.shown_tasks();
+                for (at, id) in ids.into_iter().enumerate() {
+                    let order = (at as i64 + 1) * 1024;
+                    if all.iter().any(|s| s.id == id && s.writable && s.task.sort != Some(order)) {
+                        self.change_task(id, &[beavermail_carddav::todo::Edit::sort(order)]);
+                    }
+                }
+            }
+            A::OpenMessage(id) => match self.archive.message_by_id(&id).ok().flatten() {
+                Some((key, hit)) => {
+                    let Some(serial) = self.accounts.iter().find(|v| v.account.key() == key).map(|v| v.serial) else { return };
+                    self.open_from(Section::Tasks, serial, &hit);
+                }
+                None => self.error = Some("The message this task was made from is not on this computer: deleted, or in an account not here.".into()),
+            },
+            A::NewList => self.new_task_list = Some(tasks::NewList::default()),
+            A::MakeDefault(url) => {
+                for c in &mut self.settings.calendars {
+                    c.tasks_default = c.url == url;
+                }
+                self.save_settings();
+                self.calendar_version += 1;
+            }
+            A::SyncNow => self.sync_calendars(None),
+        }
+    }
+
+    /// The Tasks section: the views and lists on the left, the tasks in the middle, the task picked on the right.
+    fn tasks_section(&mut self, ui: &mut egui::Ui, t: &theme::Tokens) {
+        let all = self.shown_tasks();
+        let lists = self.task_lists();
+        // Ticked tasks leave the list after a moment; a second click within it opens them again.
+        let now = std::time::Instant::now();
+        self.task_ticked.retain(|_, at| now.duration_since(*at) < std::time::Duration::from_secs(3));
+        if !self.task_ticked.is_empty() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+        }
+        let keep: std::collections::HashSet<i64> = self.task_ticked.keys().copied().collect();
+        if let tasks::Filter::List(url) = &self.task_filter
+            && !lists.iter().any(|l| l.url == *url)
+        {
+            self.task_filter = tasks::Filter::Today;
+        }
+        let mut actions: Vec<tasks::TaskAction> = Vec::new();
+        // The keys of the section: arrows through the tasks, Space ticks, Delete deletes, N or / to add one, Esc closes.
+        let typing = ui.ctx().egui_wants_keyboard_input() || egui::Popup::is_any_open(ui.ctx());
+        let dialogs = self.palette.is_some() || self.show_settings || self.confirm_task_delete.is_some() || self.new_task_list.is_some() || self.task_from.is_some();
+        if !typing && !dialogs {
+            let key = |k| ui.input(|i| i.key_pressed(k) && !i.modifiers.command && !i.modifiers.alt);
+            let clock = chrono::Local::now().naive_local();
+            let mut order: Vec<i64> = tasks::lines(&all, &self.task_filter, clock, &keep, &self.task_folded).iter().flat_map(|(_, rows)| rows.iter().map(|l| all[l.at].id)).collect();
+            if self.task_list.show_completed {
+                order.extend(tasks::completed(&all, &self.task_filter).into_iter().map(|i| all[i].id));
+            }
+            let at = self.task_open.and_then(|id| order.iter().position(|o| *o == id));
+            let step = if key(egui::Key::ArrowDown) { Some(true) } else if key(egui::Key::ArrowUp) { Some(false) } else { None };
+            if let Some(down) = step {
+                let next = match at {
+                    Some(at) if down => order.get(at + 1),
+                    Some(at) => at.checked_sub(1).and_then(|p| order.get(p)),
+                    None => order.first(),
+                };
+                if let Some(&next) = next {
+                    actions.push(tasks::TaskAction::Open(next));
+                    self.task_list.reveal = true;
+                }
+            }
+            if key(egui::Key::Enter) && self.task_open.is_none()
+                && let Some(&first) = order.first()
+            {
+                actions.push(tasks::TaskAction::Open(first));
+            }
+            if let Some(open) = self.task_open.filter(|id| all.iter().any(|s| s.id == *id && s.writable)) {
+                if key(egui::Key::Space) {
+                    actions.push(tasks::TaskAction::Tick(open));
+                }
+                if key(egui::Key::Delete) {
+                    actions.push(tasks::TaskAction::Delete(open));
+                }
+            }
+            if key(egui::Key::N) || ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Text(t) if t == "/"))) {
+                // The key only goes to the field: its letter is not typed into it.
+                ui.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Text(t) if matches!(t.as_str(), "n" | "N" | "/"))));
+                ui.ctx().memory_mut(|m| m.request_focus(egui::Id::new(tasks::QUICK)));
+            }
+            if key(egui::Key::Escape) {
+                self.task_open = None;
+            }
+        }
+        // Title and notes typed in the task open are kept once their field is left.
+        if let Some(open) = self.task_open.and_then(|id| all.iter().find(|s| s.id == id && s.id == self.task_edit.id)) {
+            let edits = self.task_edit.pending(ui.ctx(), &open.task);
+            if !edits.is_empty() && open.writable {
+                actions.push(tasks::TaskAction::Change(open.id, edits));
+            }
+        }
+        let clock = chrono::Local::now().naive_local();
+        let counts = [tasks::Filter::Today, tasks::Filter::Overdue, tasks::Filter::Week, tasks::Filter::All].map(|f| tasks::lines(&all, &f, clock, &Default::default(), &Default::default()).iter().map(|(_, rows)| rows.len() as u32).sum());
+        let mut open: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        for s in all.iter().filter(|s| !s.task.done) {
+            *open.entry(s.list.clone()).or_default() += 1;
+        }
+        let frame = egui::Frame::new().fill(t.bg).inner_margin(egui::Margin::same(12));
+        egui::Panel::left("task_lists").frame(frame).default_size(250.0).size_range(220.0..=340.0).show(ui, |ui| {
+            ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+                let add = egui::Button::image_and_text(Icon::Plus.image(icons::SIZE, t.text_dim), "New list");
+                let servers = self.task_servers();
+                if ui.add_enabled_ui(!servers.is_empty(), |ui| ui.add_sized([ui.available_width(), theme::CONTROL_H], add)).inner.on_hover_text("Make a task list on a calendar server").on_disabled_hover_text("Add a calendar server first, in Calendar").clicked() {
+                    actions.push(tasks::TaskAction::NewList);
+                }
+                ui.add_space(4.0);
+                ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        theme::dense(ui, self.settings.density);
+                        if let Some(a) = tasks::sidebar(ui, t, &self.task_filter, &lists, counts, &open) {
+                            actions.push(a);
+                        }
+                    });
+                });
+            });
+        });
+        let picked = self.task_open.and_then(|id| all.iter().find(|s| s.id == id).cloned());
+        if self.task_open.is_some() && picked.is_none() {
+            self.task_open = None;
+        }
+        if let Some(s) = &picked {
+            if self.task_edit.id != s.id {
+                self.keep_task_typing();
+                self.task_edit = tasks::Editing::of(s);
+            }
+            let children: Vec<&tasks::Shown> = all.iter().filter(|c| c.list == s.list && c.task.parent.as_deref() == Some(s.task.uid.as_str()) && c.id != s.id).collect();
+            let frame = egui::Frame::new().fill(t.surface).inner_margin(egui::Margin::same(24));
+            egui::Panel::right("task").frame(frame).default_size(400.0).size_range(340.0..=600.0).show(ui, |ui| {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    if let Some(a) = tasks::details(ui, t, s, &children, &lists, &mut self.task_edit) {
+                        actions.push(a);
+                    }
+                });
+            });
+        }
+        let frame = egui::Frame::new().fill(t.surface).inner_margin(egui::Margin::symmetric(24, 16));
+        egui::CentralPanel::default().frame(frame).show(ui, |ui| {
+            if lists.is_empty() {
+                let has_server = !self.task_servers().is_empty();
+                let hint = if has_server { "Make a list on your calendar server: your phone and other apps see it too." } else { "Tasks live on a calendar server (CalDAV). Add one in Calendar, then make a list." };
+                if views::empty_state(ui, t, "No task lists yet", hint, has_server.then_some("New list")) {
+                    actions.push(tasks::TaskAction::NewList);
+                }
+                return;
+            }
+            ui.set_max_width(ui.available_width().min(820.0));
+            let title = match &self.task_filter {
+                tasks::Filter::List(url) => lists.iter().find(|l| l.url == *url).map_or_else(String::new, |l| l.name.clone()),
+                f => f.title().to_owned(),
+            };
+            let can_add = match &self.task_filter {
+                tasks::Filter::List(url) if !lists.iter().any(|l| l.url == *url && l.writable) => Err("Read-only list: nothing can be added"),
+                tasks::Filter::List(_) => Ok(()),
+                _ => self.default_task_list().map(drop),
+            };
+            if let Some(a) = tasks::list(ui, t, &self.task_filter, &title, &all, &lists, &mut self.task_list, self.task_open, &keep, &self.task_folded, can_add) {
+                actions.push(a);
+            }
+        });
+        for a in actions {
+            self.task_action(a);
+        }
+    }
+
+    /// The questions of the Tasks section: deleting tasks, making a list.
+    fn task_dialogs(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
+        let lists = self.task_lists();
+        if let Some(made) = tasks::from_message_dialog(ctx, t, &mut self.task_from, &lists) {
+            use beavermail_carddav::todo::{self, Edit};
+            let uid = beavermail_carddav::new_uid();
+            let mut edits = vec![Edit::summary(&made.title), Edit::description(&made.notes)];
+            if !made.message_id.is_empty() {
+                edits.push(Edit::message(&made.message_id));
+            }
+            let ics = todo::new(&uid, &edits, chrono::Utc::now());
+            if self.keep_new_task(&made.list, &uid, &ics).is_some() {
+                self.notice = Some(("Task made".into(), std::time::Instant::now()));
+            }
+        }
+        let servers: Vec<String> = self.task_servers().iter().map(calendars::server).collect();
+        if let Some((server, name)) = tasks::new_list_dialog(ctx, t, &mut self.new_task_list, &servers) {
+            self.make_task_list(server, name);
+        }
+        let Some((ids, question)) = self.confirm_task_delete.clone() else { return };
+        let (mut confirm, mut cancel) = (false, false);
+        let modal = crate::views::modal(ctx, egui::Id::new("confirm_task_delete")).show(ctx, |ui| {
+            ui.set_width(FORM_WIDTH * 0.85);
+            ui.heading(&question);
+            ui.label(RichText::new("They leave the list, on the server too. Undo is there for a few seconds.").color(t.text_dim));
+            ui.add_space(12.0);
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
+                let label = if ids.len() == 1 { "Delete task".to_owned() } else { format!("Delete {} tasks", ids.len()) };
+                confirm = ui.add(egui::Button::new(RichText::new(label).color(t.on_accent)).fill(t.danger)).clicked();
+                cancel = ui.button("Cancel").clicked();
+            });
+        });
+        if confirm {
+            let text = if ids.len() == 1 { "Task deleted".to_owned() } else { format!("{} tasks deleted", ids.len()) };
+            self.start_task_delete(ids, text);
+        }
+        if confirm || cancel || modal.should_close() {
+            self.confirm_task_delete = None;
+        }
+    }
+
     fn ensure_local_calendar(&mut self) {
         if self.settings.calendars.iter().any(beavermail_core::CalendarSource::is_local) {
             return;
         }
         let default = !self.settings.calendars.iter().any(|c| c.default);
-        let local = beavermail_core::CalendarSource { name: "On this computer".into(), url: beavermail_core::CalendarSource::LOCAL.into(), user: String::new(), color: String::new(), shown: true, default, read_only: false };
+        let local = beavermail_core::CalendarSource { name: "On this computer".into(), url: beavermail_core::CalendarSource::LOCAL.into(), user: String::new(), color: String::new(), shown: true, default, read_only: false, events: true, tasks: Some(false), tasks_default: false };
         self.settings.calendars.insert(0, local);
         self.save_settings();
     }
@@ -5151,7 +5806,7 @@ impl BeaverApp {
             A::Added(chosen) => {
                 let Some(form) = self.add_calendar.take() else { return };
                 for found in chosen {
-                    let calendar = beavermail_core::CalendarSource { name: found.name, url: found.url, user: form.user.trim().to_owned(), color: found.color, shown: true, default: false, read_only: !found.writable };
+                    let calendar = beavermail_core::CalendarSource { name: found.name, url: found.url, user: form.user.trim().to_owned(), color: found.color, shown: true, default: false, read_only: !found.writable, events: found.events, tasks: Some(found.tasks), tasks_default: false };
                     if let Err(e) = store::set_calendar_password(&calendar, &form.password) {
                         self.error = Some(e);
                         return;
@@ -5204,7 +5859,7 @@ impl BeaverApp {
             let _ = store::forget_calendar_password(&calendar);
         }
         if calendar.default
-            && let Some(next) = self.settings.calendars.iter_mut().find(|c| !c.read_only)
+            && let Some(next) = self.settings.calendars.iter_mut().find(|c| !c.read_only && c.events)
         {
             next.default = true;
         }
@@ -5280,7 +5935,7 @@ impl BeaverApp {
         self.ensure_local_calendar();
         let now = chrono::Local::now();
         let minutes = minutes.unwrap_or(if day == now.date_naive() { (chrono::Timelike::hour(&now) + 1).min(23) * 60 } else { 9 * 60 });
-        let calendar = self.settings.calendars.iter().find(|c| c.default && !c.read_only).or_else(|| self.settings.calendars.iter().find(|c| c.is_local())).map(|c| c.url.clone()).unwrap_or_default();
+        let calendar = self.settings.calendars.iter().find(|c| c.default && !c.read_only && c.events).or_else(|| self.settings.calendars.iter().find(|c| c.is_local())).map(|c| c.url.clone()).unwrap_or_default();
         self.event_form = Some(event_form::EventForm::new(day, minutes, &calendar));
     }
 
@@ -5472,8 +6127,8 @@ impl BeaverApp {
         let (calendar, href, etag) = match self.archive.events_with_uid(uid).unwrap_or_default().into_iter().next() {
             Some(kept) => (kept.calendar, kept.href, Some(kept.etag)),
             None => {
-                let chosen = into.and_then(|url| self.settings.calendars.iter().find(|c| c.url == url && !c.read_only));
-                let target = chosen.or_else(|| self.settings.calendars.iter().find(|c| c.default && !c.read_only)).or_else(|| self.settings.calendars.iter().find(|c| c.is_local())).cloned();
+                let chosen = into.and_then(|url| self.settings.calendars.iter().find(|c| c.url == url && !c.read_only && c.events));
+                let target = chosen.or_else(|| self.settings.calendars.iter().find(|c| c.default && !c.read_only && c.events)).or_else(|| self.settings.calendars.iter().find(|c| c.is_local())).cloned();
                 let Some(target) = target else { return };
                 let href = if target.is_local() { format!("{uid}.ics") } else { beavermail_carddav::calendar::Calendar::open(&target.url, "", "").new_href(uid) };
                 (target.url, href, None)
@@ -5628,7 +6283,7 @@ impl BeaverApp {
                 ui.with_layout(Layout::top_down(Align::Min), |ui| {
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                         theme::dense(ui, self.settings.density);
-                        if let Some(a) = calendars::section(ui, t, &self.settings.calendars, &self.calendars_syncing, &self.settings.folded) {
+                        if let Some(a) = calendars::section(ui, t, &self.settings.calendars.iter().filter(|c| c.events).cloned().collect::<Vec<_>>(), &self.calendars_syncing, &self.settings.folded) {
                             action = Some(a);
                         }
                     });
@@ -6024,8 +6679,7 @@ impl BeaverApp {
                 let Some((serial, hit)) = card.recent.get(i).cloned() else { return };
                 self.card = None;
                 self.show_settings = false;
-                self.section = Section::Mail;
-                self.open_hit(serial, &hit, false);
+                self.open_from(self.section, serial, &hit);
             }
             card::CardAction::Close => self.card = None,
             card::CardAction::PickPhoto => self.spawn(async move {
@@ -6461,6 +7115,7 @@ impl BeaverApp {
                 item(ui, command, command.label());
             }
             ui.separator();
+            item(ui, Command::MakeTask, "Make a task…");
         }
         item(ui, Command::ToggleRead, if ids.iter().any(|id| self.summary_of(*id).is_some_and(|m| m.unread)) { "Mark as read" } else { "Mark as unread" });
         item(ui, Command::Pin, if all(|m| m.pinned) { "Unpin" } else { "Pin" });
@@ -6924,16 +7579,20 @@ impl BeaverApp {
             return Err("Not in the source of a message");
         }
         // Out of Mail the list and the reader are not on screen: what acts on them waits.
-        if self.section != Section::Mail && !matches!(command, Command::Palette | Command::NewMessage | Command::Settings | Command::Mail | Command::Contacts | Command::Calendar | Command::WorkOffline | Command::WorkOnline) {
+        if self.section != Section::Mail && !matches!(command, Command::Palette | Command::NewMessage | Command::Settings | Command::Mail | Command::Contacts | Command::Calendar | Command::Tasks | Command::WorkOffline | Command::WorkOnline) {
             return Err("Go to Mail first");
         }
         match command {
-            Command::Palette | Command::Search | Command::Settings | Command::Mail | Command::Contacts | Command::Calendar => Ok(()),
+            Command::Palette | Command::Search | Command::Settings | Command::Mail | Command::Contacts | Command::Calendar | Command::Tasks => Ok(()),
             Command::NewMessage if self.senders().is_empty() => Err("Add an account to send mail"),
             Command::NewMessage => Ok(()),
             // A message only selected, or still loading, is answered once its text is there.
             Command::Reply | Command::ReplyAll | Command::Forward => one().map(|_| ()),
             Command::Archive | Command::Trash | Command::ToggleRead | Command::Pin | Command::Star | Command::Label(_) => some(),
+            Command::MakeTask => {
+                one()?;
+                self.default_task_list().map(drop)
+            }
             Command::ClearLabels => {
                 some()?;
                 let any = targets.iter().any(|id| self.summary_of(*id).is_some_and(|m| !m.labels.is_empty()));
@@ -7033,6 +7692,11 @@ impl BeaverApp {
             Command::ToggleRead => {
                 let unread = targets.iter().any(|id| self.summary_of(*id).is_some_and(|m| m.unread));
                 self.request_all(targets, Action::Unread(!unread));
+            }
+            Command::MakeTask => {
+                if let Some(id) = one {
+                    self.make_task_of(id);
+                }
             }
             Command::Pin => {
                 // Pins them unless every one is pinned already.
@@ -7135,9 +7799,20 @@ impl BeaverApp {
             }
             Command::WorkOffline => self.set_work_offline(true),
             Command::WorkOnline => self.set_work_offline(false),
-            Command::Mail => self.section = Section::Mail,
-            Command::Contacts => self.section = Section::Contacts,
+            Command::Mail => {
+                self.return_to = None;
+                self.section = Section::Mail;
+            }
+            Command::Contacts => {
+                self.return_to = None;
+                self.section = Section::Contacts;
+            }
+            Command::Tasks => {
+                self.return_to = None;
+                self.section = Section::Tasks;
+            }
             Command::Calendar => {
+                self.return_to = None;
                 self.section = Section::Calendar;
                 self.calendar_morning = true;
             }
@@ -7799,10 +8474,50 @@ impl BeaverApp {
                     Err(e) => self.error = Some(format!("Contacts could not be synced: {e}")),
                 }
             }
+            Event::TaskListMade(user, made) => match made {
+                Ok(found) => {
+                    let first = !self.settings.calendars.iter().any(|c| c.tasks_default);
+                    let calendar = beavermail_core::CalendarSource { name: found.name, url: found.url.clone(), user: user.clone(), color: String::new(), shown: true, default: false, read_only: false, events: false, tasks: Some(true), tasks_default: first };
+                    // Same server and login as the calendar the list was made beside: its password is the one kept.
+                    if let Some(password) = self.settings.calendars.iter().find(|c| c.user == user && books::host(&c.url) == books::host(&found.url)).and_then(|c| store::calendar_password(c).ok()) {
+                        let _ = store::set_calendar_password(&calendar, &password);
+                    }
+                    self.settings.calendars.push(calendar);
+                    self.save_settings();
+                    self.new_task_list = None;
+                    self.task_filter = tasks::Filter::List(found.url.clone());
+                    self.calendar_version += 1;
+                    self.sync_calendars(Some(&found.url));
+                }
+                Err(e) => {
+                    if let Some(form) = self.new_task_list.as_mut() {
+                        (form.making, form.error) = (false, Some(format!("The server did not make it: {e}")));
+                    }
+                }
+            },
             Event::CalendarsSynced(url, result) => {
                 self.calendars_syncing.remove(&url);
+                if self.tasks_resync.remove(&url) {
+                    self.sync_calendars(Some(&url));
+                }
+                if result.is_ok() && !self.task_moves.is_empty() {
+                    self.finish_task_moves();
+                }
                 match result {
-                    Ok(_) => self.calendar_version += 1,
+                    Ok((done, holds)) => {
+                        self.calendar_version += 1;
+                        if let Some((events, tasks)) = holds
+                            && let Some(c) = self.settings.calendars.iter_mut().find(|c| c.url == url)
+                        {
+                            // A calendar already used for events stays one, whatever the server says.
+                            c.tasks = Some(tasks);
+                            c.events |= events;
+                            self.save_settings();
+                        }
+                        if done.lost > 0 {
+                            self.error = Some(if done.lost == 1 { "A task changed here was deleted on the server meanwhile.".to_owned() } else { format!("{} tasks changed here were deleted on the server meanwhile.", done.lost) });
+                        }
+                    }
                     Err(MailError::Offline(_)) => {}
                     Err(e) => self.error = Some(format!("A calendar could not be synced: {e}")),
                 }
@@ -8329,6 +9044,25 @@ impl BeaverApp {
                 return; // the notice waits: one at a time
             }
         }
+        if let Some((_, since, text)) = &self.task_deleting {
+            let left = std::time::Duration::from_secs(5).saturating_sub(since.elapsed());
+            if left.is_zero() {
+                self.finish_task_delete();
+            } else {
+                ctx.request_repaint_after(left);
+                let text = text.clone();
+                show(ctx, &mut |ui| {
+                    ui.label(RichText::new(&text).color(t.text));
+                    ui.add_space(8.0);
+                    undo = ui.button("Undo").clicked();
+                });
+                if undo {
+                    self.task_deleting = None;
+                    self.calendar_version += 1;
+                }
+                return;
+            }
+        }
         if let Some((text, since)) = self.notice.clone() {
             let left = NOTICE_SECS - since.elapsed().as_secs_f32();
             if left <= 0.0 {
@@ -8374,9 +9108,15 @@ impl BeaverApp {
                     self.run(Command::Settings);
                 }
                 ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                    for (section, icon, command, name) in [(Section::Mail, Icon::Mail, Command::Mail, "Mail"), (Section::Calendar, Icon::Calendar, Command::Calendar, "Calendar"), (Section::Contacts, Icon::Users, Command::Contacts, "Contacts")] {
+                    let due = self.tasks_due_today();
+                    for (section, icon, command, name) in [(Section::Mail, Icon::Mail, Command::Mail, "Mail"), (Section::Calendar, Icon::Calendar, Command::Calendar, "Calendar"), (Section::Tasks, Icon::ListChecks, Command::Tasks, "Tasks"), (Section::Contacts, Icon::Users, Command::Contacts, "Contacts")] {
                         let on = self.section == section;
+                        let name = if section == Section::Tasks && due > 0 { format!("Tasks: {due} due today or overdue") } else { name.to_owned() };
+                        let name = name.as_str();
                         let button = icons::button(ui, t, icon, name, true, on);
+                        if section == Section::Tasks {
+                            tasks::badge(ui, t, button.rect, due);
+                        }
                         button.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, on, name));
                         if button.clicked() && !on {
                             self.run(command);
@@ -8996,6 +9736,7 @@ impl BeaverApp {
                     self.searched.clear(); // asked again, there
                 }
             }
+            let with_task = self.task_messages();
             let shown = self.visible();
             let can_move = self.show_suspicious && self.holding() && !shown.is_empty();
             // The table orders by its column titles; the cards by a menu at the end of this line.
@@ -9094,15 +9835,16 @@ impl BeaverApp {
                 if table {
                     header = views::table_header(ui, t, self.sort(), columns);
                 }
+                let with_task = self.task_messages();
                 let area = list_area(reveal, view, row_h, None);
                 let shown_rows = area.show_rows(ui, row_h, self.hits.len(), |ui, range| {
                     for (serial, hit) in &self.hits[range] {
                         let id = hit.message.id;
                         let selected = if self.picked.len() >= 2 { self.picked.contains(&id) } else { self.message == Some(id) };
                         let row = if table {
-                            views::table_row(ui, t, &hit.message, selected, Some(&hit.folder), None, 1, None, columns, row_h)
+                            views::table_row(ui, t, &hit.message, selected, Some(&hit.folder), None, 1, None, columns, row_h, with_task.contains(&hit.message.message_id))
                         } else {
-                            views::message_row(ui, t, &hit.message, selected, Some(&hit.folder), None, 1, None)
+                            views::message_row(ui, t, &hit.message, selected, Some(&hit.folder), None, 1, None, with_task.contains(&hit.message.message_id))
                         };
                         let ids = menu_ids(&self.picked, id);
                         views::context_menu(&row, |ui| from_menu = self.message_menu(ui, &ids).map(|c| (ids.clone(), c)).or(from_menu.take()));
@@ -9152,9 +9894,9 @@ impl BeaverApp {
                     let summary = MessageSummary { unread, received, ..(*message).clone() };
                     let mark = self.origin.get(&message.id).and_then(|s| self.accounts.iter().position(|v| v.serial == *s)).filter(|_| self.unified).map(theme::account_color);
                     let row = if table {
-                        views::table_row(ui, t, &summary, selected, None, warning, count, mark, columns, row_h)
+                        views::table_row(ui, t, &summary, selected, None, warning, count, mark, columns, row_h, with_task.contains(&message.message_id))
                     } else {
-                        views::message_row(ui, t, &summary, selected, None, warning, count, mark)
+                        views::message_row(ui, t, &summary, selected, None, warning, count, mark, with_task.contains(&message.message_id))
                     };
                     let ids = menu_ids(&self.picked, message.id);
                     views::context_menu(&row, |ui| from_menu = self.message_menu(ui, &ids).map(|c| (ids.clone(), c)).or(from_menu.take()));
@@ -9238,6 +9980,8 @@ impl BeaverApp {
             return ReaderOutcome::default();
         }
         let mut out = ReaderOutcome::default();
+        let with_task = self.task_messages();
+        let can_make_task = self.default_task_list().is_ok();
         let scroll = self.reader_scroll.take();
         // The open message's conversation, oldest first, when the list shows conversations.
         let conversation: Vec<MessageSummary> = match self.message.filter(|_| self.threaded()) {
@@ -9329,6 +10073,12 @@ impl BeaverApp {
                 let tip = format!("{} ({})", if message.starred { "Remove the star" } else { "Star: a flag every mail app shows" }, key(Command::Star));
                 if icons::button(ui, t, Icon::Star, &tip, true, message.starred).clicked() {
                     out.action = Some((message.id, Action::Star(!message.starred)));
+                }
+                // Drawn pressed in once the message is a task; then it opens the task.
+                let has_task = with_task.contains(&message.message_id);
+                let tip = if has_task { "Open its task in Tasks".to_owned() } else if can_make_task { format!("Make a task ({})", key(Command::MakeTask)) } else { "Make a task: make a task list first, in Tasks".to_owned() };
+                if icons::button(ui, t, Icon::ListChecks, &tip, has_task || can_make_task, has_task).clicked() {
+                    out.task = Some(message.id);
                 }
                 // In Sent and Drafts the sender is the user.
                 let blockable = !matches!(role, Role::Junk | Role::Sent | Role::Drafts) && !message.address.is_empty();
@@ -9733,7 +10483,11 @@ impl eframe::App for BeaverApp {
         }
         // Changes still on their way to the server are waited for in a dialog, rather than in a window
         // that stops answering on the way out.
-        if ui.ctx().input(|i| i.viewport().close_requested()) && !self.confirm_discard && (self.pending.is_some() || !self.in_flight.is_empty()) {
+        // Tasks deleted and waiting out Undo are deleted for good: kept here, sent at the next start if not now.
+        if ui.ctx().input(|i| i.viewport().close_requested()) {
+            self.finish_task_delete();
+        }
+        if ui.ctx().input(|i| i.viewport().close_requested()) && !self.confirm_discard && (self.pending.is_some() || !self.in_flight.is_empty() || self.tasks_sending() > 0) {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.send_pending();
             self.closing = true;
@@ -9764,6 +10518,7 @@ impl eframe::App for BeaverApp {
         match self.section {
             Section::Contacts => self.contacts_view(ui, &t),
             Section::Calendar => self.calendar_section(ui, &t),
+            Section::Tasks => self.tasks_section(ui, &t),
             Section::Mail => {}
         }
         slow.mark("section");
@@ -9883,9 +10638,12 @@ impl eframe::App for BeaverApp {
         slow.mark("keys");
         // Without the reading pane only a message tab has a reader.
         let shows_reader = !contacts && (self.in_tab || self.settings.reading_pane);
-        let ReaderOutcome { action, url, mode, remember, attachment, save_many, allow_sender, mark, bulk, move_to, unsubscribe, block, unfold, collapse, expand, summarize, trust, card, retry, source, invite } =
+        let ReaderOutcome { action, url, mode, remember, attachment, save_many, allow_sender, mark, bulk, move_to, task, unsubscribe, block, unfold, collapse, expand, summarize, trust, card, retry, source, invite } =
             if shows_reader { self.reader(ui, &t) } else { ReaderOutcome::default() };
         slow.mark("reader");
+        if let Some(id) = task {
+            self.make_task_of(id);
+        }
         if retry && let Some(at) = self.active() {
             self.activate(at);
         }
@@ -9989,6 +10747,7 @@ impl eframe::App for BeaverApp {
         self.data_move_dialog(ui.ctx(), &t);
         self.filter_dialog(ui.ctx(), &t);
         self.event_dialogs(ui.ctx(), &t);
+        self.task_dialogs(ui.ctx(), &t);
         let logins: Vec<(u64, String)> = self.accounts.iter().map(|v| (v.serial, v.account.address().to_owned())).collect();
         let added: Vec<String> = self.settings.calendars.iter().map(|c| c.url.clone()).collect();
         if let Some(action) = books::add_dialog(ui.ctx(), &t, &mut self.add_calendar, &added.iter().map(String::as_str).collect::<Vec<_>>(), &calendars::CALENDARS, &logins) {
@@ -10548,7 +11307,7 @@ mod tests {
 
     #[test]
     fn the_event_dialog_offers_every_calendar_named_with_its_server() {
-        let calendar = |name: &str, url: &str, user: &str, read_only| beavermail_core::CalendarSource { name: name.into(), url: url.into(), user: user.into(), color: String::new(), shown: true, default: false, read_only };
+        let calendar = |name: &str, url: &str, user: &str, read_only| beavermail_core::CalendarSource { name: name.into(), url: url.into(), user: user.into(), color: String::new(), shown: true, default: false, read_only, events: true, tasks: Some(false), tasks_default: false };
         let calendars = [
             calendar("Calendar", "https://dav.example.org/bob/cal/", "bob", false),
             calendar("Holidays", "https://dav.example.org/bob/holidays/", "bob", true),

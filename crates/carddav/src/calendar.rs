@@ -8,9 +8,10 @@ use rrule::RRuleSet;
 use std::collections::{HashMap, HashSet};
 
 use crate::ical::{Event, When, parse};
-use crate::{Client, Found, Kind, Remote, Written};
+use crate::todo::{self, Edit};
+use crate::{Client, Found, Kind, Remote, Synced, Written};
 use beavermail_core::MailError;
-use beavermail_store::{EventSpan, Store};
+use beavermail_store::{CardState, EventSpan, Store};
 
 /// One calendar on a CalDAV server, and how to sign in to it.
 #[derive(Clone, Debug)]
@@ -26,10 +27,23 @@ impl Calendar {
         Self { url: url.to_owned(), client: Client { user: user.to_owned(), password: password.to_owned() } }
     }
 
-    /// Every calendar of the user that holds events, from a server address or a domain
+    /// Every calendar of the user that holds events or tasks, from a server address or a domain
     /// (`https://dav.example.org/`, `example.org`), found through `/.well-known/caldav` when needed.
     pub fn discover_all(start: &str, user: &str, password: &str) -> Result<Vec<Found>, MailError> {
         Client { user: user.to_owned(), password: password.to_owned() }.discover(start, Kind::Calendar)
+    }
+
+    /// A new list for tasks only, named `name`, on the server at `start` (as for [`Calendar::discover_all`]):
+    /// for an account whose calendars take no tasks.
+    pub fn make_task_list(start: &str, user: &str, password: &str, name: &str) -> Result<Found, MailError> {
+        Client { user: user.to_owned(), password: password.to_owned() }.make_task_list(start, name)
+    }
+
+    /// What the calendar takes, as (events, tasks): both when the server does not say.
+    pub fn holds(&self) -> Result<(bool, bool), MailError> {
+        let (_, answer) = self.client.dav("PROPFIND", &self.url, "0", crate::PROPFIND_HOME)?;
+        let first = crate::responses(&answer)?.into_iter().next().ok_or_else(|| MailError::Backend("the server said nothing".into()))?;
+        Ok((first.events, first.tasks))
     }
 
     /// The calendar's objects (each an event with its changed occurrences), with their versions.
@@ -58,24 +72,82 @@ impl Calendar {
     }
 }
 
-/// Brings what the server has: new and changed events stored, deleted ones forgotten. Returns how many
-/// arrived. Nothing is written to the server yet (answers to invitations come with their own sync).
-pub fn sync(calendar: &Calendar, store: &Store) -> Result<usize, MailError> {
+/// Sends the tasks changed here, then brings what the server has: new and changed events and tasks
+/// stored, deleted ones forgotten. A task changed on both sides keeps the server's version with the
+/// properties changed here applied on it again; one changed here but deleted on the server stays
+/// deleted (counted as lost). Events are written to the server as they are made, not here.
+pub fn sync(calendar: &Calendar, store: &Store) -> Result<Synced, MailError> {
     let key = calendar.url.as_str();
+    let mut done = Synced::default();
+    let now = Utc::now();
+    for task in store.tasks(key)? {
+        let etag = Some(task.etag.as_str()).filter(|e| !e.is_empty());
+        let written = match task.state {
+            CardState::Synced => continue,
+            CardState::New => calendar.put(&task.href, &task.ics, None)?,
+            CardState::Changed => calendar.put(&task.href, &task.ics, etag)?,
+            CardState::Deleted => calendar.delete(&task.href, &task.etag)?,
+        };
+        match (written, task.state) {
+            (Written::Done(_), CardState::Deleted) => store.forget_task(key, &task.href)?,
+            // Without the new version from the server, it is read again below.
+            (Written::Done(etag), _) => store.task_synced(task.id, &etag.unwrap_or_default())?,
+            (Written::Conflict, state) => match calendar.fetch(std::slice::from_ref(&task.href))?.into_iter().next() {
+                None => {
+                    store.forget_task(key, &task.href)?;
+                    if state != CardState::Deleted {
+                        done.lost += 1;
+                    }
+                    continue;
+                }
+                // Deleted here: that wins over a change made elsewhere since.
+                Some((remote, _)) if state == CardState::Deleted => {
+                    if let Written::Done(_) = calendar.delete(&task.href, &remote.etag)? {
+                        store.forget_task(key, &task.href)?;
+                    }
+                }
+                Some((remote, text)) => {
+                    let names: Vec<&'static str> = task.touched.iter().filter_map(|t| TOUCHABLE.iter().copied().find(|n| n == t)).collect();
+                    let merged = todo::apply(&text, &[Edit::from_text(&task.ics, &names)], now);
+                    match calendar.put(&task.href, &merged, Some(&remote.etag))? {
+                        Written::Done(etag) => store.put_task(key, &task.href, &etag.unwrap_or_default(), &merged, &todo::fields(&merged))?,
+                        // Changed again meanwhile: tried at the next sync.
+                        Written::Conflict => store.rebase_task(task.id, &remote.etag, &merged, &todo::fields(&merged))?,
+                    }
+                }
+            },
+        }
+        done.sent += 1;
+    }
     let remote = calendar.list()?;
-    let stored: HashMap<String, String> = store.events(key)?.into_iter().map(|e| (e.href, e.etag)).collect();
-    let wanted: Vec<String> = remote.iter().filter(|r| stored.get(&r.href) != Some(&r.etag)).map(|r| r.href.clone()).collect();
-    let mut received = 0;
-    for (event, text) in calendar.fetch(&wanted)? {
-        store.put_event(key, &event.href, &event.etag, &text, &span(&text))?;
-        received += 1;
+    let events: HashMap<String, String> = store.events(key)?.into_iter().map(|e| (e.href, e.etag)).collect();
+    let tasks = store.tasks(key)?;
+    // A task still to be sent is not overwritten by the server's version.
+    let waiting: HashSet<&str> = tasks.iter().filter(|t| t.state != CardState::Synced).map(|t| t.href.as_str()).collect();
+    let stored: HashMap<&str, &str> = events.iter().map(|(h, e)| (h.as_str(), e.as_str())).chain(tasks.iter().map(|t| (t.href.as_str(), t.etag.as_str()))).collect();
+    let wanted: Vec<String> = remote.iter().filter(|r| stored.get(r.href.as_str()) != Some(&r.etag.as_str()) && !waiting.contains(r.href.as_str())).map(|r| r.href.clone()).collect();
+    for (object, text) in calendar.fetch(&wanted)? {
+        if todo::is_task(&text) {
+            store.put_task(key, &object.href, &object.etag, &text, &todo::fields(&text))?;
+            store.forget_event(key, &object.href)?;
+        } else {
+            store.put_event(key, &object.href, &object.etag, &text, &span(&text))?;
+            store.forget_task(key, &object.href)?;
+        }
+        done.received += 1;
     }
     let there: HashSet<&str> = remote.iter().map(|r| r.href.as_str()).collect();
-    for gone in stored.keys().filter(|href| !there.contains(href.as_str())) {
+    for gone in events.keys().filter(|href| !there.contains(href.as_str())) {
         store.forget_event(key, gone)?;
     }
-    Ok(received)
+    for gone in tasks.iter().filter(|t| t.state == CardState::Synced && !there.contains(t.href.as_str())) {
+        store.forget_task(key, &gone.href)?;
+    }
+    Ok(done)
 }
+
+/// Every property a change made here can touch, for reading back the names stored with a task.
+const TOUCHABLE: [&str; 14] = ["SUMMARY", "DESCRIPTION", "DUE", "DURATION", "DTSTART", "STATUS", "COMPLETED", "PERCENT-COMPLETE", "PRIORITY", "CATEGORIES", "RELATED-TO", "X-APPLE-SORT-ORDER", "URL", "UID"];
 
 /// When an iCalendar object happens, for the archive: its first start and the end of its last
 /// occurrence, open for one that repeats (worked out when shown, see [`occurrences`]).
