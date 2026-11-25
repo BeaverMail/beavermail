@@ -2,6 +2,18 @@
 
 What changed in each version of BeaverMail, newest first.
 
+## 0.4.0 – 2026-11-25
+
+### Added
+
+- Tasks, a section of its own beside Mail, Calendar and Contacts: lists over CalDAV, made here with New list when a server has none, shown as Today, Overdue, Next 7 days, All or one list, grouped by due date, with subtasks, labels, priority and notes edited in place. Tasks under No date or due the same day are put in order by dragging, and dragged onto another list to move them. A repeating task ticked leaves a done copy and moves on to its next date. Changes made offline are sent at the next connection and merged field by field with those made elsewhere. Overdue and today's tasks are counted on the rail.
+- A message made into a task with T, Make a task… in its menu or the reader's toolbar: the title from the subject, the notes from its first lines, and a link back to it. Messages with a task show an icon, the task opens the message and closing it goes back to the task.
+
+### Fixed
+
+- Unread counts once a filter moves mail: the counts are asked of the server again, so the Inbox no longer counts a message moved into a subfolder. A folder with unread mail of its own has its name in bold, and a folded folder counts the unread of its subfolders, in an outlined pill when only they have any.
+- Closing the app no longer waits for the calendars to finish syncing, and makes final a deletion still waiting for Undo; it waits, as for mail, only while changes to tasks are being sent.
+
 ## 0.3.0 – 2026-11-24
 
 ### Added
