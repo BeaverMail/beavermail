@@ -157,20 +157,21 @@ fn role_icon(role: Role) -> Icon {
     }
 }
 
-/// A folder in the sidebar: coloured icon, name, and the unread count in a pill.
-pub fn folder_row(ui: &mut Ui, t: &Tokens, title: &str, role: Role, unread: u32, selected: bool) -> Response {
-    nav_row(ui, t, title, Lead::Icon(role_icon(role), theme::role_color(role)), unread, selected)
+/// A folder in the sidebar: coloured icon, name (bold with unread mail of its own), and the unread
+/// count in a pill; `inside`, the unread of folded subfolders, adds to it, in an outlined pill when alone.
+pub fn folder_row(ui: &mut Ui, t: &Tokens, title: &str, role: Role, unread: u32, inside: u32, selected: bool) -> Response {
+    nav_row(ui, t, title, Lead::Icon(role_icon(role), theme::role_color(role)), (unread, inside, unread > 0), selected)
 }
 
 /// Under an Inbox: the mail held apart as suspicious, with how many messages in the pill.
 pub fn suspicious_row(ui: &mut Ui, t: &Tokens, held: u32, selected: bool) -> Response {
-    nav_row(ui, t, "Suspicious", Lead::Icon(Icon::Spam, t.danger), held, selected)
+    nav_row(ui, t, "Suspicious", Lead::Icon(Icon::Spam, t.danger), (held, 0, false), selected)
 }
 
 /// A page in the settings sidebar: its icon, or with none the initials of `title` (an account).
 pub fn settings_row(ui: &mut Ui, t: &Tokens, title: &str, icon: Option<Icon>, selected: bool) -> Response {
     let lead = icon.map_or(Lead::Avatar, |i| Lead::Icon(i, if selected { t.accent } else { t.text_dim }));
-    let response = nav_row(ui, t, title, lead, 0, selected);
+    let response = nav_row(ui, t, title, lead, (0, 0, false), selected);
     response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, title));
     response
 }
@@ -186,10 +187,11 @@ enum Lead {
 
 /// A label in the sidebar: its colour and name; a click shows its mail.
 pub fn label_row(ui: &mut Ui, t: &Tokens, name: &str, color: Color32, selected: bool) -> Response {
-    nav_row(ui, t, name, Lead::Dot(color), 0, selected)
+    nav_row(ui, t, name, Lead::Dot(color), (0, 0, false), selected)
 }
 
-fn nav_row(ui: &mut Ui, t: &Tokens, title: &str, lead_with: Lead, unread: u32, selected: bool) -> Response {
+/// `count` is (the row's own count, that of folded subfolders, whether the title is bold).
+fn nav_row(ui: &mut Ui, t: &Tokens, title: &str, lead_with: Lead, (own, inside, bold): (u32, u32, bool), selected: bool) -> Response {
     // A sidebar made denser (see [`theme::dense`]) lowers it.
     let height = FOLDER_ROW_H.min(ui.spacing().interact_size.y);
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
@@ -206,18 +208,25 @@ fn nav_row(ui: &mut Ui, t: &Tokens, title: &str, lead_with: Lead, unread: u32, s
         ui.painter().rect_stroke(rect, CornerRadius::same(CONTROL_RADIUS), egui::Stroke::new(1.0, t.accent), egui::StrokeKind::Inside);
     }
     let mut right = 12.0;
+    let unread = own + inside;
     if unread > 0 {
         let galley = ui.painter().layout_no_wrap(unread.to_string(), FontId::proportional(12.5), if selected { t.accent } else { t.text_dim });
         let pill = Rect::from_center_size(
             pos2(rect.right() - 12.0 - (galley.size().x + 16.0) / 2.0, rect.center().y),
             vec2((galley.size().x + 16.0).max(26.0), 22.0),
         );
-        ui.painter().rect_filled(pill, CornerRadius::same(11), if selected { t.accent.gamma_multiply(0.22) } else { t.hover });
+        if own > 0 {
+            ui.painter().rect_filled(pill, CornerRadius::same(11), if selected { t.accent.gamma_multiply(0.22) } else { t.hover });
+        } else {
+            // Only in subfolders folded away: outlined, so it does not read as mail here.
+            ui.painter().rect_stroke(pill, CornerRadius::same(11), egui::Stroke::new(1.0, t.border_strong), egui::StrokeKind::Inside);
+        }
         ui.painter().galley(pill.center() - galley.size() / 2.0, galley, t.text_dim);
         right += pill.width() + 8.0;
     }
     let color = if selected { t.accent } else { t.text };
-    let galley = truncated(ui, title, FontId::proportional(15.0), color, rect.width() - 46.0 - right);
+    let font = if bold { FontId::new(15.0, theme::bold()) } else { FontId::proportional(15.0) };
+    let galley = truncated(ui, title, font, color, rect.width() - 46.0 - right);
     ui.painter().galley(pos2(rect.left() + 42.0, rect.center().y - galley.size().y / 2.0), galley, color);
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
@@ -1271,7 +1280,7 @@ pub fn draft_row(ui: &mut Ui, t: &Tokens, draft: &crate::drafts::DraftData) -> D
 
 /// A row of the sidebar that is not a folder: its icon, title and count.
 pub fn icon_row(ui: &mut Ui, t: &Tokens, title: &str, icon: Icon, count: u32, selected: bool) -> Response {
-    nav_row(ui, t, title, Lead::Icon(icon, if selected { t.accent } else { t.text_dim }), count, selected)
+    nav_row(ui, t, title, Lead::Icon(icon, if selected { t.accent } else { t.text_dim }), (count, 0, false), selected)
 }
 
 /// 1240 as "1,240".

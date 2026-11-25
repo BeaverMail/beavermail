@@ -7438,6 +7438,12 @@ impl BeaverApp {
                 } else if moved > 0 {
                     self.notice = Some((format!("Filters moved {moved} message{}", plural(moved)), std::time::Instant::now()));
                 }
+                // The unread counts are the server's: asked again, or the Inbox keeps counting what moved away.
+                if moved > 0
+                    && let Some(source) = self.view(serial).and_then(|v| v.source.clone())
+                {
+                    self.spawn(async move { Event::Mailboxes(serial, source.mailboxes().await, true) });
+                }
                 // What they changed shows in the list and the counts.
                 if let Some((_, index)) = self.shown().into_iter().find(|(s, _)| *s == serial)
                     && let Some(view) = self.view(serial)
@@ -8546,7 +8552,7 @@ impl BeaverApp {
                                 folder_menu(ui, Role::Inbox, (0, 0, 0), self.settings.hold_suspicious, &mut asked, &mut None, (0, 0));
                                 recheck_all |= asked.is_some();
                             };
-                            let row = views::folder_row(ui, t, "All inboxes", Role::Inbox, unread, inboxes && !self.show_suspicious).on_hover_text("The Inbox of every account, newest first");
+                            let row = views::folder_row(ui, t, "All inboxes", Role::Inbox, unread, 0, inboxes && !self.show_suspicious).on_hover_text("The Inbox of every account, newest first");
                             all = row.clicked();
                             views::context_menu(&row, &mut inbox_menu);
                             if self.settings.hold_suspicious {
@@ -8560,7 +8566,7 @@ impl BeaverApp {
                                 let title = role_title(role);
                                 let folders = || self.accounts.iter().filter_map(move |v| Some((v, v.mailboxes.iter().find(|m| m.role == role)?)));
                                 let unread = if matches!(role, Role::Drafts | Role::Sent) { 0 } else { folders().map(|(_, m)| m.unread).sum() };
-                                let row = views::folder_row(ui, t, title, role, unread, self.unified && self.unified_role == role).on_hover_text(format!("The {title} folder of every account, newest first"));
+                                let row = views::folder_row(ui, t, title, role, unread, 0, self.unified && self.unified_role == role).on_hover_text(format!("The {title} folder of every account, newest first"));
                                 if row.clicked() {
                                     all_role = Some(role);
                                 }
@@ -8669,9 +8675,9 @@ impl BeaverApp {
                                             continue;
                                         }
                                         let tip = format!("{} message{}  ·  {} unread", views::thousands(mailbox.total), if mailbox.total == 1 { "" } else { "s" }, views::thousands(mailbox.unread));
-                                        let unread = if mailbox.role == Role::Inbox { inbox_unread(view.serial, mailbox) } else { mailbox.unread } + hidden_unread;
+                                        let unread = if mailbox.role == Role::Inbox { inbox_unread(view.serial, mailbox) } else { mailbox.unread };
                                         let selected = here && !(holding && self.show_suspicious);
-                                        let row = indented(ui, depth, |ui| views::folder_row(ui, t, &title, mailbox.role, unread, selected)).on_hover_text(tip);
+                                        let row = indented(ui, depth, |ui| views::folder_row(ui, t, &title, mailbox.role, unread, hidden_unread, selected)).on_hover_text(tip);
                                         if reveal && here {
                                             row.scroll_to_me(None);
                                             revealed = true;
