@@ -269,7 +269,12 @@ impl ImapSource {
     /// encrypted, with what its signature says, checked against the key its sender was first seen with.
     /// A key the message announces (Autocrypt) is kept when none is yet.
     fn read(&self, raw: &[u8]) -> Result<MessageBody, MailError> {
-        let known: Vec<Vec<u8>> = beavermail_crypto::sender_of(raw).and_then(|from| self.store.peer_key(&from).ok().flatten()).into_iter().collect();
+        let from = beavermail_crypto::sender_of(raw);
+        let mut known: Vec<Vec<u8>> = from.as_deref().and_then(|from| self.store.peer_key(from).ok().flatten()).into_iter().collect();
+        // The user's own mail is checked with every key they had, not only the first one seen.
+        if from.is_some_and(|from| from.eq_ignore_ascii_case(&self.address)) {
+            known.extend(self.own_keys().iter().filter_map(|secret| beavermail_crypto::public_key(secret)));
+        }
         if known.is_empty()
             && let Some((address, key)) = beavermail_crypto::autocrypt_key(raw)
         {
@@ -314,14 +319,21 @@ impl ImapSource {
         Ok(MessageBody { signature, ..parse_body(&shown)? })
     }
 
-    /// The account's own S/MIME certificate, from the vault.
+    /// The account's own S/MIME certificates, from the vault: the current one first, then those it replaced.
     fn own_certificates(&self) -> Vec<Vec<u8>> {
-        self.files.read(&beavermail_crypto::certificate_path(&self.address)).ok().flatten().into_iter().collect()
+        self.own_files(&beavermail_crypto::certificate_path(&self.address))
     }
 
-    /// The account's own OpenPGP key, from the vault; none when encryption is not set up (or the vault is locked).
+    /// The account's own OpenPGP keys, from the vault: the current one first, then those it replaced;
+    /// none when encryption is not set up (or the vault is locked).
     fn own_keys(&self) -> Vec<Vec<u8>> {
-        self.files.read(&beavermail_crypto::key_path(&self.address)).ok().flatten().into_iter().collect()
+        self.own_files(&beavermail_crypto::key_path(&self.address))
+    }
+
+    /// The file at `current` and the ones it replaced.
+    fn own_files(&self, current: &std::path::Path) -> Vec<Vec<u8>> {
+        let retired = self.files.list(&beavermail_crypto::retired_dir(current)).unwrap_or_default();
+        std::iter::once(current.to_path_buf()).chain(retired).filter_map(|path| self.files.read(&path).ok().flatten()).collect()
     }
 
     /// Signs in and out on a connection of its own, touching nothing: whether the server, its TLS and
@@ -2265,6 +2277,25 @@ mod tests {
 
     fn mail(subject: &str, text: &str) -> Vec<u8> {
         format!("From: Alice <alice@example.com>\r\nTo: bob@example.org\r\nSubject: {subject}\r\nDate: Mon, 2 Nov 2026 10:00:00 +0000\r\nMessage-ID: <{subject}@example.com>\r\n\r\n{text}\r\n").into_bytes()
+    }
+
+    #[test]
+    fn mail_encrypted_to_a_replaced_key_still_opens() {
+        let account = Account { email: "alice@example.org".into(), ..Account::local() };
+        let source = ImapSource::new(&account, String::new(), Arc::new(Store::in_memory().unwrap()), Arc::new(Vault::in_memory()));
+        let old = beavermail_crypto::generate("Alice", "alice@example.org").unwrap();
+        let raw = b"From: alice@example.org\r\nTo: bob@example.org\r\nSubject: Old\r\n\r\nstill readable\r\n";
+        let sealed = beavermail_crypto::encrypt(raw, &old, &[beavermail_crypto::public_key(&old).unwrap()], &[]).unwrap();
+        let current = beavermail_crypto::key_path("alice@example.org");
+        source.files.write(&current, &beavermail_crypto::generate("Alice", "alice@example.org").unwrap()).unwrap();
+        assert!(matches!(source.read(&sealed).unwrap().encryption, Some(Encryption::NoKey(_))));
+
+        source.files.write(&beavermail_crypto::retired_dir(&current).join("1.key"), &old).unwrap();
+        let body = source.read(&sealed).unwrap();
+        assert!(matches!(body.encryption, Some(Encryption::Opened(_))));
+        assert!(body.text.contains("still readable"));
+        // Signed with the old key: still the user's own.
+        assert!(matches!(body.signature, Some(beavermail_core::Signature { check: beavermail_core::SignatureCheck::Valid { .. }, .. })));
     }
 
     #[tokio::test]

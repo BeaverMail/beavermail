@@ -13,7 +13,7 @@ pub use smime_own::{CertificateInfo, certificate_info, certificate_path, import_
 pub use smime_own::decrypt as decrypt_smime;
 
 pub use pgp_mime::{Opened, add_autocrypt, decrypt, encrypt};
-pub use keys::{ImportError, autocrypt_header, backup_password, export, generate, import, key_path, public_key, short_id};
+pub use keys::{ImportError, autocrypt_header, backup_password, export, generate, import, key_path, made_at, public_key, retired_dir, short_id};
 
 use base64::Engine;
 use mail_parser::{MessageParser, MimeHeaders, PartType};

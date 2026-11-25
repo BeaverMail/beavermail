@@ -248,7 +248,7 @@ pub fn dialogs(ctx: &egui::Context, t: &Tokens, dialogs: &mut Dialogs) -> Option
         let modal = crate::views::modal(ctx, egui::Id::new("key_remove")).show(ctx, |ui| {
             ui.set_width(crate::FORM_WIDTH * 0.85);
             ui.heading(format!("Remove the {what} of {address}?"));
-            dim(ui, &format!("Mail encrypted to it can no longer be read on this computer, until you import the {what} again from a backup. People who have it keep sending encrypted mail to it."));
+            dim(ui, "Mail encrypted to it, or to the ones it replaced, can no longer be read on this computer, until you import them again from a backup. People who have it keep sending encrypted mail to it.");
             ui.add_space(12.0);
             buttons(ui, &mut |ui| {
                 if ui.add(egui::Button::new(RichText::new(format!("Remove {what}")).color(t.on_accent)).fill(t.danger)).clicked() {

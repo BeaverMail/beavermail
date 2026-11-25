@@ -3,7 +3,7 @@
 //! The user's S/MIME certificate: imported from a `.p12`, opening mail encrypted with OpenSSL, and
 //! sealing mail that OpenSSL can open.
 
-use beavermail_crypto::{Check, ImportError, Opened, certificate_info, decrypt_smime, import_certificate, roots_from_pem, signer_certificate, smime_seal, unwrap_signed};
+use beavermail_crypto::{Check, ImportError, Opened, certificate_info, decrypt_smime, import_certificate, made_at, roots_from_pem, signer_certificate, smime_seal, unwrap_signed};
 
 fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
@@ -20,6 +20,7 @@ fn a_certificate_comes_in_with_its_password_in_either_protection() {
     let info = certificate_info(&ada()).unwrap();
     assert_eq!((info.address.as_str(), info.issuer.as_str()), ("ada@example.org", "BeaverMail Test CA"));
     assert!(info.expires.starts_with('2'), "{info:?}");
+    assert!(made_at(&ada()).is_some_and(|issued| issued > 0), "when it was issued, to tell an earlier certificate");
     assert!(import_certificate(&fixture("ada-legacy.p12"), Some("p12pass")).is_ok(), "the older 3DES/RC2 protection, as Windows makes");
 }
 

@@ -6485,6 +6485,25 @@ impl BeaverApp {
     fn keep_key(&mut self, address: &str, certificate: bool, data: Vec<u8>) {
         let address = address.trim().to_lowercase();
         let path = if certificate { beavermail_crypto::certificate_path(&address) } else { beavermail_crypto::key_path(&address) };
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("key");
+        let retired = beavermail_crypto::retired_dir(&path).join(format!("{}.{ext}", chrono::Utc::now().timestamp_millis()));
+        let current = self.vault.read(&path).ok().flatten().filter(|old| *old != data);
+        // One older than the current (a backup of a replaced one): kept only to open the mail sent to it.
+        let earlier = current.as_ref().is_some_and(|old| matches!((beavermail_crypto::made_at(&data), beavermail_crypto::made_at(old)), (Some(new), Some(now)) if new < now));
+        if earlier {
+            self.key_dialogs.unlock = None;
+            return match self.vault.write(&retired, &data) {
+                Ok(()) => self.notice = Some((format!("Added as an earlier {}: mail encrypted to it opens again", if certificate { "certificate" } else { "key" }), std::time::Instant::now())),
+                Err(e) => self.error = Some(format!("Could not keep the key: {e}")),
+            };
+        }
+        // The one it replaces is kept: mail encrypted to it must still open.
+        if let Some(old) = current
+            && let Err(e) = self.vault.write(&retired, &old)
+        {
+            self.error = Some(format!("Could not keep the key it replaces: {e}"));
+            return;
+        }
         if let Err(e) = self.vault.write(&path, &data) {
             self.error = Some(format!("Could not keep the key: {e}"));
             return;
@@ -6549,7 +6568,7 @@ impl BeaverApp {
             A::AskRemove(address, certificate) => self.key_dialogs.remove = Some((address, certificate)),
             A::Remove(address, certificate) => {
                 let path = if certificate { beavermail_crypto::certificate_path(&address) } else { beavermail_crypto::key_path(&address) };
-                match self.vault.remove(&path) {
+                match self.vault.remove(&path).and_then(|()| self.vault.remove_dir(&beavermail_crypto::retired_dir(&path))) {
                     Ok(()) => self.notice = Some((if certificate { "The certificate is removed from this computer" } else { "The key is removed from this computer" }.to_owned(), std::time::Instant::now())),
                     Err(e) => self.error = Some(format!("Could not remove it: {e}")),
                 }

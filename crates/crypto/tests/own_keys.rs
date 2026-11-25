@@ -2,7 +2,7 @@
 
 //! The user's own keys: made, exported, imported; and messages sealed and opened with them.
 
-use beavermail_crypto::{Check, ImportError, Opened, add_autocrypt, autocrypt_key, backup_password, decrypt, encrypt, export, generate, import, public_key, short_id};
+use beavermail_crypto::{Check, ImportError, Opened, add_autocrypt, autocrypt_key, backup_password, decrypt, encrypt, export, generate, import, made_at, public_key, short_id};
 
 const MESSAGE: &[u8] = b"From: Ada Lovelace <ada@example.org>\r\nTo: Bob <bob@example.org>\r\nSubject: Lunch\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 7bit\r\n\r\nSee you at noon.\r\n";
 
@@ -68,4 +68,12 @@ fn a_message_sealed_by_gnupg_opens() {
         }
         other => panic!("{other:?}"),
     }
+}
+
+#[test]
+fn a_key_tells_when_it_was_made() {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    let made = made_at(&generate("Ada", "ada@example.org").unwrap()).unwrap();
+    assert!((now - 60..=now + 60).contains(&made), "{made} vs {now}");
+    assert_eq!(made_at(b"not a key"), None);
 }

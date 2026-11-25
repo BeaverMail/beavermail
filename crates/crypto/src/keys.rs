@@ -19,6 +19,18 @@ pub fn key_path(address: &str) -> std::path::PathBuf {
     std::path::Path::new("keyring").join("openpgp").join(format!("{safe}.key"))
 }
 
+/// Where the own keys or certificates that the one at `current` replaced are kept: mail encrypted to
+/// them must still open.
+pub fn retired_dir(current: &std::path::Path) -> std::path::PathBuf {
+    current.with_extension("retired")
+}
+
+/// When an own OpenPGP key or S/MIME certificate was made (seconds since the epoch), to tell which of
+/// two is the newer.
+pub fn made_at(stored: &[u8]) -> Option<i64> {
+    secret_key(stored).map(|k| pgp::types::PublicKeyTrait::created_at(&k.signed_public_key().primary_key).timestamp()).or_else(|| crate::smime_own::issued(stored))
+}
+
 /// A new key for `name <address>`: Ed25519 to sign, Curve25519 to receive, in the v4 format every
 /// OpenPGP program reads (the newer v6 is not read by GnuPG). It never expires: losing access is a
 /// larger risk for a user who did not choose a key than a key outliving its use.

@@ -95,6 +95,11 @@ pub fn certificate_info(stored: &[u8]) -> Option<CertificateInfo> {
     Some(CertificateInfo { address: crate::smime::email_of(&cert).unwrap_or_default(), issuer: crate::smime::authority(&cert), expires })
 }
 
+/// When the user's kept certificate was issued, in seconds since the Unix epoch.
+pub(crate) fn issued(stored: &[u8]) -> Option<i64> {
+    own(stored).map(|o| o.chain[0].tbs_certificate.validity.not_before.to_unix_duration().as_secs() as i64)
+}
+
 /// "2027-10-17" from seconds since the Unix epoch, without a calendar library.
 fn chrono_free_date(secs: u64) -> String {
     // Days to civil date (Howard Hinnant's algorithm).
