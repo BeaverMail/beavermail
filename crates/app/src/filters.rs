@@ -307,7 +307,7 @@ fn section(ui: &mut egui::Ui, title: &str) {
 }
 
 /// "+ Add condition": a quiet link-like button, so the dialog's one filled button stays Save.
-fn add(ui: &mut egui::Ui, t: &Tokens, label: &str) -> bool {
+pub fn add(ui: &mut egui::Ui, t: &Tokens, label: &str) -> bool {
     let button = egui::Button::image_and_text(crate::icons::Icon::Plus.image(16.0, t.accent), RichText::new(label).color(t.accent)).frame(false);
     ui.add(button).on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
 }

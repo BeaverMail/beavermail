@@ -13,7 +13,7 @@ computer, remote content stays blocked, and it works offline. Written in Rust wi
 - Reading: plain text, simplified or original HTML; conversations, tabs, nothing remote loaded unless allowed; the list as cards or a table, ordered per folder, the message beside it, below it or in a tab.
 - Safety: sender checks, look-alike domains and links, risky attachments; held "Suspicious" mail and a spam classifier.
 - Encryption: OpenPGP (with Autocrypt) and S/MIME, signed and encrypted mail.
-- Writing: Markdown, address chips, drafts kept locally and on the server, undo send, send later, signatures, spell check.
+- Writing: Markdown, address chips, drafts kept locally and on the server, undo send, send later, signatures, other addresses (aliases) with their own name and signature, spell check.
 - Undo: Archive and Move to Trash wait 10 s before reaching the server.
 - Filters: rules that move, star, label or mark new Inbox mail as it arrives.
 - Assistant: replies drafted and conversations summarised by a language model with your own key (Anthropic, OpenAI or local), asked first and recorded.

@@ -259,6 +259,21 @@ pub struct Account {
     /// Warn when the server's space for the account is this full, in percent; 0 never warns.
     #[serde(default = "quota_warning")]
     pub quota_warning: u8,
+    /// Other addresses the account may send from (aliases), as the server allows them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<Alias>,
+}
+
+/// Another address an account sends from, with its own name and signature.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Alias {
+    /// Shown beside the address; empty for the account's name.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    pub email: String,
+    /// Empty for the account's signature.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub signature: String,
 }
 
 /// An address book synced over CardDAV: a source of its own, apart from the mail accounts (contacts
@@ -399,7 +414,7 @@ impl Account {
     /// no real account has (their user is never empty).
     pub fn local() -> Self {
         let none = Server { host: "local".to_owned(), port: 0, tls: Tls::Tls };
-        Self { name: String::new(), user: String::new(), email: String::new(), imap: none.clone(), smtp: none, save_sent: false, keep: Keep::default(), signature: String::new(), smtp_user: None, archive: String::new(), archive_by_year: false, quota_warning: 0 }
+        Self { name: String::new(), user: String::new(), email: String::new(), imap: none.clone(), smtp: none, save_sent: false, keep: Keep::default(), signature: String::new(), smtp_user: None, archive: String::new(), archive_by_year: false, quota_warning: 0, aliases: Vec::new() }
     }
 
     /// The address to send from: the configured one, else the login name.
@@ -416,11 +431,30 @@ impl Account {
 
     /// The From of messages sent from this account: "\"Ada Lovelace\" <ada@example.org>", or the address alone.
     pub fn sender(&self) -> String {
-        match self.sender_name() {
+        self.sender_as("")
+    }
+
+    /// The From for sending as `alias`, one of [`Account::aliases`]; any other value (empty, or an
+    /// alias since removed) sends from the account's own address.
+    pub fn sender_as(&self, alias: &str) -> String {
+        let found = self.alias(alias);
+        let address = found.map_or(self.address(), |a| a.email.as_str());
+        let name = found.map(|a| a.name.trim()).filter(|n| !n.is_empty()).or(self.sender_name());
+        match name {
             // Quoted, so a comma or a dot in the name stays part of it; quotes inside would end it early.
-            Some(name) => format!("\"{}\" <{}>", name.replace(['"', '\\'], ""), self.address()),
-            None => self.address().to_owned(),
+            Some(name) => format!("\"{}\" <{}>", name.replace(['"', '\\'], ""), address),
+            None => address.to_owned(),
         }
+    }
+
+    /// The alias with address `email`, if the account has one.
+    pub fn alias(&self, email: &str) -> Option<&Alias> {
+        self.aliases.iter().find(|a| !email.trim().is_empty() && a.email.eq_ignore_ascii_case(email.trim()))
+    }
+
+    /// The signature for mail sent as `alias`: its own, else the account's.
+    pub fn signature_for(&self, alias: &str) -> &str {
+        self.alias(alias).map(|a| a.signature.as_str()).filter(|s| !s.trim().is_empty()).unwrap_or(&self.signature)
     }
 
     /// The login for the outgoing server.
@@ -828,13 +862,19 @@ mod tests {
     #[test]
     fn mail_goes_out_under_the_users_name_unless_it_is_only_the_login() {
         let server = Server { host: "imap.x.org".into(), port: 993, tls: Tls::Tls };
-        let account = |name: &str| Account { name: name.into(), user: "ada".into(), email: "ada@x.org".into(), imap: server.clone(), smtp: server.clone(), save_sent: true, keep: Keep::default(), signature: String::new(), smtp_user: None, archive: String::new(), archive_by_year: false, quota_warning: 90 };
+        let account = |name: &str| Account { name: name.into(), user: "ada".into(), email: "ada@x.org".into(), imap: server.clone(), smtp: server.clone(), save_sent: true, keep: Keep::default(), signature: String::new(), smtp_user: None, archive: String::new(), archive_by_year: false, quota_warning: 90, aliases: vec![Alias { email: "info@x.org".into(), ..Alias::default() }, Alias { name: "Acme Support".into(), email: "help@x.org".into(), signature: "Acme".into() }] };
         assert_eq!(account("Ada Lovelace").sender(), "\"Ada Lovelace\" <ada@x.org>");
         assert_eq!(account("Lovelace, Ada").sender(), "\"Lovelace, Ada\" <ada@x.org>", "quoted: the comma is part of the name");
         assert_eq!(account("Ada \"the\" Countess").sender(), "\"Ada the Countess\" <ada@x.org>");
         for none in ["", "  ", "ada@x.org", "ADA"] {
             assert_eq!(account(none).sender(), "ada@x.org", "{none:?}: what older versions filled in, or nothing");
         }
+        assert_eq!(account("Ada L").sender_as("INFO@x.org"), "\"Ada L\" <info@x.org>", "an alias, as written in the account");
+        assert_eq!(account("Ada L").sender_as("gone@x.org"), "\"Ada L\" <ada@x.org>", "not an alias (any more): the account's own");
+        assert_eq!(account("Ada L").sender_as("help@x.org"), "\"Acme Support\" <help@x.org>", "the alias's own name");
+        let mut with_signature = account("Ada L");
+        with_signature.signature = "Ada".into();
+        assert_eq!((with_signature.signature_for("help@x.org"), with_signature.signature_for("info@x.org"), with_signature.signature_for("")), ("Acme", "Ada", "Ada"));
     }
 
     #[test]

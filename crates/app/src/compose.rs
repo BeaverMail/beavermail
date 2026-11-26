@@ -20,6 +20,8 @@ const LABEL_W: f32 = 76.0;
 pub struct Compose {
     /// Serial of the sending account.
     pub from: u64,
+    /// One of the account's aliases to send from; empty for its own address.
+    pub alias: String,
     to: String,
     cc: String,
     bcc: String,
@@ -69,6 +71,8 @@ pub struct Compose {
     sig: String,
     /// The account whose signature `sig` is.
     pub sig_from: u64,
+    /// The alias the signature in the body is for, with `sig_from`.
+    pub sig_alias: String,
     /// Put the caret at the top of the body when it is first drawn (above a signature).
     caret_top: bool,
     /// The message this replies to, so the assistant can read its conversation.
@@ -248,6 +252,7 @@ impl Compose {
     pub fn new(from: u64) -> Self {
         Self {
             from,
+            alias: String::new(),
             to: String::new(),
             cc: String::new(),
             bcc: String::new(),
@@ -281,6 +286,7 @@ impl Compose {
             preview: false,
             sig: String::new(),
             sig_from: from,
+            sig_alias: String::new(),
             caret_top: false,
             answers: None,
             assist: None,
@@ -313,7 +319,7 @@ impl Compose {
     fn fingerprint(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        (self.from, &self.to, &self.cc, &self.bcc, &self.subject, &self.body, self.title, &self.in_reply_to, &self.references).hash(&mut hasher);
+        (self.from, &self.alias, &self.to, &self.cc, &self.bcc, &self.subject, &self.body, self.title, &self.in_reply_to, &self.references).hash(&mut hasher);
         for f in &self.files {
             (&f.name, f.size, &f.vault).hash(&mut hasher);
         }
@@ -393,6 +399,7 @@ impl Compose {
             encrypt: (!self.encrypt_auto).then_some(self.encrypt),
             calendar: self.calendar.clone(),
             on_server: self.server_saved == self.fingerprint(),
+            alias: self.alias.clone(),
         }
     }
 
@@ -406,6 +413,8 @@ impl Compose {
         };
         let on_server = draft.on_server;
         let mut compose = Self {
+            sig_alias: draft.alias.clone(),
+            alias: draft.alias,
             to: draft.to,
             cc: draft.cc,
             bcc: draft.bcc,
@@ -656,6 +665,12 @@ pub fn sender(message: &MessageSummary) -> String {
 }
 
 /// The lower-case address inside "Name <address>", or the text itself.
+/// The first of `aliases` the message was written to (To or Cc), to answer from it.
+pub fn written_to_alias(aliases: &[beavermail_core::Alias], body: &MessageBody) -> Option<String> {
+    let recipients: Vec<String> = body.to.iter().chain(&body.cc).map(|r| bare_address(r)).collect();
+    aliases.iter().find(|a| recipients.contains(&a.email.trim().to_lowercase())).map(|a| a.email.clone())
+}
+
 fn bare_address(text: &str) -> String {
     let inner = match (text.rfind('<'), text.rfind('>')) {
         (Some(open), Some(close)) if open < close => &text[open + 1..close],
@@ -1072,9 +1087,10 @@ fn assist_row(ui: &mut Ui, t: &Tokens, compose: &mut Compose) -> Option<String> 
     asked
 }
 
-/// Shows the window. `senders` lists the accounts that can send, as (serial, address).
+/// Shows the window. `senders` lists the addresses that can send, as (account serial, address
+/// shown, alias: empty for the account's own address).
 /// `assistant`: a language model is set up, so the message can be written with it.
-pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &[(u64, String)], rich: bool, spelling: &Spelling, assistant: bool) -> Outcome {
+pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &[(u64, String, String)], rich: bool, spelling: &Spelling, assistant: bool) -> Outcome {
     let mut outcome = Outcome::Keep;
     find_misspelled(compose, spelling);
     let waiting_for_files = compose.pending() > 0;
@@ -1126,10 +1142,15 @@ pub fn window(ctx: &egui::Context, t: &Tokens, compose: &mut Compose, senders: &
             ui.add_enabled_ui(!compose.sending, |ui| {
                 ui.horizontal(|ui| {
                     label(ui, t, "From");
-                    let current = senders.iter().find(|(s, _)| *s == compose.from).map(|(_, a)| a.as_str()).unwrap_or("");
+                    let (from, from_alias) = (compose.from, compose.alias.clone());
+                    let chosen = move |s: u64, a: &str| s == from && a.eq_ignore_ascii_case(&from_alias);
+                    let current = senders.iter().find(|(s, _, a)| chosen(*s, a)).or_else(|| senders.iter().find(|(s, _, _)| *s == from)).map(|(_, shown, _)| shown.as_str()).unwrap_or("");
+                    let current = current.to_owned();
                     egui::ComboBox::from_id_salt("compose_from").selected_text(current).show_ui(ui, |ui| {
-                        for (serial, address) in senders {
-                            ui.selectable_value(&mut compose.from, *serial, address);
+                        for (serial, shown, alias) in senders {
+                            if ui.selectable_label(chosen(*serial, alias), shown).clicked() {
+                                (compose.from, compose.alias) = (*serial, alias.clone());
+                            }
                         }
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| encrypt_toggle(ui, t, compose));
@@ -1767,7 +1788,7 @@ mod tests {
         let frame = |events: Vec<egui::Event>, compose: &mut Compose| {
             let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(1600.0, 1000.0))), events, ..Default::default() };
             let mut output = ctx.run_ui(input, |ui| {
-                sent.set(matches!(window(ui.ctx(), &Tokens::dark(), compose, &[(1, "me@x.org".into())], false, &spelling, false), Outcome::Send));
+                sent.set(matches!(window(ui.ctx(), &Tokens::dark(), compose, &[(1, "me@x.org".into(), String::new())], false, &spelling, false), Outcome::Send));
             });
             output.textures_delta.clear(); // nothing is drawn here
         };
@@ -1850,7 +1871,7 @@ mod tests {
         let size = |compose: &mut Compose| {
             for _ in 0..2 {
                 let mut output = ctx.run_ui(input(), |ui| {
-                    window(ui.ctx(), &Tokens::dark(), compose, &[(1, "me@x.org".into())], false, &OFF, false);
+                    window(ui.ctx(), &Tokens::dark(), compose, &[(1, "me@x.org".into(), String::new())], false, &OFF, false);
                 });
                 output.textures_delta.clear(); // nothing is drawn here
             }
@@ -1884,7 +1905,7 @@ mod tests {
         let frame = |events: Vec<egui::Event>, compose: &mut Compose| {
             let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(1600.0, 1000.0))), events, ..Default::default() };
             let mut output = ctx.run_ui(input, |ui| {
-                window(ui.ctx(), &Tokens::dark(), compose, &[(1, "me@x.org".into())], false, &OFF, false);
+                window(ui.ctx(), &Tokens::dark(), compose, &[(1, "me@x.org".into(), String::new())], false, &OFF, false);
             });
             output.textures_delta.clear(); // nothing is drawn here
         };
@@ -1931,7 +1952,7 @@ mod tests {
         let frame = |events: Vec<egui::Event>, compose: &mut Compose| {
             let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(1600.0, 1000.0))), events, ..Default::default() };
             let mut output = ctx.run_ui(input, |ui| {
-                window(ui.ctx(), &Tokens::dark(), compose, &[(1, "me@x.org".into())], false, &OFF, false);
+                window(ui.ctx(), &Tokens::dark(), compose, &[(1, "me@x.org".into(), String::new())], false, &OFF, false);
             });
             output.textures_delta.clear(); // nothing is drawn here
         };
@@ -2119,6 +2140,20 @@ mod tests {
             ..MessageBody::default()
         };
         (summary, body)
+    }
+
+    #[test]
+    fn an_answer_goes_from_the_alias_it_was_written_to() {
+        let (summary, mut body) = message();
+        assert_eq!(written_to_alias(&[beavermail_core::Alias { email: "sales@example.org".into(), ..Default::default() }], &body), None);
+        body.cc.push("Shop <Sales@Example.org>".into());
+        let alias = |email: &str| beavermail_core::Alias { email: email.into(), ..Default::default() };
+        let alias = written_to_alias(&[alias("info@example.org"), alias("sales@example.org")], &body).unwrap();
+        assert_eq!(alias, "sales@example.org");
+        let mut c = Compose::reply(0, &alias, &summary, &body, true);
+        assert!(!c.cc.to_lowercase().contains("sales@"), "not a copy to the alias itself: {}", c.cc);
+        c.alias = alias;
+        assert_eq!(Compose::from_draft(0, c.to_draft(1)).alias, "sales@example.org", "kept in the draft");
     }
 
     #[test]

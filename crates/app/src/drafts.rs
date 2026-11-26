@@ -41,6 +41,9 @@ pub struct DraftData {
     /// here only to go on writing it.
     #[serde(default)]
     pub on_server: bool,
+    /// The alias it is sent from; empty for the account's own address.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub alias: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

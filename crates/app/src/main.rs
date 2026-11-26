@@ -694,6 +694,8 @@ struct NewAccount {
     save_sent: bool,
     keep: Keep,
     signature: String,
+    /// See [`Account::aliases`].
+    aliases: Vec<beavermail_core::Alias>,
     /// See [`Account::archive`].
     archive: String,
     archive_by_year: bool,
@@ -726,6 +728,7 @@ impl Default for NewAccount {
             save_sent: true,
             keep: Keep::default(),
             signature: String::new(),
+            aliases: Vec::new(),
             archive: String::new(),
             archive_by_year: false,
             quota_warning: 90,
@@ -768,6 +771,7 @@ impl NewAccount {
             save_sent: account.save_sent,
             keep: account.keep,
             signature: account.signature.clone(),
+            aliases: account.aliases.clone(),
             archive: account.archive.clone(),
             archive_by_year: account.archive_by_year,
             quota_warning: account.quota_warning,
@@ -805,6 +809,19 @@ impl NewAccount {
             "" => return Err("enter the user for the outgoing server".into()),
             user => Some(user.to_owned()),
         };
+        let mut aliases: Vec<beavermail_core::Alias> = Vec::new();
+        for alias in &self.aliases {
+            let address = alias.email.trim();
+            match address {
+                // A row left empty is dropped; one with only a name or signature needs its address.
+                "" if alias.name.trim().is_empty() && alias.signature.trim().is_empty() => continue,
+                "" => return Err("enter the address of each other address".into()),
+                _ if !beavermail_smtp::valid_address(address) || address.contains(['<', ' ']) => return Err(format!("{address} is not an email address")),
+                _ if address.eq_ignore_ascii_case(email) => return Err(format!("{address} is already the account's address")),
+                _ if aliases.iter().any(|a| a.email.eq_ignore_ascii_case(address)) => return Err(format!("{address} is listed twice")),
+                _ => aliases.push(beavermail_core::Alias { name: alias.name.trim().to_owned(), email: address.to_owned(), signature: alias.signature.trim_end().to_owned() }),
+            }
+        }
 
         Ok(Account {
             name: self.name.trim().to_owned(),
@@ -819,6 +836,7 @@ impl NewAccount {
             archive: self.archive.clone(),
             archive_by_year: self.archive_by_year,
             quota_warning: self.quota_warning,
+            aliases,
         })
     }
 }
@@ -1099,6 +1117,30 @@ fn account_page(ui: &mut egui::Ui, t: &theme::Tokens, form: &mut NewAccount, fol
     section_title(ui, "Signature");
     ui.add(egui::TextEdit::multiline(&mut form.signature).id_salt("signature").desired_rows(4).desired_width(f32::INFINITY).margin(egui::Margin::same(12)));
     hint(ui, "Added under new messages, replies and forwards. Leave empty for none.");
+
+    section_title(ui, "Other addresses");
+    hint(ui, "Aliases this account sends from: offered in From, and used to answer mail written to them. The server must allow them (in Gmail: Send mail as), or it refuses the message or sends it from the main address.");
+    let mut remove = None;
+    for (i, alias) in form.aliases.iter_mut().enumerate() {
+        ui.add_space(8.0);
+        ui.push_id(("alias", i), |ui| {
+            ui.horizontal(|ui| {
+                let width = (ui.available_width() - theme::CONTROL_H - 2.0 * ui.spacing().item_spacing.x) / 2.0;
+                ui.add(sized_field(&mut alias.name, width).hint_text("Name (empty: your name)"));
+                ui.add(sized_field(&mut alias.email, width).hint_text("name@example.org"));
+                if icons::button(ui, t, Icon::X, "Remove this address", true, false).clicked() {
+                    remove = Some(i);
+                }
+            });
+            ui.add(egui::TextEdit::multiline(&mut alias.signature).hint_text("Signature (empty: the account's)").desired_rows(2).desired_width(f32::INFINITY).margin(egui::Margin::same(12)));
+        });
+    }
+    if let Some(i) = remove {
+        form.aliases.remove(i);
+    }
+    if filters::add(ui, t, "Add address") {
+        form.aliases.push(beavermail_core::Alias::default());
+    }
 
     section_title(ui, "Sync");
     form_grid(ui, "account_sync", |ui| {
@@ -3382,7 +3424,7 @@ impl BeaverApp {
         let Some(view) = self.view(compose.from) else { return false };
         let (account, sender, source) = (view.account.clone(), view.sender.clone(), view.source.clone());
         let Some(sender) = sender else { return false };
-        let mut message = compose.outgoing(&account.sender(), self.settings.rich_outgoing);
+        let mut message = compose.outgoing(&account.sender_as(&compose.alias), self.settings.rich_outgoing);
         // With a key, it goes out with each message, so people's programs learn it (Autocrypt).
         message.autocrypt = self.own_key(account.address()).and_then(|secret| beavermail_crypto::public_key(&secret));
         match (compose.encrypt_auto, compose.encrypt, self.seal_keys(compose)) {
@@ -3516,7 +3558,16 @@ impl BeaverApp {
             let Some(back) = self.compose.take() else { return };
             compose = back;
         }
-        let senders = self.senders();
+        let senders: Vec<(u64, String, String)> = self
+            .accounts
+            .iter()
+            .filter(|v| v.sender.is_some())
+            .flat_map(|v| {
+                // As recipients will see it: the name (the alias's own, else the account's) beside the address.
+                let shown = |name: &str, address: &str| beavermail_core::address_text(if name.trim().is_empty() { v.account.sender_name().unwrap_or("") } else { name.trim() }, address);
+                std::iter::once((v.serial, shown("", v.account.address()), String::new())).chain(v.account.aliases.iter().map(move |a| (v.serial, shown(&a.name, &a.email), a.email.clone())))
+            })
+            .collect();
         // The focus is dropped again the frame after the question closes, so it is asked for a few times.
         if self.refocus > 0 && let Some(field) = self.compose_focus {
             self.refocus -= 1;
@@ -3548,9 +3599,10 @@ impl BeaverApp {
             before_send: self.settings.spelling_before_send,
         };
         let outcome = if esc { compose::Outcome::Discard } else { compose::window(ctx, t, &mut compose, &senders, self.settings.rich_outgoing, &spelling, assistant::ready(&self.settings.assistant)) };
-        if compose.from != compose.sig_from {
-            let signature = self.view(compose.from).map(|v| v.account.signature.clone()).unwrap_or_default();
+        if compose.from != compose.sig_from || compose.alias != compose.sig_alias {
+            let signature = self.view(compose.from).map(|v| v.account.signature_for(&compose.alias).to_owned()).unwrap_or_default();
             compose.change_signature(compose.from, &signature);
+            compose.sig_alias = compose.alias.clone();
         }
         match outcome {
             compose::Outcome::Keep => {}
@@ -7338,16 +7390,22 @@ impl BeaverApp {
         // on this computer, that is the account it was written to, else the first one that sends.
         let source = self.view(serial).and_then(|v| v.source.clone());
         let senders = self.senders();
-        let written_to = |(_, address): &&(u64, String)| body.to.iter().chain(&body.cc).any(|r| r.to_lowercase().contains(&address.to_lowercase()));
+        let written_to = |(s, address): &&(u64, String)| {
+            body.to.iter().chain(&body.cc).any(|r| r.to_lowercase().contains(&address.to_lowercase())) || self.view(*s).is_some_and(|v| compose::written_to_alias(&v.account.aliases, body).is_some())
+        };
         let from = if senders.iter().any(|(s, _)| *s == serial) { Some(serial) } else { senders.iter().find(written_to).or(senders.first()).map(|(s, _)| *s) };
         let Some(view) = from.and_then(|f| self.view(f)) else { return };
-        let own = view.account.address();
+        // Written to one of the account's aliases: the answer goes from that address.
+        let alias = compose::written_to_alias(&view.account.aliases, body).unwrap_or_default();
+        let own = if alias.is_empty() { view.account.address() } else { alias.as_str() };
         let key = view.account.key();
         let compose = match action {
             Action::Forward => compose::Compose::forward(view.serial, &key, summary, body, &body.attachments),
             _ => compose::Compose::reply(view.serial, own, summary, body, matches!(action, Action::ReplyAll)),
         };
-        let mut compose = compose.with_signature(&view.account.signature);
+        let mut compose = compose.with_signature(view.account.signature_for(&alias));
+        compose.sig_alias = alias.clone();
+        compose.alias = alias;
         if !matches!(action, Action::Forward) {
             compose.answers = Some(id);
         }
@@ -7443,7 +7501,7 @@ impl BeaverApp {
     fn upload_draft(&mut self, compose: &compose::Compose) -> bool {
         let Some(view) = self.view(compose.from) else { return false };
         let Some(source) = view.source.clone() else { return false };
-        let message = compose.outgoing(&view.account.sender(), self.settings.rich_outgoing);
+        let message = compose.outgoing(&view.account.sender_as(&compose.alias), self.settings.rich_outgoing);
         // A message meant to go encrypted is not left readable on the server as a draft: it is
         // encrypted to the user's own key.
         let address = view.account.address().to_owned();
@@ -8671,7 +8729,10 @@ impl BeaverApp {
                         Err(e) => {
                             if let Some(compose) = &mut self.compose {
                                 compose.sending = false;
-                                compose.error = Some(e.to_string());
+                                compose.error = Some(match compose.alias.as_str() {
+                                    "" => e.to_string(),
+                                    alias => format!("{e}. If the server does not let this account send as {alias}, allow it there first or choose another From"),
+                                });
                             }
                         }
                     }
@@ -11238,7 +11299,7 @@ mod tests {
     fn what_an_account_knows_is_loaded_again_only_when_its_marks_change() {
         let archive = Arc::new(Store::in_memory().unwrap());
         let server = Server { host: "mail.example.org".into(), port: 993, tls: Tls::Tls };
-        let account = Account { name: "Ada".into(), user: "ada@example.org".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true, keep: Keep::default(), signature: String::new(), smtp_user: None, archive: String::new(), archive_by_year: false, quota_warning: 90 };
+        let account = Account { name: "Ada".into(), user: "ada@example.org".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true, keep: Keep::default(), signature: String::new(), smtp_user: None, archive: String::new(), archive_by_year: false, quota_warning: 90, aliases: Vec::new() };
         let (cache, mut settings) = (KnownCache::default(), Settings::default());
         let first = cache.get(&archive, &account, &[], &settings).unwrap();
         assert!(Arc::ptr_eq(&first, &cache.get(&archive, &account, &[], &settings).unwrap()), "kept");
@@ -11308,6 +11369,20 @@ mod tests {
         let account = form.build().unwrap();
         assert_eq!((account.smtp_user.as_deref(), account.smtp_login(), account.user.as_str()), (Some("relay-ada"), "relay-ada", "ada@example.org"));
         assert_eq!(NewAccount::editing(7, &account).build().unwrap(), account, "kept through an edit");
+    }
+
+    #[test]
+    fn aliases_are_addresses_listed_once() {
+        let mut form = filled();
+        let alias = |name: &str, email: &str| beavermail_core::Alias { name: name.into(), email: email.into(), signature: String::new() };
+        form.aliases = vec![alias(" Acme Support ", " info@example.org "), alias("", ""), alias("", "sales@example.org")];
+        let account = form.build().unwrap();
+        assert_eq!(account.aliases, [alias("Acme Support", "info@example.org"), alias("", "sales@example.org")], "trimmed, the empty row left out");
+        assert_eq!(NewAccount::editing(7, &account).build().unwrap(), account, "kept through an edit");
+        for wrong in [alias("", "info"), alias("", "Ada@example.org"), alias("", "SALES@example.org"), alias("Shop", ""), alias("", "Shop <shop@example.org>")] {
+            form.aliases = vec![alias("", "sales@example.org"), wrong.clone()];
+            assert!(form.build().is_err(), "{wrong:?}");
+        }
     }
 
     fn filled() -> NewAccount {
