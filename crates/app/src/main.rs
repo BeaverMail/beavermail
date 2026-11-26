@@ -924,9 +924,9 @@ enum Section {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 enum SettingsPage {
-    #[default]
     Appearance,
-    /// The list of accounts, each opening its own page.
+    /// The list of accounts, each opening its own page; the first one shown, as it heads the list.
+    #[default]
     Accounts,
     Reading,
     Writing,
