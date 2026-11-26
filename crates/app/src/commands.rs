@@ -204,7 +204,8 @@ impl Command {
             Self::SelectAll => &[Trigger::Shortcut(CTRL, Key::A, false)],
             Self::Search => &[Trigger::Text("/")],
             Self::SwitchPane => &[Trigger::Key(Key::F6)],
-            Self::NewFolder | Self::NotSpam | Self::OpenInFolder | Self::TrustSender | Self::BlockSender | Self::CreateFilter | Self::Refresh | Self::AllInboxes | Self::Mail | Self::Calendar | Self::Tasks | Self::Attachments | Self::Contacts | Self::WorkOffline | Self::WorkOnline | Self::Settings => &[],
+            Self::Settings => &[Trigger::Shortcut(CTRL, Key::Comma, false)],
+            Self::NewFolder | Self::NotSpam | Self::OpenInFolder | Self::TrustSender | Self::BlockSender | Self::CreateFilter | Self::Refresh | Self::AllInboxes | Self::Mail | Self::Calendar | Self::Tasks | Self::Attachments | Self::Contacts | Self::WorkOffline | Self::WorkOnline => &[],
         }
     }
 
@@ -263,6 +264,7 @@ mod tests {
         assert_eq!(Command::Reply.tip(&ctx), "Reply (R)");
         let ctrl_n = ctx.format_shortcut(&KeyboardShortcut::new(CTRL, egui::Key::N));
         assert_eq!(Command::NewMessage.keys(&ctx), format!("{ctrl_n} or C"));
+        assert_eq!(Command::Settings.keys(&ctx), ctx.format_shortcut(&KeyboardShortcut::new(CTRL, egui::Key::Comma)));
     }
 
     #[test]

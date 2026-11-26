@@ -23,7 +23,7 @@ computer, remote content stays blocked, and it works offline. Written in Rust wi
 - Tasks: lists over CalDAV (made here when a server has none), grouped by due date and put in order by dragging, with subtasks, labels and priority; changes kept offline and merged with those made elsewhere.
 
 Keys (Ctrl+K lists every command): Up/Down, Page Up/Down, Home/End (with Shift, pick a range), F6, Enter,
-E, Delete, V (move to folder), U, P, S, T (make a task), 1–5, 0, `!`, C or Ctrl+N, R, A, F, `/`, Ctrl+Z, Ctrl+U, Ctrl+W, Ctrl+Tab; in the calendar
+E, Delete, V (move to folder), U, P, S, T (make a task), 1–5, 0, `!`, C or Ctrl+N, R, A, F, `/`, Ctrl+Z, Ctrl+U, Ctrl+W, Ctrl+Tab, Ctrl+, (Settings); in the calendar
 T, Left/Right, W, M, A, N; in Tasks Up/Down, Space, Delete, N or `/`, Esc; in Attachments the arrows and Enter.
 
 Drag and drop of attachments does not work on Wayland yet: start with `WAYLAND_DISPLAY=` to use X11.
