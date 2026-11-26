@@ -3222,6 +3222,12 @@ impl BeaverApp {
         !self.query.trim().is_empty()
     }
 
+    /// Ends the search shown: the folder it was over comes back (see [`Self::run_search`]).
+    fn close_search(&mut self) {
+        self.query.clear();
+        self.search_opened = None;
+    }
+
     /// Runs saved search `i` again, wherever its query says (everywhere when it names no folder).
     fn open_saved_search(&mut self, i: usize) {
         let Some(search) = self.settings.saved_searches.get(i) else { return };
@@ -4822,6 +4828,7 @@ impl BeaverApp {
                 Entry::Folder(serial, index) => {
                     self.section = Section::Mail;
                     self.show_suspicious = false;
+                    self.close_search();
                     self.select_mailbox(serial, index);
                 }
                 Entry::MoveTo(serial, index) => self.move_to_folder(palette.moving, serial, index),
@@ -10882,6 +10889,10 @@ impl eframe::App for BeaverApp {
         let SidebarOutcome { chosen, suspicious, recheck, empty, recheck_all, empty_all, removed, edit, mut add, all, local, all_suspicious, all_role, dropped, new_inside, rename, delete, label, saved } =
             if self.in_tab || contacts { SidebarOutcome::default() } else { self.sidebar(ui, &t) };
         slow.mark("sidebar");
+        // Another place picked: the search ends there, as in most mail apps.
+        if all || all_suspicious || all_role.is_some() || chosen.is_some() || suspicious.is_some() || local.is_some() {
+            self.close_search();
+        }
         if let Some((serial, index)) = new_inside {
             let parent = index.and_then(|i| self.view(serial)?.mailboxes.get(i)).map(|m| m.name.clone());
             self.new_folder = Some(NewFolder { serial, parent, name: String::new(), busy: false, error: None, renaming: None });
