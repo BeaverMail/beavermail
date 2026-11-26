@@ -144,7 +144,7 @@ pub fn is_inside(child: &str, parent: &str, delimiter: Option<char>) -> bool {
     rest.next().is_some() && next.is_some_and(|c| delimiter.map_or(c == '/' || c == '.', |d| c == d))
 }
 
-fn role_icon(role: Role) -> Icon {
+pub fn role_icon(role: Role) -> Icon {
     match role {
         Role::Inbox => Icon::Inbox,
         Role::Starred => Icon::Star,
@@ -193,6 +193,11 @@ pub fn dot_row(ui: &mut Ui, t: &Tokens, name: &str, color: Color32, count: u32, 
 /// A label in the sidebar: its colour and name; a click shows its mail.
 pub fn label_row(ui: &mut Ui, t: &Tokens, name: &str, color: Color32, selected: bool) -> Response {
     nav_row(ui, t, name, Lead::Dot(color), (0, 0, false), selected)
+}
+
+/// A saved search in the sidebar, as a label row with a bookmark.
+pub fn saved_search_row(ui: &mut Ui, t: &Tokens, name: &str, selected: bool) -> Response {
+    nav_row(ui, t, name, Lead::Icon(Icon::Bookmark, if selected { t.accent } else { t.text_dim }), (0, 0, false), selected)
 }
 
 /// `count` is (the row's own count, that of folded subfolders, whether the title is bold).

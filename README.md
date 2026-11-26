@@ -9,7 +9,7 @@ computer, remote content stays blocked, and it works offline. Written in Rust wi
 ## Status
 
 - Accounts: any IMAP/SMTP server (Gmail with an app password); several at once, with All inboxes and every account's Drafts, Sent, Archive, Spam and Trash together; mail moved between accounts; server storage shown, with a warning when nearly full.
-- Offline: encrypted local archive with full-text search (encrypted mail included, once opened with your key); changes and mail wait in an Outbox for the server; folders on this computer (Inbox, Archive, Trash and your own) to move mail off the servers and back.
+- Offline: encrypted local archive with full-text search (encrypted mail included, once opened with your key) and saved searches in the sidebar; changes and mail wait in an Outbox for the server; folders on this computer (Inbox, Archive, Trash and your own) to move mail off the servers and back.
 - Reading: plain text, simplified or original HTML; conversations, tabs, nothing remote loaded unless allowed; the list as cards or a table, ordered per folder, the message beside it, below it or in a tab.
 - Safety: sender checks, look-alike domains and links, risky attachments; held "Suspicious" mail and a spam classifier.
 - Encryption: OpenPGP (with Autocrypt) and S/MIME, signed and encrypted mail.

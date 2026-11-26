@@ -207,6 +207,24 @@ enum Entry {
     Run(Command),
     Folder(u64, usize),
     MoveTo(u64, usize),
+    /// A saved search, by its place in the list.
+    Saved(usize),
+}
+
+/// The name asked for a saved search: a new one (`index` none) or one renamed or updated, with the
+/// query it keeps.
+struct NamingSearch {
+    index: Option<usize>,
+    name: String,
+    query: String,
+}
+
+/// What was asked of a saved search in the sidebar, by its place in the list.
+#[derive(Clone, Copy)]
+enum SavedAction {
+    Open(usize),
+    Rename(usize),
+    Delete(usize),
 }
 
 /// The New folder dialog: the account, the folder it goes inside (by name; `None` at the top), the
@@ -241,6 +259,14 @@ fn typing_folder(query: &str) -> Option<(usize, &str)> {
 }
 
 /// The query without its `in:` words, quoted ones included, then `in:"folder"`.
+/// What `in:` takes for a folder: the word for a standard one ("sent", every account's), else its name.
+fn in_word(role: Role, name: &str) -> Option<String> {
+    match role {
+        Role::Other => Some(name.to_owned()).filter(|n| !n.is_empty()),
+        role => beavermail_store::ROLE_WORDS.iter().find(|(_, r)| *r == role).map(|(w, _)| (*w).to_owned()),
+    }
+}
+
 fn in_folder(query: &str, folder: &str) -> String {
     let mut out = String::new();
     let mut rest = query;
@@ -332,6 +358,7 @@ struct SidebarOutcome {
     delete: Option<(u64, usize)>,
     /// A label was clicked: its mail, searched for everywhere.
     label: Option<String>,
+    saved: Option<SavedAction>,
 }
 
 /// A message as the server holds it, shown in a source tab.
@@ -1474,6 +1501,10 @@ struct BeaverApp {
     contact_query: String,
     new_contact: Option<(String, String)>,
     new_folder: Option<NewFolder>,
+    /// The "Save search" or "Rename" dialog of a saved search.
+    naming_search: Option<NamingSearch>,
+    /// The saved search last opened, by name, while its search is shown: Save offers to update it.
+    search_opened: Option<String>,
     /// Delete folder… asked for (account, folder name); waiting for the user to confirm. With why the
     /// server refused it in the trash, when it did: then it can only be deleted for good.
     confirm_folder_delete: Option<(u64, String, Option<String>)>,
@@ -1756,6 +1787,8 @@ impl BeaverApp {
             contact_query: String::new(),
             new_contact: None,
             new_folder: None,
+            naming_search: None,
+            search_opened: None,
             confirm_folder_delete: None,
             settings_leave: None,
             confirm_remove: None,
@@ -3187,6 +3220,71 @@ impl BeaverApp {
 
     fn searching(&self) -> bool {
         !self.query.trim().is_empty()
+    }
+
+    /// Runs saved search `i` again, wherever its query says (everywhere when it names no folder).
+    fn open_saved_search(&mut self, i: usize) {
+        let Some(search) = self.settings.saved_searches.get(i) else { return };
+        (self.query, self.search_opened) = (search.query.clone(), Some(search.name.clone()));
+        self.search_scope = Scope::Everywhere;
+        self.section = Section::Mail;
+        self.show_suspicious = false;
+    }
+
+    /// The query to save for the search shown: limited to the folder shown, that folder is written into
+    /// it (in:…), so it looks there again. shortcut: the scope of one account has no operator and is
+    /// saved as everywhere; add an account: operator if that is missed.
+    fn query_to_save(&self) -> String {
+        let query = self.query.trim();
+        if self.search_scope != Scope::Folder || names_folder(query) || self.local.is_some() {
+            return query.to_owned();
+        }
+        let folder = if self.unified {
+            in_word(self.unified_role, "")
+        } else {
+            self.selected.and_then(|(s, i)| self.view(s)?.mailboxes.get(i).cloned()).and_then(|m| in_word(m.role, &m.name))
+        };
+        folder.map_or_else(|| query.to_owned(), |f| in_folder(query, &f).trim_end().to_owned())
+    }
+
+    /// "Save search" and "Rename": asks the name, then keeps the search or renames it.
+    fn saved_search_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
+        let Some(mut form) = self.naming_search.take() else { return };
+        let (mut save, mut cancel) = (false, false);
+        let modal = crate::views::modal(ctx, egui::Id::new("saved_search")).show(ctx, |ui| {
+            ui.set_width(FORM_WIDTH);
+            ui.heading(if form.index.is_some() { "Rename saved search" } else { "Save search" });
+            ui.label(RichText::new("Shown under Saved searches in the sidebar; opening it searches again, so it always shows the mail of now.").color(t.text_dim));
+            ui.add_space(12.0);
+            form_grid(ui, "saved_search_form", |ui| {
+                ui.label("Name");
+                let field = ui.add(field(&mut form.name).hint_text("Unread from the team"));
+                if ui.memory(|m| m.focused().is_none()) {
+                    field.request_focus();
+                }
+                ui.end_row();
+                ui.label("Search");
+                ui.label(RichText::new(&form.query).color(t.text_dim));
+                ui.end_row();
+            });
+            ui.add_space(12.0);
+            let ready = !form.name.trim().is_empty();
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
+                let label = if form.index.is_some() { "Rename" } else { "Save" };
+                save = views::primary_button(ui, t, label, ready).on_disabled_hover_text("Type a name first").clicked() || (ready && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                cancel = ui.button("Cancel").clicked();
+            });
+        });
+        if save {
+            let search = beavermail_core::SavedSearch { name: form.name.trim().to_owned(), query: form.query };
+            match form.index.filter(|i| *i < self.settings.saved_searches.len()) {
+                Some(i) => self.settings.saved_searches[i] = search,
+                None => self.settings.saved_searches.push(search),
+            }
+            self.save_settings();
+        } else if !cancel && !modal.should_close() {
+            self.naming_search = Some(form);
+        }
     }
 
     /// Asks every account's archive for the query typed in the search box.
@@ -4647,10 +4745,15 @@ impl BeaverApp {
                 entries.push((Entry::Folder(view.serial, i), format!("Go to {place} › {}", views::folder_title(&mailbox.name, mailbox.role, mailbox.delimiter)), String::new()));
             }
         }
+        if !moving {
+            for (i, search) in self.settings.saved_searches.iter().enumerate() {
+                entries.push((Entry::Saved(i), format!("Go to saved search › {}", search.name), String::new()));
+            }
+        }
         entries.retain(|(_, label, _)| Command::matches(label, &palette.query));
         let why = |entry: &Entry| match entry {
             Entry::Run(c) => self.can(*c).err(),
-            Entry::Folder(..) | Entry::MoveTo(..) => None,
+            Entry::Folder(..) | Entry::MoveTo(..) | Entry::Saved(_) => None,
         };
         let last = entries.len().saturating_sub(1);
         if !palette.moved {
@@ -4722,6 +4825,7 @@ impl BeaverApp {
                     self.select_mailbox(serial, index);
                 }
                 Entry::MoveTo(serial, index) => self.move_to_folder(palette.moving, serial, index),
+                Entry::Saved(i) => self.open_saved_search(i),
             }
         } else if !modal.should_close() {
             self.palette = Some(palette);
@@ -9408,6 +9512,7 @@ impl BeaverApp {
         let mut new_inside = None;
         let (mut rename, mut delete) = (None, None);
         let mut label = None;
+        let mut saved = None;
         // shortcut: only the Inboxes being shown have verdicts; the others keep the count of their last
         // check (All inboxes, shown at start, checks every one). Checking every account in the background
         // during sync would keep them all current.
@@ -9444,9 +9549,13 @@ impl BeaverApp {
                 ui.with_layout(Layout::top_down(Align::Min), |ui| {
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                         theme::dense(ui, self.settings.density);
+                        // A saved search or a label is shown: its row is the one marked, not the folder under it.
+                        let query = self.query.trim();
+                        let elsewhere = self.searching()
+                            && (self.settings.saved_searches.iter().any(|s| s.query.trim() == query) || theme::labels().iter().any(|(_, name, _)| search_form::quoted(&format!("label:{name}")) == query));
                         if self.accounts.len() >= 2 {
                             let unread = self.accounts.iter().filter_map(|v| Some(inbox_unread(v.serial, v.mailboxes.iter().find(|m| m.role == Role::Inbox)?))).sum();
-                            let inboxes = self.unified && self.unified_role == Role::Inbox;
+                            let inboxes = self.unified && self.unified_role == Role::Inbox && !elsewhere;
                             // The menus of every account's folders: the one of an account's own, for all of them at once.
                             // Its (account, folder) answer stands for every account here.
                             let mut inbox_menu = |ui: &mut egui::Ui| {
@@ -9468,7 +9577,7 @@ impl BeaverApp {
                                 let title = role_title(role);
                                 let folders = || self.accounts.iter().filter_map(move |v| Some((v, v.mailboxes.iter().find(|m| m.role == role)?)));
                                 let unread = if matches!(role, Role::Drafts | Role::Sent) { 0 } else { folders().map(|(_, m)| m.unread).sum() };
-                                let row = views::folder_row(ui, t, title, role, unread, 0, self.unified && self.unified_role == role).on_hover_text(format!("The {title} folder of every account, newest first"));
+                                let row = views::folder_row(ui, t, title, role, unread, 0, self.unified && self.unified_role == role && !elsewhere).on_hover_text(format!("The {title} folder of every account, newest first"));
                                 if row.clicked() {
                                     all_role = Some(role);
                                 }
@@ -9487,6 +9596,40 @@ impl BeaverApp {
                         if self.accounts.len() >= 2 {
                             ui.add_space(8.0);
                         }
+                        // Views across every account, above each account's folders: saved searches, then labels.
+                        if !self.accounts.is_empty() {
+                            if !self.settings.saved_searches.is_empty() {
+                                ui.add_space(12.0);
+                                ui.label(RichText::new("SAVED SEARCHES").size(12.0).color(t.text_dim));
+                            }
+                            for (i, search) in self.settings.saved_searches.iter().enumerate() {
+                                let shown = self.searching() && self.query.trim() == search.query.trim();
+                                let row = views::saved_search_row(ui, t, &search.name, shown).on_hover_text(&search.query);
+                                if row.clicked() {
+                                    saved = Some(SavedAction::Open(i));
+                                }
+                                views::context_menu(&row, |ui| {
+                                    if ui.button("Rename…").clicked() {
+                                        saved = Some(SavedAction::Rename(i));
+                                        ui.close();
+                                    }
+                                    if ui.button("Delete").clicked() {
+                                        saved = Some(SavedAction::Delete(i));
+                                        ui.close();
+                                    }
+                                });
+                            }
+                            ui.add_space(12.0);
+                            ui.label(RichText::new("LABELS").size(12.0).color(t.text_dim));
+                            for (_, name, color) in theme::labels() {
+                                let query = search_form::quoted(&format!("label:{name}"));
+                                let shown = self.searching() && self.query.trim() == query;
+                                if views::label_row(ui, t, &name, color, shown).on_hover_text("Its mail in every folder of every account").clicked() {
+                                    label = Some(query);
+                                }
+                            }
+                            ui.add_space(12.0);
+                        }
                         // What is only on this computer, apart from the servers' folders; a place shows while it holds something.
                         let places = [
                             (Local::Drafts, "Drafts", Icon::Drafts, "Drafts not on the server yet, every account's: they go to its Drafts folder when it can be reached"),
@@ -9496,7 +9639,7 @@ impl BeaverApp {
                         let show_places = |ui: &mut egui::Ui, local: &mut Option<Local>| {
                             for (place, title, icon, tip) in places {
                                 let count = self.kept(place).len();
-                                if count > 0 && views::icon_row(ui, t, title, icon, count as u32, self.local == Some(place)).on_hover_text(tip).clicked() {
+                                if count > 0 && views::icon_row(ui, t, title, icon, count as u32, self.local == Some(place) && !elsewhere).on_hover_text(tip).clicked() {
                                     *local = Some(place);
                                 }
                             }
@@ -9569,7 +9712,7 @@ impl BeaverApp {
                                         let holding = self.settings.hold_suspicious && !on_computer && mailbox.role == Role::Inbox;
                                         if held {
                                             let count = held_of.get(&view.serial).map_or(0, |h| h.0);
-                                            let row = indented(ui, depth, |ui| views::suspicious_row(ui, t, count, here && self.show_suspicious)).on_hover_text("Mail from new senders that failed a check, held apart from the Inbox");
+                                            let row = indented(ui, depth, |ui| views::suspicious_row(ui, t, count, here && self.show_suspicious && !elsewhere)).on_hover_text("Mail from new senders that failed a check, held apart from the Inbox");
                                             if row.clicked() {
                                                 suspicious = Some((view.serial, i));
                                             }
@@ -9578,7 +9721,7 @@ impl BeaverApp {
                                         }
                                         let tip = format!("{} message{}  ·  {} unread", views::thousands(mailbox.total), if mailbox.total == 1 { "" } else { "s" }, views::thousands(mailbox.unread));
                                         let unread = if mailbox.role == Role::Inbox { inbox_unread(view.serial, mailbox) } else { mailbox.unread };
-                                        let selected = here && !(holding && self.show_suspicious);
+                                        let selected = here && !elsewhere && !(holding && self.show_suspicious);
                                         let row = indented(ui, depth, |ui| views::folder_row(ui, t, &title, mailbox.role, unread, hidden_unread, selected)).on_hover_text(tip);
                                         if reveal && here {
                                             row.scroll_to_me(None);
@@ -9695,16 +9838,6 @@ impl BeaverApp {
                         }
                         if self.accounts.is_empty() {
                             ui.label(RichText::new("No accounts yet").color(t.text_dim));
-                        } else {
-                            ui.add_space(12.0);
-                            ui.label(RichText::new("LABELS").size(12.0).color(t.text_dim));
-                            for (_, name, color) in theme::labels() {
-                                let query = search_form::quoted(&format!("label:{name}"));
-                                let shown = self.searching() && self.query.trim() == query;
-                                if views::label_row(ui, t, &name, color, shown).on_hover_text("Its mail in every folder of every account").clicked() {
-                                    label = Some(query);
-                                }
-                            }
                         }
                     });
                 });
@@ -9720,7 +9853,7 @@ impl BeaverApp {
             }
             self.save_settings();
         }
-        SidebarOutcome { chosen, suspicious, recheck, empty, recheck_all, empty_all, removed, edit, add, all, local, all_suspicious, all_role, dropped, new_inside, rename, delete, label }
+        SidebarOutcome { chosen, suspicious, recheck, empty, recheck_all, empty_all, removed, edit, add, all, local, all_suspicious, all_role, dropped, new_inside, rename, delete, label, saved }
     }
 
     /// Search, refresh and the message list. Returns the message the user clicked and whether to add an account.
@@ -9745,6 +9878,9 @@ impl BeaverApp {
             if self.accounts.is_empty() {
                 add = views::empty_state(ui, t, "Welcome to BeaverMail", "Add an account to start reading your mail.", Some("Add account"));
                 return;
+            }
+            if !self.searching() {
+                self.search_opened = None;
             }
             ui.add_space(12.0);
             // The folders `in:` may mean, under the box while one is typed: Up and Down choose, Enter or a
@@ -9856,14 +9992,21 @@ impl BeaverApp {
                     ui.add_space(16.0);
                     ui.label(RichText::new("Search in").size(13.0).color(t.text_dim));
                     let named = names_folder(&self.query);
+                    let shown_role = if self.unified { Some(self.unified_role) } else { self.selected.and_then(|(s, i)| Some(self.view(s)?.mailboxes.get(i)?.role)) };
                     for (choice, label, tip) in self.scopes() {
-                        let button = ui.add_enabled(!named, egui::Button::selectable(scope == choice && !named, label));
+                        let icon = match choice {
+                            Scope::Folder => shown_role.map_or(Icon::Folder, views::role_icon),
+                            Scope::Account => Icon::Mail,
+                            Scope::Everywhere => Icon::Globe,
+                        };
+                        let on = scope == choice && !named;
+                        let button = ui.add_enabled(!named, egui::Button::selectable(on, (icon.image(icons::SIZE, if on { t.accent } else { t.text_dim }), label)));
                         if button.on_hover_text(tip).on_disabled_hover_text("The search names its folder itself (in:…)").clicked() {
                             scope = choice;
                         }
                     }
                     let look = egui::containers::menu::MenuConfig::new().style(views::menu_look);
-                    egui::containers::menu::MenuButton::new("Other folder…").config(look).ui(ui, |ui| {
+                    egui::containers::menu::MenuButton::new((Icon::Folder.image(icons::SIZE, t.text_dim), "Other folder…")).config(look.clone()).ui(ui, |ui| {
                         // What is typed stays while the menu is reopened, until a folder is picked.
                         let id = ui.id().with("search");
                         let mut filter: String = ui.data_mut(|d| d.get_temp(id)).unwrap_or_default();
@@ -9889,6 +10032,36 @@ impl BeaverApp {
                         }
                         ui.data_mut(|d| d.insert_temp(id, filter));
                     }).0.on_hover_text("Search one folder of your choice; writes in:… in the box");
+                    ui.add_space(12.0);
+                    {
+                        let query = self.query_to_save();
+                        let searches = &self.settings.saved_searches;
+                        // The one opened from the sidebar, now changed: kept as it was, updated, or saved apart.
+                        let opened = searches.iter().position(|s| s.query == query).map(|_| None).unwrap_or_else(|| searches.iter().position(|s| Some(s.name.as_str()) == self.search_opened.as_deref()));
+                        let saved = searches.iter().any(|s| s.query == query);
+                        match opened.filter(|_| !saved) {
+                            Some(i) => {
+                                let name = searches[i].name.clone();
+                                egui::containers::menu::MenuButton::new((Icon::BookmarkPlus.image(icons::SIZE, t.text_dim), "Save…")).config(look).ui(ui, |ui| {
+                                    if ui.button(format!("Update \"{name}\"")).clicked() {
+                                        self.settings.saved_searches[i].query = query.clone();
+                                        self.save_settings();
+                                        ui.close();
+                                    }
+                                    if ui.button("Save as new…").clicked() {
+                                        self.naming_search = Some(NamingSearch { index: None, name: String::new(), query: query.clone() });
+                                        ui.close();
+                                    }
+                                });
+                            }
+                            None if saved => {}
+                            None => {
+                                if ui.add(egui::Button::image_and_text(Icon::BookmarkPlus.image(icons::SIZE, t.text_dim), "Save search…")).on_hover_text("Keep this search in the sidebar, under Saved searches").clicked() {
+                                    self.naming_search = Some(NamingSearch { index: None, name: String::new(), query });
+                                }
+                            }
+                        }
+                    }
                 });
                 if let Some(folder) = other {
                     self.query = in_folder(&self.query, &folder);
@@ -10706,7 +10879,7 @@ impl eframe::App for BeaverApp {
                 _ => {}
             }
         }
-        let SidebarOutcome { chosen, suspicious, recheck, empty, recheck_all, empty_all, removed, edit, mut add, all, local, all_suspicious, all_role, dropped, new_inside, rename, delete, label } =
+        let SidebarOutcome { chosen, suspicious, recheck, empty, recheck_all, empty_all, removed, edit, mut add, all, local, all_suspicious, all_role, dropped, new_inside, rename, delete, label, saved } =
             if self.in_tab || contacts { SidebarOutcome::default() } else { self.sidebar(ui, &t) };
         slow.mark("sidebar");
         if let Some((serial, index)) = new_inside {
@@ -10751,6 +10924,20 @@ impl eframe::App for BeaverApp {
         if let Some(query) = label {
             self.query = query;
             self.search_scope = Scope::Everywhere;
+        }
+        match saved {
+            Some(SavedAction::Open(i)) => self.open_saved_search(i),
+            Some(SavedAction::Rename(i)) => {
+                if let Some(search) = self.settings.saved_searches.get(i) {
+                    self.naming_search = Some(NamingSearch { index: Some(i), name: search.name.clone(), query: search.query.clone() });
+                }
+            }
+            Some(SavedAction::Delete(i)) if i < self.settings.saved_searches.len() => {
+                let gone = self.settings.saved_searches.remove(i);
+                self.save_settings();
+                self.notice = Some((format!("Saved search \"{}\" deleted", gone.name), std::time::Instant::now()));
+            }
+            _ => {}
         }
         if let Some(local) = local {
             self.show_local(local);
@@ -10908,6 +11095,7 @@ impl eframe::App for BeaverApp {
         self.card_delete_dialog(ui.ctx(), &t);
         self.new_contact_dialog(ui.ctx(), &t);
         self.new_folder_dialog(ui.ctx(), &t);
+        self.saved_search_dialog(ui.ctx(), &t);
         self.folder_delete_dialog(ui.ctx(), &t);
         self.book_remove_dialog(ui.ctx(), &t);
         self.calendar_remove_dialog(ui.ctx(), &t);
@@ -11477,6 +11665,8 @@ mod tests {
         assert_eq!(in_folder("budget in:inbox from:ada", "INBOX/Testing"), "budget from:ada in:INBOX/Testing ");
         assert_eq!(in_folder("in:\"Old stuff\" budget", "sent"), "budget in:sent ");
         assert_eq!(in_folder("", "Old stuff"), "in:\"Old stuff\" ");
+        assert_eq!((in_word(Role::Sent, "Posta inviata").as_deref(), in_word(Role::Junk, "Bulk").as_deref()), (Some("sent"), Some("spam")), "a standard folder by what it is");
+        assert_eq!(in_word(Role::Other, "Work/Clients").as_deref(), Some("Work/Clients"));
     }
 
     #[test]

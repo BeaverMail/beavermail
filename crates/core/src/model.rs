@@ -669,6 +669,9 @@ pub struct Settings {
     /// own, in the order shown. The server keeps only their keywords.
     #[serde(default)]
     pub labels: Vec<Label>,
+    /// Searches kept by name in the sidebar, in the order shown.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub saved_searches: Vec<SavedSearch>,
     /// The language model that drafts replies and summarises conversations; off when it has no provider.
     #[serde(default)]
     pub assistant: Assistant,
@@ -718,6 +721,14 @@ impl LlmProvider {
             Self::Local => "local",
         }
     }
+}
+
+/// A search kept by name: opening it runs the query again, so it shows the mail of now.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedSearch {
+    pub name: String,
+    /// As typed in the search box, operators included ("from:ada in:inbox is:unread").
+    pub query: String,
 }
 
 /// A label as this computer shows it.
@@ -786,7 +797,7 @@ fn undo_secs() -> u32 {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { display: DisplayMode::default(), sender_display: Default::default(), rich_outgoing: true, undo_send_secs: undo_secs(), remote_senders: Default::default(), hold_suspicious: true, marked: Default::default(), threads: true, reading_pane: true, reader_below: false, list_layout: ListLayout::default(), columns: Columns::default(), sorts: Default::default(), folded: Default::default(), density: Density::default(), diagnostics: false, link_params: String::new(), address_books: Vec::new(), calendars: Vec::new(), spelling: true, spelling_language: String::new(), spelling_words: Default::default(), spelling_before_send: false, data_folder: String::new(), moving_to: String::new(), filters: Vec::new(), filtered_upto: Default::default(), labels: Vec::new(), assistant: Assistant::default() }
+        Self { display: DisplayMode::default(), sender_display: Default::default(), rich_outgoing: true, undo_send_secs: undo_secs(), remote_senders: Default::default(), hold_suspicious: true, marked: Default::default(), threads: true, reading_pane: true, reader_below: false, list_layout: ListLayout::default(), columns: Columns::default(), sorts: Default::default(), folded: Default::default(), density: Density::default(), diagnostics: false, link_params: String::new(), address_books: Vec::new(), calendars: Vec::new(), spelling: true, spelling_language: String::new(), spelling_words: Default::default(), spelling_before_send: false, data_folder: String::new(), moving_to: String::new(), filters: Vec::new(), filtered_upto: Default::default(), labels: Vec::new(), saved_searches: Vec::new(), assistant: Assistant::default() }
     }
 }
 
