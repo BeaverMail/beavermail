@@ -2,6 +2,19 @@
 
 What changed in each version of BeaverMail, newest first.
 
+## 0.4.1 – 2026-11-26
+
+### Added
+
+- Attachments, a section of its own on the rail: every file of the downloaded mail outside Trash and Spam, by kind and account, found by name, sender or subject, as a list or a grid of pictures, with a preview, Open, Save as and Go to message. Encrypted mail is read with your keys once downloaded, so its text is searchable and its files listed; one no key opens waits for the next key imported.
+- Other addresses for an account (aliases), each with its own name and signature, in Settings › account › Other addresses. They are offered in From, which now shows every address with the name recipients will see, and an answer to mail written to an alias goes from it.
+- Ctrl+, (Cmd+, on macOS) opens Settings.
+
+### Changed
+
+- A new OpenPGP key or S/MIME certificate no longer replaces the one before, which stays to open the mail encrypted to it; an older one imported (a backup of a replaced key) is added as an earlier key.
+- Settings opens on Accounts, the first page in its list, and then on the last page shown.
+
 ## 0.4.0 – 2026-11-25
 
 ### Added
