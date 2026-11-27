@@ -34,6 +34,8 @@ struct Mock {
     message: Arc<Mutex<String>>,
     /// The folders the server answers LIST with.
     list: Arc<Mutex<String>>,
+    /// Folders of `list` left out of LSUB, as not subscribed to.
+    unsubscribed: Arc<Mutex<Vec<String>>>,
     /// A command the server answers with BYE before closing the connection, as when shutting down.
     bye: Arc<Mutex<Option<&'static str>>>,
     /// The server describes its message's structure in a way that breaks the protocol.
@@ -82,18 +84,19 @@ async fn start_opts(move_works: bool, attachment: bool, idle: bool) -> Mock {
     let log = Arc::new(Mutex::new(Vec::new()));
     let message = Arc::new(Mutex::new(MESSAGE.to_owned()));
     let list = Arc::new(Mutex::new(LIST.to_owned()));
+    let unsubscribed = Arc::new(Mutex::new(Vec::new()));
     let (bye, broken, tls_only, modseq, qresync, full) = (Arc::new(Mutex::new(None)), Arc::new(Mutex::new(false)), Arc::new(Mutex::new(false)), Arc::new(Mutex::new(None)), Arc::new(Mutex::new(None)), Arc::new(Mutex::new(false)));
-    let (served, replies) = (log.clone(), Replies { message: message.clone(), list: list.clone(), bye: bye.clone(), broken: broken.clone(), tls_only: tls_only.clone(), modseq: modseq.clone(), qresync: qresync.clone(), full: full.clone() });
+    let (served, replies) = (log.clone(), Replies { message: message.clone(), list: list.clone(), unsubscribed: unsubscribed.clone(), bye: bye.clone(), broken: broken.clone(), tls_only: tls_only.clone(), modseq: modseq.clone(), qresync: qresync.clone(), full: full.clone() });
     tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
             tokio::spawn(serve(socket, served.clone(), move_works, attachment, idle, replies.clone()));
         }
     });
     let server = Server { host: "127.0.0.1".into(), port, tls: Tls::None };
-    let account = Account { name: "mock".into(), user: "u".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true, keep: beavermail_core::Keep::default(), signature: String::new(), smtp_user: None, archive: String::new(), archive_by_year: false, quota_warning: 90, aliases: Vec::new() };
+    let account = Account { name: "mock".into(), user: "u".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true, keep: beavermail_core::Keep::default(), signature: String::new(), smtp_user: None, archive: String::new(), archive_by_year: false, quota_warning: 90, aliases: Vec::new(), hidden_folders: Vec::new() };
     let store = Arc::new(Store::in_memory().unwrap());
     let files = Arc::new(Vault::in_memory());
-    Mock { source: ImapSource::new(&account, "p".into(), store.clone(), files.clone()), account, store, files, log, message, list, bye, broken, tls_only, modseq, qresync, full }
+    Mock { source: ImapSource::new(&account, "p".into(), store.clone(), files.clone()), account, store, files, log, message, list, unsubscribed, bye, broken, tls_only, modseq, qresync, full }
 }
 
 /// What a test can change in the server's answers while it runs; see [`Mock`].
@@ -101,6 +104,7 @@ async fn start_opts(move_works: bool, attachment: bool, idle: bool) -> Mock {
 struct Replies {
     message: Arc<Mutex<String>>,
     list: Arc<Mutex<String>>,
+    unsubscribed: Arc<Mutex<Vec<String>>>,
     bye: Arc<Mutex<Option<&'static str>>>,
     broken: Arc<Mutex<bool>>,
     tls_only: Arc<Mutex<bool>>,
@@ -110,7 +114,7 @@ struct Replies {
 }
 
 async fn serve(socket: TcpStream, log: Arc<Mutex<Vec<String>>>, move_works: bool, attachment: bool, idle: bool, replies: Replies) {
-    let Replies { message, list, bye, broken, tls_only, modseq, qresync, full } = replies;
+    let Replies { message, list, unsubscribed, bye, broken, tls_only, modseq, qresync, full } = replies;
     let (read, mut write) = socket.into_split();
     let mut read = BufReader::new(read);
     let _ = write.write_all(b"* OK ready\r\n").await;
@@ -158,6 +162,17 @@ async fn serve(socket: TcpStream, log: Arc<Mutex<Vec<String>>>, move_works: bool
             format!("{tag} NO [OVERQUOTA] Quota exceeded\r\n")
         } else if verb.starts_with("NOOP") {
             format!("{tag} OK done\r\n")
+        } else if let Some(name) = verb.strip_prefix("UNSUBSCRIBE ") {
+            unsubscribed.lock().unwrap().push(command[command.len() - name.len()..].trim_matches('"').to_owned());
+            format!("{tag} OK done\r\n")
+        } else if let Some(name) = verb.strip_prefix("SUBSCRIBE ") {
+            let name = command[command.len() - name.len()..].trim_matches('"').to_owned();
+            unsubscribed.lock().unwrap().retain(|n| *n != name);
+            format!("{tag} OK done\r\n")
+        } else if verb.starts_with("LSUB") {
+            let off = unsubscribed.lock().unwrap();
+            let lines: String = list.lock().unwrap().lines().filter(|l| !off.iter().any(|f| l.ends_with(&format!("\"{f}\"")))).map(|l| format!("{}\r\n", l.replacen("* LIST", "* LSUB", 1))).collect();
+            format!("{lines}{tag} OK done\r\n")
         } else if verb.starts_with("LIST") {
             format!("{}{tag} OK done\r\n", list.lock().unwrap())
         } else if verb.starts_with("STATUS") {
@@ -930,4 +945,42 @@ async fn a_folder_the_server_lacks_is_made_before_mail_goes_in() {
     mock.source.save_sent(b"Subject: Again\r\n\r\nHello".to_vec()).await.expect("made again and kept");
     let appends = mock.commands().iter().filter(|c| c.starts_with("APPEND \"Sent\"")).count();
     assert_eq!(appends, 3, "the second copy was refused once, then taken");
+}
+
+#[tokio::test]
+async fn a_hidden_folder_and_its_subfolders_leave_this_computer() {
+    let mock = start(true).await;
+    mock.list.lock().unwrap().push_str("* LIST (\\HasChildren) \"/\" \"Work\"\r\n* LIST (\\HasNoChildren) \"/\" \"Work/Clients\"\r\n");
+    message_in(&mock, "Work").await;
+    let files = beavermail_vault::folder_path(&mock.account.key(), "Work");
+    mock.files.write(&files.join("1-5.eml"), b"kept here").unwrap(); // as a message opened once
+    assert!(!mock.files.list(&files).unwrap_or_default().is_empty());
+    mock.source.set_subscriptions(&["Work".to_owned(), "Sent".to_owned()]).await.unwrap();
+    let names: Vec<String> = mock.source.mailboxes().await.unwrap().into_iter().map(|m| m.name).collect();
+    assert!(!names.iter().any(|n| n.starts_with("Work")), "{names:?}");
+    assert!(names.contains(&"Sent".to_owned()), "a folder the app needs stays");
+    assert!(mock.source.messages("Work").await.unwrap().is_empty());
+    assert!(mock.files.list(&files).unwrap_or_default().is_empty(), "nor its files");
+    assert!(mock.source.server_folders().iter().any(|(n, ..)| n == "Work/Clients"), "still offered in the account's settings");
+    mock.source.set_subscriptions(&[]).await.unwrap();
+    assert!(mock.source.mailboxes().await.unwrap().iter().any(|m| m.name == "Work"), "shown again");
+}
+
+#[tokio::test]
+async fn the_folders_shown_follow_the_servers_subscriptions() {
+    let mock = start(true).await;
+    mock.list.lock().unwrap().push_str("* LIST (\\HasNoChildren) \"/\" \"Work\"\r\n* LIST (\\HasNoChildren) \"/\" \"Notes\"\r\n");
+    mock.unsubscribed.lock().unwrap().push("Work".into());
+    let names: Vec<String> = mock.source.mailboxes().await.unwrap().into_iter().map(|m| m.name).collect();
+    assert!(!names.contains(&"Work".to_owned()) && names.contains(&"Notes".to_owned()), "{names:?}");
+    assert_eq!(mock.source.hidden(), ["Work"], "kept, for the app to save");
+    // Chosen here: written to the server, which then says the same at every listing.
+    mock.source.set_subscriptions(&["Notes".to_owned(), "Sent".to_owned()]).await.unwrap();
+    assert!(mock.commands().iter().any(|c| c == "UNSUBSCRIBE \"Notes\""));
+    assert!(mock.commands().iter().any(|c| c == "SUBSCRIBE \"Work\"") && mock.commands().iter().any(|c| c == "SUBSCRIBE \"Sent\""), "a folder with a role stays");
+    let names: Vec<String> = mock.source.mailboxes().await.unwrap().into_iter().map(|m| m.name).collect();
+    assert!(names.contains(&"Work".to_owned()) && !names.contains(&"Notes".to_owned()), "{names:?}");
+    // Changed by another client: followed.
+    mock.unsubscribed.lock().unwrap().clear();
+    assert!(mock.source.mailboxes().await.unwrap().iter().any(|m| m.name == "Notes"));
 }

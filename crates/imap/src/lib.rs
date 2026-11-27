@@ -46,6 +46,8 @@ struct State {
     qresync: bool,
     /// The server answers GETQUOTAROOT (RFC 9208).
     quota: bool,
+    /// The server answers LIST (SUBSCRIBED) (RFC 5258, and IMAP4rev2, where LSUB is deprecated).
+    list_subscribed: bool,
 }
 
 /// What a write does to one message.
@@ -91,6 +93,12 @@ pub struct ImapSource {
     /// Where Archive moves messages: the account's choice of folder (empty for the server's archive)
     /// and whether into a folder for each year. Changed with the account's settings, see [`Self::set_archive`].
     archive: std::sync::Mutex<(String, bool)>,
+    /// [`Account::hidden_folders`], changed with the account's settings, see [`Self::set_hidden`].
+    hidden: std::sync::Mutex<Vec<String>>,
+    /// Every folder the server listed last, hidden ones included, as (name, role, separator).
+    listed: std::sync::Mutex<Vec<(String, Role, Option<char>)>>,
+    /// The server listed no subscribed folder last time: it keeps none, or none were ever made.
+    no_subscriptions: std::sync::atomic::AtomicBool,
     /// What [`Self::auth_server`] found, and whether it was learned (then it is final) and when not.
     auth_server: std::sync::Mutex<Option<(String, Option<std::time::Instant>)>>,
     /// Messages as (folder, uid) whose flags were changed here and are on their way to the server: a
@@ -194,7 +202,7 @@ impl ImapSource {
     /// Creates the source over the shared archive; the connection is opened on first use.
     pub fn new(account: &Account, password: String, store: Arc<Store>, files: Arc<Vault>) -> Self {
         let config = Config { server: account.imap.clone(), user: account.user.clone(), password, offline: Default::default(), uidplus: Default::default(), local: false };
-        Self { config, poll_interval: std::time::Duration::from_secs(180), account: account.key(), address: account.address().to_lowercase(), store, files, state: Mutex::new(State::default()), reader: Mutex::new(State::default()), plain: Default::default(), archive: std::sync::Mutex::new((account.archive.clone(), account.archive_by_year)), auth_server: std::sync::Mutex::new(None), writing: Default::default() }
+        Self { config, poll_interval: std::time::Duration::from_secs(180), account: account.key(), address: account.address().to_lowercase(), store, files, state: Mutex::new(State::default()), reader: Mutex::new(State::default()), plain: Default::default(), archive: std::sync::Mutex::new((account.archive.clone(), account.archive_by_year)), hidden: std::sync::Mutex::new(account.hidden_folders.clone()), listed: Default::default(), no_subscriptions: Default::default(), auth_server: std::sync::Mutex::new(None), writing: Default::default() }
     }
 
     /// The folders on this computer ([`Account::local`]): a source without a server, over the same archive, whose messages
@@ -423,6 +431,27 @@ impl ImapSource {
     }
 }
 
+/// Whether folder `name` is one of `hidden` or inside one, by the server's `separator`.
+pub fn hidden_by(name: &str, separator: Option<char>, hidden: &[String]) -> bool {
+    hidden.iter().any(|h| name == h || separator.is_some_and(|d| name.strip_prefix(h.as_str()).is_some_and(|rest| rest.starts_with(d))))
+}
+
+/// The folders to hide when an account is first listed: those without a role the user is not
+/// subscribed to on the server, unless one inside them is (it needs its parent shown), and only the
+/// outermost of them. No subscriptions at all (a server that keeps none) hides nothing.
+fn unsubscribed(folders: &[(String, Role)], delimiters: &std::collections::HashMap<String, Option<char>>, subscribed: &[String]) -> Vec<String> {
+    if subscribed.is_empty() {
+        return Vec::new();
+    }
+    let separator = |name: &str| delimiters.get(name).copied().flatten();
+    let off: Vec<String> = folders
+        .iter()
+        .filter(|(name, role)| *role == Role::Other && !subscribed.contains(name) && !subscribed.iter().any(|s| hidden_by(s, separator(s), std::slice::from_ref(name))))
+        .map(|(name, _)| name.clone())
+        .collect();
+    off.iter().filter(|name| !hidden_by(name, separator(name), &off.iter().filter(|o| o != name).cloned().collect::<Vec<_>>())).cloned().collect()
+}
+
 /// Why the Inbox and the folders with a role keep their names: the app finds some of them by name.
 const KEEPS_NAME: &str = "the Inbox and the folders for sent mail, drafts, the archive, spam and the trash keep their names";
 
@@ -466,6 +495,7 @@ async fn append_creating(session: &mut Session<Stream>, folder: &str, flags: &st
     match session.append(folder, Some(flags), None, raw).await {
         Err(e) if try_create(&e) => {
             let _ = session.create(folder).await; // one made meanwhile is as good
+            let _ = session.subscribe(folder).await; // shown, as the folders listed are the subscribed ones
             session.append(folder, Some(flags), None, raw).await
         }
         done => done,
@@ -672,6 +702,7 @@ impl State {
                 let _ = session.run_command_and_check_ok("ENABLE CONDSTORE").await;
             }
             self.quota = has("QUOTA");
+            self.list_subscribed = has("LIST-EXTENDED") || has("IMAP4rev2");
             config.uidplus.store(has("UIDPLUS"), std::sync::atomic::Ordering::Relaxed);
             self.session = Some(session);
         }
@@ -901,6 +932,48 @@ impl ImapSource {
         *self.archive.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = (folder.to_owned(), by_year);
     }
 
+    /// The folders not to show nor sync; they go at the next listing of the folders.
+    pub fn set_hidden(&self, folders: &[String]) {
+        *self.hidden.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = folders.to_vec();
+    }
+
+    /// The folders hidden, as the server's subscriptions said last.
+    pub fn hidden(&self) -> Vec<String> {
+        self.hidden.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    /// The server listed no subscribed folder last time: saving a choice subscribes every folder shown.
+    pub fn no_subscriptions(&self) -> bool {
+        self.no_subscriptions.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Subscribes on the server to every folder listed but `hidden` and those inside them, and
+    /// unsubscribes from those; the whole state, so a server that kept none follows it too. A folder
+    /// with a role stays subscribed. Then the folders are shown as chosen.
+    pub async fn set_subscriptions(&self, hidden: &[String]) -> Result<(), MailError> {
+        if !self.config.local {
+            let listed = self.server_folders();
+            let mut state = self.state.lock().await;
+            for (name, role, separator) in &listed {
+                let session = state.session(&self.config).await?;
+                let done = if *role == Role::Other && hidden_by(name, *separator, hidden) { session.unsubscribe(name).await } else { session.subscribe(name).await };
+                match done {
+                    // Already so, or a folder gone meanwhile: the next listing tells.
+                    Ok(()) | Err(async_imap::error::Error::No(_)) => {}
+                    Err(e) => return Err(state.failed(e)),
+                }
+            }
+        }
+        self.set_hidden(hidden);
+        Ok(())
+    }
+
+    /// Every folder the server listed last, hidden ones included: (name, role, separator). Empty
+    /// until the folders have been asked once.
+    pub fn server_folders(&self) -> Vec<(String, Role, Option<char>)> {
+        self.listed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
     /// Where Archive moves message `id`: the folder chosen for the account, or the server's archive;
     /// by year, the folder of its year inside that one, made the first time it is needed.
     async fn archive_folder(&self, id: MessageId) -> Result<String, MailError> {
@@ -1053,6 +1126,7 @@ impl ImapSource {
                     let mut moved = session.uid_mv(&uid, &dest).await;
                     if moved.as_ref().is_err_and(try_create) {
                         let _ = session.create(&dest).await;
+                        let _ = session.subscribe(&dest).await;
                         moved = session.uid_mv(&uid, &dest).await;
                     }
                     if moved.is_err() {
@@ -1062,6 +1136,7 @@ impl ImapSource {
                                 return Err(e);
                             }
                             let _ = session.create(&dest).await;
+                            let _ = session.subscribe(&dest).await;
                             session.uid_copy(&uid, &dest).await?;
                         }
                         session.uid_store(&uid, "+FLAGS.SILENT (\\Deleted)").await?.try_collect::<Vec<_>>().await?;
@@ -1812,6 +1887,23 @@ impl MailSource for ImapSource {
             }
             folders.sort_by_key(|(n, _)| (n != "INBOX", n.clone()));
             resolve_roles(&mut folders);
+            // The server's subscriptions say which folders are shown; one refusing to tell keeps the
+            // choice known here.
+            let command = if state.list_subscribed { "LIST (SUBSCRIBED) \"\" *" } else { "LSUB \"\" *" };
+            let session = state.session(&self.config).await?;
+            if let Ok(subscribed) = answered(session, command, |r| match r {
+                Response::MailboxData(MailboxDatum::List(list)) => Some(list.name.to_string()),
+                _ => None,
+            })
+            .await
+            {
+                self.no_subscriptions.store(subscribed.is_empty(), std::sync::atomic::Ordering::Relaxed);
+                *self.hidden.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = unsubscribed(&folders, &delimiters, &subscribed);
+            }
+            *self.listed.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = folders.iter().map(|(n, r)| (n.clone(), *r, delimiters.get(n).copied().flatten())).collect();
+            // A folder the app needs (Inbox, Sent…) is never hidden.
+            let hidden = self.hidden.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+            folders.retain(|(name, role)| *role != Role::Other || !hidden_by(name, delimiters.get(name).copied().flatten(), &hidden));
             let mut mailboxes = Vec::with_capacity(folders.len());
             for (name, role) in &folders {
                 let status = session.status(name, "(UNSEEN MESSAGES)").await.map_err(imap_error)?;
@@ -1823,6 +1915,10 @@ impl MailSource for ImapSource {
         .await;
         match result {
             Ok((folders, mut mailboxes)) => {
+                // A folder no longer listed (hidden here, or gone from the server) leaves no files behind.
+                for gone in self.store.folders(&self.account)?.into_iter().filter(|row| !folders.iter().any(|(n, _)| *n == row.name)) {
+                    let _ = self.files.remove_dir(&folder_path(&self.account, &gone.name));
+                }
                 self.store.set_folders(&self.account, &folders)?;
                 for m in &mut mailboxes {
                     self.store.set_total(&self.account, &m.name, m.total)?;
@@ -2545,6 +2641,24 @@ mod tests {
         assert_eq!(checks, [("dkim", "pass", "bank.com"), ("spf", "fail", "attacker.io"), ("dmarc", "pass", "bank.com")]);
         assert_eq!(body.auth[1].server, "mx.attacker.io");
         assert!(!parse_body(b"From: a@b.org\r\nX-Spam-Status: No, score=0\r\n\r\nhi").unwrap().spam);
+    }
+
+    #[test]
+    fn a_hidden_folder_takes_its_subfolders_but_not_lookalikes() {
+        let hidden = ["Work".to_owned(), "Old.2019".to_owned()];
+        assert!(hidden_by("Work", Some('/'), &hidden) && hidden_by("Work/Clients", Some('/'), &hidden));
+        assert!(!hidden_by("Workshop", Some('/'), &hidden), "only inside it, by the separator");
+        assert!(!hidden_by("Work.Clients", Some('/'), &hidden), "a dot is part of a name where the separator is /");
+        assert!(hidden_by("Old.2019.March", Some('.'), &hidden) && !hidden_by("Old.2020", Some('.'), &hidden));
+    }
+
+    #[test]
+    fn folders_unsubscribed_elsewhere_start_hidden() {
+        let folders: Vec<(String, Role)> = [("INBOX", Role::Inbox), ("Sent", Role::Sent), ("Work", Role::Other), ("Work/Old", Role::Other), ("Lists", Role::Other), ("Lists/Rust", Role::Other), ("Notes", Role::Other)].map(|(n, r)| (n.to_owned(), r)).into();
+        let delimiters = folders.iter().map(|(n, _)| (n.clone(), Some('/'))).collect();
+        let subscribed = ["INBOX", "Lists/Rust", "Notes"].map(str::to_owned);
+        assert_eq!(unsubscribed(&folders, &delimiters, &subscribed), ["Work"], "Sent has a role, Lists holds a subscribed one, Work/Old goes with Work");
+        assert!(unsubscribed(&folders, &delimiters, &[]).is_empty(), "no subscriptions kept: all shown");
     }
 
     #[test]
