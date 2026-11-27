@@ -685,9 +685,25 @@ pub struct Settings {
     /// Searches kept by name in the sidebar, in the order shown.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub saved_searches: Vec<SavedSearch>,
+    /// The tabs open when the app was last closed, in order, opened again at the next start.
+    #[serde(default)]
+    pub open_tabs: Vec<OpenTab>,
+    /// Which of `open_tabs` was shown; none for the mail.
+    #[serde(default)]
+    pub shown_tab: Option<usize>,
     /// The language model that drafts replies and summarises conversations; off when it has no provider.
     #[serde(default)]
     pub assistant: Assistant,
+}
+
+/// A tab kept from one run to the next.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenTab {
+    /// A part of the app, by its name ("calendar").
+    Section(String),
+    /// A message of the archive, or its source.
+    Message { id: u64, source: bool },
 }
 
 /// Where the assistant's requests go; the key is in the credential store, never here.
@@ -810,7 +826,7 @@ fn undo_secs() -> u32 {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { display: DisplayMode::default(), sender_display: Default::default(), rich_outgoing: true, undo_send_secs: undo_secs(), remote_senders: Default::default(), hold_suspicious: true, marked: Default::default(), threads: true, reading_pane: true, reader_below: false, list_layout: ListLayout::default(), columns: Columns::default(), sorts: Default::default(), folded: Default::default(), density: Density::default(), diagnostics: false, link_params: String::new(), address_books: Vec::new(), calendars: Vec::new(), spelling: true, spelling_language: String::new(), spelling_words: Default::default(), spelling_before_send: false, data_folder: String::new(), moving_to: String::new(), filters: Vec::new(), filtered_upto: Default::default(), labels: Vec::new(), saved_searches: Vec::new(), assistant: Assistant::default() }
+        Self { display: DisplayMode::default(), sender_display: Default::default(), rich_outgoing: true, undo_send_secs: undo_secs(), remote_senders: Default::default(), hold_suspicious: true, marked: Default::default(), threads: true, reading_pane: true, reader_below: false, list_layout: ListLayout::default(), columns: Columns::default(), sorts: Default::default(), folded: Default::default(), density: Density::default(), diagnostics: false, link_params: String::new(), address_books: Vec::new(), calendars: Vec::new(), spelling: true, spelling_language: String::new(), spelling_words: Default::default(), spelling_before_send: false, data_folder: String::new(), moving_to: String::new(), filters: Vec::new(), filtered_upto: Default::default(), labels: Vec::new(), saved_searches: Vec::new(), open_tabs: Vec::new(), shown_tab: None, assistant: Assistant::default() }
     }
 }
 

@@ -55,6 +55,8 @@ pub fn slot(tabs: &[Tab], id: MessageId, pin: bool) -> Slot {
 pub enum TabEvent {
     Activate(usize),
     Close(usize),
+    /// Dragged from one place to another.
+    Move(usize, usize),
 }
 
 /// A tab as the bar shows it.
@@ -74,8 +76,14 @@ pub fn tab_bar(ui: &mut Ui, t: &Tokens, entries: &[Entry], current: usize) -> Op
     egui::ScrollArea::horizontal().id_salt("tabs").auto_shrink([false, true]).show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
+            let mut rects = Vec::with_capacity(entries.len());
+            let mut dragged = None;
             for (i, entry) in entries.iter().enumerate() {
                 let (close, response) = tab(ui, t, entry.icon, &entry.title, current == i, entry.closable);
+                rects.push(response.rect);
+                if response.dragged() || response.drag_stopped() {
+                    dragged = Some((i, response.drag_stopped()));
+                }
                 let response = response.on_hover_text(&entry.hover);
                 if close.is_some_and(|c| c.on_hover_text("Close (Ctrl+W)").clicked()) || (entry.closable && response.middle_clicked()) {
                     event = Some(TabEvent::Close(i));
@@ -83,9 +91,30 @@ pub fn tab_bar(ui: &mut Ui, t: &Tokens, entries: &[Entry], current: usize) -> Op
                     event = Some(TabEvent::Activate(i));
                 }
             }
+            // A tab dragged along the bar goes where it is dropped, never before the mail's.
+            if let (Some((from, dropped)), Some(x)) = (dragged, ui.ctx().pointer_interact_pos().map(|p| p.x)) {
+                let to = drop_place(&rects, from, x);
+                if dropped {
+                    if to != from {
+                        event = Some(TabEvent::Move(from, to));
+                    }
+                } else {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                    if to != from {
+                        let edge = if to < from { rects[to].left() - 2.0 } else { rects[to].right() + 2.0 };
+                        ui.painter().line_segment([pos2(edge, rects[to].top() + 4.0), pos2(edge, rects[to].bottom() - 4.0)], egui::Stroke::new(2.0, t.accent));
+                    }
+                }
+            }
         });
     });
     event
+}
+
+/// Where tab `from`, dragged to `x`, goes: the place of the tab under the pointer, never the first.
+fn drop_place(rects: &[Rect], from: usize, x: f32) -> usize {
+    let under = rects.iter().position(|r| x < r.right()).unwrap_or(rects.len().saturating_sub(1));
+    if from == 0 { 0 } else { under.max(1) }
 }
 
 /// One tab: its close button, if `closable`, and the tab itself.
@@ -97,7 +126,9 @@ fn tab(ui: &mut Ui, t: &Tokens, icon: Option<Icon>, title: &str, current: bool, 
     let mut job = egui::text::LayoutJob::simple_singleline(title.to_owned(), font, color);
     job.wrap = egui::text::TextWrapping::truncate_at_width(TAB_MAX_W - lead - trail);
     let galley = ui.painter().layout_job(job);
-    let (rect, response) = ui.allocate_exact_size(vec2(galley.size().x + lead + trail, TAB_H), Sense::click());
+    // Every tab but the mail's can be dragged along the bar.
+    let sense = if closable { Sense::click_and_drag() } else { Sense::click() };
+    let (rect, response) = ui.allocate_exact_size(vec2(galley.size().x + lead + trail, TAB_H), sense);
     let fill = if current {
         Some(t.surface)
     } else if response.hovered() {
@@ -166,6 +197,15 @@ mod tests {
         assert_eq!(slot(&tabs, MessageId(2), true), Slot::Push, "the reading pane's message gets a tab too");
         assert_eq!(slot(&tabs, MessageId(1), false), Slot::Replace(1), "and a tab's message can be shown in the pane");
         assert_eq!(slot(&[tab(1, true)], MessageId(2), false), Slot::Push, "nothing in the pane yet");
+    }
+
+    #[test]
+    fn a_tab_dropped_takes_the_place_under_the_pointer_after_the_mail() {
+        let rects: Vec<Rect> = (0..4).map(|i| Rect::from_min_size(pos2(i as f32 * 100.0, 0.0), vec2(96.0, 34.0))).collect();
+        assert_eq!(drop_place(&rects, 3, 150.0), 1);
+        assert_eq!(drop_place(&rects, 3, 20.0), 1, "never before the mail's tab");
+        assert_eq!(drop_place(&rects, 1, 350.0), 3);
+        assert_eq!(drop_place(&rects, 1, 900.0), 3, "past the last: the end");
     }
 
     #[test]

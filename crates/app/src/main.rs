@@ -979,6 +979,33 @@ impl Section {
             Self::Contacts => (Icon::Users, "Contacts", Command::Contacts),
         }
     }
+
+    /// Its name in the settings, for the tabs kept from one run to the next.
+    fn key(self) -> &'static str {
+        match self {
+            Self::Mail => "mail",
+            Self::Calendar => "calendar",
+            Self::Tasks => "tasks",
+            Self::Attachments => "attachments",
+            Self::Contacts => "contacts",
+        }
+    }
+
+    fn from_key(key: &str) -> Option<Self> {
+        [Self::Calendar, Self::Tasks, Self::Attachments, Self::Contacts].into_iter().find(|s| s.key() == key)
+    }
+}
+
+/// A message tab of the last run, opened again once its account's folders are read.
+struct Restoring {
+    /// Its place among the tabs.
+    opened: u64,
+    id: MessageId,
+    source: bool,
+    /// It was the tab shown.
+    shown: bool,
+    /// Where it is, once read from the archive: its account's key and folder.
+    found: Option<(String, Hit)>,
 }
 
 /// A tab of the bar across the top: the mail, a part of the app, or a message tab (by its place in
@@ -1751,6 +1778,8 @@ struct BeaverApp {
     section_tabs: Vec<(Section, u64)>,
     /// Counts the tabs opened, to keep them in that order.
     tab_seq: u64,
+    /// Message tabs of the last run still to open again.
+    restoring: Vec<Restoring>,
     /// A message tab fills the window, rather than the mail (folders, list and reading pane).
     in_tab: bool,
     /// Where the checks put each message of the Inbox being shown; empty until they have run.
@@ -1957,6 +1986,7 @@ impl BeaverApp {
             tabs: Vec::new(),
             section_tabs: Vec::new(),
             tab_seq: 0,
+            restoring: Vec::new(),
             in_tab: false,
             screening: std::collections::HashMap::new(),
             show_suspicious: false,
@@ -1989,6 +2019,7 @@ impl BeaverApp {
         app.read_drafts(); // what waited from the last session shows at once
         app.load_offline();
         app.ensure_local_book();
+        app.restore_tabs();
         app.warm_known();
         log::debug!("start: app ready {:.0?} after start", diag::since_start());
         app
@@ -2671,6 +2702,86 @@ impl BeaverApp {
                 if self.current_tab() != tab {
                     self.activate(at);
                 }
+            }
+        }
+    }
+
+    /// Opens again the tabs of the last run: the parts of the app at once, the messages once their
+    /// account's folders are read.
+    fn restore_tabs(&mut self) {
+        let shown = self.settings.shown_tab;
+        for (i, tab) in self.settings.open_tabs.clone().into_iter().enumerate() {
+            let opened = i as u64 + 1;
+            match tab {
+                beavermail_core::OpenTab::Section(key) => {
+                    let Some(section) = Section::from_key(&key) else { continue };
+                    self.section_tabs.push((section, opened));
+                    if shown == Some(i) {
+                        self.section = section;
+                    }
+                }
+                beavermail_core::OpenTab::Message { id, source } => self.restoring.push(Restoring { opened, id: MessageId(id), source, shown: shown == Some(i), found: None }),
+            }
+        }
+        self.tab_seq = self.settings.open_tabs.len() as u64;
+    }
+
+    /// Opens the message tabs of the last run whose account's folders are read; one no longer on this
+    /// computer, or whose account or folder is gone, is left out.
+    fn reopen_tabs(&mut self) {
+        if self.restoring.is_empty() || self.vault.is_locked() {
+            return;
+        }
+        for mut tab in std::mem::take(&mut self.restoring) {
+            if tab.found.is_none() {
+                match self.archive.hit(tab.id) {
+                    Ok(Some(found)) => tab.found = Some(found),
+                    Ok(None) => continue,
+                    Err(e) => {
+                        log::warn!("tab of message {} not opened again: {e}", tab.id.0);
+                        continue;
+                    }
+                }
+            }
+            let Some((key, hit)) = &tab.found else { continue };
+            let Some(view) = self.accounts.iter().chain(self.here.as_ref()).find(|v| v.account.key() == *key) else { continue };
+            if view.mailboxes.is_empty() {
+                self.restoring.push(tab); // its folders are not read yet
+                continue;
+            }
+            let Some(role) = view.mailboxes.iter().find(|m| m.name == hit.folder).map(|m| m.role) else { continue };
+            self.tabs.push(tabs::Tab { serial: view.serial, message: hit.message.clone(), role, pinned: true, source: tab.source, opened: tab.opened });
+            if tab.shown && self.current_tab() == BarTab::Mail {
+                self.activate(self.tabs.len() - 1);
+            }
+        }
+    }
+
+    /// The tabs to open again at the next start, and which of them is shown.
+    fn tabs_to_keep(&self) -> (Vec<beavermail_core::OpenTab>, Option<usize>) {
+        let current = self.current_tab();
+        let mut kept: Vec<(u64, beavermail_core::OpenTab, bool)> = self.section_tabs.iter().map(|(s, at)| (*at, beavermail_core::OpenTab::Section(s.key().to_owned()), current == BarTab::Section(*s))).collect();
+        kept.extend(self.tabs.iter().enumerate().filter(|(_, t)| t.pinned).map(|(i, t)| (t.opened, beavermail_core::OpenTab::Message { id: t.message.id.0, source: t.source }, current == BarTab::Message(i))));
+        kept.extend(self.restoring.iter().map(|t| (t.opened, beavermail_core::OpenTab::Message { id: t.id.0, source: t.source }, t.shown && current == BarTab::Mail)));
+        kept.sort_by_key(|(at, ..)| *at);
+        let shown = kept.iter().position(|(_, _, shown)| *shown);
+        (kept.into_iter().map(|(_, tab, _)| tab).collect(), shown)
+    }
+
+    /// Moves the tab at place `from` of the bar to place `to` (never before the mail's).
+    fn move_tab(&mut self, from: usize, to: usize) {
+        let mut bar = self.bar();
+        if from == 0 || to == 0 || from >= bar.len() || to >= bar.len() {
+            return;
+        }
+        let tab = bar.remove(from);
+        bar.insert(to, tab);
+        for (place, tab) in bar.into_iter().enumerate() {
+            let opened = place as u64;
+            match tab {
+                BarTab::Mail => {}
+                BarTab::Section(section) => self.section_tabs.iter_mut().filter(|(s, _)| *s == section).for_each(|(_, at)| *at = opened),
+                BarTab::Message(at) => self.tabs[at].opened = opened,
             }
         }
     }
@@ -11122,6 +11233,8 @@ impl BeaverApp {
 
 impl eframe::App for BeaverApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        (self.settings.open_tabs, self.settings.shown_tab) = self.tabs_to_keep();
+        self.save_settings();
         // Downloads and reading stop at their next message, so the window closes without waiting for them.
         for view in self.accounts.iter().chain(self.here.as_ref()) {
             view.progress.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -11230,6 +11343,7 @@ impl eframe::App for BeaverApp {
         if self.in_tab && self.open_tab().is_none() {
             self.show_mail(); // its tab went with its folder or account
         }
+        self.reopen_tabs();
         // A part of the app shown has its tab, however it was reached.
         if self.section != Section::Mail && !self.section_tabs.iter().any(|(s, _)| *s == self.section) {
             self.tab_seq += 1;
@@ -11259,14 +11373,15 @@ impl eframe::App for BeaverApp {
             egui::Panel::top("tabs").frame(frame).show(ui, |ui| {
                 event = tabs::tab_bar(ui, &t, &entries, current);
             });
-            match event.map(|e| match e {
-                tabs::TabEvent::Activate(at) => (bar[at], false),
-                tabs::TabEvent::Close(at) => (bar[at], true),
-            }) {
-                Some((tab, false)) => self.go_to(tab),
-                Some((BarTab::Section(section), true)) => self.close_section(section),
-                Some((BarTab::Message(at), true)) => self.close_tab(at),
-                _ => {}
+            match event {
+                Some(tabs::TabEvent::Activate(at)) => self.go_to(bar[at]),
+                Some(tabs::TabEvent::Close(at)) => match bar[at] {
+                    BarTab::Section(section) => self.close_section(section),
+                    BarTab::Message(at) => self.close_tab(at),
+                    BarTab::Mail => {}
+                },
+                Some(tabs::TabEvent::Move(from, to)) => self.move_tab(from, to),
+                None => {}
             }
         }
         // Out of Mail, its folders, list and reader give the window to the section.

@@ -245,6 +245,8 @@ mod tests {
     fn settings_round_trip_and_tolerate_missing_keys() {
         let mut settings = Settings { display: beavermail_core::DisplayMode::Simplified, ..Settings::default() };
         settings.set_sender_mode("a@example.org", beavermail_core::DisplayMode::Plain);
+        settings.open_tabs = vec![beavermail_core::OpenTab::Section("calendar".into()), beavermail_core::OpenTab::Message { id: 7, source: true }];
+        settings.shown_tab = Some(1);
         let text = toml::to_string_pretty(&settings).unwrap();
         assert_eq!(toml::from_str::<Settings>(&text).unwrap(), settings);
         assert_eq!(toml::from_str::<Settings>("").unwrap(), Settings::default());
