@@ -404,7 +404,8 @@ pub fn thread_row(ui: &mut Ui, t: &Tokens, message: &MessageSummary, current: bo
 /// A person in the Contacts list: avatar, name and a dim line under it (an address, where they are).
 /// `photo`: theirs, drawn in the avatar's place.
 pub fn person_row(ui: &mut Ui, t: &Tokens, name: &str, line: &str, photo: Option<&egui::TextureHandle>, selected: bool) -> Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), PERSON_ROW_H), Sense::click());
+    // Dragged onto an address book to move them there.
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), PERSON_ROW_H), Sense::click_and_drag());
     let card = rect.shrink2(vec2(8.0, 2.0));
     row_background(ui, card, &response, selected, t);
     let center = pos2(card.left() + 12.0 + PERSON_AVATAR / 2.0, card.center().y);
@@ -1090,6 +1091,13 @@ pub fn primary_button(ui: &mut Ui, t: &Tokens, label: &str, enabled: bool) -> Re
 /// The filled button with a leading icon, as wide as the available space. Disabled, it keeps the
 /// accent hue but muted, instead of egui's grey fade, and explains itself in `why_disabled`.
 pub fn primary_wide(ui: &mut Ui, t: &Tokens, icon: Icon, label: &str, why_disabled: Option<&str>) -> Response {
+    let width = ui.available_width();
+    primary_icon(ui, t, icon, label, why_disabled, width)
+}
+
+/// The filled button with a leading icon, as wide as its text (or `min_width`); disabled as
+/// [`primary_wide`].
+pub fn primary_icon(ui: &mut Ui, t: &Tokens, icon: Icon, label: &str, why_disabled: Option<&str>, min_width: f32) -> Response {
     let (fill, text) = if why_disabled.is_some() {
         (t.accent.gamma_multiply(0.45), t.on_accent.gamma_multiply(0.75))
     } else {
@@ -1097,7 +1105,7 @@ pub fn primary_wide(ui: &mut Ui, t: &Tokens, icon: Icon, label: &str, why_disabl
     };
     let button = egui::Button::image_and_text(icon.image(icons::SIZE, text), egui::RichText::new(label).color(text).family(theme::bold()))
         .fill(fill)
-        .min_size(vec2(ui.available_width(), CONTROL_H));
+        .min_size(vec2(min_width, CONTROL_H));
     match why_disabled {
         Some(why) => ui.add(button.sense(Sense::hover())).on_hover_text(why),
         None => ui.add(button),

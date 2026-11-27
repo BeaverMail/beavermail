@@ -6950,7 +6950,50 @@ impl BeaverApp {
                 self.contacts_synced = Some(std::time::Instant::now());
                 self.sync_contacts(None);
             }
+            // Out of a read-only address book a contact can only be copied.
+            A::Dropped(card, url) => self.put_card_in(card.id, &url, !card.read_only),
         }
+    }
+
+    /// The address books other than `book` a card of it can go to: those that can be written.
+    fn card_targets(&self, book: &str) -> Vec<(String, String)> {
+        let books = &self.settings.address_books;
+        books.iter().filter(|b| b.url != book && !b.read_only).map(|b| (b.url.clone(), books::label(b, books))).collect()
+    }
+
+    /// Puts card `id` in address book `to`: moved (`out`), the same card under the same UID, gone from
+    /// its own; else a copy under a UID of its own. Both address books are synced, and a card shown
+    /// of it shows it where it went.
+    fn put_card_in(&mut self, id: i64, to: &str, out: bool) {
+        let Some(stored) = self.archive.card(id).ok().flatten() else { return };
+        let uid = match beavermail_carddav::vcard::parse(&stored.vcard).uid {
+            uid if out && !uid.is_empty() => uid,
+            _ => beavermail_carddav::new_uid(),
+        };
+        let text = beavermail_carddav::vcard::with_uid(&stored.vcard, &uid);
+        let href = beavermail_carddav::new_href(to, &uid);
+        let verb = if out { "move" } else { "copy" };
+        if let Err(e) = self.archive.add_card(to, &href, &text, &beavermail_carddav::fields(&text)) {
+            self.error = Some(format!("Could not {verb} the contact: {e}"));
+            return;
+        }
+        if out && let Err(e) = self.archive.delete_card(id) {
+            self.error = Some(format!("The contact was copied but not taken out of {}: {e}", self.settings.address_books.iter().find(|b| b.url == stored.book).map_or("its address book".to_owned(), |b| books::label(b, &self.settings.address_books))));
+        }
+        self.address_book = None;
+        self.sync_book(to);
+        if out {
+            self.sync_book(&stored.book);
+            let moved = self.archive.cards(to).ok().and_then(|cards| cards.into_iter().find(|c| c.href == href)).map(|c| c.id);
+            if self.contact_pane.as_ref().is_some_and(|c| c.book_card == Some(id)) {
+                self.contact_pane = moved.and_then(|m| self.load_book_card(m));
+            }
+            if self.card.as_ref().is_some_and(|c| c.book_card == Some(id)) {
+                self.card = moved.and_then(|m| self.load_book_card(m));
+            }
+        }
+        let name = self.settings.address_books.iter().find(|b| b.url == to).map_or_else(String::new, |b| books::label(b, &self.settings.address_books));
+        self.notice = Some((format!("{} {} to {name}", if stored.name.is_empty() { "Contact" } else { stored.name.as_str() }, if out { "moved" } else { "copied" }), std::time::Instant::now()));
     }
 
     /// No longer syncs the address book at `url`: its cards leave this computer, nothing changes on the server.
@@ -7142,6 +7185,7 @@ impl BeaverApp {
         card.also_in = others.filter_map(|c| books.iter().find(|b| b.url == c.book).map(|b| books::label(b, books))).collect();
         card.also_in.dedup();
         card.can_add = false;
+        card.targets = self.card_targets(&stored.book);
         Some(card)
     }
 
@@ -7208,6 +7252,16 @@ impl BeaverApp {
                 }
             }
             card::CardAction::Remove => {}
+            card::CardAction::MoveTo(url) => {
+                if let Some(id) = book_card {
+                    self.put_card_in(id, &url, true);
+                }
+            }
+            card::CardAction::CopyTo(url) => {
+                if let Some(id) = book_card {
+                    self.put_card_in(id, &url, false);
+                }
+            }
             card::CardAction::Export => {
                 let text = match book_card.and_then(|id| self.archive.card(id).ok().flatten()) {
                     Some(stored) => stored.vcard,
@@ -9861,6 +9915,8 @@ impl BeaverApp {
             });
         });
         let mut action = None;
+        let mut action_on_row: Option<(i64, card::CardAction)> = None;
+        let targets: std::collections::HashMap<String, Vec<(String, String)>> = self.settings.address_books.iter().map(|b| (b.url.clone(), self.card_targets(&b.url))).collect();
         let frame = egui::Frame::new().fill(t.surface).inner_margin(egui::Margin::same(28));
         egui::Panel::right("contact_card").frame(frame).default_size(470.0).size_range(360.0..=900.0).show(ui, |ui| match self.contact_pane.as_mut() {
             Some(card) => {
@@ -9906,17 +9962,39 @@ impl BeaverApp {
                         // Twice the size drawn, for sharp edges on a high-density screen.
                         Person::Card(c, _) => self.contact_photos.entry(c.id).or_insert_with(|| beavermail_carddav::vcard::details(&c.vcard).photo.and_then(|bytes| card::texture(ui.ctx(), &bytes, 72))).as_ref(),
                     };
-                    if views::person_row(ui, t, &name, &line, photo, here).clicked() && !here {
+                    let row = views::person_row(ui, t, &name, &line, photo, here);
+                    if row.clicked() && !here {
                         pick = Some(key);
                     }
+                    let Person::Card(c, _) = person;
+                    let read_only = self.settings.address_books.iter().any(|b| b.url == c.book && b.read_only);
+                    row.dnd_set_drag_payload(books::DraggedCard { id: c.id, name: name.clone(), book: c.book.clone(), read_only });
+                    views::context_menu(&row, |ui| {
+                        if let Some(chosen) = card::book_menus(ui, targets.get(&c.book).map_or(&[][..], Vec::as_slice), !read_only) {
+                            action_on_row = Some((c.id, chosen));
+                        }
+                    });
                 }
             });
         });
         if let Some(action) = book_action {
             self.book_action(action);
         }
+        // The contact being dragged follows the pointer.
+        if let (Some(dragged), Some(at)) = (egui::DragAndDrop::payload::<books::DraggedCard>(ui.ctx()), ui.ctx().pointer_interact_pos()) {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            let verb = if dragged.read_only { "Copy" } else { "Move" };
+            egui::Area::new(egui::Id::new("dragged_card")).order(egui::Order::Tooltip).fixed_pos(at + vec2(14.0, 10.0)).interactable(false).show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| ui.label(format!("{verb} {}", dragged.name)));
+            });
+        }
         if let Some(id) = pick {
             self.contact_pane = self.load_book_card(id);
+        }
+        match action_on_row {
+            Some((id, card::CardAction::MoveTo(url))) => self.put_card_in(id, &url, true),
+            Some((id, card::CardAction::CopyTo(url))) => self.put_card_in(id, &url, false),
+            _ => {}
         }
         if let Some(action) = action {
             self.card_action(action, true);

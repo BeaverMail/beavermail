@@ -48,6 +48,19 @@ pub enum BookAction {
     Fold(String),
     /// Pick a file of contacts to import, into this address book or one chosen after.
     Import(Option<String>),
+    /// A contact dropped on this address book (by URL).
+    Dropped(DraggedCard, String),
+}
+
+/// A contact dragged from the list.
+#[derive(Clone)]
+pub struct DraggedCard {
+    pub id: i64,
+    pub name: String,
+    /// The address book it is in.
+    pub book: String,
+    /// It is in a read-only address book: dropped elsewhere, it is copied.
+    pub read_only: bool,
 }
 
 /// The host of a URL, to name a server.
@@ -113,6 +126,14 @@ pub fn section(ui: &mut egui::Ui, t: &Tokens, books: &[AddressBook], syncing: &s
                 let row = views::icon_row(ui, t, &title, crate::icons::Icon::Users, counts.get(&book.url).copied().unwrap_or(0), here).on_hover_text(tip);
                 if row.clicked() && !here {
                     action = Some(BookAction::Show(Some(book.url.clone())));
+                }
+                // A contact is dropped on any address book but its own that can be written.
+                let takes = |d: &DraggedCard| !book.read_only && d.book != book.url;
+                if row.dnd_hover_payload::<DraggedCard>().is_some_and(|d| takes(&d)) {
+                    ui.painter().rect_stroke(row.rect, egui::CornerRadius::same(crate::theme::CONTROL_RADIUS), egui::Stroke::new(2.0, t.accent), egui::StrokeKind::Inside);
+                }
+                if let Some(d) = row.dnd_release_payload::<DraggedCard>().filter(|d| takes(d)) {
+                    action = Some(BookAction::Dropped((*d).clone(), book.url.clone()));
                 }
                 crate::views::context_menu(&row, |ui| {
                     let why = if book.read_only { "Read-only: the server makes it" } else { "New contacts already go here" };

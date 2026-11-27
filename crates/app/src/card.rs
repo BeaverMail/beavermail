@@ -8,6 +8,7 @@ use beavermail_core::Hit;
 use beavermail_store::ContactCard;
 use eframe::egui::{self, Align, Layout, RichText, vec2};
 
+use crate::icons::{self, Icon};
 use crate::theme::{self, Tokens};
 use crate::views;
 
@@ -35,6 +36,8 @@ pub struct Card {
     pub can_add: bool,
     /// The card is in the address book on this computer, never synced.
     pub local: bool,
+    /// The other address books it can go to, by URL with their names.
+    pub targets: Vec<(String, String)>,
 }
 
 pub enum CardAction {
@@ -49,6 +52,10 @@ pub enum CardAction {
     Remove,
     /// Save the card to a vCard file.
     Export,
+    /// Put it in this other address book (by URL), out of its own.
+    MoveTo(String),
+    /// Put a copy of it in this other address book (by URL).
+    CopyTo(String),
     /// Write them a new message.
     Write,
     /// Open this message of the conversations with them, by its place in `recent`.
@@ -58,7 +65,7 @@ pub enum CardAction {
 
 impl Card {
     pub fn new(data: ContactCard, recent: Vec<(u64, Hit)>) -> Self {
-        Self { name: data.name.clone(), notes: data.notes.clone(), data, recent, book_card: None, read_only: false, can_add: false, local: false, book: String::new(), also_in: Vec::new(), details: None, editing: None, photo: None }
+        Self { name: data.name.clone(), notes: data.notes.clone(), data, recent, book_card: None, read_only: false, can_add: false, local: false, targets: Vec::new(), book: String::new(), also_in: Vec::new(), details: None, editing: None, photo: None }
     }
 
     /// The name and notes differ from what is saved.
@@ -101,9 +108,9 @@ pub fn show(ctx: &egui::Context, t: &Tokens, card: &mut Card) -> Option<CardActi
         // The whole form of an address book's card is taller than a small window: it scrolls, and the
         // buttons stay below it, always in reach.
         egui::ScrollArea::vertical().max_height((ctx.content_rect().height() - 220.0).max(160.0)).show(ui, |ui| {
-            action = content(ui, t, card);
+            action = content(ui, t, card, true);
         });
-        action = actions(ui, t, card, true).or(action.take());
+        action = actions(ui, t, card).or(action.take());
     });
     if modal.should_close() && action.is_none() {
         action = Some(CardAction::Close);
@@ -330,12 +337,13 @@ fn detail_rows(ui: &mut egui::Ui, t: &Tokens, d: &Details, first_email: &str) {
 
 /// The card's content, in a dialog (`closable`, with Close) or in the Contacts section.
 pub fn body(ui: &mut egui::Ui, t: &Tokens, card: &mut Card, closable: bool) -> Option<CardAction> {
-    let action = content(ui, t, card);
-    actions(ui, t, card, closable).or(action)
+    let action = content(ui, t, card, closable);
+    actions(ui, t, card).or(action)
 }
 
-/// Who they are, the form when editing, and the latest conversations.
-fn content(ui: &mut egui::Ui, t: &Tokens, card: &mut Card) -> Option<CardAction> {
+/// Who they are, with Edit, More and Close on the right as a message's header has its buttons; what
+/// to do with them; the form when editing; and the latest conversations.
+fn content(ui: &mut egui::Ui, t: &Tokens, card: &mut Card, closable: bool) -> Option<CardAction> {
     let mut action = None;
     let shown = if card.data.name.is_empty() { card.data.address.clone() } else { card.data.name.clone() };
     ui.horizontal(|ui| {
@@ -347,6 +355,23 @@ fn content(ui: &mut egui::Ui, t: &Tokens, card: &mut Card) -> Option<CardAction>
                 ui.label(RichText::new(&card.data.address).color(t.text_dim));
             }
         });
+        ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+            if closable && icons::button(ui, t, Icon::X, "Close (Esc)", true, false).clicked() {
+                action = Some(CardAction::Close);
+            }
+            // While editing, Save and Cancel below are the only way out.
+            if card.editing.is_none() {
+                if let Some(chosen) = more_menu(ui, t, card) {
+                    action = Some(chosen);
+                }
+                if card.details.is_some() {
+                    let tip = if card.read_only { "This address book is read-only on the server" } else { "Edit" };
+                    if icons::button(ui, t, Icon::Pencil, tip, !card.read_only, false).clicked() {
+                        card.editing = card.details.clone();
+                    }
+                }
+            }
+        });
     });
     ui.add_space(6.0);
     ui.add(egui::Label::new(RichText::new(card.standing()).size(13.0).color(t.text_dim)).wrap());
@@ -354,6 +379,10 @@ fn content(ui: &mut egui::Ui, t: &Tokens, card: &mut Card) -> Option<CardAction>
     if let Some(editing) = card.editing.as_mut() {
         ui.add_space(10.0);
         return edit_form(ui, t, editing);
+    }
+    ui.add_space(12.0);
+    if let Some(chosen) = quick_actions(ui, t, card) {
+        action = Some(chosen);
     }
     match &card.details {
         Some(details) => detail_rows(ui, t, details, &card.data.address),
@@ -390,15 +419,91 @@ fn content(ui: &mut egui::Ui, t: &Tokens, card: &mut Card) -> Option<CardAction>
     action
 }
 
-/// The card's buttons: what to do with them, then Edit or Save and Close; Save and Cancel when editing.
-fn actions(ui: &mut egui::Ui, t: &Tokens, card: &mut Card, closable: bool) -> Option<CardAction> {
+/// "Move to" (when `movable`: out of a read-only address book it can only be copied) and "Copy to",
+/// each listing the other address books it can go to.
+pub fn book_menus(ui: &mut egui::Ui, targets: &[(String, String)], movable: bool) -> Option<CardAction> {
+    if targets.is_empty() {
+        return None;
+    }
     let mut action = None;
-    if let Some(editing) = card.editing.as_ref() {
-        let why = invalid(editing);
-        ui.add_space(10.0);
-        ui.separator();
-        ui.add_space(4.0);
-        ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
+    for (label, make) in [("Move to", CardAction::MoveTo as fn(String) -> CardAction), ("Copy to", CardAction::CopyTo)] {
+        if label == "Move to" && !movable {
+            continue;
+        }
+        ui.menu_button(label, |ui| {
+            for (url, name) in targets {
+                if ui.button(name).clicked() {
+                    action = Some(make(url.clone()));
+                    ui.close();
+                }
+            }
+        });
+    }
+    action
+}
+
+/// Write message, the one main action, then copying the address and adding them to an address book.
+fn quick_actions(ui: &mut egui::Ui, t: &Tokens, card: &Card) -> Option<CardAction> {
+    // Someone the address book knows only by phone has no address to write to: no row at all, as a
+    // card offers only what its details allow.
+    if card.data.address.is_empty() {
+        return None;
+    }
+    let mut action = None;
+    ui.horizontal_wrapped(|ui| {
+        if views::primary_icon(ui, t, Icon::Mail, "Write message", None, 0.0).clicked() {
+            action = Some(CardAction::Write);
+        }
+        if ui.add(egui::Button::image_and_text(Icon::Copy.image(icons::SIZE, t.text_dim), "Copy address")).clicked() {
+            ui.ctx().copy_text(card.data.address.clone());
+        }
+        if card.can_add && ui.add(egui::Button::image_and_text(Icon::Plus.image(icons::SIZE, t.text_dim), "Add to address book")).on_hover_text("On the server, and every device that syncs the address book").clicked() {
+            action = Some(CardAction::AddToBook);
+        }
+    });
+    action
+}
+
+/// "More": what is done to the card now and then, Remove last and apart.
+fn more_menu(ui: &mut egui::Ui, t: &Tokens, card: &Card) -> Option<CardAction> {
+    let exportable = card.book_card.is_some() || card.data.saved;
+    let removable = card.data.saved && !card.read_only;
+    if !exportable && !removable {
+        return None;
+    }
+    let mut action = None;
+    let more = icons::button(ui, t, Icon::Ellipsis, "More: Export, Move to, Copy to, Remove", true, false);
+    egui::Popup::menu(&more).style(views::menu_look).show(|ui| {
+        if exportable && ui.button("Export…").on_hover_text("Save the card as a vCard file").clicked() {
+            action = Some(CardAction::Export);
+        }
+        if card.book_card.is_some() && let Some(chosen) = book_menus(ui, &card.targets, !card.read_only) {
+            action = Some(chosen);
+        }
+        if removable {
+            ui.separator();
+            let tip = if card.local { "Delete them from your contacts on this computer" } else { "Delete them from your address book, on every device that syncs it" };
+            if ui.button(RichText::new("Remove").color(t.danger)).on_hover_text(tip).clicked() {
+                action = Some(CardAction::Remove);
+            }
+        }
+    });
+    action
+}
+
+/// The bottom row, only when there is something to save: Save and Cancel when editing, Save for the
+/// name and notes of a contact on this computer, Save to contacts for someone not yet saved.
+fn actions(ui: &mut egui::Ui, t: &Tokens, card: &mut Card) -> Option<CardAction> {
+    let mut action = None;
+    if card.editing.is_none() && card.details.is_some() {
+        return None;
+    }
+    ui.add_space(10.0);
+    ui.separator();
+    ui.add_space(4.0);
+    ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
+        if let Some(editing) = card.editing.as_ref() {
+            let why = invalid(editing);
             let changed = card.details.as_ref() != card.editing.as_ref();
             let save = views::primary_button(ui, t, "Save", why.is_none() && changed).on_disabled_hover_text(why.unwrap_or("Nothing changed yet"));
             if save.clicked() {
@@ -407,48 +512,11 @@ fn actions(ui: &mut egui::Ui, t: &Tokens, card: &mut Card, closable: bool) -> Op
             if ui.button("Cancel").clicked() {
                 card.editing = None;
             }
-        });
-        return action;
-    }
-    ui.add_space(10.0);
-    // What to do with them on a row of its own: with Save and Close beside, four buttons do not fit.
-    ui.horizontal(|ui| {
-        // Someone the address book knows only by phone has no address to write to.
-        let reachable = !card.data.address.is_empty();
-        if ui.add_enabled(reachable, egui::Button::new("Write message")).on_disabled_hover_text("No email address for them").clicked() {
-            action = Some(CardAction::Write);
-        }
-        if reachable && ui.button("Copy address").clicked() {
-            ui.ctx().copy_text(card.data.address.clone());
-        }
-        if card.can_add && reachable && ui.button("Add to address book").on_hover_text("On the server, and every device that syncs the address book").clicked() {
-            action = Some(CardAction::AddToBook);
-        }
-        if (card.book_card.is_some() || card.data.saved) && ui.button("Export…").on_hover_text("Save the card as a vCard file").clicked() {
-            action = Some(CardAction::Export);
-        }
-        let tip = if card.local { "Delete them from your contacts on this computer" } else { "Delete them from your address book, on every device that syncs it" };
-        if card.data.saved && !card.read_only && ui.button(RichText::new("Remove").color(t.danger)).on_hover_text(tip).clicked() {
-            action = Some(CardAction::Remove);
-        }
-    });
-    ui.add_space(4.0);
-    ui.separator();
-    ui.add_space(4.0);
-    ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
-        if card.details.is_some() {
-            let edit = views::primary_button(ui, t, "Edit", !card.read_only).on_disabled_hover_text("This address book is read-only on the server");
-            if edit.clicked() {
-                card.editing = card.details.clone();
-            }
         } else {
             let (label, enabled) = if card.data.saved { ("Save", card.edited()) } else { ("Save to contacts", true) };
             if views::primary_button(ui, t, label, enabled).on_hover_text("Kept on this computer only").clicked() {
                 action = Some(CardAction::Save);
             }
-        }
-        if closable && ui.button("Close").clicked() {
-            action = Some(CardAction::Close);
         }
     });
     action

@@ -403,6 +403,14 @@ pub fn card_text(uid: &str, card: &Card) -> String {
     fold(&lines)
 }
 
+/// The same card under another UID, every other field kept: a copy of it in another address book.
+pub fn with_uid(text: &str, uid: &str) -> String {
+    let mut lines: Vec<String> = unfold(text).into_iter().filter(|l| !l.trim().is_empty() && !l.to_ascii_uppercase().starts_with("UID:") && !l.to_ascii_uppercase().starts_with("UID;")).collect();
+    let at = lines.iter().position(|l| l.eq_ignore_ascii_case("BEGIN:VCARD")).map_or(0, |i| i + 1);
+    lines.insert(at, format!("UID:{uid}"));
+    fold(&lines)
+}
+
 /// Lines joined with CRLF, each folded at 75 octets (on a character boundary).
 pub(crate) fn fold(lines: &[String]) -> String {
     let mut out = String::new();
@@ -432,6 +440,14 @@ mod tests {
     use super::*;
 
     const PHONE_CARD: &str = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:abc-1\r\nFN:Ada Lovelace\r\nN:Lovelace;Ada;;;\r\nitem1.EMAIL;TYPE=WORK:Ada@Example.org\r\nTEL;TYPE=CELL:+44 20 7946 0000\r\nBDAY:1815-12-10\r\nPHOTO;ENCODING=b;TYPE=JPEG:/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDA\r\n sLCxkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/\r\nNOTE:Met at the fair\\, 2026\r\nEND:VCARD\r\n";
+
+    #[test]
+    fn a_copy_has_its_own_uid_and_every_other_field() {
+        let copy = with_uid(PHONE_CARD, "new-2");
+        assert_eq!(parse(&copy).uid, "new-2");
+        assert_eq!(copy.matches("UID:").count(), 1);
+        assert_eq!(details(&copy), details(PHONE_CARD), "photo, birthday and the rest kept");
+    }
 
     #[test]
     fn a_card_reads_with_its_name_addresses_phones_and_notes() {
