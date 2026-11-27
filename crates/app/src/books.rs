@@ -46,6 +46,8 @@ pub enum BookAction {
     SyncNow,
     /// Fold or unfold a server's address books (by its key in the folded set).
     Fold(String),
+    /// Pick a file of contacts to import, into this address book or one chosen after.
+    Import(Option<String>),
 }
 
 /// The host of a URL, to name a server.
@@ -64,6 +66,9 @@ pub fn label(book: &AddressBook, books: &[AddressBook]) -> String {
 /// The server an address book is on, as the Mail column names an account: its host, with the login
 /// when the same host is there with another one too.
 pub fn server(book: &AddressBook, books: &[AddressBook]) -> String {
+    if book.is_local() {
+        return "This computer".to_owned();
+    }
     let other_login = books.iter().any(|b| host(&b.url) == host(&book.url) && b.user != book.user);
     if other_login { format!("{}@{}", book.user, host(&book.url)) } else { host(&book.url).to_owned() }
 }
@@ -100,7 +105,7 @@ pub fn section(ui: &mut egui::Ui, t: &Tokens, books: &[AddressBook], syncing: &s
                     (true, false) => format!("{name}  ·  default"),
                     (false, false) => name.to_owned(),
                 };
-                let mut tip = format!("{} on {}", book.user, host(&book.url));
+                let mut tip = if book.is_local() { "Kept on this computer only, never synced".to_owned() } else { format!("{} on {}", book.user, host(&book.url)) };
                 if book.default {
                     tip.push_str("\nNew contacts go here");
                 }
@@ -114,6 +119,13 @@ pub fn section(ui: &mut egui::Ui, t: &Tokens, books: &[AddressBook], syncing: &s
                     if ui.add_enabled(!book.default && !book.read_only, egui::Button::new("Make default")).on_disabled_hover_text(why).clicked() {
                         action = Some(BookAction::MakeDefault(book.url.clone()));
                         ui.close();
+                    }
+                    if !book.read_only && ui.button("Import contacts…").clicked() {
+                        action = Some(BookAction::Import(Some(book.url.clone())));
+                        ui.close();
+                    }
+                    if book.is_local() {
+                        return;
                     }
                     if ui.button("Sync now").clicked() {
                         action = Some(BookAction::SyncNow);

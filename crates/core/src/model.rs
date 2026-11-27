@@ -280,7 +280,8 @@ pub struct Alias {
 }
 
 /// An address book synced over CardDAV: a source of its own, apart from the mail accounts (contacts
-/// may live on another server than mail, or with no mail account at all).
+/// may live on another server than mail, or with no mail account at all); or the one kept on this
+/// computer only ([`AddressBook::LOCAL`] as its URL).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AddressBook {
     /// As the server names it ("Personal", "Contacts").
@@ -295,6 +296,15 @@ pub struct AddressBook {
     /// read, never written, never the default.
     #[serde(default)]
     pub read_only: bool,
+}
+
+impl AddressBook {
+    /// The URL that stands for the address book on this computer, never synced.
+    pub const LOCAL: &'static str = "local:";
+
+    pub fn is_local(&self) -> bool {
+        self.url == Self::LOCAL
+    }
 }
 
 /// A calendar: one synced over CalDAV, a source of its own as address books are, or the one kept on

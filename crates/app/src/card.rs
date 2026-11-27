@@ -33,6 +33,8 @@ pub struct Card {
     photo: Option<(u64, egui::TextureHandle)>,
     /// Not in an address book, and there is one to add them to: shown as "Add to address book".
     pub can_add: bool,
+    /// The card is in the address book on this computer, never synced.
+    pub local: bool,
 }
 
 pub enum CardAction {
@@ -54,7 +56,7 @@ pub enum CardAction {
 
 impl Card {
     pub fn new(data: ContactCard, recent: Vec<(u64, Hit)>) -> Self {
-        Self { name: data.name.clone(), notes: data.notes.clone(), data, recent, book_card: None, read_only: false, can_add: false, book: String::new(), also_in: Vec::new(), details: None, editing: None, photo: None }
+        Self { name: data.name.clone(), notes: data.notes.clone(), data, recent, book_card: None, read_only: false, can_add: false, local: false, book: String::new(), also_in: Vec::new(), details: None, editing: None, photo: None }
     }
 
     /// The name and notes differ from what is saved.
@@ -70,6 +72,7 @@ impl Card {
         };
         if self.book_card.is_some() {
             let mut book = match (self.read_only, self.book.is_empty()) {
+                _ if self.local => "In your contacts on this computer".to_owned(),
                 (true, _) => format!("In {}, read-only on the server", self.book),
                 (false, true) => "In your address book, synced with your other devices".to_owned(),
                 (false, false) => format!("In {}, synced with your other devices", self.book),
@@ -419,7 +422,7 @@ fn actions(ui: &mut egui::Ui, t: &Tokens, card: &mut Card, closable: bool) -> Op
         if card.can_add && reachable && ui.button("Add to address book").on_hover_text("On the server, and every device that syncs the address book").clicked() {
             action = Some(CardAction::AddToBook);
         }
-        let tip = if card.book_card.is_some() { "Delete them from your address book, on every device that syncs it" } else { "Take them out of your contacts; they stay a suggestion if you wrote to them" };
+        let tip = if card.local { "Delete them from your contacts on this computer" } else { "Delete them from your address book, on every device that syncs it" };
         if card.data.saved && !card.read_only && ui.button(RichText::new("Remove").color(t.danger)).on_hover_text(tip).clicked() {
             action = Some(CardAction::Remove);
         }

@@ -17,7 +17,7 @@ computer, remote content stays blocked, and it works offline. Written in Rust wi
 - Undo: Archive and Move to Trash wait 10 s before reaching the server.
 - Filters: rules that move, star, label or mark new Inbox mail as it arrives.
 - Assistant: replies drafted and conversations summarised by a language model with your own key (Anthropic, OpenAI or local), asked first and recorded.
-- Contacts: cards, address books synced over CardDAV.
+- Contacts: cards, an address book on this computer and address books synced over CardDAV; import from vCard or CSV (Google, Outlook, Thunderbird).
 - Calendar: week, month and agenda over CalDAV or on this computer; events made and changed here; invitations answered from mail; calendars renamed, recoloured and their servers' passwords changed in Settings.
 - Attachments: every file of the downloaded mail, encrypted mail included, found by name, sender or kind, as a list or a grid of pictures.
 - Tasks: lists over CalDAV (made here when a server has none), grouped by due date and put in order by dragging, with subtasks, labels and priority; changes kept offline and merged with those made elsewhere.

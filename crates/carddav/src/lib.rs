@@ -6,6 +6,7 @@
 
 pub mod calendar;
 pub mod ical;
+pub mod import;
 pub mod sync;
 pub mod todo;
 pub mod vcard;

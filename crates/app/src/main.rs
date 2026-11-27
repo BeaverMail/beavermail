@@ -121,6 +121,8 @@ enum Event {
     Thumb(library::Key, Option<egui::ColorImage>),
     /// Saving attachments through a file dialog ended: `None` when the user cancelled, else what to tell them.
     Saved(Result<Option<String>, String>),
+    /// A file of contacts was picked to import (its name and text), into this address book if one was named.
+    ContactsFile(Option<String>, Option<(String, String)>),
     /// What one folder on a server holds for search `seq`, added to what the archive found.
     FoundOnServer(u64, u64, Vec<Hit>),
     /// An account's server was searched to the end, or stopped.
@@ -230,6 +232,14 @@ struct ChoosingFolders {
     filter: String,
     /// OK was pressed once on a server with no subscriptions: it is asked to confirm.
     confirm: bool,
+}
+
+/// "Import contacts": the cards read from a file, those already in an address book left out.
+struct ImportContacts {
+    file: String,
+    book: String,
+    cards: Vec<String>,
+    skipped: usize,
 }
 
 /// What was asked of a saved search in the sidebar, by its place in the list.
@@ -889,14 +899,12 @@ impl NewAccount {
 #[derive(Clone)]
 enum Person {
     Card(beavermail_store::StoredCard, Vec<String>),
-    Saved(beavermail_store::Contact),
 }
 
 impl Person {
     fn name(&self) -> &str {
         match self {
             Self::Card(c, _) => &c.name,
-            Self::Saved(c) => &c.name,
         }
     }
 
@@ -905,7 +913,6 @@ impl Person {
         match self {
             _ if !self.name().is_empty() => self.name().to_owned(),
             Self::Card(c, _) => c.emails.first().or(c.phones.first()).cloned().unwrap_or_default(),
-            Self::Saved(c) => c.address.clone(),
         }
     }
 
@@ -914,7 +921,6 @@ impl Person {
     fn lines(&self, books: &[beavermail_core::AddressBook], own: bool) -> (String, String) {
         let reach = match self {
             Self::Card(c, _) => c.emails.first().or(c.phones.first()).cloned().unwrap_or_default(),
-            Self::Saved(c) => c.address.clone(),
         };
         let mut second = if self.name().is_empty() { String::new() } else { reach };
         let mut add = |part: String| {
@@ -933,8 +939,6 @@ impl Person {
                     add(format!("also in {}", also.iter().map(|u| name_of(u)).collect::<Vec<_>>().join(", ")));
                 }
             }
-            Self::Saved(_) if own && !books.is_empty() => add("on this computer".to_owned()),
-            Self::Saved(_) => {}
         }
         (self.title(), second)
     }
@@ -942,7 +946,6 @@ impl Person {
     fn matches(&self, query: &str) -> bool {
         match self {
             Self::Card(c, _) => beavermail_store::Contact { name: c.name.clone(), address: c.emails.join(" "), folded: beavermail_store::fold(&format!("{} {} {}", c.name, c.emails.join(" "), c.phones.join(" "))) }.matches(query),
-            Self::Saved(c) => c.matches(query),
         }
     }
 }
@@ -1299,9 +1302,25 @@ fn people(archive: &Store) -> Vec<Person> {
         others
     };
     let mut all: Vec<Person> = cards.iter().map(|c| Person::Card(c.clone(), also(c))).collect();
-    all.extend(archive.saved_contacts().unwrap_or_default().into_iter().filter(|c| !held.contains_key(c.address.as_str())).map(Person::Saved));
     all.sort_by_key(|p| p.title().to_lowercase());
     all
+}
+
+/// The contacts saved on this computer before it had an address book, made cards of the one here;
+/// one an address book already has stays as it was, as its card is what shows.
+fn move_saved_contacts(archive: &Store) -> Result<(), MailError> {
+    use beavermail_core::AddressBook;
+    for contact in archive.saved_contacts()? {
+        if archive.card_with_email(&contact.address)?.is_some() {
+            continue;
+        }
+        let notes = archive.contact_card(&contact.address)?.map(|c| c.notes).unwrap_or_default();
+        let uid = beavermail_carddav::new_uid();
+        let text = beavermail_carddav::vcard::new_card(&uid, &contact.name, std::slice::from_ref(&contact.address), &notes);
+        archive.add_card(AddressBook::LOCAL, &beavermail_carddav::new_href(AddressBook::LOCAL, &uid), &text, &beavermail_carddav::fields(&text))?;
+        archive.unsave_contact(&contact.address)?;
+    }
+    Ok(())
 }
 
 /// A key file read as an OpenPGP key, or (`certificate`) an S/MIME `.p12`, unlocked with `password`.
@@ -1527,6 +1546,7 @@ struct BeaverApp {
     /// What is typed in the Contacts section's search, and the "New contact" dialog: (address, name).
     contact_query: String,
     new_contact: Option<(String, String)>,
+    importing: Option<ImportContacts>,
     new_folder: Option<NewFolder>,
     /// The "Save search" or "Rename" dialog of a saved search.
     naming_search: Option<NamingSearch>,
@@ -1814,6 +1834,7 @@ impl BeaverApp {
             confirm_card_delete: None,
             contact_query: String::new(),
             new_contact: None,
+            importing: None,
             new_folder: None,
             naming_search: None,
             choosing_folders: None,
@@ -1939,6 +1960,7 @@ impl BeaverApp {
         app.refresh_folders(LOCAL_SERIAL);
         app.read_drafts(); // what waited from the last session shows at once
         app.load_offline();
+        app.ensure_local_book();
         app.warm_known();
         log::debug!("start: app ready {:.0?} after start", diag::since_start());
         app
@@ -5407,7 +5429,7 @@ impl BeaverApp {
     /// Syncs the address book at `url`, or every one, in the background; one already syncing is left
     /// to finish.
     fn sync_contacts(&mut self, url: Option<&str>) {
-        let books: Vec<beavermail_core::AddressBook> = self.settings.address_books.iter().filter(|b| url.is_none_or(|u| u == b.url)).cloned().collect();
+        let books: Vec<beavermail_core::AddressBook> = self.settings.address_books.iter().filter(|b| !b.is_local() && url.is_none_or(|u| u == b.url)).cloned().collect();
         for book in books {
             if !self.contacts_syncing.insert(book.url.clone()) {
                 continue;
@@ -6091,6 +6113,20 @@ impl BeaverApp {
         }
     }
 
+    /// The address book on this computer, made once; the contacts saved here before it existed become
+    /// its cards. One an address book already has stays as it was, as its card is what shows.
+    fn ensure_local_book(&mut self) {
+        use beavermail_core::AddressBook;
+        if !self.settings.address_books.iter().any(AddressBook::is_local) {
+            let default = !self.settings.address_books.iter().any(|b| b.default);
+            self.settings.address_books.insert(0, AddressBook { name: "On this computer".into(), url: AddressBook::LOCAL.into(), user: String::new(), default, read_only: false });
+            self.save_settings();
+        }
+        if let Err(e) = move_saved_contacts(&self.archive) {
+            self.error = Some(format!("Could not move the contacts saved on this computer to its address book: {e}"));
+        }
+    }
+
     fn ensure_local_calendar(&mut self) {
         if self.settings.calendars.iter().any(beavermail_core::CalendarSource::is_local) {
             return;
@@ -6691,6 +6727,14 @@ impl BeaverApp {
             A::Find => self.find_books(),
             A::Login(serial) => self.add_book = Some(self.dav_login(serial)),
             A::Show(url) => self.contacts_shown = url,
+            A::Import(book) => self.spawn(async move {
+                let file = rfd::AsyncFileDialog::new().set_title("Import contacts").add_filter("Contacts", &["vcf", "vcard", "csv"]).pick_file().await;
+                let read = match file {
+                    Some(file) => Some((file.file_name(), String::from_utf8_lossy(&file.read().await).into_owned())),
+                    None => None,
+                };
+                Event::ContactsFile(book, read)
+            }),
             A::Fold(key) => {
                 if !self.settings.folded.remove(&key) {
                     self.settings.folded.insert(key);
@@ -6908,6 +6952,7 @@ impl BeaverApp {
         let books = &self.settings.address_books;
         card.details = Some(beavermail_carddav::vcard::details(&stored.vcard));
         card.read_only = books.iter().any(|b| b.url == stored.book && b.read_only);
+        card.local = stored.book == beavermail_core::AddressBook::LOCAL;
         card.book = books.iter().find(|b| b.url == stored.book).map(|b| books::label(b, books)).unwrap_or_default();
         // The other address books with one of their addresses: the same person twice, kept apart.
         let others = self.archive.address_book().unwrap_or_default().into_iter().filter(|c| c.book != stored.book && c.emails.iter().any(|e| stored.emails.contains(e)));
@@ -6931,7 +6976,7 @@ impl BeaverApp {
         let keys: Vec<(String, u64)> = self.accounts.iter().map(|v| (v.account.key(), v.serial)).collect();
         let recent = self.archive.messages_with(&address, 12).unwrap_or_default().into_iter().filter_map(|(key, hit)| Some((keys.iter().find(|(k, _)| *k == key)?.1, hit))).collect();
         let mut card = card::Card::new(data, recent);
-        card.can_add = self.default_book().is_some();
+        card.can_add = self.server_book().is_some();
         Some(card)
     }
 
@@ -6968,29 +7013,18 @@ impl BeaverApp {
             }
             card::CardAction::Remove if book_card.is_some() => self.confirm_card_delete = book_card,
             card::CardAction::AddToBook => {
-                if self.add_to_book(&address, &name, &notes) {
+                if self.add_to_book(self.server_book(), &address, &name, &notes) {
                     reload(self);
                 }
             }
             // Someone not in an address book: kept on this computer only. Only "Add to address book"
             // sends someone to the server, so no one gets there by accident.
             card::CardAction::Save => {
-                if let Err(e) = self.archive.save_contact(&address, &name, &notes) {
-                    self.error = Some(format!("Could not save the contact: {e}"));
-                    return;
+                if self.add_to_book(Some(beavermail_core::AddressBook::LOCAL.to_owned()), &address, &name, &notes) {
+                    reload(self);
                 }
-                self.address_book = None;
-                self.notice = Some((format!("{} is in your contacts", if name.trim().is_empty() { &address } else { name.trim() }), std::time::Instant::now()));
-                reload(self);
             }
-            card::CardAction::Remove => {
-                if let Err(e) = self.archive.unsave_contact(&address) {
-                    self.error = Some(format!("Could not remove the contact: {e}"));
-                    return;
-                }
-                self.address_book = None;
-                reload(self);
-            }
+            card::CardAction::Remove => {}
             card::CardAction::Write => {
                 if !inline {
                     self.card = None;
@@ -7014,8 +7048,8 @@ impl BeaverApp {
     }
 
     /// Puts someone in the default address book, sent at once; false when it could not.
-    fn add_to_book(&mut self, address: &str, name: &str, notes: &str) -> bool {
-        let Some(url) = self.default_book() else { return false };
+    fn add_to_book(&mut self, url: Option<String>, address: &str, name: &str, notes: &str) -> bool {
+        let Some(url) = url else { return false };
         let uid = beavermail_carddav::new_uid();
         let text = beavermail_carddav::vcard::new_card(&uid, name, &[address.to_owned()], notes);
         if let Err(e) = self.archive.add_card(&url, &beavermail_carddav::new_href(&url, &uid), &text, &beavermail_carddav::fields(&text)) {
@@ -7037,6 +7071,103 @@ impl BeaverApp {
         shown.or(writable.find(|b| b.default)).or(first).map(|b| b.url.clone())
     }
 
+    /// The address book on a server "Add to address book" sends someone to: the default one, else the
+    /// first that can be written.
+    fn server_book(&self) -> Option<String> {
+        let mut writable = self.settings.address_books.iter().filter(|b| !b.read_only && !b.is_local());
+        let first = writable.clone().next();
+        writable.find(|b| b.default).or(first).map(|b| b.url.clone())
+    }
+
+    /// Reads a file of contacts (vCard, or CSV by its name) and asks where to import them; those whose
+    /// address an address book already has are left out, as are repeats in the file.
+    fn read_contacts(&mut self, book: Option<String>, file: String, text: &str) {
+        let cards = if file.to_lowercase().ends_with(".csv") {
+            match beavermail_carddav::import::from_csv(text) {
+                Ok(read) => read.iter().map(|c| beavermail_carddav::vcard::card_text(&beavermail_carddav::new_uid(), c)).collect(),
+                Err(e) => {
+                    self.error = Some(format!("{file} has no contacts BeaverMail can read: {e}"));
+                    return;
+                }
+            }
+        } else {
+            beavermail_carddav::import::from_vcf(text, beavermail_carddav::new_uid)
+        };
+        if cards.is_empty() {
+            self.error = Some(format!("{file} has no contacts BeaverMail can read: export them as vCard (.vcf) or CSV"));
+            return;
+        }
+        let total = cards.len();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let cards: Vec<String> = cards
+            .into_iter()
+            .filter(|text| {
+                let emails = beavermail_carddav::fields(text).emails;
+                let known = emails.iter().any(|e| seen.contains(e) || self.archive.card_with_email(e).ok().flatten().is_some());
+                seen.extend(emails);
+                !known
+            })
+            .collect();
+        let book = book.or_else(|| self.default_book()).unwrap_or_else(|| beavermail_core::AddressBook::LOCAL.to_owned());
+        self.importing = Some(ImportContacts { file, book, skipped: total - cards.len(), cards });
+    }
+
+    /// "Import contacts": how many, into which address book.
+    fn import_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
+        let Some(mut form) = self.importing.take() else { return };
+        let books: Vec<(String, String)> = self.settings.address_books.iter().filter(|b| !b.read_only).map(|b| (b.url.clone(), books::label(b, &self.settings.address_books))).collect();
+        let (mut import, mut cancel) = (false, false);
+        let modal = crate::views::modal(ctx, egui::Id::new("import_contacts")).show(ctx, |ui| {
+            ui.set_width(FORM_WIDTH);
+            ui.heading("Import contacts");
+            let found = match form.cards.len() {
+                1 => "1 contact".to_owned(),
+                n => format!("{n} contacts"),
+            };
+            let mut about = format!("{found} in {}.", form.file);
+            if form.skipped > 0 {
+                about.push_str(&format!(" {} already in your address books, or twice in the file, left out.", form.skipped));
+            }
+            ui.label(RichText::new(about).color(t.text_dim));
+            ui.add_space(12.0);
+            form_grid(ui, "import_contacts_form", |ui| {
+                ui.label("Into");
+                let shown = books.iter().find(|(url, _)| *url == form.book).map(|(_, name)| name.clone()).unwrap_or_default();
+                egui::ComboBox::from_id_salt("import_book").width(FIELD_WIDTH).selected_text(shown).show_ui(ui, |ui| {
+                    for (url, name) in &books {
+                        ui.selectable_value(&mut form.book, url.clone(), name);
+                    }
+                });
+                ui.end_row();
+            });
+            if form.book != beavermail_core::AddressBook::LOCAL {
+                ui.label(RichText::new("Sent to the server, so every device that syncs this address book gets them.").size(13.0).color(t.text_dim));
+            }
+            ui.add_space(12.0);
+            let ready = !form.cards.is_empty();
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
+                import = views::primary_button(ui, t, "Import", ready).on_disabled_hover_text("Every contact in the file is already in your address books").clicked();
+                cancel = ui.button("Cancel").clicked();
+            });
+        });
+        if import {
+            let mut done = 0;
+            for text in &form.cards {
+                let uid = beavermail_carddav::vcard::parse(text).uid;
+                if let Err(e) = self.archive.add_card(&form.book, &beavermail_carddav::new_href(&form.book, &uid), text, &beavermail_carddav::fields(text)) {
+                    self.error = Some(format!("Could not import every contact ({done} of {} done): {e}", form.cards.len()));
+                    break;
+                }
+                done += 1;
+            }
+            self.address_book = None;
+            self.sync_book(&form.book);
+            self.notice = Some((if done == 1 { "1 contact imported".to_owned() } else { format!("{done} contacts imported") }, std::time::Instant::now()));
+        } else if !cancel && !modal.should_close() {
+            self.importing = Some(form);
+        }
+    }
+
     /// "New contact": an address, and a name if wished; their card opens to be saved.
     fn new_contact_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
         let book = self.default_book();
@@ -7047,6 +7178,7 @@ impl BeaverApp {
             ui.set_width(FORM_WIDTH);
             ui.heading("New contact");
             let about = match &book {
+                Some(url) if url == beavermail_core::AddressBook::LOCAL => "Added to your contacts on this computer.".to_owned(),
                 Some(url) => format!("Added to {}.", self.settings.address_books.iter().find(|b| b.url == *url).map(|b| if b.name.is_empty() { books::host(url).to_owned() } else { format!("{} on {}", b.name, books::host(url)) }).unwrap_or_default()),
                 None => "Their card opens with what you type; save it there.".to_owned(),
             };
@@ -7073,8 +7205,8 @@ impl BeaverApp {
         if add && let Some((address, name)) = self.new_contact.take() {
             let address = address.trim().to_lowercase();
             // Someone the address book already has opens as they are: never a second card.
-            if book.is_some() && self.archive.card_with_email(&address).ok().flatten().is_none() {
-                self.add_to_book(&address, name.trim(), "");
+            if self.archive.card_with_email(&address).ok().flatten().is_none() {
+                self.add_to_book(book, &address, name.trim(), "");
             }
             self.contact_pane = self.load_card(&address, &name);
         } else if cancel || modal.should_close() {
@@ -7295,11 +7427,13 @@ impl BeaverApp {
         let (mut confirm, mut cancel) = (false, false);
         let modal = crate::views::modal(ctx, egui::Id::new("confirm_card_delete")).show(ctx, |ui| {
             ui.set_width(FORM_WIDTH * 0.85);
-            ui.heading(format!("Delete {who} everywhere?"));
-            ui.label(RichText::new("They are deleted from your address book on the server, and from every device that syncs it.").color(t.text_dim));
+            let local = stored.book == beavermail_core::AddressBook::LOCAL;
+            ui.heading(if local { format!("Delete {who}?") } else { format!("Delete {who} everywhere?") });
+            let about = if local { "They are deleted from your contacts on this computer." } else { "They are deleted from your address book on the server, and from every device that syncs it." };
+            ui.label(RichText::new(about).color(t.text_dim));
             ui.add_space(12.0);
             ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
-                confirm = ui.add(egui::Button::new(RichText::new("Delete everywhere").color(t.on_accent)).fill(t.danger)).clicked();
+                confirm = ui.add(egui::Button::new(RichText::new(if local { "Delete" } else { "Delete everywhere" }).color(t.on_accent)).fill(t.danger)).clicked();
                 cancel = ui.button("Cancel").clicked();
             });
         });
@@ -8276,6 +8410,8 @@ impl BeaverApp {
             self.in_flight.remove(at);
         }
         match event {
+            Event::ContactsFile(book, Some((file, text))) => self.read_contacts(book, file, &text),
+            Event::ContactsFile(_, None) => {}
             Event::Subscribed(serial, result) => match result {
                 Ok(()) => self.refresh_folders(serial), // shown as chosen, and saved here once listed
                 Err(e) => self.error = Some(format!("Could not change the folders shown: {e}")),
@@ -9493,13 +9629,11 @@ impl BeaverApp {
         }
         let book = self.address_book.get_or_insert_with(|| people(&archive)).clone();
         let open = self.contact_pane.as_ref().map(|c| (c.book_card, c.data.address.clone()));
-        let mut pick: Option<Result<i64, String>> = None;
+        let mut pick: Option<i64> = None;
         let mut book_action = None;
         let mut counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-        for person in book.iter() {
-            if let Person::Card(c, _) = person {
-                *counts.entry(c.book.clone()).or_default() += 1;
-            }
+        for Person::Card(c, _) in book.iter() {
+            *counts.entry(c.book.clone()).or_default() += 1;
         }
         // Laid out as Mail: the sources on the left (main action on top, "Add …" at the bottom), the
         // list in the middle, the open card on the right.
@@ -9513,6 +9647,11 @@ impl BeaverApp {
                 let add = egui::Button::image_and_text(Icon::Plus.image(icons::SIZE, t.text_dim), "Add address book");
                 if ui.add_sized([ui.available_width(), theme::CONTROL_H], add).on_hover_text("Sync contacts with Fastmail, Nextcloud, iCloud or another CardDAV server").clicked() {
                     book_action = Some(books::BookAction::Open);
+                }
+                ui.add_space(4.0);
+                let import = egui::Button::image_and_text(Icon::Download.image(icons::SIZE, t.text_dim), "Import contacts…");
+                if ui.add_sized([ui.available_width(), theme::CONTROL_H], import).on_hover_text("From a vCard (.vcf) or CSV file another app exported").clicked() {
+                    book_action = Some(books::BookAction::Import(None));
                 }
                 ui.add_space(4.0);
                 ui.with_layout(Layout::top_down(Align::Min), |ui| {
@@ -9565,13 +9704,11 @@ impl BeaverApp {
                     // In one address book, where they are goes without saying: only the others are named.
                     let (name, line) = person.lines(&self.settings.address_books, shown.is_none());
                     let (key, here) = match person {
-                        Person::Card(c, _) => (Ok(c.id), open.as_ref().is_some_and(|(card, _)| *card == Some(c.id))),
-                        Person::Saved(c) => (Err(c.address.clone()), open.as_ref().is_some_and(|(card, address)| card.is_none() && *address == c.address)),
+                        Person::Card(c, _) => (c.id, open.as_ref().is_some_and(|(card, _)| *card == Some(c.id))),
                     };
                     let photo = match person {
                         // Twice the size drawn, for sharp edges on a high-density screen.
                         Person::Card(c, _) => self.contact_photos.entry(c.id).or_insert_with(|| beavermail_carddav::vcard::details(&c.vcard).photo.and_then(|bytes| card::texture(ui.ctx(), &bytes, 72))).as_ref(),
-                        Person::Saved(_) => None,
                     };
                     if views::person_row(ui, t, &name, &line, photo, here).clicked() && !here {
                         pick = Some(key);
@@ -9582,10 +9719,8 @@ impl BeaverApp {
         if let Some(action) = book_action {
             self.book_action(action);
         }
-        match pick {
-            Some(Ok(id)) => self.contact_pane = self.load_book_card(id),
-            Some(Err(address)) => self.contact_pane = self.load_card(&address, ""),
-            None => {}
+        if let Some(id) = pick {
+            self.contact_pane = self.load_book_card(id);
         }
         if let Some(action) = action {
             self.card_action(action, true);
@@ -11256,6 +11391,7 @@ impl eframe::App for BeaverApp {
         self.card_dialog(ui.ctx(), &t);
         self.card_delete_dialog(ui.ctx(), &t);
         self.new_contact_dialog(ui.ctx(), &t);
+        self.import_dialog(ui.ctx(), &t);
         self.new_folder_dialog(ui.ctx(), &t);
         self.saved_search_dialog(ui.ctx(), &t);
         self.folders_dialog(ui.ctx(), &t);
@@ -11674,18 +11810,33 @@ mod tests {
     fn someone_in_two_address_books_shows_in_both_marked() {
         let store = Store::in_memory().unwrap();
         let book = |name: &str, url: &str| beavermail_core::AddressBook { name: name.into(), url: url.into(), user: "ada".into(), default: false, read_only: false };
-        let books = [book("Contacts", "https://cloud.example.org/c/"), book("Contacts", "https://google.example.com/g/")];
-        for (b, uid) in [(&books[0], "1"), (&books[1], "2")] {
-            let text = beavermail_carddav::vcard::new_card(uid, "Bob Brown", &["bob@y.org".into()], "");
-            store.add_card(&b.url, &format!("{}{uid}.vcf", b.url), &text, &beavermail_carddav::fields(&text)).unwrap();
+        let books = [book("Contacts", "https://cloud.example.org/c/"), book("Contacts", "https://google.example.com/g/"), book("On this computer", beavermail_core::AddressBook::LOCAL)];
+        for (b, uid, name, email) in [(&books[0], "1", "Bob Brown", "bob@y.org"), (&books[1], "2", "Bob Brown", "bob@y.org"), (&books[2], "3", "Dora", "dora@z.org")] {
+            let text = beavermail_carddav::vcard::new_card(uid, name, &[email.into()], "");
+            store.add_card(&b.url, &beavermail_carddav::new_href(&b.url, uid), &text, &beavermail_carddav::fields(&text)).unwrap();
         }
-        store.save_contact("dora@z.org", "Dora", "").unwrap();
         let all = people(&store);
         assert_eq!(all.len(), 3);
         let lines: Vec<(String, String)> = all.iter().map(|p| p.lines(&books, true)).collect();
         assert_eq!(lines[0], ("Bob Brown".to_owned(), "bob@y.org  ·  Contacts (cloud.example.org)  ·  also in Contacts (google.example.com)".to_owned()));
-        assert_eq!(lines[2], ("Dora".to_owned(), "dora@z.org  ·  on this computer".to_owned()));
+        assert_eq!(lines[2], ("Dora".to_owned(), "dora@z.org  ·  On this computer".to_owned()));
         assert_eq!(all[1].lines(&books, false).1, "bob@y.org  ·  also in Contacts (cloud.example.org)", "in one address book, only the others are named");
+    }
+
+    #[test]
+    fn contacts_saved_here_become_cards_of_the_local_address_book() {
+        let store = Store::in_memory().unwrap();
+        store.save_contact("dora@z.org", "Dora", "Met at the fair").unwrap();
+        store.save_contact("bob@y.org", "Bob", "").unwrap();
+        let text = beavermail_carddav::vcard::new_card("1", "Bob Brown", &["bob@y.org".into()], "");
+        store.add_card("https://cloud.example.org/c/", "/c/1.vcf", &text, &beavermail_carddav::fields(&text)).unwrap();
+        move_saved_contacts(&store).unwrap();
+        let dora = store.card_with_email("dora@z.org").unwrap().unwrap();
+        assert_eq!((dora.book.as_str(), dora.name.as_str(), dora.note.as_str()), (beavermail_core::AddressBook::LOCAL, "Dora", "Met at the fair"));
+        assert_eq!(store.card_with_email("bob@y.org").unwrap().unwrap().book, "https://cloud.example.org/c/", "the card already there stays the one");
+        assert_eq!(store.saved_contacts().unwrap().len(), 1, "only Bob, as he was");
+        move_saved_contacts(&store).unwrap();
+        assert_eq!(store.address_book().unwrap().len(), 2, "moved once");
     }
 
     #[test]

@@ -385,17 +385,26 @@ fn structured_name(name: &str) -> String {
 
 /// A new card, in vCard 3.0, the version every server and client reads.
 pub fn new_card(uid: &str, name: &str, emails: &[String], note: &str) -> String {
-    let mut lines = vec!["BEGIN:VCARD".to_owned(), "VERSION:3.0".to_owned(), "PRODID:-//BeaverMail//EN".to_owned(), format!("UID:{uid}"), format!("FN:{}", escape(name.trim())), structured_name(name)];
-    lines.extend(emails.iter().map(|e| format!("EMAIL;TYPE=INTERNET:{}", escape(e))));
-    if !note.trim().is_empty() {
-        lines.push(format!("NOTE:{}", escape(note.trim_end())));
+    card_text(uid, &Card { name: name.to_owned(), emails: emails.to_vec(), note: note.to_owned(), ..Card::default() })
+}
+
+/// A vCard 3.0 of what `card` holds, under `uid` (its own UID is not used).
+pub fn card_text(uid: &str, card: &Card) -> String {
+    let mut lines = vec!["BEGIN:VCARD".to_owned(), "VERSION:3.0".to_owned(), "PRODID:-//BeaverMail//EN".to_owned(), format!("UID:{uid}"), format!("FN:{}", escape(card.name.trim())), structured_name(&card.name)];
+    lines.extend(card.emails.iter().map(|e| format!("EMAIL;TYPE=INTERNET:{}", escape(e))));
+    lines.extend(card.phones.iter().map(|p| format!("TEL:{}", escape(p))));
+    if !card.organization.trim().is_empty() {
+        lines.push(format!("ORG:{}", escape(card.organization.trim())));
+    }
+    if !card.note.trim().is_empty() {
+        lines.push(format!("NOTE:{}", escape(card.note.trim_end())));
     }
     lines.push("END:VCARD".to_owned());
     fold(&lines)
 }
 
 /// Lines joined with CRLF, each folded at 75 octets (on a character boundary).
-fn fold(lines: &[String]) -> String {
+pub(crate) fn fold(lines: &[String]) -> String {
     let mut out = String::new();
     for line in lines {
         let mut rest = line.as_str();
