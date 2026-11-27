@@ -205,7 +205,13 @@ impl Command {
             Self::Search => &[Trigger::Text("/")],
             Self::SwitchPane => &[Trigger::Key(Key::F6)],
             Self::Settings => &[Trigger::Shortcut(CTRL, Key::Comma, false)],
-            Self::NewFolder | Self::NotSpam | Self::OpenInFolder | Self::TrustSender | Self::BlockSender | Self::CreateFilter | Self::Refresh | Self::AllInboxes | Self::Mail | Self::Calendar | Self::Tasks | Self::Attachments | Self::Contacts | Self::WorkOffline | Self::WorkOnline => &[],
+            // The parts of the app in the rail's order, as Outlook numbers them.
+            Self::Mail => &[Trigger::Shortcut(CTRL, Key::Num1, true)],
+            Self::Calendar => &[Trigger::Shortcut(CTRL, Key::Num2, true)],
+            Self::Tasks => &[Trigger::Shortcut(CTRL, Key::Num3, true)],
+            Self::Attachments => &[Trigger::Shortcut(CTRL, Key::Num4, true)],
+            Self::Contacts => &[Trigger::Shortcut(CTRL, Key::Num5, true)],
+            Self::NewFolder | Self::NotSpam | Self::OpenInFolder | Self::TrustSender | Self::BlockSender | Self::CreateFilter | Self::Refresh | Self::AllInboxes | Self::WorkOffline | Self::WorkOnline => &[],
         }
     }
 

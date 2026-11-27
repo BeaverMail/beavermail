@@ -8121,7 +8121,7 @@ impl BeaverApp {
         };
         let some = || if targets.is_empty() { Err("Open or pick a message first") } else { Ok(()) };
         // A source tab shows text, not the message: what acts on a message is for its own tab.
-        if self.showing_source() && !matches!(command, Command::Palette | Command::NewMessage | Command::Settings | Command::Mail | Command::Contacts | Command::WorkOffline | Command::WorkOnline | Command::CloseTab | Command::PreviousTab | Command::NextTab | Command::AllInboxes | Command::FindInSource | Command::SelectAll) {
+        if self.showing_source() && !matches!(command, Command::Palette | Command::NewMessage | Command::Settings | Command::Mail | Command::Contacts | Command::Calendar | Command::Tasks | Command::Attachments | Command::WorkOffline | Command::WorkOnline | Command::CloseTab | Command::PreviousTab | Command::NextTab | Command::AllInboxes | Command::FindInSource | Command::SelectAll) {
             return Err("Not in the source of a message");
         }
         // Out of Mail the list and the reader are not on screen: what acts on them waits.
@@ -9691,7 +9691,7 @@ impl BeaverApp {
                         let on = self.section == section;
                         let name = if section == Section::Tasks && due > 0 { format!("Tasks: {due} due today or overdue") } else { name.to_owned() };
                         let name = name.as_str();
-                        let button = icons::button(ui, t, icon, name, true, on);
+                        let button = icons::button(ui, t, icon, &format!("{name} ({})", command.keys(ui.ctx())), true, on);
                         if section == Section::Tasks {
                             tasks::badge(ui, t, button.rect, due);
                         }
