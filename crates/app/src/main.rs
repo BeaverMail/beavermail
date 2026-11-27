@@ -64,6 +64,8 @@ use tokio::runtime::Runtime;
 enum Event {
     /// The folders of an account. The flag is true when the answer came from the server.
     Mailboxes(u64, Result<Vec<Mailbox>, MailError>, bool),
+    /// The folders chosen in "Folders" were written to the server as its subscriptions.
+    Subscribed(u64, Result<(), MailError>),
     /// The server's folders, asked again on its own after the account went offline.
     Retried(u64, Result<Vec<Mailbox>, MailError>),
     /// The background download of an account ended.
@@ -174,6 +176,7 @@ enum Event {
 enum PageAction {
     Remove,
     Test,
+    Folders,
 }
 
 enum VaultOutcome {
@@ -217,6 +220,16 @@ struct NamingSearch {
     index: Option<usize>,
     name: String,
     query: String,
+}
+
+/// The "Folders" dialog of an account: the folders hidden on this computer, as being ticked, and
+/// the text the list is narrowed to.
+struct ChoosingFolders {
+    serial: u64,
+    hidden: Vec<String>,
+    filter: String,
+    /// OK was pressed once on a server with no subscriptions: it is asked to confirm.
+    confirm: bool,
 }
 
 /// What was asked of a saved search in the sidebar, by its place in the list.
@@ -340,6 +353,8 @@ struct SidebarOutcome {
     empty_all: Option<Role>,
     removed: Option<u64>,
     edit: Option<u64>,
+    /// "Folders…" was chosen in this account's menu.
+    folders: Option<u64>,
     add: bool,
     /// "All inboxes" was clicked.
     all: bool,
@@ -864,6 +879,7 @@ impl NewAccount {
             archive_by_year: self.archive_by_year,
             quota_warning: self.quota_warning,
             aliases,
+            hidden_folders: Vec::new(), // kept by save_account
         })
     }
 }
@@ -1129,6 +1145,7 @@ fn section_title(ui: &mut egui::Ui, text: &str) {
 
 /// One account's page in Settings. `waiting`: a sign-in for it is open in the browser.
 /// `folders`: the account's folders as (name on the server, as shown), for where Archive moves mail.
+/// `server`: every folder the server lists, hidden ones included, as (name, role, separator).
 fn account_page(ui: &mut egui::Ui, t: &theme::Tokens, form: &mut NewAccount, folders: &[(String, String)], quota: Option<Quota>) -> Option<PageAction> {
     let mut action = None;
     let hint = |ui: &mut egui::Ui, text: &str| ui.label(RichText::new(text).size(13.0).color(t.text_dim));
@@ -1203,6 +1220,16 @@ fn account_page(ui: &mut egui::Ui, t: &theme::Tokens, form: &mut NewAccount, fol
             ui.end_row();
         });
         views::switch_row(ui, t, &mut form.archive_by_year, "A folder for each year", "Inside it, by each message's date: 2026, 2025… Made the first time one is needed.");
+    }
+
+    // A new account has no folders listed yet.
+    if form.editing.is_some() {
+        section_title(ui, "Folders");
+        hint(ui, "Choose the folders shown and downloaded here: the server's subscriptions, shared with other apps. The others stay on the server.");
+        ui.add_space(4.0);
+        if ui.button("Folders…").clicked() {
+            action = Some(PageAction::Folders);
+        }
     }
 
     // Only where the server sets limits and says so.
@@ -1503,6 +1530,7 @@ struct BeaverApp {
     new_folder: Option<NewFolder>,
     /// The "Save search" or "Rename" dialog of a saved search.
     naming_search: Option<NamingSearch>,
+    choosing_folders: Option<ChoosingFolders>,
     /// The saved search last opened, by name, while its search is shown: Save offers to update it.
     search_opened: Option<String>,
     /// Delete folder… asked for (account, folder name); waiting for the user to confirm. With why the
@@ -1788,6 +1816,7 @@ impl BeaverApp {
             new_contact: None,
             new_folder: None,
             naming_search: None,
+            choosing_folders: None,
             search_opened: None,
             confirm_folder_delete: None,
             settings_leave: None,
@@ -3293,6 +3322,104 @@ impl BeaverApp {
         }
     }
 
+    /// Opens the "Folders" dialog of an account.
+    fn choose_folders(&mut self, serial: u64) {
+        if let Some(view) = self.view(serial) {
+            self.choosing_folders = Some(ChoosingFolders { serial, hidden: view.account.hidden_folders.clone(), filter: String::new(), confirm: false });
+        }
+    }
+
+    /// "Folders": which folders of the account are shown and downloaded here. Saved at once on OK.
+    fn folders_dialog(&mut self, ctx: &egui::Context, t: &theme::Tokens) {
+        let Some(mut form) = self.choosing_folders.take() else { return };
+        let Some(view) = self.view(form.serial) else { return };
+        // The server's full list, hidden folders included; before it is asked, the ones shown.
+        let mut server = view.source.as_ref().map(|s| s.server_folders()).unwrap_or_default();
+        if server.is_empty() {
+            server = view.mailboxes.iter().map(|m| (m.name.clone(), m.role, m.delimiter)).collect();
+        }
+        let address = view.account.address().to_owned();
+        let unchanged = form.hidden == view.account.hidden_folders;
+        let source = view.source.clone();
+        let no_subscriptions = source.as_ref().is_some_and(|s| s.no_subscriptions());
+        let (mut save, mut cancel) = (false, false);
+        let modal = crate::views::modal(ctx, egui::Id::new("choose_folders")).show(ctx, |ui| {
+            ui.set_width(FORM_WIDTH);
+            ui.heading("Folders");
+            ui.label(RichText::new(format!("Ticked folders of {address} are shown and downloaded here, and subscribed to on the server, so other apps that follow subscriptions show the same. The others stay on the server; their mail is removed from this computer, and downloaded again once ticked.")).color(t.text_dim));
+            ui.add_space(12.0);
+            ui.add(field(&mut form.filter).hint_text("Show folders that contain"));
+            ui.add_space(8.0);
+            let needle = form.filter.trim().to_lowercase();
+            // In the sidebar's order and nesting.
+            let boxes: Vec<beavermail_core::Mailbox> = server.iter().map(|(name, role, delimiter)| beavermail_core::Mailbox { name: name.clone(), unread: 0, role: *role, total: 0, stored: 0, delimiter: *delimiter }).collect();
+            let mut toggled = None;
+            egui::ScrollArea::vertical().max_height(320.0).auto_shrink([false, true]).show(ui, |ui| {
+                for (i, depth) in views::folder_tree(&boxes) {
+                    let (name, role, separator) = &server[i];
+                    let title = views::folder_title(name, *role, *separator);
+                    if !needle.is_empty() && !title.to_lowercase().contains(&needle) {
+                        continue;
+                    }
+                    let others: Vec<String> = form.hidden.iter().filter(|h| *h != name).cloned().collect();
+                    let inside = beavermail_imap::hidden_by(name, *separator, &others);
+                    let mut on = !form.hidden.contains(name) && !inside;
+                    ui.horizontal(|ui| {
+                        ui.add_space(if needle.is_empty() { depth as f32 * 18.0 } else { 0.0 });
+                        let check = ui.add_enabled(*role == Role::Other && !inside, egui::Checkbox::new(&mut on, title));
+                        let check = if *role != Role::Other { check.on_disabled_hover_text("Always shown: BeaverMail uses this folder") } else { check.on_disabled_hover_text("Hidden with the folder it is in") };
+                        if check.changed() {
+                            toggled = Some((name.clone(), on, *separator));
+                        }
+                    });
+                }
+            });
+            if let Some((name, on, separator)) = toggled {
+                // Hiding a folder takes its subfolders: their own entries are no longer needed.
+                let this = [name.clone()];
+                form.hidden.retain(|h| !beavermail_imap::hidden_by(h, separator, &this));
+                if !on {
+                    form.hidden.push(name);
+                }
+            }
+            ui.add_space(12.0);
+            if form.confirm {
+                ui.label(RichText::new("This server lists no subscribed folders yet. Saving subscribes to every ticked folder, so other apps that show only subscribed folders start showing them too.").color(t.danger));
+                ui.add_space(8.0);
+            }
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
+                save = views::primary_button(ui, t, if form.confirm { "Subscribe" } else { "OK" }, true).clicked();
+                cancel = ui.button("Cancel").clicked();
+            });
+        });
+        if save && !unchanged && no_subscriptions && !form.confirm {
+            form.confirm = true;
+            self.choosing_folders = Some(form);
+        } else if save {
+            if let (false, Some(source)) = (unchanged, source) {
+                let serial = form.serial;
+                self.spawn(async move { Event::Subscribed(serial, source.set_subscriptions(&form.hidden).await) });
+            }
+        } else if !cancel && !modal.should_close() {
+            self.choosing_folders = Some(form);
+        }
+    }
+
+    /// Saves here the folders the server's subscriptions hid, for a start without a connection.
+    fn keep_hidden_folders(&mut self, serial: u64) {
+        let Some(at) = self.accounts.iter().position(|v| v.serial == serial) else { return };
+        let Some(hidden) = self.accounts[at].source.as_ref().map(|s| s.hidden()) else { return };
+        if hidden == self.accounts[at].account.hidden_folders {
+            return;
+        }
+        let mut all: Vec<Account> = self.accounts.iter().map(|v| v.account.clone()).collect();
+        all[at].hidden_folders = hidden.clone();
+        match store::save(&all) {
+            Ok(()) => self.accounts[at].account.hidden_folders = hidden,
+            Err(e) => self.error = Some(format!("Could not save the folders: {e}")),
+        }
+    }
+
     /// Asks every account's archive for the query typed in the search box.
     fn run_search(&mut self) {
         self.searched.clone_from(&self.query);
@@ -4232,7 +4359,8 @@ impl BeaverApp {
                                     let folders: Vec<(String, String)> = form.editing.and_then(|serial| self.accounts.iter().find(|v| v.serial == serial)).map(|v| {
                                         v.mailboxes.iter().filter(|m| matches!(m.role, Role::Archive | Role::Other)).map(|m| (m.name.clone(), views::folder_path(&m.name, m.role, m.delimiter))).collect()
                                     }).unwrap_or_default();
-                                    let quota = form.editing.and_then(|serial| self.accounts.iter().find(|v| v.serial == serial)?.quota);
+                                    let view = form.editing.and_then(|serial| self.accounts.iter().find(|v| v.serial == serial));
+                                    let quota = view.and_then(|v| v.quota);
                                     page_action = account_page(ui, t, form, &folders, quota);
                                 }
                             }
@@ -4664,6 +4792,7 @@ impl BeaverApp {
         match (page_action, self.settings_page) {
             (Some(PageAction::Remove), SettingsPage::Account(serial)) => self.confirm_remove = Some(serial),
             (Some(PageAction::Test), SettingsPage::Account(serial)) => self.test_connection(Some(serial)),
+            (Some(PageAction::Folders), SettingsPage::Account(serial)) => self.choose_folders(serial),
             _ => {}
         }
         if add {
@@ -8028,9 +8157,11 @@ impl BeaverApp {
     /// the settings file second, so a failure never leaves one without the other.
     /// Saves the form as a new or changed account and returns the serial it is shown under now.
     fn save_account(&mut self, form: &NewAccount) -> Result<u64, String> {
-        let account = form.build()?;
+        let mut account = form.build()?;
         let editing = form.editing.and_then(|serial| self.accounts.iter().position(|v| v.serial == serial));
         let old = editing.map(|at| self.accounts[at].account.clone());
+        // Chosen in the Folders dialog, which saves them itself.
+        account.hidden_folders = old.as_ref().map(|o| o.hidden_folders.clone()).unwrap_or_default();
         if self.accounts.iter().enumerate().any(|(i, v)| Some(i) != editing && v.account.key() == account.key()) {
             return Err("this account is already configured".into());
         }
@@ -8145,6 +8276,10 @@ impl BeaverApp {
             self.in_flight.remove(at);
         }
         match event {
+            Event::Subscribed(serial, result) => match result {
+                Ok(()) => self.refresh_folders(serial), // shown as chosen, and saved here once listed
+                Err(e) => self.error = Some(format!("Could not change the folders shown: {e}")),
+            },
             Event::Mailboxes(serial, result, fresh) => {
                 let selected_name = self.selected.filter(|(s, _)| *s == serial).and_then(|(_, i)| self.view(serial)?.mailboxes.get(i)).map(|m| m.name.clone());
                 if serial == LOCAL_SERIAL {
@@ -8157,6 +8292,9 @@ impl BeaverApp {
                         }
                     }
                     return;
+                }
+                if fresh && result.is_ok() {
+                    self.keep_hidden_folders(serial);
                 }
                 let Some(view) = self.accounts.iter_mut().find(|v| v.serial == serial) else { return };
                 if !fresh && !view.mailboxes.is_empty() {
@@ -8199,8 +8337,13 @@ impl BeaverApp {
                         let inbox = view.mailboxes.iter().position(|m| m.role == Role::Inbox).unwrap_or(0);
                         let joins = view.mailboxes.iter().position(|m| m.role == self.unified_role);
                         let moved = selected_name.and_then(|name| view.mailboxes.iter().position(|m| m.name == name));
+                        let gone = self.selected.is_some_and(|(s, _)| s == serial) && moved.is_none() && !view.mailboxes.is_empty();
                         if self.selected.is_some_and(|(s, _)| s == serial) {
                             self.selected = moved.map(|i| (serial, i));
+                            // The folder shown went (hidden here, or deleted elsewhere): its account's Inbox instead.
+                            if gone {
+                                self.select_mailbox(serial, inbox);
+                            }
                         } else if self.unified {
                             // An account whose folders arrive after All inboxes was opened joins it now.
                             if let Some(folder) = joins.filter(|_| !self.origin.values().any(|s| *s == serial)) {
@@ -9510,6 +9653,7 @@ impl BeaverApp {
     /// Accounts and their folders. Returns (folder chosen, account to remove, account to edit, add-account clicked).
     fn sidebar(&mut self, ui: &mut egui::Ui, t: &theme::Tokens) -> SidebarOutcome {
         let (mut chosen, mut removed, mut edit, mut add, mut suspicious, mut recheck, mut empty) = (None, None, None, false, None, None, None);
+        let mut folders = None;
         let (mut all, mut local, mut all_suspicious, mut all_role) = (false, None, false, None);
         let (mut recheck_all, mut empty_all) = (false, None);
         // Kept until the folder's row is drawn: an account unfolding shows it a frame later.
@@ -9837,6 +9981,10 @@ impl BeaverApp {
                                     edit = Some(view.serial);
                                     ui.close();
                                 }
+                                if ui.button("Folders…").clicked() {
+                                    folders = Some(view.serial);
+                                    ui.close();
+                                }
                                 if ui.button("Remove account…").clicked() {
                                     removed = Some(view.serial);
                                     ui.close();
@@ -9860,7 +10008,7 @@ impl BeaverApp {
             }
             self.save_settings();
         }
-        SidebarOutcome { chosen, suspicious, recheck, empty, recheck_all, empty_all, removed, edit, add, all, local, all_suspicious, all_role, dropped, new_inside, rename, delete, label, saved }
+        SidebarOutcome { chosen, suspicious, recheck, empty, recheck_all, empty_all, removed, edit, folders, add, all, local, all_suspicious, all_role, dropped, new_inside, rename, delete, label, saved }
     }
 
     /// Search, refresh and the message list. Returns the message the user clicked and whether to add an account.
@@ -10886,7 +11034,7 @@ impl eframe::App for BeaverApp {
                 _ => {}
             }
         }
-        let SidebarOutcome { chosen, suspicious, recheck, empty, recheck_all, empty_all, removed, edit, mut add, all, local, all_suspicious, all_role, dropped, new_inside, rename, delete, label, saved } =
+        let SidebarOutcome { chosen, suspicious, recheck, empty, recheck_all, empty_all, removed, edit, folders, mut add, all, local, all_suspicious, all_role, dropped, new_inside, rename, delete, label, saved } =
             if self.in_tab || contacts { SidebarOutcome::default() } else { self.sidebar(ui, &t) };
         slow.mark("sidebar");
         // Another place picked: the search ends there, as in most mail apps.
@@ -10952,6 +11100,9 @@ impl eframe::App for BeaverApp {
         }
         if let Some(local) = local {
             self.show_local(local);
+        }
+        if let Some(serial) = folders {
+            self.choose_folders(serial);
         }
         if let Some(serial) = edit {
             self.show_settings = true;
@@ -11107,6 +11258,7 @@ impl eframe::App for BeaverApp {
         self.new_contact_dialog(ui.ctx(), &t);
         self.new_folder_dialog(ui.ctx(), &t);
         self.saved_search_dialog(ui.ctx(), &t);
+        self.folders_dialog(ui.ctx(), &t);
         self.folder_delete_dialog(ui.ctx(), &t);
         self.book_remove_dialog(ui.ctx(), &t);
         self.calendar_remove_dialog(ui.ctx(), &t);
@@ -11498,7 +11650,7 @@ mod tests {
     fn what_an_account_knows_is_loaded_again_only_when_its_marks_change() {
         let archive = Arc::new(Store::in_memory().unwrap());
         let server = Server { host: "mail.example.org".into(), port: 993, tls: Tls::Tls };
-        let account = Account { name: "Ada".into(), user: "ada@example.org".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true, keep: Keep::default(), signature: String::new(), smtp_user: None, archive: String::new(), archive_by_year: false, quota_warning: 90, aliases: Vec::new() };
+        let account = Account { name: "Ada".into(), user: "ada@example.org".into(), email: String::new(), imap: server.clone(), smtp: server, save_sent: true, keep: Keep::default(), signature: String::new(), smtp_user: None, archive: String::new(), archive_by_year: false, quota_warning: 90, aliases: Vec::new(), hidden_folders: Vec::new() };
         let (cache, mut settings) = (KnownCache::default(), Settings::default());
         let first = cache.get(&archive, &account, &[], &settings).unwrap();
         assert!(Arc::ptr_eq(&first, &cache.get(&archive, &account, &[], &settings).unwrap()), "kept");
