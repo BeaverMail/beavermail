@@ -262,6 +262,9 @@ pub struct Account {
     /// Other addresses the account may send from (aliases), as the server allows them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub aliases: Vec<Alias>,
+    /// Server folders not shown nor synced here, by full name; their subfolders go with them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden_folders: Vec<String>,
 }
 
 /// Another address an account sends from, with its own name and signature.
@@ -414,7 +417,7 @@ impl Account {
     /// no real account has (their user is never empty).
     pub fn local() -> Self {
         let none = Server { host: "local".to_owned(), port: 0, tls: Tls::Tls };
-        Self { name: String::new(), user: String::new(), email: String::new(), imap: none.clone(), smtp: none, save_sent: false, keep: Keep::default(), signature: String::new(), smtp_user: None, archive: String::new(), archive_by_year: false, quota_warning: 0, aliases: Vec::new() }
+        Self { name: String::new(), user: String::new(), email: String::new(), imap: none.clone(), smtp: none, save_sent: false, keep: Keep::default(), signature: String::new(), smtp_user: None, archive: String::new(), archive_by_year: false, quota_warning: 0, aliases: Vec::new(), hidden_folders: Vec::new() }
     }
 
     /// The address to send from: the configured one, else the login name.
@@ -873,7 +876,7 @@ mod tests {
     #[test]
     fn mail_goes_out_under_the_users_name_unless_it_is_only_the_login() {
         let server = Server { host: "imap.x.org".into(), port: 993, tls: Tls::Tls };
-        let account = |name: &str| Account { name: name.into(), user: "ada".into(), email: "ada@x.org".into(), imap: server.clone(), smtp: server.clone(), save_sent: true, keep: Keep::default(), signature: String::new(), smtp_user: None, archive: String::new(), archive_by_year: false, quota_warning: 90, aliases: vec![Alias { email: "info@x.org".into(), ..Alias::default() }, Alias { name: "Acme Support".into(), email: "help@x.org".into(), signature: "Acme".into() }] };
+        let account = |name: &str| Account { name: name.into(), user: "ada".into(), email: "ada@x.org".into(), imap: server.clone(), smtp: server.clone(), save_sent: true, keep: Keep::default(), signature: String::new(), smtp_user: None, archive: String::new(), archive_by_year: false, quota_warning: 90, aliases: vec![Alias { email: "info@x.org".into(), ..Alias::default() }, Alias { name: "Acme Support".into(), email: "help@x.org".into(), signature: "Acme".into() }], hidden_folders: Vec::new() };
         assert_eq!(account("Ada Lovelace").sender(), "\"Ada Lovelace\" <ada@x.org>");
         assert_eq!(account("Lovelace, Ada").sender(), "\"Lovelace, Ada\" <ada@x.org>", "quoted: the comma is part of the name");
         assert_eq!(account("Ada \"the\" Countess").sender(), "\"Ada the Countess\" <ada@x.org>");
