@@ -7025,6 +7025,17 @@ impl BeaverApp {
                 }
             }
             card::CardAction::Remove => {}
+            card::CardAction::Export => {
+                let text = match book_card.and_then(|id| self.archive.card(id).ok().flatten()) {
+                    Some(stored) => stored.vcard,
+                    None => beavermail_carddav::vcard::new_card(&beavermail_carddav::new_uid(), &name, &[address.clone()], &notes),
+                };
+                let file_name = format!("{}.vcf", attachments::safe_name(if name.trim().is_empty() { &address } else { &name }));
+                self.spawn(async move {
+                    let Some(file) = rfd::AsyncFileDialog::new().set_title("Export contact").add_filter("vCard", &["vcf"]).set_file_name(&file_name).save_file().await else { return Event::Saved(Ok(None)) };
+                    Event::Saved(std::fs::write(file.path(), text).map(|()| Some(format!("Saved to {}", file.path().display()))).map_err(|e| format!("{}: {e}", file.path().display())))
+                });
+            }
             card::CardAction::Write => {
                 if !inline {
                     self.card = None;

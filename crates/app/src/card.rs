@@ -47,6 +47,8 @@ pub enum CardAction {
     AddToBook,
     /// Take them out of the address book.
     Remove,
+    /// Save the card to a vCard file.
+    Export,
     /// Write them a new message.
     Write,
     /// Open this message of the conversations with them, by its place in `recent`.
@@ -421,6 +423,9 @@ fn actions(ui: &mut egui::Ui, t: &Tokens, card: &mut Card, closable: bool) -> Op
         }
         if card.can_add && reachable && ui.button("Add to address book").on_hover_text("On the server, and every device that syncs the address book").clicked() {
             action = Some(CardAction::AddToBook);
+        }
+        if (card.book_card.is_some() || card.data.saved) && ui.button("Export…").on_hover_text("Save the card as a vCard file").clicked() {
+            action = Some(CardAction::Export);
         }
         let tip = if card.local { "Delete them from your contacts on this computer" } else { "Delete them from your address book, on every device that syncs it" };
         if card.data.saved && !card.read_only && ui.button(RichText::new("Remove").color(t.danger)).on_hover_text(tip).clicked() {
