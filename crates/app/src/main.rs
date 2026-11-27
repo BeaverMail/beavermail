@@ -968,6 +968,28 @@ enum Section {
     Attachments,
 }
 
+impl Section {
+    /// Its icon, name and the command that goes there, as the rail and the tab bar show them.
+    fn label(self) -> (Icon, &'static str, Command) {
+        match self {
+            Self::Mail => (Icon::Mail, "Mail", Command::Mail),
+            Self::Calendar => (Icon::Calendar, "Calendar", Command::Calendar),
+            Self::Tasks => (Icon::ListChecks, "Tasks", Command::Tasks),
+            Self::Attachments => (Icon::Paperclip, "Attachments", Command::Attachments),
+            Self::Contacts => (Icon::Users, "Contacts", Command::Contacts),
+        }
+    }
+}
+
+/// A tab of the bar across the top: the mail, a part of the app, or a message tab (by its place in
+/// `tabs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BarTab {
+    Mail,
+    Section(Section),
+    Message(usize),
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 enum SettingsPage {
     Appearance,
@@ -1725,6 +1747,10 @@ struct BeaverApp {
     view_modes: std::collections::HashMap<MessageId, DisplayMode>,
     /// Open messages: the reading pane's and those in tabs; the one shown is `message`.
     tabs: Vec<tabs::Tab>,
+    /// The parts of the app open in a tab of their own, each with when it got it.
+    section_tabs: Vec<(Section, u64)>,
+    /// Counts the tabs opened, to keep them in that order.
+    tab_seq: u64,
     /// A message tab fills the window, rather than the mail (folders, list and reading pane).
     in_tab: bool,
     /// Where the checks put each message of the Inbox being shown; empty until they have run.
@@ -1929,6 +1955,8 @@ impl BeaverApp {
             unlocking: false,
             view_modes: std::collections::HashMap::new(),
             tabs: Vec::new(),
+            section_tabs: Vec::new(),
+            tab_seq: 0,
             in_tab: false,
             screening: std::collections::HashMap::new(),
             show_suspicious: false,
@@ -2407,8 +2435,8 @@ impl BeaverApp {
 
     /// Shows message `id`: in the reading pane, or `pin`, in its tab (opened if need be).
     fn open_message(&mut self, id: MessageId, pin: bool) {
-        let listed = self.messages.iter().find(|m| m.id == id).and_then(|m| Some(tabs::Tab { serial: self.serial_of(id)?, message: m.clone(), role: self.role(), pinned: pin, source: false }));
-        let tabbed = || self.tabs.iter().find(|t| t.message.id == id).map(|t| tabs::Tab { serial: t.serial, message: t.message.clone(), role: t.role, pinned: pin, source: false });
+        let listed = self.messages.iter().find(|m| m.id == id).and_then(|m| Some(tabs::Tab { serial: self.serial_of(id)?, message: m.clone(), role: self.role(), pinned: pin, source: false, opened: 0 }));
+        let tabbed = || self.tabs.iter().find(|t| t.message.id == id).map(|t| tabs::Tab { serial: t.serial, message: t.message.clone(), role: t.role, pinned: pin, source: false, opened: 0 });
         if let Some(tab) = listed.or_else(tabbed) {
             self.open(tab);
         }
@@ -2429,6 +2457,8 @@ impl BeaverApp {
                 preview
             }
             tabs::Slot::Push => {
+                self.tab_seq += 1;
+                tab.opened = self.tab_seq;
                 self.tabs.push(tab);
                 self.tabs.len() - 1
             }
@@ -2578,38 +2608,79 @@ impl BeaverApp {
         }
     }
 
-    /// Closes message tab `at`; when it was shown, the tab before it takes its place, or the mail.
+    /// Closes message tab `at`; when it was shown, the section it was opened from takes its place,
+    /// else the tab before it.
     fn close_tab(&mut self, at: usize) {
         if !self.tabs.get(at).is_some_and(|t| t.pinned) {
             return;
         }
-        let was_open = self.active() == Some(at);
+        let was_open = self.current_tab() == BarTab::Message(at);
         let back = self.return_to.filter(|(id, _)| self.tabs[at].message.id == *id).map(|(_, from)| from);
+        let before = self.tab_before(BarTab::Message(at));
         self.tabs.remove(at);
         if was_open {
-            let pinned: Vec<usize> = (0..self.tabs.len()).filter(|i| self.tabs[*i].pinned).collect();
-            match pinned.iter().rev().find(|i| **i < at).or(pinned.first()) {
-                Some(&next) => self.activate(next),
-                None => self.show_mail(),
-            }
-        }
-        if let Some(from) = back {
             self.return_to = None;
-            self.section = from;
+            self.go_to(back.map_or(before, BarTab::Section));
         }
     }
 
-    /// Ctrl+Tab: the mail, then each message tab, round.
-    fn cycle_tabs(&mut self, back: bool) {
-        let mut order: Vec<Option<usize>> = vec![None];
-        order.extend((0..self.tabs.len()).filter(|i| self.tabs[*i].pinned).map(Some));
-        let now = order.iter().position(|o| *o == self.active().filter(|_| self.in_tab)).unwrap_or(0);
-        let count = order.len();
-        match order[if back { (now + count - 1) % count } else { (now + 1) % count }] {
-            Some(at) => self.activate(at),
-            None if self.in_tab => self.show_mail(),
-            None => {}
+    /// Closes the tab of a part of the app; when it was shown, the tab before it takes its place.
+    fn close_section(&mut self, section: Section) {
+        let before = self.tab_before(BarTab::Section(section));
+        self.section_tabs.retain(|(s, _)| *s != section);
+        if self.section == section {
+            self.go_to(before);
         }
+    }
+
+    /// The tabs of the bar in order: the mail, then the others as they were opened.
+    fn bar(&self) -> Vec<BarTab> {
+        let mut opened: Vec<(u64, BarTab)> = self.section_tabs.iter().map(|(s, at)| (*at, BarTab::Section(*s))).collect();
+        opened.extend(self.tabs.iter().enumerate().filter(|(_, t)| t.pinned).map(|(i, t)| (t.opened, BarTab::Message(i))));
+        opened.sort_by_key(|(at, _)| *at);
+        std::iter::once(BarTab::Mail).chain(opened.into_iter().map(|(_, tab)| tab)).collect()
+    }
+
+    /// The tab shown.
+    fn current_tab(&self) -> BarTab {
+        match self.active() {
+            _ if self.section != Section::Mail => BarTab::Section(self.section),
+            Some(at) if self.in_tab => BarTab::Message(at),
+            _ => BarTab::Mail,
+        }
+    }
+
+    /// The tab before `tab` in the bar, the mail for the first.
+    fn tab_before(&self, tab: BarTab) -> BarTab {
+        let bar = self.bar();
+        bar.iter().position(|t| *t == tab).and_then(|at| at.checked_sub(1)).map_or(BarTab::Mail, |at| bar[at])
+    }
+
+    /// Shows `tab`, as it was left.
+    fn go_to(&mut self, tab: BarTab) {
+        match tab {
+            BarTab::Mail => {
+                self.section = Section::Mail;
+                if self.in_tab {
+                    self.show_mail();
+                }
+            }
+            BarTab::Section(section) => self.section = section,
+            BarTab::Message(at) => {
+                self.section = Section::Mail;
+                if self.current_tab() != tab {
+                    self.activate(at);
+                }
+            }
+        }
+    }
+
+    /// Ctrl+Tab: each tab of the bar, round.
+    fn cycle_tabs(&mut self, back: bool) {
+        let bar = self.bar();
+        let now = bar.iter().position(|t| *t == self.current_tab()).unwrap_or(0);
+        let count = bar.len();
+        self.go_to(bar[if back { (now + count - 1) % count } else { (now + 1) % count }]);
     }
 
     /// The index of the tab shown: a message tab, or the reading pane's.
@@ -3595,7 +3666,7 @@ impl BeaverApp {
 
     fn open_hit(&mut self, serial: u64, hit: &Hit, pin: bool) {
         let Some(role) = self.view(serial).and_then(|v| v.mailboxes.iter().find(|m| m.name == hit.folder)).map(|m| m.role) else { return };
-        self.open(tabs::Tab { serial, message: hit.message.clone(), role, pinned: pin, source: false });
+        self.open(tabs::Tab { serial, message: hit.message.clone(), role, pinned: pin, source: false, opened: 0 });
     }
 
     /// Asks the server again for the selected folder and its account's folder list.
@@ -5140,7 +5211,8 @@ impl BeaverApp {
             Some(at) => at,
             None => {
                 let (Some(serial), Some(message)) = (self.serial_of(id), self.summary_of(id).cloned()) else { return };
-                self.tabs.push(tabs::Tab { serial, message, role: self.role_of(id), pinned: true, source: true });
+                self.tab_seq += 1;
+                self.tabs.push(tabs::Tab { serial, message, role: self.role_of(id), pinned: true, source: true, opened: self.tab_seq });
                 self.tabs.len() - 1
             }
         };
@@ -7028,7 +7100,7 @@ impl BeaverApp {
             card::CardAction::Export => {
                 let text = match book_card.and_then(|id| self.archive.card(id).ok().flatten()) {
                     Some(stored) => stored.vcard,
-                    None => beavermail_carddav::vcard::new_card(&beavermail_carddav::new_uid(), &name, &[address.clone()], &notes),
+                    None => beavermail_carddav::vcard::new_card(&beavermail_carddav::new_uid(), &name, std::slice::from_ref(&address), &notes),
                 };
                 let file_name = format!("{}.vcf", attachments::safe_name(if name.trim().is_empty() { &address } else { &name }));
                 self.spawn(async move {
@@ -8053,7 +8125,7 @@ impl BeaverApp {
             return Err("Not in the source of a message");
         }
         // Out of Mail the list and the reader are not on screen: what acts on them waits.
-        if self.section != Section::Mail && !matches!(command, Command::Palette | Command::NewMessage | Command::Settings | Command::Mail | Command::Contacts | Command::Calendar | Command::Tasks | Command::Attachments | Command::WorkOffline | Command::WorkOnline) {
+        if self.section != Section::Mail && !matches!(command, Command::Palette | Command::NewMessage | Command::Settings | Command::Mail | Command::Contacts | Command::Calendar | Command::Tasks | Command::Attachments | Command::WorkOffline | Command::WorkOnline | Command::CloseTab | Command::PreviousTab | Command::NextTab) {
             return Err("Go to Mail first");
         }
         match command {
@@ -8121,8 +8193,8 @@ impl BeaverApp {
             Command::FindInSource => if self.showing_source() { Ok(()) } else { Err("Only in the source of a message") },
             Command::OpenInTab => one().and(if self.in_tab { Err("Already in a tab") } else { Ok(()) }),
             Command::OpenInFolder => one().and(if self.searching() || self.unified { Ok(()) } else { Err("Only for search results and All inboxes") }),
-            Command::CloseTab => if self.in_tab { Ok(()) } else { Err("No message tab is shown") },
-            Command::PreviousTab | Command::NextTab => if self.tabs.iter().any(|t| t.pinned) { Ok(()) } else { Err("No message is open in a tab") },
+            Command::CloseTab => if self.current_tab() != BarTab::Mail { Ok(()) } else { Err("The mail's tab stays open") },
+            Command::PreviousTab | Command::NextTab => if self.bar().len() > 1 { Ok(()) } else { Err("Nothing else is open in a tab") },
             Command::SelectAll => if self.showing_source() || !(self.in_tab || self.listed().is_empty()) { Ok(()) } else { Err("No list is shown") },
             Command::Refresh if self.work_offline => Err("Working offline"),
             Command::Refresh => if self.shown().is_empty() { Err("No folder is shown") } else { Ok(()) },
@@ -8245,11 +8317,11 @@ impl BeaverApp {
                     self.open_in_folder(id);
                 }
             }
-            Command::CloseTab => {
-                if let Some(at) = self.active().filter(|_| self.in_tab) {
-                    self.close_tab(at);
-                }
-            }
+            Command::CloseTab => match self.current_tab() {
+                BarTab::Section(section) => self.close_section(section),
+                BarTab::Message(at) => self.close_tab(at),
+                BarTab::Mail => {}
+            },
             Command::PreviousTab => self.cycle_tabs(true),
             Command::NextTab => self.cycle_tabs(false),
             Command::SelectAll if self.showing_source() => {
@@ -8275,7 +8347,7 @@ impl BeaverApp {
             Command::WorkOnline => self.set_work_offline(false),
             Command::Mail => {
                 self.return_to = None;
-                self.section = Section::Mail;
+                self.go_to(BarTab::Mail);
             }
             Command::Contacts => {
                 self.return_to = None;
@@ -9614,7 +9686,8 @@ impl BeaverApp {
                 }
                 ui.with_layout(Layout::top_down(Align::Min), |ui| {
                     let due = self.tasks_due_today();
-                    for (section, icon, command, name) in [(Section::Mail, Icon::Mail, Command::Mail, "Mail"), (Section::Calendar, Icon::Calendar, Command::Calendar, "Calendar"), (Section::Tasks, Icon::ListChecks, Command::Tasks, "Tasks"), (Section::Attachments, Icon::Paperclip, Command::Attachments, "Attachments"), (Section::Contacts, Icon::Users, Command::Contacts, "Contacts")] {
+                    for section in [Section::Mail, Section::Calendar, Section::Tasks, Section::Attachments, Section::Contacts] {
+                        let (icon, name, command) = section.label();
                         let on = self.section == section;
                         let name = if section == Section::Tasks && due > 0 { format!("Tasks: {due} due today or overdue") } else { name.to_owned() };
                         let name = name.as_str();
@@ -9623,7 +9696,8 @@ impl BeaverApp {
                             tasks::badge(ui, t, button.rect, due);
                         }
                         button.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, on, name));
-                        if button.clicked() && !on {
+                        // Mail from a message tab goes back to the mail's tab.
+                        if button.clicked() && (!on || self.current_tab() != BarTab::Mail && section == Section::Mail) {
                             self.run(command);
                         }
                     }
@@ -11153,7 +11227,49 @@ impl eframe::App for BeaverApp {
         slow.mark("status bar");
         self.rail(ui, &t);
         slow.mark("rail");
-        // Out of Mail, its tabs, folders, list and reader give the window to the section.
+        if self.in_tab && self.open_tab().is_none() {
+            self.show_mail(); // its tab went with its folder or account
+        }
+        // A part of the app shown has its tab, however it was reached.
+        if self.section != Section::Mail && !self.section_tabs.iter().any(|(s, _)| *s == self.section) {
+            self.tab_seq += 1;
+            self.section_tabs.push((self.section, self.tab_seq));
+        }
+        let bar = self.bar();
+        if bar.len() > 1 {
+            let entries: Vec<tabs::Entry> = bar
+                .iter()
+                .map(|tab| match *tab {
+                    BarTab::Mail => tabs::Entry { icon: Some(Icon::Mail), title: "Mail".into(), hover: "Folders and messages (Ctrl+Tab)".into(), closable: false },
+                    BarTab::Section(section) => {
+                        let (icon, name, _) = section.label();
+                        tabs::Entry { icon: Some(icon), title: name.into(), hover: name.into(), closable: true }
+                    }
+                    BarTab::Message(at) => {
+                        let tab = &self.tabs[at];
+                        let title = if tab.message.subject.trim().is_empty() { "(no subject)" } else { tab.message.subject.as_str() };
+                        let (title, icon) = if tab.source { (format!("Source: {title}"), Some(Icon::FileCode)) } else { (title.to_owned(), None) };
+                        tabs::Entry { icon, title, hover: format!("{}\n{}", tab.message.from, tab.message.subject), closable: true }
+                    }
+                })
+                .collect();
+            let current = bar.iter().position(|tab| *tab == self.current_tab()).unwrap_or(0);
+            let mut event = None;
+            let frame = egui::Frame::new().fill(t.bg).inner_margin(egui::Margin { left: 8, right: 8, top: 6, bottom: 0 });
+            egui::Panel::top("tabs").frame(frame).show(ui, |ui| {
+                event = tabs::tab_bar(ui, &t, &entries, current);
+            });
+            match event.map(|e| match e {
+                tabs::TabEvent::Activate(at) => (bar[at], false),
+                tabs::TabEvent::Close(at) => (bar[at], true),
+            }) {
+                Some((tab, false)) => self.go_to(tab),
+                Some((BarTab::Section(section), true)) => self.close_section(section),
+                Some((BarTab::Message(at), true)) => self.close_tab(at),
+                _ => {}
+            }
+        }
+        // Out of Mail, its folders, list and reader give the window to the section.
         let contacts = self.section != Section::Mail;
         match self.section {
             Section::Contacts => self.contacts_view(ui, &t),
@@ -11164,22 +11280,6 @@ impl eframe::App for BeaverApp {
         }
         slow.mark("section");
 
-        if self.in_tab && self.open_tab().is_none() {
-            self.show_mail(); // its tab went with its folder or account
-        }
-        if !contacts && self.tabs.iter().any(|t| t.pinned) {
-            let mut event = None;
-            let bar = egui::Frame::new().fill(t.bg).inner_margin(egui::Margin { left: 8, right: 8, top: 6, bottom: 0 });
-            egui::Panel::top("tabs").frame(bar).show(ui, |ui| {
-                event = tabs::tab_bar(ui, &t, &self.tabs, self.active().filter(|_| self.in_tab));
-            });
-            match event {
-                Some(tabs::TabEvent::Mail) if self.in_tab => self.show_mail(),
-                Some(tabs::TabEvent::Activate(at)) => self.activate(at),
-                Some(tabs::TabEvent::Close(at)) => self.close_tab(at),
-                _ => {}
-            }
-        }
         let SidebarOutcome { chosen, suspicious, recheck, empty, recheck_all, empty_all, removed, edit, folders, mut add, all, local, all_suspicious, all_role, dropped, new_inside, rename, delete, label, saved } =
             if self.in_tab || contacts { SidebarOutcome::default() } else { self.sidebar(ui, &t) };
         slow.mark("sidebar");

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Messages open in tabs across the top of the window. The first tab is
-//! the mail itself (folders, list and reading pane); a double click, a middle click, Ctrl+click or
+//! Messages and parts of the app open in tabs across the top of the window. The first tab is
+//! the mail itself (folders, list and reading pane); Calendar, Tasks, Attachments and Contacts open
+//! in a tab of their own from the rail, one each. A double click, a middle click, Ctrl+click or
 //! Enter opens a message in a tab of its own, as wide as the window. A plain click only shows it in
 //! the reading pane: that one is kept here too, unpinned, so going back to the mail shows it again.
 //! A tab remembers where its message came from, so it stays usable after another folder or account
@@ -23,6 +24,8 @@ pub struct Tab {
     pub pinned: bool,
     /// Shows the message's source (View source) instead of the message; always a tab of its own.
     pub source: bool,
+    /// When it got its tab, to order it among the other tabs.
+    pub opened: u64,
 }
 
 /// Where a message opens.
@@ -48,33 +51,33 @@ pub fn slot(tabs: &[Tab], id: MessageId, pin: bool) -> Slot {
     }
 }
 
-/// What the user did on the tab bar.
+/// What the user did on the tab bar, by the place of the tab in it.
 pub enum TabEvent {
-    /// Back to the mail.
-    Mail,
     Activate(usize),
     Close(usize),
+}
+
+/// A tab as the bar shows it.
+pub struct Entry {
+    pub icon: Option<Icon>,
+    pub title: String,
+    pub hover: String,
+    pub closable: bool,
 }
 
 const TAB_H: f32 = 34.0;
 const TAB_MAX_W: f32 = 200.0;
 
-/// The mail, then each message tab; `active` is the message tab shown, `None` the mail.
-pub fn tab_bar(ui: &mut Ui, t: &Tokens, tabs: &[Tab], active: Option<usize>) -> Option<TabEvent> {
+/// The tabs, in order; `current` is the place of the one shown.
+pub fn tab_bar(ui: &mut Ui, t: &Tokens, entries: &[Entry], current: usize) -> Option<TabEvent> {
     let mut event = None;
     egui::ScrollArea::horizontal().id_salt("tabs").auto_shrink([false, true]).show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            let (_, mail) = tab(ui, t, Some(Icon::Mail), "Mail", active.is_none(), false);
-            if mail.on_hover_text("Folders and messages (Ctrl+Tab)").clicked() {
-                event = Some(TabEvent::Mail);
-            }
-            for (i, tab_) in tabs.iter().enumerate().filter(|(_, tab)| tab.pinned) {
-                let title = if tab_.message.subject.trim().is_empty() { "(no subject)" } else { tab_.message.subject.as_str() };
-                let (title, icon) = if tab_.source { (format!("Source: {title}"), Some(Icon::FileCode)) } else { (title.to_owned(), None) };
-                let (close, response) = tab(ui, t, icon, &title, active == Some(i), true);
-                let response = response.on_hover_text(format!("{}\n{}", tab_.message.from, tab_.message.subject));
-                if close.is_some_and(|c| c.on_hover_text("Close (Ctrl+W)").clicked()) || response.middle_clicked() {
+            for (i, entry) in entries.iter().enumerate() {
+                let (close, response) = tab(ui, t, entry.icon, &entry.title, current == i, entry.closable);
+                let response = response.on_hover_text(&entry.hover);
+                if close.is_some_and(|c| c.on_hover_text("Close (Ctrl+W)").clicked()) || (entry.closable && response.middle_clicked()) {
                     event = Some(TabEvent::Close(i));
                 } else if response.clicked() {
                     event = Some(TabEvent::Activate(i));
@@ -130,7 +133,7 @@ mod tests {
     use super::*;
 
     fn tab(id: u64, pinned: bool) -> Tab {
-        Tab { serial: 1, message: MessageSummary { id: MessageId(id), ..sample() }, role: Role::Inbox, pinned, source: false }
+        Tab { serial: 1, message: MessageSummary { id: MessageId(id), ..sample() }, role: Role::Inbox, pinned, source: false, opened: id }
     }
 
     fn sample() -> MessageSummary {
