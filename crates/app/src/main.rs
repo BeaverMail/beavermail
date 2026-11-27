@@ -7287,6 +7287,22 @@ impl BeaverApp {
                 self.open_from(self.section, serial, &hit);
             }
             card::CardAction::Close => self.card = None,
+            // An edit left with its changes discarded: on to what left it.
+            card::CardAction::Left(how) => match how {
+                card::Leave::Close => self.card = None,
+                card::Leave::Open(id) => self.contact_pane = self.load_book_card(id),
+                card::Leave::NewContact => self.new_contact = Some((String::new(), String::new())),
+                card::Leave::Quit => self.ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                card::Leave::Cancel => {}
+            },
+            card::CardAction::SaveAndQuit => {
+                self.card_action(card::CardAction::Save, inline);
+                // Saved: the card shown again is no longer edited. Not saved, the error says why and the app stays.
+                let shown = if inline { self.contact_pane.as_ref() } else { self.card.as_ref() };
+                if shown.is_none_or(|c| c.editing.is_none()) {
+                    self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
             card::CardAction::PickPhoto => self.spawn(async move {
                 let Some(file) = rfd::AsyncFileDialog::new().set_title("Choose a photo").add_filter("Picture", &["jpg", "jpeg", "png"]).pick_file().await else { return Event::ContactPhoto(None) };
                 let bytes = file.read().await;
@@ -9889,7 +9905,9 @@ impl BeaverApp {
         // list in the middle, the open card on the right.
         let frame = egui::Frame::new().fill(t.bg).inner_margin(egui::Margin::same(12));
         egui::Panel::left("contact_books").frame(frame).default_size(260.0).size_range(210.0..=340.0).show(ui, |ui| {
-            if views::primary_wide(ui, t, Icon::Plus, "New contact", None).on_hover_text("Add someone by their address").clicked() {
+            if views::primary_wide(ui, t, Icon::Plus, "New contact", None).on_hover_text("Add someone by their address").clicked()
+                && self.contact_pane.as_mut().is_none_or(|c| c.leave(card::Leave::NewContact))
+            {
                 self.new_contact = Some((String::new(), String::new()));
             }
             ui.add_space(8.0);
@@ -9988,7 +10006,10 @@ impl BeaverApp {
                 egui::Frame::popup(ui.style()).show(ui, |ui| ui.label(format!("{verb} {}", dragged.name)));
             });
         }
-        if let Some(id) = pick {
+        // Another contact picked while one is edited: asked first when it has changes.
+        if let Some(id) = pick
+            && self.contact_pane.as_mut().is_none_or(|c| c.leave(card::Leave::Open(id)))
+        {
             self.contact_pane = self.load_book_card(id);
         }
         match action_on_row {
@@ -11386,13 +11407,29 @@ impl eframe::App for BeaverApp {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
             (self.confirm_discard, self.quitting) = (true, true);
         }
+        // A card edited with changes: asked first, on its own card, shown for that.
+        if ui.ctx().input(|i| i.viewport().close_requested()) && !self.confirm_discard {
+            let mut asked = false;
+            for card in [self.card.as_mut(), self.contact_pane.as_mut()].into_iter().flatten() {
+                if !asked && card.asking.is_none() && !card.leave(card::Leave::Quit) {
+                    asked = true;
+                }
+            }
+            if asked || [&self.card, &self.contact_pane].iter().any(|c| c.as_ref().is_some_and(|c| c.asking.is_some())) {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                if self.card.as_ref().is_none_or(|c| c.asking.is_none()) {
+                    self.go_to(BarTab::Section(Section::Contacts));
+                }
+            }
+        }
         // Changes still on their way to the server are waited for in a dialog, rather than in a window
         // that stops answering on the way out.
         // Tasks deleted and waiting out Undo are deleted for good: kept here, sent at the next start if not now.
         if ui.ctx().input(|i| i.viewport().close_requested()) {
             self.finish_task_delete();
         }
-        if ui.ctx().input(|i| i.viewport().close_requested()) && !self.confirm_discard && (self.pending.is_some() || !self.in_flight.is_empty() || self.tasks_sending() > 0) {
+        let card_asking = [&self.card, &self.contact_pane].iter().any(|c| c.as_ref().is_some_and(|c| c.asking.is_some()));
+        if ui.ctx().input(|i| i.viewport().close_requested()) && !self.confirm_discard && !card_asking && (self.pending.is_some() || !self.in_flight.is_empty() || self.tasks_sending() > 0) {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.send_pending();
             self.closing = true;

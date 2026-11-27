@@ -1088,6 +1088,28 @@ pub fn primary_button(ui: &mut Ui, t: &Tokens, label: &str, enabled: bool) -> Re
     ui.add_enabled(enabled, button)
 }
 
+/// A line under a form field, from its left edge `left` and as wide as it, with its icon: help in
+/// dim text while something is still being picked, or (`error`) what is wrong once the field is
+/// left, in the danger colour.
+pub fn field_note(ui: &mut Ui, t: &Tokens, text: &str, error: bool, left: f32, width: f32) -> Response {
+    ui.scope(|ui| {
+        // As tall as its text: a row is otherwise a control's height, the note centred far below the field.
+        ui.spacing_mut().interact_size.y = 0.0;
+        ui.horizontal(|ui| {
+            ui.add_space(left - ui.cursor().left());
+            ui.allocate_ui_with_layout(vec2(width, 0.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let (icon, color) = if error { (Icon::CircleAlert, t.danger) } else { (Icon::Info, t.text_dim) };
+                ui.add(icon.image(14.0, color));
+                ui.add(egui::Label::new(egui::RichText::new(text).size(13.0).color(color)).wrap());
+            })
+            .response
+        })
+        .inner
+    })
+    .inner
+}
+
 /// The filled button with a leading icon, as wide as the available space. Disabled, it keeps the
 /// accent hue but muted, instead of egui's grey fade, and explains itself in `why_disabled`.
 pub fn primary_wide(ui: &mut Ui, t: &Tokens, icon: Icon, label: &str, why_disabled: Option<&str>) -> Response {
