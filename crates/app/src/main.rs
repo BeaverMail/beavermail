@@ -2639,19 +2639,19 @@ impl BeaverApp {
         }
     }
 
-    /// Closes message tab `at`; when it was shown, the section it was opened from takes its place,
-    /// else the tab before it.
+    /// Closes message tab `at`; when it was shown, where it was opened from takes its place, as a
+    /// browser goes back to the tab that opened one.
     fn close_tab(&mut self, at: usize) {
         if !self.tabs.get(at).is_some_and(|t| t.pinned) {
             return;
         }
         let was_open = self.current_tab() == BarTab::Message(at);
-        let back = self.return_to.filter(|(id, _)| self.tabs[at].message.id == *id).map(|(_, from)| from);
-        let before = self.tab_before(BarTab::Message(at));
+        let from = self.return_to.filter(|(id, _)| self.tabs[at].message.id == *id).map(|(_, from)| from);
         self.tabs.remove(at);
         if was_open {
             self.return_to = None;
-            self.go_to(back.map_or(before, BarTab::Section));
+            let open: Vec<Section> = self.section_tabs.iter().map(|(s, _)| *s).collect();
+            self.go_to(back_from_message(from, &open));
         }
     }
 
@@ -12119,9 +12119,22 @@ fn range(ids: &[MessageId], anchor: MessageId, to: MessageId) -> Option<Vec<Mess
     Some(range)
 }
 
+/// Where closing a message tab goes: the section it was opened from while its tab is open, else the
+/// mail's list.
+fn back_from_message(from: Option<Section>, open: &[Section]) -> BarTab {
+    from.filter(|s| open.contains(s)).map_or(BarTab::Mail, BarTab::Section)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_closed_message_goes_back_where_it_was_opened_from() {
+        assert!(back_from_message(None, &[Section::Contacts]) == BarTab::Mail, "from the list: back to it, not to the tab before");
+        assert!(back_from_message(Some(Section::Contacts), &[Section::Calendar, Section::Contacts]) == BarTab::Section(Section::Contacts));
+        assert!(back_from_message(Some(Section::Contacts), &[Section::Calendar]) == BarTab::Mail, "its section closed since");
+    }
 
     #[test]
     fn what_an_account_knows_is_loaded_again_only_when_its_marks_change() {
